@@ -45,7 +45,7 @@ pub fn decide(rule: &Rule, running: Option<&Version>, candidate: &Version) -> De
     let Some(running) = running else {
         return Decision::Manual;
     };
-    match candidate.cmp(running) {
+    match candidate.cmp_precedence(running) {
         Ordering::Equal => Decision::Refused(Refusal::AlreadyRunning),
         Ordering::Less => Decision::Manual,
         Ordering::Greater => {
@@ -62,6 +62,7 @@ pub fn decide(rule: &Rule, running: Option<&Version>, candidate: &Version) -> De
 }
 
 /// The smallest level that permits moving from `running` up to `candidate`.
+/// Pre-release and build fields are ignored: only major, minor and patch count.
 fn jump(running: &Version, candidate: &Version) -> Level {
     if candidate.major != running.major {
         Level::Any
@@ -152,6 +153,39 @@ mod tests {
         assert_eq!(
             decide_str(&patch, Some("1.3.0-rc.1"), "1.3.0"),
             Decision::Auto
+        );
+    }
+
+    #[test]
+    fn build_metadata_does_not_make_versions_differ() {
+        let any = rule(Some("any"), Some("any"), false);
+        assert_eq!(
+            decide_str(&any, Some("1.2.3+a"), "1.2.3+b"),
+            Decision::Refused(Refusal::AlreadyRunning)
+        );
+        assert_eq!(
+            decide_str(&any, Some("1.2.3+b"), "1.2.3+a"),
+            Decision::Refused(Refusal::AlreadyRunning)
+        );
+    }
+
+    #[test]
+    fn level_boundaries_are_inclusive() {
+        let minor = rule(Some("minor"), None, false);
+        assert_eq!(decide_str(&minor, Some("1.2.3"), "1.3.0"), Decision::Auto);
+        let approve_only = rule(None, Some("patch"), false);
+        assert_eq!(
+            decide_str(&approve_only, Some("1.2.3"), "1.2.4"),
+            Decision::NeedsApproval
+        );
+    }
+
+    #[test]
+    fn first_deploy_of_a_prerelease_is_refused_unless_opted_in() {
+        let closed = rule(Some("any"), None, false);
+        assert_eq!(
+            decide_str(&closed, None, "1.0.0-rc.1"),
+            Decision::Refused(Refusal::Prerelease)
         );
     }
 
