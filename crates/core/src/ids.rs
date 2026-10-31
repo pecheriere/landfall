@@ -51,7 +51,7 @@ pub struct TagError {
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident, $variant:ident, $valid:path) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(String);
 
         impl FromStr for $name {
