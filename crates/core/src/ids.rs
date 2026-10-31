@@ -32,6 +32,9 @@ pub enum IdError {
     /// Not 40 lowercase hex digits.
     #[error("invalid commit sha {0:?}: expected 40 lowercase hex digits")]
     Commit(String),
+    /// Not 1 to 128 bytes of `[A-Za-z0-9._/+-]`.
+    #[error("invalid release tag {0:?}: expected 1 to 128 bytes of [A-Za-z0-9._/+-]")]
+    ReleaseTag(String),
     /// Not `<prefix>*` with prefix `[A-Za-z0-9._/-]{0,32}`.
     #[error("invalid tag pattern {0:?}: expected <prefix>*, prefix [A-Za-z0-9._/-]{{0,32}}")]
     TagPattern(String),
@@ -127,6 +130,12 @@ fn is_lower_hex(s: &str) -> bool {
     s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+fn is_release_tag(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-'))
+}
+
 fn is_digest(s: &str) -> bool {
     s.strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && is_lower_hex(hex))
@@ -153,6 +162,15 @@ id_type!(
     PrincipalId,
     Principal,
     is_label
+);
+id_type!(
+    /// A release tag as shown to approvers and signed into a deploy intent:
+    /// 1 to 128 bytes of `[A-Za-z0-9._/+-]`, so it can carry no control or
+    /// bidirectional-override characters. Whether it is a release version is
+    /// decided separately by [`TagPattern::parse_tag`].
+    ReleaseTag,
+    ReleaseTag,
+    is_release_tag
 );
 id_type!(
     /// A GitHub repository, `<owner>/<repo>`.
@@ -321,6 +339,26 @@ mod tests {
                 .parse::<TagPattern>()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn release_tags_admit_only_plain_characters() {
+        for ok in ["v1.2.4", "v1.3.0-rc.1", "release/1.2", "v1.0.0+build_5"] {
+            assert!(ok.parse::<ReleaseTag>().is_ok(), "{ok}");
+        }
+        assert!("v".repeat(128).parse::<ReleaseTag>().is_ok());
+        for bad in [
+            "",
+            "v1.2.4\n",
+            "v1.2.4\"",
+            "v1.2 4",
+            "v1.2.4\u{202e}",
+            "v1.2.4\0",
+            "v\u{e9}",
+        ] {
+            assert!(bad.parse::<ReleaseTag>().is_err(), "{bad:?}");
+        }
+        assert!("v".repeat(129).parse::<ReleaseTag>().is_err());
     }
 
     #[test]

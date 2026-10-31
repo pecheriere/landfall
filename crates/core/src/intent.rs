@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::hex;
-use crate::ids::{CommitSha, DeploymentId, ImageDigest};
+use crate::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 
 /// Domain-separation prefix of the canonical encoding.
 const DOMAIN: &[u8] = b"landfall-deploy-intent-v1";
@@ -23,12 +23,15 @@ pub struct DeployIntent {
     /// The deployment being changed.
     pub deployment: DeploymentId,
     /// The release tag being deployed.
-    pub tag: String,
+    pub tag: ReleaseTag,
     /// The commit the tag points at.
     pub commit: CommitSha,
     /// The image content digest to run.
     pub digest: ImageDigest,
-    /// The digest the host must be running now; `None` for a first deploy.
+    /// The digest the host must be running now; `None` (JSON `null`) for a
+    /// first deploy. The key must be present: an omitted key is an error, so
+    /// a truncated payload can never silently become a first deploy.
+    #[serde(deserialize_with = "Option::deserialize")]
     pub expected_running: Option<ImageDigest>,
     /// One-time value that makes this approval unrepeatable; 64 hex digits
     /// on the wire.
@@ -53,13 +56,14 @@ mod nonce_hex {
 
 /// Appends `field` as a 4-byte big-endian length followed by its bytes.
 ///
-/// The length saturates at `u32::MAX` instead of truncating. No field can get
-/// near that: identifiers are validated to a few dozen bytes and the tag is a
-/// release tag of at most a few hundred, so saturation is unreachable in
-/// practice and, were it ever reached, still cannot alias a shorter field.
+/// Every field of a [`DeployIntent`] is bounded by its type: identifiers and
+/// digests by their validated grammar, the tag by [`ReleaseTag`] (at most 128
+/// bytes) and the nonce by its array length. The longest is therefore far
+/// below `u32::MAX`, so the low four bytes of the length are the whole length
+/// and nothing is truncated.
 fn push_field(out: &mut Vec<u8>, field: &[u8]) {
-    let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
-    out.extend_from_slice(&len.to_be_bytes());
+    let [.., a, b, c, d] = field.len().to_be_bytes();
+    out.extend_from_slice(&[a, b, c, d]);
     out.extend_from_slice(field);
 }
 
@@ -74,7 +78,7 @@ impl DeployIntent {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = DOMAIN.to_vec();
         push_field(&mut out, self.deployment.as_ref().as_bytes());
-        push_field(&mut out, self.tag.as_bytes());
+        push_field(&mut out, self.tag.as_ref().as_bytes());
         push_field(&mut out, self.commit.as_ref().as_bytes());
         push_field(&mut out, self.digest.as_ref().as_bytes());
         push_field(
@@ -101,7 +105,7 @@ mod tests {
     fn intent() -> DeployIntent {
         DeployIntent {
             deployment: "app/prod".parse().unwrap(),
-            tag: "v1.2.4".to_owned(),
+            tag: "v1.2.4".parse().unwrap(),
             commit: "a".repeat(40).parse().unwrap(),
             digest: format!("sha256:{}", "b".repeat(64)).parse().unwrap(),
             expected_running: Some(format!("sha256:{}", "c".repeat(64)).parse().unwrap()),
@@ -142,7 +146,7 @@ mod tests {
         v.deployment = "app/stage".parse().unwrap();
         variants.push(v);
         let mut v = base.clone();
-        v.tag = "v1.2.5".to_owned();
+        v.tag = "v1.2.5".parse().unwrap();
         variants.push(v);
         let mut v = base.clone();
         v.commit = "d".repeat(40).parse().unwrap();
@@ -159,19 +163,11 @@ mod tests {
         let mut v = base.clone();
         v.nonce = [8; 32];
         variants.push(v);
-        for tag in ["v1.2.4\"", "v1.2.4\n", "v1.2.4 ", "", "app/prodv1.2.4"] {
+        for tag in ["v1.2.4-rc.1", "v1.2.4+1", "app/prodv1.2.4", "v1.2.", "x"] {
             let mut v = base.clone();
-            v.tag = tag.to_owned();
+            v.tag = tag.parse().unwrap();
             variants.push(v);
         }
-        // A tag that absorbs the next field's length prefix and bytes must
-        // not collide with the honest encoding.
-        let mut v = base.clone();
-        let mut smuggled = b"v1.2.4".to_vec();
-        smuggled.extend_from_slice(&40_u32.to_be_bytes());
-        smuggled.extend_from_slice("a".repeat(40).as_bytes());
-        v.tag = String::from_utf8(smuggled).unwrap();
-        variants.push(v);
 
         let mut seen = vec![base.challenge()];
         for v in &variants {
@@ -193,6 +189,25 @@ mod tests {
             let json = serde_json::to_string(&i).unwrap();
             assert!(json.contains(&"07".repeat(32)), "{json}");
             assert_eq!(serde_json::from_str::<DeployIntent>(&json).unwrap(), i);
+        }
+    }
+
+    #[test]
+    fn expected_running_must_be_present_even_when_null() {
+        let mut v = serde_json::to_value(intent()).unwrap();
+        v["expected_running"] = serde_json::Value::Null;
+        let parsed: DeployIntent = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(parsed.expected_running, None);
+        v.as_object_mut().unwrap().remove("expected_running");
+        assert!(serde_json::from_value::<DeployIntent>(v).is_err());
+    }
+
+    #[test]
+    fn hostile_tags_do_not_deserialise() {
+        let mut v = serde_json::to_value(intent()).unwrap();
+        for bad in ["v1\n", "v1\"", "v1\u{202e}"] {
+            v["tag"] = serde_json::Value::String(bad.to_owned());
+            assert!(serde_json::from_value::<DeployIntent>(v.clone()).is_err());
         }
     }
 
