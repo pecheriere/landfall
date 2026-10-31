@@ -10,6 +10,8 @@ passkey approvals. Agents drive it through a typed API. Design:
 
 ## Crate map
 
+- `landfall-core` (`crates/core`): shared library with no I/O: validated
+  identifiers, configuration types and the pure verification and rule logic.
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI.
