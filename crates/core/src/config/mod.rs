@@ -445,16 +445,7 @@ getters!(Grant, g {
 /// compare these to detect configuration drift.
 #[must_use]
 pub fn config_hash(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    Sha256::digest(bytes)
-        .iter()
-        .flat_map(|b| {
-            [
-                char::from(HEX[usize::from(b >> 4)]),
-                char::from(HEX[usize::from(b & 0x0f)]),
-            ]
-        })
-        .collect()
+    crate::hex::encode(&Sha256::digest(bytes))
 }
 
 /// Parses and validates a configuration file.
