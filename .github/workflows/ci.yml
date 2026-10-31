@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The release workflow reruns the whole CI on the tagged commit before it
+  # publishes anything.
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --all-features --locked
+          command: check
+
+  crate-age:
+    # Compares Cargo.lock with the PR's base, so it only runs on pull requests.
+    # Nothing stops a push straight to main from skipping it, so a release
+    # workflow must run the same check against the previous release tag before
+    # it publishes anything (release.yml does).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The PR's merge commit and its first parent, the base it merges into.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Lint and test the CI scripts
+        run: |
+          python3 -m venv "$RUNNER_TEMP/lint"
+          "$RUNNER_TEMP/lint/bin/pip" install --quiet --require-hashes --only-binary :all: \
+            -r .github/requirements-lint.txt
+          "$RUNNER_TEMP/lint/bin/ruff" check .github/scripts
+          "$RUNNER_TEMP/lint/bin/ruff" format --check .github/scripts
+          python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Refuse crate versions published less than 7 days ago
+        run: python3 -I .github/scripts/crate_age.py --base HEAD^1
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          # Both platforms the image supports. The builder stage
+          # cross-compiles with zig and the final stage only copies files, so
+          # no emulation is needed.
+          platforms: linux/arm64,linux/amd64
+          push: false
+          # Pull requests and main share one build cache. The release workflow's
+          # publish job never reads it, so a cache entry cannot reach a
+          # published image.
+          cache-from: type=gha,scope=docker-build
+          cache-to: type=gha,mode=max,scope=docker-build

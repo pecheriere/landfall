@@ -1,0 +1,19 @@
+[package]
+name = "landfall-agent"
+description = "Runs on each host: verifies and deploys releases, checks health, rolls back."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "landfall-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true

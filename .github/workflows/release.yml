@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+jobs:
+  on-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the tagged commit to be on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  crate-age:
+    needs: on-main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Pull requests check Cargo.lock against their base, but a push straight to
+      # main skips that, so every version added since the previous release is
+      # checked again here. The first release has no previous tag and checks all.
+      - name: Refuse crate versions published less than 7 days ago
+        run: |
+          if [ -z "$(git tag --list 'v[0-9]*' --merged HEAD^)" ]; then
+            python3 -I .github/scripts/crate_age.py --no-base
+          else
+            previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^)
+            python3 -I .github/scripts/crate_age.py --base "$previous"
+          fi
+
+  ci:
+    needs: on-main
+    uses: $/.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    needs: [on-main, crate-age, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/pecheriere/landfall
+          tags: type=semver,pattern={{version}}
+          flavor: latest=false
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/arm64,linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/pecheriere/landfall
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
