@@ -61,9 +61,9 @@ pattern as signers.
 | `id` | string | required | `<name>/<stage>`, each part `[a-z0-9][a-z0-9-]{0,62}`. Unique. |
 | `repo` | table | required | `name` (`<owner>/<repo>`), `id` and `owner_id` (GitHub numeric ids, integers). |
 | `host` | string | required | Host that runs it, `[a-z0-9][a-z0-9-]{0,62}`. |
-| `compose.dir` | string | required | Absolute directory of the compose project; no `..` component. |
+| `compose.dir` | string | required | Absolute, canonical directory of the compose project: no trailing or doubled `/`, no `.` or `..` component (so one directory has one spelling). |
 | `compose.service` | string | required | Service name, `[a-z0-9][a-z0-9_.-]*`. |
-| `origin.workflow` | string | required | Release workflow, `.github/workflows/<name>.yml` or `.yaml`, no `..`. |
+| `origin.workflow` | string | required | Release workflow, `.github/workflows/<name>.yml` or `.yaml`, canonical (no `.` or `..` component). |
 | `origin.tags` | string | required | Release tag pattern: a prefix and a final `*`, for example `v*`. The rest of the tag must be strict semver without build metadata. |
 | `origin.signers` | list | required | Keys of `[signers]` trusted for this deployment; at least one. |
 | `rule.auto` | `"patch"`, `"minor"` or `"any"` | none | Deploy without a human when the new version is higher than the running one and differs by at most this part. |
@@ -71,7 +71,7 @@ pattern as signers.
 | `rule.approvers` | list | required | Keys of `[approvers]` who may approve; at least one. |
 | `rule.prereleases` | bool | `false` | Whether prerelease versions are eligible. |
 | `checks` | list | required | Post-deploy checks; at least one (see below). |
-| `backup.paths` | list | required if `backup` | Paths relative to `compose.dir`, non-empty, no `..`, not absolute. |
+| `backup.paths` | list | required if `backup` | Paths relative to `compose.dir`, non-empty and canonical (no leading, trailing or doubled `/`, no `.` or `..` component). |
 | `backup.stop` | bool | `true` | Stop the service while copying. |
 | `promote_to.deployment` | string | required if `promote_to` | Deployment to promote to. |
 | `promote_to.healthy_for` | string | required if `promote_to` | How long this deployment must stay healthy: `<n>m`, `<n>h` or `<n>d`, `n` above zero. |
@@ -116,5 +116,6 @@ The file is refused, with an error naming the deployment and the value, when:
    principal not in `[approvers]`;
 8. two deployments on one host use the same `compose.dir` and `compose.service`.
 
-Malformed values (relative `compose.dir`, a `..` in a path, a bad
-`healthy_for`, an unknown check) are refused too.
+Malformed values (relative or non-canonical paths, a bad `healthy_for`, an
+unknown or ill-formed check) are refused too; check errors name the entry,
+for example `checks[2]`, and the keys found in it.
