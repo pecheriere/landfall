@@ -5,7 +5,8 @@ verified and healthy container comes out on your hosts, or the previous
 version stays and you can see exactly why.
 
 **Status:** early development; nothing usable yet. The design is in
-[`docs/design/landfall.md`](docs/design/landfall.md).
+[`docs/design/landfall.md`](docs/design/landfall.md); the configuration
+file is documented in [`docs/configuration.md`](docs/configuration.md).
 
 ## How it will work
 
