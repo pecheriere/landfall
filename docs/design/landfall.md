@@ -179,9 +179,17 @@ backup = { paths = ["state"], stop = true }
 
 [[deployment]]
 id = "app/staging"
-rule = { auto = "any" }
+repo = { name = "example/app", id = 1234, owner_id = 5678 }
+host = "home-1"
+compose = { dir = "/srv/compose/app-staging", service = "app" }
+origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
+rule = { auto = "any", approvers = ["operator"] }   # first deploys and downgrades still need one
+checks = ["container-healthy"]
 promote_to = { deployment = "app/prod", healthy_for = "24h" }
 ```
+
+`origin.tags` is required (there is no default pattern), and so is `rule.approvers` on every
+deployment. The full key reference and validation rules are in `docs/configuration.md`.
 
 ### 6.2 Rule kinds
 - `auto = "patch" | "minor" | "any"`: deploy without a human when the new version is **higher** than

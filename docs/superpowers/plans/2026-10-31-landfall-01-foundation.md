@@ -30,7 +30,7 @@
 - Every config struct uses `#[serde(deny_unknown_fields)]`: a typo in the config is an error, never ignored.
 - Errors are `thiserror` enums; every validation error names the deployment id (or section) and the offending value, so an operator can fix the file from the message alone.
 - Full gate before each commit: `cargo fmt --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && cargo test --workspace --all-features --locked && RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked && cargo deny --all-features --locked check`.
-- `CARGO_TARGET_DIR` must point at the external SSD: use `"/Volumes/Caldrin SSD/cargo-target-landfall"` (export it; never a path on the internal disk). sccache is configured globally.
+- Build output goes wherever your `CARGO_TARGET_DIR` points; never commit machine-specific paths.
 - Public, generic repository: no hostnames, addresses or user names of any real deployment in code, docs or tests (use `example/app`, `home-1`, `maintainer`, `operator`).
 - Commits: conventional-commit subject, no `Co-Authored-By`, `Claude-Session` or "Generated with" trailers.
 - Tests specify behaviour; none restate the implementation or exist for coverage.
