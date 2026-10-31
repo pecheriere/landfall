@@ -32,11 +32,18 @@ pub enum IdError {
     /// Not 40 lowercase hex digits.
     #[error("invalid commit sha {0:?}: expected 40 lowercase hex digits")]
     Commit(String),
-    /// Not 1 to 128 bytes of `[A-Za-z0-9._/+-]`.
-    #[error("invalid release tag {0:?}: expected 1 to 128 bytes of [A-Za-z0-9._/+-]")]
+    /// Not 1 to 128 bytes of `[A-Za-z0-9._/+-]` forming a valid git ref name.
+    #[error(
+        "invalid release tag {0:?}: expected 1 to 128 bytes of [A-Za-z0-9._/+-], not starting with '-', \
+         no '..', no empty component (leading, trailing or doubled '/'), no component starting with '.' \
+         or ending with '.lock' (any case), not ending with '.'"
+    )]
     ReleaseTag(String),
-    /// Not `<prefix>*` with prefix `[A-Za-z0-9._/-]{0,32}`.
-    #[error("invalid tag pattern {0:?}: expected <prefix>*, prefix [A-Za-z0-9._/-]{{0,32}}")]
+    /// Not `<prefix>*` with prefix `[A-Za-z0-9._/-]{0,32}` that does not end
+    /// with a digit or `.`.
+    #[error(
+        "invalid tag pattern {0:?}: expected <prefix>*, prefix [A-Za-z0-9._/-]{{0,32}} not ending with a digit or '.'"
+    )]
     TagPattern(String),
 }
 
@@ -130,10 +137,28 @@ fn is_lower_hex(s: &str) -> bool {
     s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The byte grammar plus the subset of `git check-ref-format` that the
+/// grammar leaves open, so every accepted value is also a usable git tag.
 fn is_release_tag(s: &str) -> bool {
     (1..=128).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'+' | b'-'))
+        && !s.starts_with('-')
+        && !s.ends_with('.')
+        && !s.contains("..")
+        && s.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !ends_with_lock(component)
+        })
+}
+
+/// Whether `component` ends with `.lock`, in any case: git refuses the exact
+/// suffix, and a case-insensitive filesystem would confuse the others with it.
+fn ends_with_lock(component: &str) -> bool {
+    component
+        .len()
+        .checked_sub(5)
+        .and_then(|start| component.as_bytes().get(start..))
+        .is_some_and(|end| end.eq_ignore_ascii_case(b".lock"))
 }
 
 fn is_digest(s: &str) -> bool {
@@ -166,8 +191,11 @@ id_type!(
 id_type!(
     /// A release tag as shown to approvers and signed into a deploy intent:
     /// 1 to 128 bytes of `[A-Za-z0-9._/+-]`, so it can carry no control or
-    /// bidirectional-override characters. Whether it is a release version is
-    /// decided separately by [`TagPattern::parse_tag`].
+    /// bidirectional-override characters, and a valid git ref name: not
+    /// starting with `-`, no `..`, no empty component, no component starting
+    /// with `.` or ending with `.lock` (in any case), not ending with `.`.
+    /// Whether it is a release version is decided separately by
+    /// [`TagPattern::parse_tag`].
     ReleaseTag,
     ReleaseTag,
     is_release_tag
@@ -192,13 +220,17 @@ id_type!(
 );
 
 /// Which tags count as releases: `"<prefix>*"`, for example `"v*"`.
+///
+/// The prefix must not end with a digit or `.`: with `"v1*"`, the tag
+/// `v12.0.0` would parse as version `2.0.0`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TagPattern {
     prefix: String,
 }
 
 impl TagPattern {
-    /// Extracts the version from `tag`: strips the literal prefix, parses
+    /// Extracts the version from `tag`, already validated as a
+    /// [`ReleaseTag`]: strips the literal prefix, parses
     /// strict semver and refuses build metadata.
     ///
     /// # Errors
@@ -206,12 +238,13 @@ impl TagPattern {
     /// Returns [`TagError`] when the prefix is missing, the rest is not
     /// strict semver (`MAJOR.MINOR.PATCH`, no leading zeros) or the version
     /// carries build metadata.
-    pub fn parse_tag(&self, tag: &str) -> Result<semver::Version, TagError> {
+    pub fn parse_tag(&self, tag: &ReleaseTag) -> Result<semver::Version, TagError> {
         let refuse = |reason| TagError {
-            tag: tag.to_owned(),
+            tag: tag.to_string(),
             reason,
         };
         let rest = tag
+            .as_ref()
             .strip_prefix(&self.prefix)
             .ok_or_else(|| refuse("does not start with the pattern prefix"))?;
         let version = semver::Version::parse(rest)
@@ -234,6 +267,10 @@ impl FromStr for TagPattern {
                     && prefix.bytes().all(|b| {
                         b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-')
                     })
+                    && !prefix
+                        .bytes()
+                        .last()
+                        .is_some_and(|b| b.is_ascii_digit() || b == b'.')
             })
             .map(|prefix| Self {
                 prefix: prefix.to_owned(),
@@ -286,6 +323,43 @@ mod tests {
         );
         assert!("v*".parse::<TagPattern>().is_ok());
         assert!("*".parse::<TagPattern>().is_ok());
+    }
+
+    #[test]
+    fn ids_accept_values_at_their_length_limits() {
+        let label = format!("a{}", "-".repeat(61) + "z");
+        assert_eq!(label.len(), 63);
+        assert!(label.parse::<HostId>().is_ok());
+        assert!(label.parse::<PrincipalId>().is_ok());
+        assert!(format!("{label}/{label}").parse::<DeploymentId>().is_ok());
+        let owner = "o".repeat(39);
+        let repo = "r".repeat(100);
+        assert!(format!("{owner}/{repo}").parse::<RepoName>().is_ok());
+        assert!(
+            format!("{}/{repo}", "o".repeat(40))
+                .parse::<RepoName>()
+                .is_err()
+        );
+        assert!(
+            format!("{owner}/{}", "r".repeat(101))
+                .parse::<RepoName>()
+                .is_err()
+        );
+        assert!(format!("{}*", "v".repeat(32)).parse::<TagPattern>().is_ok());
+    }
+
+    #[test]
+    fn tag_prefixes_ending_in_a_digit_or_dot_are_refused() {
+        // With "v1*", v12.0.0 would parse as 2.0.0.
+        for bad in ["v1*", "v1.*", "release-2*", ".*"] {
+            assert!(
+                matches!(bad.parse::<TagPattern>(), Err(IdError::TagPattern(_))),
+                "{bad}"
+            );
+        }
+        for ok in ["v*", "release-*", "release/*", "app_v*"] {
+            assert!(ok.parse::<TagPattern>().is_ok(), "{ok}");
+        }
     }
 
     #[test]
@@ -362,29 +436,55 @@ mod tests {
     }
 
     #[test]
+    fn release_tags_follow_git_ref_name_rules() {
+        for bad in [
+            "../../x", "a..b", "-x", "a//b", "/x", "x/", "x.", "x.lock", "x.LOCK", "a.lock/b",
+            ".x", "a/.b",
+        ] {
+            assert!(
+                matches!(bad.parse::<ReleaseTag>(), Err(IdError::ReleaseTag(_))),
+                "{bad}"
+            );
+        }
+        for ok in ["x-", "a/b", "v1.2.3.locked", "lock", "x.lockx"] {
+            assert!(ok.parse::<ReleaseTag>().is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
     fn ids_round_trip_through_display() {
         let id: DeploymentId = "app/prod".parse().unwrap();
         assert_eq!(id.to_string(), "app/prod");
         assert_eq!(id.as_ref(), "app/prod");
     }
 
+    fn tag(text: &str) -> ReleaseTag {
+        text.parse().unwrap()
+    }
+
     #[test]
     fn tags_parse_with_their_prefix() {
         let pattern: TagPattern = "v*".parse().unwrap();
-        assert_eq!(pattern.parse_tag("v1.2.3").unwrap(), Version::new(1, 2, 3));
-        let rc = pattern.parse_tag("v1.3.0-rc.1").unwrap();
+        assert_eq!(
+            pattern.parse_tag(&tag("v1.2.3")).unwrap(),
+            Version::new(1, 2, 3)
+        );
+        let rc = pattern.parse_tag(&tag("v1.3.0-rc.1")).unwrap();
         assert_eq!(rc.pre, Prerelease::new("rc.1").unwrap());
         let bare: TagPattern = "*".parse().unwrap();
-        assert_eq!(bare.parse_tag("1.2.3").unwrap(), Version::new(1, 2, 3));
+        assert_eq!(
+            bare.parse_tag(&tag("1.2.3")).unwrap(),
+            Version::new(1, 2, 3)
+        );
     }
 
     #[test]
     fn tags_that_only_look_like_versions_are_rejected() {
         let pattern: TagPattern = "v*".parse().unwrap();
         for bad in ["v1.2", "v01.2.3", "1.2.3", "v1.2.3+build", "release-1.2.3"] {
-            assert!(pattern.parse_tag(bad).is_err(), "{bad}");
+            assert!(pattern.parse_tag(&tag(bad)).is_err(), "{bad}");
         }
-        let err = pattern.parse_tag("v1.2.3+build").unwrap_err();
+        let err = pattern.parse_tag(&tag("v1.2.3+build")).unwrap_err();
         assert!(err.reason.contains("build metadata"), "{err}");
     }
 

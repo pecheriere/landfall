@@ -163,7 +163,7 @@ mod tests {
         let mut v = base.clone();
         v.nonce = [8; 32];
         variants.push(v);
-        for tag in ["v1.2.4-rc.1", "v1.2.4+1", "app/prodv1.2.4", "v1.2.", "x"] {
+        for tag in ["v1.2.4-rc.1", "v1.2.4+1", "app/prodv1.2.4", "v1.2", "x"] {
             let mut v = base.clone();
             v.tag = tag.parse().unwrap();
             variants.push(v);
@@ -175,6 +175,19 @@ mod tests {
             assert!(!seen.contains(&c), "collision for {v:?}");
             seen.push(c);
         }
+    }
+
+    #[test]
+    fn shifting_the_deployment_tag_boundary_changes_the_challenge() {
+        // Without length prefixes these two would concatenate to the same
+        // bytes: "app/prod" + "v1.2.4" and "app/pro" + "dv1.2.4".
+        let base = intent();
+        let shifted = DeployIntent {
+            deployment: "app/pro".parse().unwrap(),
+            tag: "dv1.2.4".parse().unwrap(),
+            ..base.clone()
+        };
+        assert_ne!(base.challenge(), shifted.challenge());
     }
 
     #[test]
