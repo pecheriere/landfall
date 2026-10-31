@@ -6,7 +6,9 @@ use semver::Version;
 
 use crate::config::{Level, Rule};
 
-/// What a rule says about a candidate version.
+/// What a rule says about a candidate version. Callers match on it
+/// exhaustively: there is deliberately no boolean shortcut, so a refused
+/// candidate can never fall through to a deploy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     /// Deploy without a human.
@@ -17,14 +19,6 @@ pub enum Decision {
     Manual,
     /// Never deploy this candidate.
     Refused(Refusal),
-}
-
-impl Decision {
-    /// Whether a human approval is required before deploying.
-    #[must_use]
-    pub fn needs_approval(&self) -> bool {
-        matches!(self, Self::NeedsApproval | Self::Manual)
-    }
 }
 
 /// Why a candidate is refused outright.
@@ -76,17 +70,35 @@ fn jump(running: &Version, candidate: &Version) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config;
 
+    /// The rule of the only deployment in a minimal valid configuration.
     fn rule(auto: Option<&str>, approve: Option<&str>, prereleases: bool) -> Rule {
         let level = |key: &str, value: Option<&str>| {
-            value.map_or_else(String::new, |level| format!("{key} = \"{level}\"\n"))
+            value.map_or_else(String::new, |level| format!("{key} = \"{level}\", "))
         };
-        let toml = format!(
-            "approvers = [\"operator\"]\nprereleases = {prereleases}\n{}{}",
+        let text = format!(
+            r#"
+[signers]
+maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly"
+
+[approvers]
+operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}
+
+[[deployment]]
+id = "app/prod"
+repo = {{ name = "example/app", id = 1234, owner_id = 5678 }}
+host = "home-1"
+compose = {{ dir = "/srv/compose/app", service = "app" }}
+origin = {{ workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }}
+rule = {{ {}{}prereleases = {prereleases}, approvers = ["operator"] }}
+checks = ["container-healthy"]
+"#,
             level("auto", auto),
             level("approve", approve),
         );
-        toml::from_str(&toml).unwrap()
+        let config = config::parse(text.as_bytes()).unwrap();
+        config.deployments()[0].rule().clone()
     }
 
     fn v(text: &str) -> Version {
@@ -122,7 +134,7 @@ mod tests {
 
     #[test]
     fn equal_is_refused_and_lower_is_manual() {
-        let any = rule(Some("any"), Some("any"), false);
+        let any = rule(Some("any"), None, false);
         assert_eq!(
             decide_str(&any, Some("1.2.3"), "1.2.3"),
             Decision::Refused(Refusal::AlreadyRunning)
@@ -158,7 +170,7 @@ mod tests {
 
     #[test]
     fn build_metadata_does_not_make_versions_differ() {
-        let any = rule(Some("any"), Some("any"), false);
+        let any = rule(Some("any"), None, false);
         assert_eq!(
             decide_str(&any, Some("1.2.3+a"), "1.2.3+b"),
             Decision::Refused(Refusal::AlreadyRunning)
@@ -190,10 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn only_approval_and_manual_need_approval() {
-        assert!(!Decision::Auto.needs_approval());
-        assert!(Decision::NeedsApproval.needs_approval());
-        assert!(Decision::Manual.needs_approval());
-        assert!(!Decision::Refused(Refusal::Prerelease).needs_approval());
+    fn a_prerelease_of_the_running_version_is_a_downgrade() {
+        // 1.3.0-rc.1 precedes 1.3.0, so it is manual, never automatic.
+        let open = rule(Some("any"), None, true);
+        assert_eq!(
+            decide_str(&open, Some("1.3.0"), "1.3.0-rc.1"),
+            Decision::Manual
+        );
     }
 }
