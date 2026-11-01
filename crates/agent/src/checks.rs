@@ -602,7 +602,7 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
-    use crate::testing::{Call, FakeDocker, running};
+    use crate::testing::{Call, FakeDocker, container_id, running};
 
     const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
@@ -1161,10 +1161,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn container_that_exits_during_a_log_window_fails() {
         let docker = FakeDocker::new();
-        let up = running(None, &[]);
-        let mut exited = up.clone();
-        exited.status = "exited".to_owned();
-        docker.script_inspect([Ok(up), Ok(exited)]);
+        docker.script_inspect([Ok(running(None, &[]))]);
+        // The driver lists running containers: an exited one is gone from it.
+        docker.script_container([Ok(Some(container_id())), Ok(None)]);
         docker.script_exec([Ok(true)]);
         let failure = run_checks(
             &docker,
@@ -1177,7 +1176,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(failure.check, "container");
-        assert_eq!(failure.reason, "status is \"exited\"");
+        assert_eq!(failure.reason, "service \"app\" has no running container");
     }
 
     #[tokio::test(start_paused = true)]

@@ -84,6 +84,13 @@ pub enum Call {
         /// Service name.
         service: String,
     },
+    /// `container_at(dir, service)`.
+    ContainerAt {
+        /// Compose directory.
+        dir: PathBuf,
+        /// Service name.
+        service: String,
+    },
     /// `inspect(id)`.
     Inspect(ContainerId),
     /// `exec(id, argv)`.
@@ -137,7 +144,9 @@ struct Inner {
     compose_service: Script<ServiceConfig>,
     compose_up: Script<()>,
     compose_stop: Script<()>,
-    container: Script<Option<ContainerId>>,
+    container: Script<Vec<ContainerId>>,
+    /// The last `compose_stop` has not been followed by a `compose_up`.
+    stopped: bool,
     inspect: Script<ContainerInfo>,
     inspect_after_up: BTreeMap<usize, Script<ContainerInfo>>,
     exec: Script<bool>,
@@ -209,6 +218,7 @@ impl FakeDocker {
                 compose_up: Script::empty(),
                 compose_stop: Script::empty(),
                 container: Script::empty(),
+                stopped: false,
                 inspect: Script::empty(),
                 inspect_after_up: BTreeMap::new(),
                 exec: Script::empty(),
@@ -291,10 +301,41 @@ impl FakeDocker {
         /// Replies of `compose_stop`. Default: success.
         script_compose_stop, compose_stop, ()
     );
-    script_setter!(
-        /// Replies of `container`. Default: the id from [`container_id`].
-        script_container, container, Option<ContainerId>
-    );
+    /// Replies of `container` and `container_at`, each none or one container.
+    /// Default: the id from [`container_id`]. After a successful `compose_stop`
+    /// they answer none until the next successful `compose_up`, as the real
+    /// driver does, which only sees running containers.
+    pub fn script_container(&self, replies: impl IntoIterator<Item = Reply<Option<ContainerId>>>) {
+        self.script_containers(
+            replies
+                .into_iter()
+                .map(|reply| reply.map(|found| found.into_iter().collect())),
+        );
+    }
+
+    /// [`script_container`](Self::script_container) with the containers found
+    /// spelled out: more than one is a [`DockerError::SeveralContainers`].
+    pub fn script_containers(&self, replies: impl IntoIterator<Item = Reply<Vec<ContainerId>>>) {
+        self.lock().container = Script(replies.into_iter().collect());
+    }
+
+    /// What `container` and `container_at` answer.
+    fn found_container(&self) -> Result<Option<ContainerId>, DockerError> {
+        const LABEL: &str = "docker ps";
+        let mut inner = self.lock();
+        if inner.stopped {
+            return Ok(None);
+        }
+        let reply = inner
+            .container
+            .next()
+            .unwrap_or_else(|| Ok(vec![container_id()]));
+        match lift(LABEL, reply)?.as_slice() {
+            [] => Ok(None),
+            [id] => Ok(Some(id.clone())),
+            _ => Err(DockerError::SeveralContainers { command: LABEL }),
+        }
+    }
     script_setter!(
         /// Replies of `inspect`. Default: an error.
         script_inspect, inspect, ContainerInfo
@@ -364,10 +405,12 @@ impl Docker for FakeDocker {
             service: service.to_owned(),
         })
         .await;
-        lift(
-            "compose up",
-            self.lock().compose_up.next().unwrap_or(Ok(())),
-        )
+        let mut inner = self.lock();
+        let reply = lift("compose up", inner.compose_up.next().unwrap_or(Ok(())));
+        if reply.is_ok() {
+            inner.stopped = false;
+        }
+        reply
     }
 
     async fn compose_stop(&self, dir: &Path, service: &str) -> Result<(), DockerError> {
@@ -376,10 +419,12 @@ impl Docker for FakeDocker {
             service: service.to_owned(),
         })
         .await;
-        lift(
-            "compose stop",
-            self.lock().compose_stop.next().unwrap_or(Ok(())),
-        )
+        let mut inner = self.lock();
+        let reply = lift("compose stop", inner.compose_stop.next().unwrap_or(Ok(())));
+        if reply.is_ok() {
+            inner.stopped = true;
+        }
+        reply
     }
 
     async fn container(
@@ -392,13 +437,20 @@ impl Docker for FakeDocker {
             service: service.to_owned(),
         })
         .await;
-        lift(
-            "compose ps",
-            self.lock()
-                .container
-                .next()
-                .unwrap_or_else(|| Ok(Some(container_id()))),
-        )
+        self.found_container()
+    }
+
+    async fn container_at(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> Result<Option<ContainerId>, DockerError> {
+        self.record(Call::ContainerAt {
+            dir: dir.to_owned(),
+            service: service.to_owned(),
+        })
+        .await;
+        self.found_container()
     }
 
     async fn inspect(&self, id: &ContainerId) -> Result<ContainerInfo, DockerError> {
@@ -452,7 +504,7 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
-    use super::{Arc, Call, Docker, FakeDocker, Path, container_id, running};
+    use super::{Arc, Call, Docker, DockerError, FakeDocker, Path, container_id, running};
 
     #[tokio::test]
     async fn on_call_runs_during_the_call_and_may_use_the_fake() {
@@ -470,6 +522,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seen.load(Ordering::SeqCst), 1, "logged before the hook ran");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_service_has_no_container_until_it_is_up_again() {
+        let docker = FakeDocker::new();
+        let dir = Path::new("/srv/compose/app");
+        assert_eq!(
+            docker.container(dir, "app").await.unwrap(),
+            Some(container_id())
+        );
+        docker.compose_stop(dir, "app").await.unwrap();
+        assert_eq!(docker.container(dir, "app").await.unwrap(), None);
+        assert_eq!(docker.container_at(dir, "app").await.unwrap(), None);
+        docker.compose_up(dir, "app").await.unwrap();
+        assert_eq!(
+            docker.container(dir, "app").await.unwrap(),
+            Some(container_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn several_scripted_containers_are_the_drivers_error() {
+        let docker = FakeDocker::new();
+        docker.script_containers([Ok(vec![container_id(), container_id()])]);
+        let err = docker
+            .container(Path::new("/srv/compose/app"), "app")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DockerError::SeveralContainers { .. }),
+            "{err}"
+        );
     }
 
     #[tokio::test]

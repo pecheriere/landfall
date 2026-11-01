@@ -330,6 +330,28 @@ pub enum DeployError {
         /// The service.
         service: String,
     },
+    /// The project asks for more than one container of the service.
+    #[error(
+        "deployment {deployment}: service {service:?} asks for {replicas} containers; landfall deploys a service with one, so remove `scale` and `deploy.replicas` from the compose file"
+    )]
+    Scaled {
+        /// The deployment.
+        deployment: DeploymentId,
+        /// The service.
+        service: String,
+        /// How many it asks for.
+        replicas: u64,
+    },
+    /// The service runs in more than one container right now.
+    #[error(
+        "deployment {deployment}: service {service:?} has more than one running container, so landfall cannot tell which to check; scale it down with `docker compose up -d --no-deps --scale {service}=1 {service}`, or remove a second project running from this directory with `docker compose -p <other> down`"
+    )]
+    SeveralContainers {
+        /// The deployment.
+        deployment: DeploymentId,
+        /// The service.
+        service: String,
+    },
     /// With the new override in place, the project does not resolve to the
     /// pinned image. What it does resolve to is not named: compose config is
     /// interpolated and can hold a secret.
@@ -543,7 +565,7 @@ pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<D
         Some(Pin::Image(_)) => OverrideFile::Pinned,
         Some(Pin::Unrecognised) => OverrideFile::Unrecognised,
     };
-    let Some(id) = docker.container(dir, service).await? else {
+    let Some(id) = docker.container_at(dir, service).await? else {
         return Ok(Drift {
             override_file,
             running_image: None,
@@ -868,6 +890,10 @@ impl<D: Docker> Engine<'_, D> {
                 deployment: self.deployment.id().clone(),
                 service,
             },
+            DockerError::SeveralContainers { .. } => DeployError::SeveralContainers {
+                deployment: self.deployment.id().clone(),
+                service: self.service().to_owned(),
+            },
             source => DeployError::Compose {
                 deployment: self.deployment.id().clone(),
                 source,
@@ -907,6 +933,25 @@ impl<D: Docker> Engine<'_, D> {
                 service: self.service().to_owned(),
             });
         }
+        if base.replicas > 1 {
+            return Err(DeployError::Scaled {
+                deployment: self.deployment.id().clone(),
+                service: self.service().to_owned(),
+                replicas: base.replicas,
+            });
+        }
+        // Every step after this one needs to tell the service's one container,
+        // which the project's name does. A second project running from this
+        // directory has a container of its own and would be left out of that,
+        // while it shares the directory's data with a backup and a restore.
+        self.docker
+            .container(self.dir, self.service())
+            .await
+            .map_err(|e| self.compose_error(e))?;
+        self.docker
+            .container_at(self.dir, self.service())
+            .await
+            .map_err(|e| self.compose_error(e))?;
         Ok(Preflight {
             previous,
             previous_can_start: base.image.is_some(),
@@ -1783,6 +1828,7 @@ mod tests {
         ServiceConfig {
             image: image.map(str::to_owned),
             has_build: false,
+            replicas: 1,
         }
     }
 
@@ -1942,7 +1988,10 @@ mod tests {
         let log = Arc::clone(&seen);
         let dir = f.dir.clone();
         f.docker.on_call(move |call| {
-            if !matches!(call, Call::Container { .. } | Call::Inspect(_)) {
+            if !matches!(
+                call,
+                Call::Container { .. } | Call::ContainerAt { .. } | Call::Inspect(_)
+            ) {
                 log.lock().unwrap().push(override_text(&dir));
             }
         });
@@ -1955,13 +2004,15 @@ mod tests {
             ["config", "config", "pull", "stop", "up"],
             "preflight twice, then pull, stop for the backup and up"
         );
-        assert!(
-            matches!(f.docker.calls()[1], Call::ComposeServiceChecked { .. }),
+        assert_eq!(
+            f.docker
+                .count(|c| matches!(c, Call::ComposeServiceChecked { .. })),
+            1,
             "the read with the new override is held to what `up` requires"
         );
         assert_eq!(
-            f.docker.calls()[2],
-            Call::Pull(PINNED.to_owned()),
+            f.docker.count(|c| *c == Call::Pull(PINNED.to_owned())),
+            1,
             "pulled by digest"
         );
         assert_eq!(
@@ -3593,6 +3644,70 @@ mod tests {
         assert_eq!(f.state.in_progress().unwrap(), None);
     }
 
+    /// A refusal in the preflight: nothing was run after it, and nothing is left.
+    fn refused_before_anything_changed(f: &Fixture, err: &DeployError) {
+        assert_eq!(changes(f), ["config"], "{err}");
+        assert_eq!(override_text(&f.dir), PREVIOUS, "{err}");
+        assert_eq!(f.state.in_progress().unwrap(), None, "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_service_asking_for_several_containers_is_refused_naming_the_fix() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(ServiceConfig {
+            replicas: 2,
+            ..image(Some(OLD))
+        })]);
+        let err = deploy(&f).await.unwrap_err();
+        assert!(
+            matches!(err, DeployError::Scaled { replicas: 2, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("deploy.replicas"), "{err}");
+        refused_before_anything_changed(&f, &err);
+    }
+
+    #[tokio::test]
+    async fn several_running_containers_are_refused_naming_the_fix() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        let id = crate::testing::container_id();
+        f.docker.script_containers([Ok(vec![id.clone(), id])]);
+        let err = deploy(&f).await.unwrap_err();
+        assert!(
+            matches!(err, DeployError::SeveralContainers { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--scale app=1"), "{err}");
+        refused_before_anything_changed(&f, &err);
+    }
+
+    #[tokio::test]
+    async fn a_second_project_in_the_directory_is_refused() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        let id = crate::testing::container_id();
+        // One of its own by the project's name, two by the directory.
+        f.docker
+            .script_containers([Ok(vec![id.clone()]), Ok(vec![id.clone(), id])]);
+        let err = deploy(&f).await.unwrap_err();
+        assert!(
+            matches!(err, DeployError::SeveralContainers { .. }),
+            "{err}"
+        );
+        refused_before_anything_changed(&f, &err);
+    }
+
+    #[tokio::test]
+    async fn a_failing_container_lookup_is_refused_before_the_marker() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        f.docker.script_container([Err("daemon gone")]);
+        let err = deploy(&f).await.unwrap_err();
+        assert!(matches!(err, DeployError::Compose { .. }), "{err}");
+        refused_before_anything_changed(&f, &err);
+    }
+
     #[tokio::test]
     async fn service_without_an_image_after_the_override_is_refused_too() {
         let f = fixture("");
@@ -3621,6 +3736,7 @@ mod tests {
         f.docker.script_compose_service([Ok(ServiceConfig {
             image: None,
             has_build: true,
+            replicas: 1,
         })]);
 
         let err = deploy(&f).await.unwrap_err();
@@ -3880,6 +3996,11 @@ mod tests {
         f.docker.script_inspect([Ok(container(PINNED, true))]);
         drift(&f.docker, &f.dir, "app").await.unwrap();
         assert_eq!(changes(&f), Vec::<&str>::new());
+        assert_eq!(
+            f.docker.count(|c| matches!(c, Call::Container { .. })),
+            0,
+            "the lookup by project loads the stack's files"
+        );
     }
 
     #[tokio::test]

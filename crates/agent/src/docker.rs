@@ -2,7 +2,8 @@
 //!
 //! Commands are argument vectors, never a shell. Their environment loses
 //! `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME` and `COMPOSE_PROFILES`, so the
-//! stack's `.env` decides. Every call has a timeout and every captured
+//! stack's `.env` decides, and `PWD`, or compose would label a container with
+//! the agent's symlink to the directory. Every call has a timeout and every captured
 //! output a cap. Each runs in its own process group, which a timeout, or
 //! dropping the call, kills whole: `docker compose` is a plugin run by the `docker` client, and a
 //! call given up on must not keep working under the rollback that follows it.
@@ -48,8 +49,15 @@ const READ_CHUNK: usize = 64 * 1024;
 const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// Environment variables that would make a compose command read something
-/// other than the stack's own files.
-const SCRUBBED_ENV: [&str; 3] = ["COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOSE_PROFILES"];
+/// other than the stack's own files, or, for `PWD`, label a container with
+/// another spelling of its directory: Go takes the path from it when it leads
+/// to the working directory, a symlink included.
+const SCRUBBED_ENV: [&str; 4] = [
+    "COMPOSE_FILE",
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_PROFILES",
+    "PWD",
+];
 
 /// The Go template `docker inspect` is given: the fields the agent needs and
 /// nothing else (no `.Config.Env`). `.State.Health` is absent without a
@@ -147,6 +155,13 @@ pub enum DockerError {
         /// The service.
         service: String,
     },
+    /// The service has more than one running container: it is scaled, or a
+    /// second project runs it from the same directory.
+    #[error("{command}: more than one running container")]
+    SeveralContainers {
+        /// The command.
+        command: &'static str,
+    },
     /// An argument was refused before anything ran.
     #[error("{command}: refused argument: {reason}")]
     BadArgument {
@@ -199,6 +214,9 @@ pub struct ServiceConfig {
     pub image: Option<String>,
     /// Whether the service has a `build` section (refused by the agent).
     pub has_build: bool,
+    /// How many containers the project asks for: the larger of `scale` and
+    /// `deploy.replicas`, 1 with neither.
+    pub replicas: u64,
 }
 
 /// What the agent reads of a container; its environment is not among it.
@@ -261,10 +279,30 @@ pub trait Docker: Send + Sync {
         service: &str,
     ) -> impl Future<Output = Result<(), DockerError>> + Send;
 
-    /// The service's running container; none if it isn't running, which
-    /// includes a stopped one and one never created. More than one (a scaled
-    /// service) is an error.
+    /// The service's running container in the compose project of `dir`, found
+    /// by the project's name, whichever directory it was started from; none if
+    /// it isn't running, which includes a stopped one and one never created.
+    /// It loads the project, so it needs the stack's files.
+    ///
+    /// # Errors
+    ///
+    /// [`DockerError::SeveralContainers`] for a scaled service.
     fn container(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> impl Future<Output = Result<Option<ContainerId>, DockerError>> + Send;
+
+    /// [`container`](Self::container) by the working directory the container
+    /// is labelled with, without loading the project. This is for reporting
+    /// on a stack that may not be readable: a container started from elsewhere
+    /// (a compose file in another directory, a path through a symlink) is not
+    /// found, and a second project in `dir` counts.
+    ///
+    /// # Errors
+    ///
+    /// [`DockerError::SeveralContainers`] when `dir` has more than one.
+    fn container_at(
         &self,
         dir: &Path,
         service: &str,
@@ -425,6 +463,20 @@ impl DockerCli {
         let project = parse_project_name(&captured.stdout)?;
         not_a_flag(label, &project)?;
         Ok(project)
+    }
+
+    /// `docker ps` for the running containers of `service` that `selector`
+    /// picks. By the labels compose gives its containers, not through compose,
+    /// which would refuse a service without an image, the state before a first
+    /// deploy. `oneoff` leaves out the containers of `compose run`.
+    fn ps_command(&self, selector: OsString, service: &str) -> Command {
+        let mut cmd = self.command(None);
+        cmd.args(["ps", "--quiet", "--no-trunc", "--filter"])
+            .arg(selector)
+            .arg("--filter")
+            .arg(format!("label=com.docker.compose.service={service}"))
+            .args(["--filter", "label=com.docker.compose.oneoff=False"]);
+        cmd
     }
 
     /// [`capture`](Self::capture), failing on a non-zero exit with the
@@ -626,6 +678,13 @@ struct ConfigDoc {
 struct ServiceDoc {
     image: Option<String>,
     build: Option<IgnoredAny>,
+    scale: Option<u64>,
+    deploy: Option<DeployDoc>,
+}
+
+#[derive(Deserialize)]
+struct DeployDoc {
+    replicas: Option<u64>,
 }
 
 /// Reads `service` out of `docker compose config --format json`. Errors say
@@ -644,6 +703,12 @@ fn parse_config(raw: &[u8], service: &str) -> Result<ServiceConfig, DockerError>
     Ok(ServiceConfig {
         image: svc.image.clone(),
         has_build: svc.build.is_some(),
+        replicas: svc
+            .scale
+            .into_iter()
+            .chain(svc.deploy.as_ref().and_then(|deploy| deploy.replicas))
+            .max()
+            .unwrap_or(1),
     })
 }
 
@@ -726,9 +791,8 @@ fn parse_container(raw: &[u8]) -> Result<Option<ContainerId>, DockerError> {
         return Ok(None);
     };
     if ids.next().is_some() {
-        return Err(DockerError::BadOutput {
+        return Err(DockerError::SeveralContainers {
             command: "docker ps",
-            reason: "more than one container",
         });
     }
     first
@@ -879,18 +943,24 @@ impl Docker for DockerCli {
     ) -> Result<Option<ContainerId>, DockerError> {
         const LABEL: &str = "docker ps";
         not_a_flag(LABEL, service)?;
-        // By the labels compose gives its containers, not through compose: it
-        // would have to load the stack's files, and compose refuses a service
-        // without an image, which is the state before a first deploy. `oneoff`
-        // leaves out the containers of `compose run`.
-        let mut working_dir = OsString::from("label=com.docker.compose.project.working_dir=");
-        working_dir.push(dir);
-        let mut cmd = self.command(None);
-        cmd.args(["ps", "--quiet", "--no-trunc", "--filter"])
-            .arg(working_dir)
-            .arg("--filter")
-            .arg(format!("label=com.docker.compose.service={service}"))
-            .args(["--filter", "label=com.docker.compose.oneoff=False"]);
+        let project = self.project_name(LABEL, dir).await?;
+        let selector = format!("label=com.docker.compose.project={project}");
+        let cmd = self.ps_command(selector.into(), service);
+        // The project's name is interpolated: stderr could repeat it.
+        let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
+        parse_container(&captured.stdout)
+    }
+
+    async fn container_at(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> Result<Option<ContainerId>, DockerError> {
+        const LABEL: &str = "docker ps";
+        not_a_flag(LABEL, service)?;
+        let mut selector = OsString::from("label=com.docker.compose.project.working_dir=");
+        selector.push(dir);
+        let cmd = self.ps_command(selector, service);
         let captured = Self::run(LABEL, cmd, self.timeout).await?;
         parse_container(&captured.stdout)
     }
@@ -1113,6 +1183,31 @@ mod tests {
     }
 
     #[test]
+    fn compose_config_reads_how_many_containers_the_service_asks_for() {
+        let raw = br#"{"services":{
+            "plain":{"image":"i"},
+            "one":{"image":"i","scale":1,"deploy":{"replicas":1}},
+            "scaled":{"image":"i","scale":2},
+            "replicated":{"image":"i","deploy":{"replicas":3,"resources":{"limits":{"memory":"1"}}}},
+            "other":{"image":"i","deploy":{"resources":{}}},
+            "both":{"image":"i","scale":2,"deploy":{"replicas":4}}}}"#;
+        for (service, replicas) in [
+            ("plain", 1),
+            ("one", 1),
+            ("scaled", 2),
+            ("replicated", 3),
+            ("other", 1),
+            ("both", 4),
+        ] {
+            assert_eq!(
+                parse_config(raw, service).unwrap().replicas,
+                replicas,
+                "{service}"
+            );
+        }
+    }
+
+    #[test]
     fn compose_config_error_never_contains_the_output() {
         // `image` has the wrong type, so serde would quote the offending
         // value; the secret sits in the value and in the key.
@@ -1210,7 +1305,10 @@ mod tests {
         assert_eq!(parse_container(b"").unwrap(), None);
         assert_eq!(parse_container(b"\n").unwrap(), None);
         assert_eq!(parse_container(b"0123456789ab\n").unwrap(), Some(id()));
-        assert!(parse_container(b"0123456789ab\n0123456789ac\n").is_err());
+        assert!(matches!(
+            parse_container(b"0123456789ab\n0123456789ac\n"),
+            Err(DockerError::SeveralContainers { .. })
+        ));
         assert!(parse_container(b"not-an-id\n").is_err());
     }
 
@@ -1437,13 +1535,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn container_lookup_goes_by_labels_and_leaves_out_one_offs() {
+    async fn container_lookup_goes_by_the_project_and_leaves_out_one_offs() {
         let stub = Stub::new(
-            "{ for a in \"$@\"; do echo \"arg:$a\"; done; } > \"$(dirname \"$0\")/seen\"\necho 0123456789ab",
+            "case \"$1\" in compose) echo '{\"name\":\"stack\",\"services\":{}}'; exit 0;; esac\n{ for a in \"$@\"; do echo \"arg:$a\"; done; } > \"$(dirname \"$0\")/seen\"\necho 0123456789ab",
+        );
+        let found = stub.cli().container(stub.dir.path(), "app").await.unwrap();
+        assert_eq!(found, Some(id()));
+        let seen = fs::read_to_string(stub.path("seen")).unwrap();
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            [
+                "arg:ps",
+                "arg:--quiet",
+                "arg:--no-trunc",
+                "arg:--filter",
+                "arg:label=com.docker.compose.project=stack",
+                "arg:--filter",
+                "arg:label=com.docker.compose.service=app",
+                "arg:--filter",
+                "arg:label=com.docker.compose.oneoff=False",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_by_project_does_not_repeat_the_name() {
+        let stub = Stub::new(
+            "case \"$1\" in compose) echo '{\"name\":\"s3cretproject\",\"services\":{}}'; exit 0;; esac\necho 's3cretproject: bad filter' >&2\nexit 1",
+        );
+        let err = stub
+            .cli()
+            .container(stub.dir.path(), "app")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DockerError::FailedQuietly { .. }), "{err}");
+        let text = format!("{err} {err:?}");
+        assert!(!text.contains("s3cretproject"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn lookup_by_directory_loads_no_project() {
+        let stub = Stub::new(
+            "{ for a in \"$@\"; do echo \"arg:$a\"; done; } >> \"$(dirname \"$0\")/seen\"\necho 0123456789ab",
         );
         let found = stub
             .cli()
-            .container(Path::new("/srv/app"), "app")
+            .container_at(Path::new("/srv/app"), "app")
             .await
             .unwrap();
         assert_eq!(found, Some(id()));
@@ -1727,6 +1864,10 @@ mod tests {
 
             cli.compose_stop(project.path(), "plain").await.unwrap();
             assert_eq!(cli.container(project.path(), "plain").await.unwrap(), None);
+            assert_eq!(
+                cli.container_at(project.path(), "plain").await.unwrap(),
+                None
+            );
         }
 
         #[tokio::test]

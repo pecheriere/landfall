@@ -804,6 +804,7 @@ mod tests {
         docker.script_compose_service([Ok(ServiceConfig {
             image: Some(IMAGE.to_owned()),
             has_build: false,
+            replicas: 1,
         })]);
         docker.script_inspect([Ok(container(IMAGE))]);
         docker.script_exec([Ok(true)]);
