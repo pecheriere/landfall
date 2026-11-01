@@ -24,7 +24,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:
   `state` (the agent's own directory: deployed and in-progress records,
-  the previous override, reports, a per-deployment lock).
+  the previous override, reports, a per-deployment lock), `safefs` (the only
+  code that may touch a directory a container can write to: no-follow walking
+  by directory descriptor, atomic write, snapshot, restore, prune).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 
