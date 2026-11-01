@@ -169,25 +169,31 @@ impl Stack {
         .unwrap()
     }
 
-    /// [`Self::deploy`], and whether `data/<name>` appeared while it ran.
+    /// [`Self::deploy`], and whether `seen` was ever true while it ran.
     async fn deploy_watching(
         &self,
         rest: &str,
         tag: &str,
         digest: &str,
-        name: &str,
+        seen: impl Fn() -> bool,
     ) -> (DeployReport, bool) {
         let deploy = self.deploy(rest, tag, digest);
         tokio::pin!(deploy);
-        let mut seen = false;
+        let mut was_seen = false;
         loop {
             tokio::select! {
-                report = &mut deploy => return (report, seen),
+                report = &mut deploy => return (report, was_seen),
                 () = tokio::time::sleep(Duration::from_millis(50)) => {
-                    seen = seen || fs::symlink_metadata(self.data(name)).is_ok();
+                    was_seen = was_seen || seen();
                 }
             }
         }
+    }
+
+    /// Whether version B has started: the file it adds is there.
+    fn b_started(&self) -> impl Fn() -> bool {
+        let file = self.data("started-v1.28.4");
+        move || fs::symlink_metadata(&file).is_ok()
     }
 
     async fn container(&self) -> ContainerId {
@@ -237,7 +243,8 @@ impl Stack {
         path
     }
 
-    async fn status(&self, rest: &str) -> Value {
+    /// The real `status`: its exit status and its lines.
+    async fn status_lines(&self, rest: &str) -> (Option<i32>, Vec<Value>) {
         let config = self.config_file(rest);
         let out = self
             .binary(&[
@@ -248,10 +255,36 @@ impl Stack {
                 "home-1",
             ])
             .await;
-        assert_eq!(out.status.code(), Some(0), "{out:?}");
         let text = String::from_utf8(out.stdout).unwrap();
-        assert_eq!(text.lines().count(), 1, "{text}");
-        serde_json::from_str(&text).unwrap()
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (out.status.code(), lines)
+    }
+
+    /// The real `status` of the only deployment, which must be readable.
+    async fn status(&self, rest: &str) -> Value {
+        let (code, mut lines) = self.status_lines(rest).await;
+        assert_eq!(code, Some(0), "{lines:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.remove(0)
+    }
+
+    fn write_override_for(&self, rest: &str, digest: &str) {
+        let deployment = self.deployment(rest);
+        let next = plan(&deployment, "v2.0.0", digest);
+        fs::write(
+            self.dir.join(OVERRIDE_FILE),
+            compose::render_override(
+                "app",
+                next.image(),
+                next.deployment(),
+                next.tag(),
+                next.commit(),
+            ),
+        )
+        .unwrap();
     }
 }
 
@@ -314,21 +347,34 @@ fn assert_rolled_back(report: &DeployReport) {
     );
 }
 
-/// What a read of `/etc` would notice changing.
-fn etc_fingerprint() -> Vec<(String, u64, i64, u32, u32)> {
+/// What a write, `chmod` or `chown` through a link to `/etc` would change: `/etc`
+/// itself and what is directly in it.
+fn etc_fingerprint() -> Vec<(String, u64, i64, u32, u32, u32)> {
+    let print = |name: String, meta: &fs::Metadata| {
+        // Beyond a regular file's, the times of what is in `/etc` move on their
+        // own on a live host.
+        let (len, mtime) = if meta.is_file() {
+            (meta.len(), meta.mtime())
+        } else {
+            (0, 0)
+        };
+        (name, len, mtime, meta.mode(), meta.uid(), meta.gid())
+    };
     let mut seen: Vec<_> = fs::read_dir("/etc")
         .unwrap()
         .map(|entry| {
             let entry = entry.unwrap();
-            let meta = entry.metadata().unwrap();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // A directory's times move on their own, on a live host.
-            let len = if meta.is_file() { meta.len() } else { 0 };
-            let mtime = if meta.is_file() { meta.mtime() } else { 0 };
-            (name, len, mtime, meta.mode(), meta.uid())
+            print(
+                entry.file_name().to_string_lossy().into_owned(),
+                &entry.metadata().unwrap(),
+            )
         })
         .collect();
     seen.sort();
+    let etc = fs::metadata("/etc").unwrap();
+    let mut itself = print("/etc".to_owned(), &etc);
+    itself.2 = etc.mtime();
+    seen.insert(0, itself);
     seen
 }
 
@@ -346,14 +392,19 @@ async fn docker_real_deploy_then_failed_check_rolls_back() {
         .await;
 
     let bad = format!("{}{BACKUP}", passes_only_on("v1.36"));
-    // Named by its version: the container of B, which started and wrote.
-    let (report, b_ran) = stack
-        .deploy_watching(&bad, "v2.0.0", DIGEST_B, "started-v1.28.4")
+    let db = stack.data("db");
+    let (report, overwritten) = stack
+        .deploy_watching(&bad, "v2.0.0", DIGEST_B, || {
+            fs::read_to_string(&db).is_ok_and(|text| text == "overwritten\n")
+        })
         .await;
 
     assert_rolled_back(&report);
     assert!(failed_step(&report, "checks"), "{report:?}");
-    assert!(b_ran, "version B never ran, so the restore proves nothing");
+    assert!(
+        overwritten,
+        "version B never overwrote the file, so the restore proves nothing"
+    );
     assert_eq!(stack.running_image().await, image(DIGEST_A));
     assert_eq!(fs::read_to_string(stack.data("db")).unwrap(), "before\n");
     assert_eq!(
@@ -391,7 +442,7 @@ async fn docker_real_symlink_in_backup_is_not_followed() {
 
     let bad = format!("{}{BACKUP}", passes_only_on("v1.36"));
     let (report, b_ran) = stack
-        .deploy_watching(&bad, "v2.0.0", DIGEST_B, "started-v1.28.4")
+        .deploy_watching(&bad, "v2.0.0", DIGEST_B, stack.b_started())
         .await;
 
     assert_rolled_back(&report);
@@ -536,20 +587,8 @@ async fn docker_real_recover_rolls_back_an_interrupted_deploy() {
             started_at: Timestamp::now(),
         })
         .unwrap();
-    let deployment = stack.deployment(&rest);
-    let next = plan(&deployment, "v2.0.0", DIGEST_B);
-    fs::write(
-        stack.dir.join(OVERRIDE_FILE),
-        compose::render_override(
-            "app",
-            next.image(),
-            next.deployment(),
-            next.tag(),
-            next.commit(),
-        ),
-    )
-    .unwrap();
-    stack.docker.pull(next.image()).await.unwrap();
+    stack.write_override_for(&rest, DIGEST_B);
+    stack.docker.pull(&image(DIGEST_B)).await.unwrap();
     stack.docker.compose_up(&stack.dir, "app").await.unwrap();
     assert_eq!(stack.running_image().await, image(DIGEST_B));
     fs::write(stack.data("db"), "half migrated\n").unwrap();
@@ -597,22 +636,99 @@ async fn docker_real_status_reports_drift() {
     assert_eq!(status["drift"], false);
 
     // The override moves on and the container doesn't.
-    let deployment = stack.deployment(rest);
-    let next = plan(&deployment, "v2.0.0", DIGEST_B);
+    stack.write_override_for(rest, DIGEST_B);
+    let status = stack.status(rest).await;
+    assert_eq!(status["override_file"], "pinned");
+    assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_A)));
+    assert_eq!(status["drift"], true);
+
+    // A hand-edited override isn't the agent's to go by.
     fs::write(
         stack.dir.join(OVERRIDE_FILE),
-        compose::render_override(
-            "app",
-            next.image(),
-            next.deployment(),
-            next.tag(),
-            next.commit(),
-        ),
+        format!("services:\n  app:\n    image: {}\n", image(DIGEST_A)),
     )
     .unwrap();
     let status = stack.status(rest).await;
-    assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_A)));
+    assert_eq!(status["override_file"], "unrecognised");
     assert_eq!(status["drift"], true);
+}
+
+/// The project no longer uses the override: `.env` is emptied and the base file
+/// names an image, which is what `docker compose` then resolves to and runs.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_real_drift_goes_by_the_override_not_by_what_env_resolves_to() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let first = stack.deploy(PASSES, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+
+    fs::write(stack.dir.join(".env"), "").unwrap();
+    let base = fs::read_to_string(stack.dir.join("compose.yaml")).unwrap();
+    fs::write(
+        stack.dir.join("compose.yaml"),
+        base.replace(
+            "  app:\n",
+            &format!("  app:\n    image: {}\n", image(DIGEST_B)),
+        ),
+    )
+    .unwrap();
+    let up = StdCommand::new("docker")
+        .args(["compose", "up", "-d", "--no-deps", "app"])
+        .current_dir(&stack.dir)
+        .output()
+        .unwrap();
+    assert!(up.status.success(), "{up:?}");
+    assert_eq!(stack.running_image().await, image(DIGEST_B));
+
+    let status = stack.status(PASSES).await;
+    assert_eq!(status["override_file"], "pinned");
+    assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_B)));
+    assert_eq!(status["drift"], true);
+}
+
+/// Before a first deploy: no override, and a stack the agent's user can't read.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_real_status_needs_neither_an_override_nor_compose() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    fs::set_permissions(stack.dir.join(".env"), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::remove_file(stack.dir.join("compose.yaml")).unwrap();
+
+    let status = stack.status(PASSES).await;
+
+    assert_eq!(status["override_file"], "missing");
+    assert_eq!(status["deployed"], Value::Null);
+    assert_eq!(status["in_progress"], false);
+    assert_eq!(status["running_image"], Value::Null);
+    assert_eq!(status["drift"], false);
+    assert_eq!(status["error"], Value::Null);
+}
+
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_real_status_reports_every_deployment_and_exits_2_if_one_is_bad() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let first = stack.deploy(PASSES, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+    let gone = stack.dir.join("gone");
+    let rest = format!(
+        "{PASSES}[[deployment]]\nid = \"app/gone\"\nrepo = {{ name = \"{REPO}\", id = 1, owner_id = 2 }}\n\
+         host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
+         origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
+         rule = {{ auto = \"any\", approvers = [\"operator\"] }}\n{PASSES}",
+        gone.to_str().unwrap()
+    );
+
+    let (code, lines) = stack.status_lines(&rest).await;
+
+    assert_eq!(code, Some(2), "{lines:?}");
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["deployment"], DEPLOYMENT);
+    assert_eq!(lines[0]["drift"], false);
+    assert_eq!(lines[0]["error"], Value::Null);
+    assert_eq!(lines[1]["deployment"], "app/gone");
+    assert_eq!(lines[1]["drift"], Value::Null);
+    assert!(lines[1]["error"].is_string(), "{lines:?}");
 }
 
 /// Whether this test can run: it needs root to see another user's files
@@ -641,6 +757,7 @@ async fn docker_foreign_owner_survives_backup_and_restore() {
     if !has_root("docker_foreign_owner_survives_backup_and_restore") {
         return;
     }
+    let etc = etc_fingerprint();
     let stack = Stack::new(RunAs::Root, &script_with("chown 3000:3000 /data/db"));
     let good = format!("{PASSES}{BACKUP}");
     let first = stack.deploy(&good, "v1.0.0", DIGEST_A).await;
@@ -655,7 +772,7 @@ async fn docker_foreign_owner_survives_backup_and_restore() {
 
     let bad = format!("{}{BACKUP}", passes_only_on("v1.36"));
     let (report, b_ran) = stack
-        .deploy_watching(&bad, "v2.0.0", DIGEST_B, "started-v1.28.4")
+        .deploy_watching(&bad, "v2.0.0", DIGEST_B, stack.b_started())
         .await;
 
     assert_rolled_back(&report);
@@ -677,6 +794,7 @@ async fn docker_foreign_owner_survives_backup_and_restore() {
         fs::read_link(stack.data("link")).unwrap(),
         Path::new("/etc")
     );
+    assert_eq!(etc_fingerprint(), etc, "/etc changed");
 }
 
 /// The host reaches the container's address on a bridge network, which a Mac's

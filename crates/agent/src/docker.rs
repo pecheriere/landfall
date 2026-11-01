@@ -18,6 +18,7 @@
 //! so a container's environment is never read.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -716,7 +717,7 @@ fn parse_inspect(raw: &[u8]) -> Result<ContainerInfo, DockerError> {
 
 fn parse_container(raw: &[u8]) -> Result<Option<ContainerId>, DockerError> {
     let text = std::str::from_utf8(raw).map_err(|_| DockerError::BadOutput {
-        command: "docker compose ps",
+        command: "docker ps",
         reason: "not UTF-8",
     })?;
     let mut ids = text.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -725,7 +726,7 @@ fn parse_container(raw: &[u8]) -> Result<Option<ContainerId>, DockerError> {
     };
     if ids.next().is_some() {
         return Err(DockerError::BadOutput {
-            command: "docker compose ps",
+            command: "docker ps",
             reason: "more than one container",
         });
     }
@@ -733,7 +734,7 @@ fn parse_container(raw: &[u8]) -> Result<Option<ContainerId>, DockerError> {
         .parse()
         .map(Some)
         .map_err(|_: ContainerIdError| DockerError::BadOutput {
-            command: "docker compose ps",
+            command: "docker ps",
             reason: "not a container id",
         })
 }
@@ -875,13 +876,21 @@ impl Docker for DockerCli {
         dir: &Path,
         service: &str,
     ) -> Result<Option<ContainerId>, DockerError> {
-        const LABEL: &str = "docker compose ps";
+        const LABEL: &str = "docker ps";
         not_a_flag(LABEL, service)?;
-        let project = self.project_name(LABEL, dir).await?;
-        // Without `--all`: that also lists the one-off containers of
-        // `compose run`, and a service is only ever up as a long-running one.
-        let cmd = self.compose(dir, &["-p", &project, "ps", "--quiet", "--", service]);
-        let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
+        // By the labels compose gives its containers, not through compose: it
+        // would have to load the stack's files, and compose refuses a service
+        // without an image, which is the state before a first deploy. `oneoff`
+        // leaves out the containers of `compose run`.
+        let mut working_dir = OsString::from("label=com.docker.compose.project.working_dir=");
+        working_dir.push(dir);
+        let mut cmd = self.command(None);
+        cmd.args(["ps", "--quiet", "--no-trunc", "--filter"])
+            .arg(working_dir)
+            .arg("--filter")
+            .arg(format!("label=com.docker.compose.service={service}"))
+            .args(["--filter", "label=com.docker.compose.oneoff=False"]);
+        let captured = Self::run(LABEL, cmd, self.timeout).await?;
         parse_container(&captured.stdout)
     }
 
@@ -1417,7 +1426,6 @@ mod tests {
         let errors = [
             cli.compose_up(dir, "app").await.unwrap_err(),
             cli.compose_stop(dir, "app").await.unwrap_err(),
-            cli.container(dir, "app").await.unwrap_err(),
         ];
         for err in errors {
             let text = format!("{err} {err:?}");
@@ -1428,14 +1436,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn container_lookup_leaves_out_one_off_containers() {
+    async fn container_lookup_goes_by_labels_and_leaves_out_one_offs() {
         let stub = Stub::new(
-            "case \"$2\" in config) echo '{\"name\":\"stack\"}';; *) echo \"$@\" > \"$(dirname \"$0\")/seen\"; echo 0123456789ab;; esac",
+            "{ for a in \"$@\"; do echo \"arg:$a\"; done; } > \"$(dirname \"$0\")/seen\"\necho 0123456789ab",
         );
-        let found = stub.cli().container(stub.dir.path(), "app").await.unwrap();
+        let found = stub
+            .cli()
+            .container(Path::new("/srv/app"), "app")
+            .await
+            .unwrap();
         assert_eq!(found, Some(id()));
         let seen = fs::read_to_string(stub.path("seen")).unwrap();
-        assert_eq!(seen.trim(), "compose -p stack ps --quiet -- app");
+        assert_eq!(
+            seen.lines().collect::<Vec<_>>(),
+            [
+                "arg:ps",
+                "arg:--quiet",
+                "arg:--no-trunc",
+                "arg:--filter",
+                "arg:label=com.docker.compose.project.working_dir=/srv/app",
+                "arg:--filter",
+                "arg:label=com.docker.compose.service=app",
+                "arg:--filter",
+                "arg:label=com.docker.compose.oneoff=False",
+            ]
+        );
     }
 
     #[tokio::test]

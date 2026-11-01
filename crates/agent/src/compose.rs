@@ -12,7 +12,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 
-use landfall_core::config::Config;
+use landfall_core::config::{Config, Deployment};
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag, RepoName};
 use landfall_origin::release::{REGISTRY_HOST, image_name};
 
@@ -32,6 +32,43 @@ const HEADER: &str = header!();
 /// The override of a service nothing has been deployed to yet: it names no
 /// service, so a `COMPOSE_FILE` listing it still works.
 pub const PLACEHOLDER: &str = concat!(header!(), "services: {}\n");
+
+/// What an override file says of a service's image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin<'a> {
+    /// The placeholder: nothing is pinned yet.
+    Nothing,
+    /// The image, in the form the agent writes.
+    Image(&'a str),
+    /// Not a file the agent wrote for this service. The file is in a directory
+    /// others can write to, so what it does say is not to be repeated.
+    Unrecognised,
+}
+
+/// Reads the pinned image of `service` out of an override, without reading it
+/// as YAML: it recognises what [`render_override`] writes, and nothing else.
+#[must_use]
+pub fn pinned_image<'a>(file: &'a [u8], service: &str) -> Pin<'a> {
+    if file == PLACEHOLDER.as_bytes() {
+        return Pin::Nothing;
+    }
+    let Ok(text) = std::str::from_utf8(file) else {
+        return Pin::Unrecognised;
+    };
+    let is_image = |line: &str| line.trim_start().starts_with("image:");
+    if text.lines().filter(|line| is_image(line)).count() != 1 {
+        return Pin::Unrecognised;
+    }
+    let key = format!("  {}:", quote(service));
+    let mut lines = text.lines().skip_while(|line| *line != key);
+    lines.next();
+    let image = lines
+        .next()
+        .and_then(|line| line.strip_prefix("    image: \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|image| !image.is_empty() && !image.contains(['"', '\\']));
+    image.map_or(Pin::Unrecognised, Pin::Image)
+}
 
 /// A failure resolving the compose directories of a host.
 #[derive(Debug, thiserror::Error)]
@@ -117,6 +154,34 @@ fn quote(text: &str) -> String {
     out
 }
 
+/// The canonical path of the compose directory of `deployment`, on its own,
+/// for what reports on one deployment whatever the state of the others.
+///
+/// # Errors
+///
+/// [`ComposeError`] when it is missing or not a directory.
+pub fn resolve_dir(deployment: &Deployment) -> Result<PathBuf, ComposeError> {
+    resolve_one(deployment).map(|(canonical, _)| canonical)
+}
+
+fn resolve_one(d: &Deployment) -> Result<(PathBuf, fs::Metadata), ComposeError> {
+    let dir = d.compose().dir();
+    let unusable = |source| ComposeError::Unusable {
+        deployment: d.id().clone(),
+        dir: dir.to_owned(),
+        source,
+    };
+    let canonical = fs::canonicalize(dir).map_err(unusable)?;
+    let meta = fs::metadata(&canonical).map_err(unusable)?;
+    if !meta.is_dir() {
+        return Err(ComposeError::NotADirectory {
+            deployment: d.id().clone(),
+            dir: dir.to_owned(),
+        });
+    }
+    Ok((canonical, meta))
+}
+
 /// Resolves the compose directory of each deployment on `host` to its
 /// canonical path, once, at start-up. A directory that is missing or not a
 /// directory, or two deployments that resolve to the same one, is an error,
@@ -134,20 +199,7 @@ pub fn resolve_dirs(
     // the same through a bind mount.
     let mut owners: BTreeMap<(u64, u64), DeploymentId> = BTreeMap::new();
     for d in config.deployments_for_host(host) {
-        let dir = d.compose().dir();
-        let unusable = |source| ComposeError::Unusable {
-            deployment: d.id().clone(),
-            dir: dir.to_owned(),
-            source,
-        };
-        let canonical = fs::canonicalize(dir).map_err(unusable)?;
-        let meta = fs::metadata(&canonical).map_err(unusable)?;
-        if !meta.is_dir() {
-            return Err(ComposeError::NotADirectory {
-                deployment: d.id().clone(),
-                dir: dir.to_owned(),
-            });
-        }
+        let (canonical, meta) = resolve_one(d)?;
         if let Some(first) = owners.insert((meta.dev(), meta.ino()), d.id().clone()) {
             return Err(ComposeError::Aliased {
                 first,
@@ -192,6 +244,56 @@ mod tests {
              dev.landfall.commit: \"{COMMIT}\"\n"
         );
         assert_eq!(text, expected);
+    }
+
+    fn rendered(service: &str, image: &str) -> String {
+        render_override(
+            service,
+            image,
+            &"app/prod".parse::<DeploymentId>().unwrap(),
+            &"v1.2.3".parse::<ReleaseTag>().unwrap(),
+            &COMMIT.parse::<CommitSha>().unwrap(),
+        )
+    }
+
+    #[test]
+    fn pinned_image_reads_what_the_agent_writes() {
+        let file = rendered("app", "ghcr.io/example/app@sha256:00");
+        assert_eq!(
+            pinned_image(file.as_bytes(), "app"),
+            Pin::Image("ghcr.io/example/app@sha256:00")
+        );
+        assert_eq!(pinned_image(PLACEHOLDER.as_bytes(), "app"), Pin::Nothing);
+    }
+
+    #[test]
+    fn pinned_image_recognises_nothing_else() {
+        let good = rendered("app", "example");
+        let other_service = rendered("web", "example");
+        let two_images = format!("{good}  \"web\":\n    image: \"other\"\n");
+        let hidden = good.replace("    labels:", "    image: \"other\"\n    labels:");
+        let unquoted = good.replace("image: \"example\"", "image: example");
+        let escaped = good.replace("image: \"example\"", "image: \"a\\u0041\"");
+        let trailing = good.replace("image: \"example\"", "image: \"example\" # no");
+        let cases = [
+            "",
+            "services: {}\n",
+            "garbage",
+            other_service.as_str(),
+            two_images.as_str(),
+            hidden.as_str(),
+            unquoted.as_str(),
+            escaped.as_str(),
+            trailing.as_str(),
+        ];
+        for file in cases {
+            assert_eq!(
+                pinned_image(file.as_bytes(), "app"),
+                Pin::Unrecognised,
+                "{file}"
+            );
+        }
+        assert_eq!(pinned_image(b"\xff\xfe", "app"), Pin::Unrecognised);
     }
 
     #[test]

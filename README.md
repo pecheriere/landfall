@@ -90,14 +90,15 @@ landfall-agent recover --config fleet.toml --deployment app/prod [--state-dir <d
 ```
 
 `status` prints one JSON object per deployment of the host: its directory, what
-is deployed, whether a deploy is unfinished, the running image and whether it has
-drifted. `recover` rolls back an interrupted deploy, and exits 0 on success, 1
+is deployed, whether a deploy is unfinished, what the override file is, the running
+image and whether it has drifted from the override, or the error that kept it from
+being read. `recover` rolls back an interrupted deploy, and exits 0 on success, 1
 if the rollback failed and 2 if it could not run. The state directory defaults to
 `/var/lib/landfall-agent`.
 
-A host needs Linux 5.8 or later, a unique uid for the agent, and five
-capabilities (`CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_OVERRIDE`,
-`CAP_DAC_READ_SEARCH`, `CAP_FSETID`), and each stack needs
+A host needs Linux 5.8 or later, a unique uid for the agent, and four
+capabilities (`CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_OVERRIDE`, `CAP_FSETID`), and
+each stack needs
 `COMPOSE_FILE=compose.yaml:compose.landfall.yaml` in its `.env`. The Docker socket
 it uses is root-equivalent. See [`docs/operations.md`](docs/operations.md) for
 these, the systemd unit, and what to do when a deploy goes wrong.

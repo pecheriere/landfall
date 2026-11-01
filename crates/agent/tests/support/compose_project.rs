@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::os::unix::process::CommandExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -23,7 +23,8 @@ const DOWN_LIMIT: Duration = Duration::from_secs(60);
 pub struct ComposeProject {
     /// The project's name.
     pub name: String,
-    dir: tempfile::TempDir,
+    path: PathBuf,
+    _dir: tempfile::TempDir,
 }
 
 impl ComposeProject {
@@ -52,13 +53,20 @@ impl ComposeProject {
             format!("name: {name}\nservices:\n{services}networks:\n  net:\n    name: {name}-net\n"),
         )
         .unwrap();
-        Self { name, dir }
+        // Canonical, as the agent's directories are: compose labels a
+        // container with the real path it ran in.
+        let path = dir.path().canonicalize().unwrap();
+        Self {
+            name,
+            path,
+            _dir: dir,
+        }
     }
 
     /// The compose directory.
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.dir.path()
+        &self.path
     }
 
     /// The ids of the project's containers, one-offs included.

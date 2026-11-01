@@ -106,7 +106,7 @@ group (Docker socket access is root-equivalent; stated plainly in the docs), wit
 (`ProtectSystem=strict`, `ReadWritePaths=` limited to the managed compose directories, its state and
 its backup directory, `NoNewPrivileges`). Not a container, so it can't be stopped by its own deploys.
 Files in backed-up directories belong to the users containers run as, so it holds `CAP_CHOWN`,
-`CAP_FOWNER`, `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` and `CAP_FSETID` as ambient capabilities, and its
+`CAP_FOWNER`, `CAP_DAC_OVERRIDE` and `CAP_FSETID` as ambient capabilities, and its
 uid must not be shared with any container's. Linux 5.8 or later. See `docs/operations.md`.
 
 landfall never deploys landfall: the controller and agents are upgraded by hand in v0.

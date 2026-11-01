@@ -14,8 +14,10 @@ use landfall_core::ids::{DeploymentId, HostId};
 use serde::Serialize;
 
 use crate::compose::{self, ComposeError};
-use crate::deploy::{self, DeployError, DeployReport, EngineOptions, Outcome};
-use crate::docker::{Docker, DockerCli, DockerError};
+use crate::deploy::{
+    self, DeployError, DeployReport, DriftError, EngineOptions, Outcome, OverrideFile,
+};
+use crate::docker::{Docker, DockerCli};
 use crate::journal::{self, Priority};
 use crate::state::{Deployed, DeploymentState, StateDir, StateError};
 
@@ -36,11 +38,15 @@ pub const EXIT_COULD_NOT_RUN: u8 = 2;
 /// disk must not keep the agent from reporting its exit status.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
+/// How long reading a deployment's local files may take.
+const LOCAL_READ_LIMIT: Duration = Duration::from_secs(60);
+
 const EXIT_STATUS: &str = "\
 Exit status:
   0  success
   1  recover ran and the rollback failed; deploys stay blocked, run it again
-  2  could not run: usage, configuration, state or Docker";
+  2  could not run: usage, configuration, state or Docker; for status, some
+     deployment could not be read (its line has the error)";
 
 /// Runs on each host: verifies and deploys releases, checks health, rolls back.
 #[derive(Debug, Parser)]
@@ -53,8 +59,9 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print one JSON object per deployment of a host: its compose directory,
-    /// what is recorded as deployed, whether a deploy is unfinished, the
-    /// running image and whether it has drifted from the project's.
+    /// what is recorded as deployed, whether a deploy is unfinished, what the
+    /// override file is, the running image and whether it has drifted from the
+    /// override, or the error that kept it from being read.
     Status(StatusArgs),
     /// Finish an interrupted deploy by rolling it back, and print its report.
     Recover(RecoverArgs),
@@ -117,14 +124,17 @@ pub enum CliError {
     /// The agent's state could not be read.
     #[error(transparent)]
     State(#[from] StateError),
-    /// Docker could not tell what is running.
+    /// The override or the running container could not be read.
     #[error("deployment {deployment}: {source}")]
-    Docker {
+    Drift {
         /// The deployment.
         deployment: DeploymentId,
         /// The failure.
-        source: DockerError,
+        source: DriftError,
     },
+    /// Reading the compose directory or the state did not finish.
+    #[error("reading local files did not finish within {0:?}")]
+    LocalRead(Duration),
     /// The recovery did not start.
     #[error(transparent)]
     Deploy(#[from] DeployError),
@@ -136,30 +146,27 @@ pub enum CliError {
     Output(#[source] io::Error),
 }
 
-/// What `status` prints for one deployment. The only thing in it a container
-/// has a say in is `running_image`, which is quoted and truncated.
+/// What `status` prints for one deployment. What could not be found out is
+/// `null`, and `error` says why. The only thing in it a container has a say in
+/// is `running_image`, which is quoted and truncated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeploymentStatus {
     /// The deployment.
     pub deployment: DeploymentId,
-    /// The resolved compose directory.
+    /// The compose directory, resolved if it could be.
     pub dir: PathBuf,
     /// What is recorded as deployed, if anything.
     pub deployed: Option<Deployed>,
     /// Whether a deploy started and did not finish.
-    pub in_progress: bool,
+    pub in_progress: Option<bool>,
+    /// What the override file is.
+    pub override_file: Option<OverrideFile>,
     /// The running container's image, quoted and truncated.
     pub running_image: Option<String>,
-    /// Whether the running image differs from the project's.
-    pub drift: bool,
-}
-
-/// One deployment to report on, with what the state directory says of it.
-struct Target<'a> {
-    deployment: &'a Deployment,
-    dir: PathBuf,
-    deployed: Option<Deployed>,
-    in_progress: bool,
+    /// Whether the running image differs from the override.
+    pub drift: Option<bool>,
+    /// Why this deployment could not be read in full.
+    pub error: Option<String>,
 }
 
 fn load_config(path: &Path) -> Result<Config, CliError> {
@@ -173,59 +180,106 @@ fn load_config(path: &Path) -> Result<Config, CliError> {
     })
 }
 
-/// Reads what the host's deployments need from the disk, before any Docker
-/// call runs.
-fn status_targets<'a>(
-    config: &'a Config,
-    host: &'a HostId,
-    state_dir: &Path,
-) -> Result<Vec<Target<'a>>, CliError> {
-    let mut dirs = compose::resolve_dirs(config, host)?;
-    let state = StateDir::open(state_dir)?;
-    let mut targets = Vec::new();
-    for deployment in config.deployments_for_host(host) {
-        let id = deployment.id();
-        let dir = dirs
-            .remove(id)
-            .ok_or_else(|| CliError::UnknownDeployment(id.clone()))?;
-        let record = state.deployment(id)?;
-        targets.push(Target {
-            deployment,
-            dir,
-            deployed: record.deployed()?,
-            in_progress: record.in_progress()?.is_some(),
-        });
+/// Runs file work on a thread, so a hung disk ends in an error row.
+async fn on_thread<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, CliError> + Send + 'static,
+) -> Result<T, CliError> {
+    match tokio::time::timeout(LOCAL_READ_LIMIT, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => Err(CliError::LocalRead(LOCAL_READ_LIMIT)),
     }
-    if targets.is_empty() {
-        return Err(CliError::NoDeployments(host.clone()));
-    }
-    Ok(targets)
 }
 
+/// Fills in `row` as far as it can be read; the first failure ends it.
+async fn fill_status<D: Docker>(
+    docker: &D,
+    deployment: &Deployment,
+    state_dir: &Path,
+    row: &mut DeploymentStatus,
+) -> Result<(), CliError> {
+    let id = deployment.id();
+    let owned = deployment.clone();
+    row.dir = on_thread(move || compose::resolve_dir(&owned).map_err(CliError::from)).await?;
+    let (state_dir, state_id) = (state_dir.to_owned(), id.clone());
+    let (deployed, in_progress) = on_thread(move || {
+        let record = StateDir::open(&state_dir)?.deployment(&state_id)?;
+        Ok((record.deployed()?, record.in_progress()?.is_some()))
+    })
+    .await?;
+    row.deployed = deployed;
+    row.in_progress = Some(in_progress);
+    let seen = deploy::drift(docker, &row.dir, deployment.compose().service())
+        .await
+        .map_err(|source| CliError::Drift {
+            deployment: id.clone(),
+            source,
+        })?;
+    row.override_file = Some(seen.override_file);
+    row.running_image = seen.running_image;
+    row.drift = Some(seen.drift);
+    Ok(())
+}
+
+/// One row per deployment of `host`. One that can't be read gets an error in
+/// its row and doesn't stop the others.
 async fn statuses<D: Docker>(
     docker: &D,
-    targets: Vec<Target<'_>>,
+    config: &Config,
+    host: &HostId,
+    state_dir: &Path,
 ) -> Result<Vec<DeploymentStatus>, CliError> {
-    let mut rows = Vec::with_capacity(targets.len());
-    for target in targets {
-        let id = target.deployment.id();
-        let service = target.deployment.compose().service();
-        let seen = deploy::drift(docker, &target.dir, service)
-            .await
-            .map_err(|source| CliError::Docker {
-                deployment: id.clone(),
-                source,
-            })?;
-        rows.push(DeploymentStatus {
-            deployment: id.clone(),
-            dir: target.dir,
-            deployed: target.deployed,
-            in_progress: target.in_progress,
-            running_image: seen.running_image,
-            drift: seen.drift,
-        });
+    let mut rows = Vec::new();
+    for deployment in config.deployments_for_host(host) {
+        let mut row = DeploymentStatus {
+            deployment: deployment.id().clone(),
+            dir: PathBuf::from(deployment.compose().dir()),
+            deployed: None,
+            in_progress: None,
+            override_file: None,
+            running_image: None,
+            drift: None,
+            error: None,
+        };
+        if let Err(error) = fill_status(docker, deployment, state_dir, &mut row).await {
+            row.error = Some(error.to_string());
+        }
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Err(CliError::NoDeployments(host.clone()));
     }
     Ok(rows)
+}
+
+/// The exit status of a `status` that printed `rows`.
+#[must_use]
+pub fn status_exit_code(rows: &[DeploymentStatus]) -> u8 {
+    if rows.iter().any(|row| row.error.is_some()) {
+        EXIT_COULD_NOT_RUN
+    } else {
+        EXIT_OK
+    }
+}
+
+fn journal_status_errors(rows: &[DeploymentStatus]) {
+    #[derive(Serialize)]
+    struct Unreadable<'a> {
+        event: &'static str,
+        deployment: &'a DeploymentId,
+        error: &'a str,
+    }
+    for row in rows {
+        if let Some(error) = &row.error {
+            journal::emit(
+                Priority::Error,
+                &Unreadable {
+                    event: "status_unreadable",
+                    deployment: &row.deployment,
+                    error,
+                },
+            );
+        }
+    }
 }
 
 /// Finds what `recover` works on.
@@ -290,10 +344,13 @@ fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
     match cli.command {
         Command::Status(args) => {
             let config = load_config(&args.config)?;
-            let targets = status_targets(&config, &args.host, &args.state_dir)?;
-            let rows = block_on_bounded(statuses(&docker, targets), SHUTDOWN_WAIT)??;
+            let rows = block_on_bounded(
+                statuses(&docker, &config, &args.host, &args.state_dir),
+                SHUTDOWN_WAIT,
+            )??;
             write_status(out, &rows).map_err(CliError::Output)?;
-            Ok(EXIT_OK)
+            journal_status_errors(&rows);
+            Ok(status_exit_code(&rows))
         }
         Command::Recover(args) => {
             let config = load_config(&args.config)?;
@@ -348,9 +405,9 @@ mod tests {
     use super::{
         Cli, CliError, Command, DEFAULT_STATE_DIR, Deployed, EXIT_COULD_NOT_RUN, EXIT_OK,
         EXIT_ROLLBACK_FAILED, block_on_bounded, execute, load_config, recover_exit_code,
-        recover_target, status_targets, statuses, write_status,
+        recover_target, status_exit_code, statuses, write_status,
     };
-    use crate::compose::{OVERRIDE_FILE, PLACEHOLDER};
+    use crate::compose::{OVERRIDE_FILE, PLACEHOLDER, render_override};
     use crate::deploy::{self, DeployError, EngineOptions, Outcome};
     use crate::docker::{ContainerInfo, ServiceConfig};
     use crate::state::{DeploymentState, InProgress, Phase};
@@ -436,19 +493,34 @@ mod tests {
             .unwrap()
     }
 
-    /// Runs `status` on the fake and returns the lines it prints, parsed.
-    async fn status_lines(f: &Fixture, docker: &FakeDocker) -> Vec<Value> {
+    /// Runs `status` on the fake and returns the lines it prints, parsed, and
+    /// the exit status.
+    async fn status_lines(f: &Fixture, docker: &FakeDocker) -> (Vec<Value>, u8) {
         let config = load_config(&f.config_file).unwrap();
         let host = "home-1".parse().unwrap();
-        let targets = status_targets(&config, &host, &f.state_dir).unwrap();
-        let rows = statuses(docker, targets).await.unwrap();
+        let rows = statuses(docker, &config, &host, &f.state_dir)
+            .await
+            .unwrap();
         let mut out = Vec::new();
         write_status(&mut out, &rows).unwrap();
-        String::from_utf8(out)
+        let lines = String::from_utf8(out)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+            .collect();
+        (lines, status_exit_code(&rows))
+    }
+
+    fn write_pinned(f: &Fixture, image: &str) {
+        let tag = "v1.2.3".parse().unwrap();
+        let file = render_override(
+            "app",
+            image,
+            &"app/prod".parse().unwrap(),
+            &tag,
+            &COMMIT.parse().unwrap(),
+        );
+        fs::write(f.compose.join(OVERRIDE_FILE), file).unwrap();
     }
 
     #[test]
@@ -545,13 +617,18 @@ mod tests {
         assert!(matches!(err, CliError::ReadConfig { .. }), "{err}");
     }
 
-    #[test]
-    fn a_host_without_deployments_could_not_run() {
+    #[tokio::test]
+    async fn a_host_without_deployments_could_not_run() {
         let f = fixture();
         let config = load_config(&f.config_file).unwrap();
-        let err = status_targets(&config, &"home-2".parse().unwrap(), &f.state_dir)
-            .err()
-            .unwrap();
+        let err = statuses(
+            &FakeDocker::new(),
+            &config,
+            &"home-2".parse().unwrap(),
+            &f.state_dir,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, CliError::NoDeployments(_)), "{err}");
     }
 
@@ -570,46 +647,126 @@ mod tests {
         let f = fixture();
         state_of(&f).set_deployed(&deployed()).unwrap();
         state_of(&f).set_in_progress(&marker()).unwrap();
+        write_pinned(&f, IMAGE);
         let docker = FakeDocker::new();
-        docker.script_compose_service([Ok(ServiceConfig {
-            image: Some(IMAGE.to_owned()),
-            has_build: false,
-        })]);
         docker.script_inspect([Ok(container(IMAGE))]);
 
-        let lines = status_lines(&f, &docker).await;
+        let (lines, code) = status_lines(&f, &docker).await;
 
+        assert_eq!(code, EXIT_OK);
         assert_eq!(lines.len(), 1);
         let row = &lines[0];
         assert_eq!(row["deployment"], "app/prod");
         assert_eq!(row["dir"], f.compose.to_str().unwrap());
         assert_eq!(row["deployed"]["tag"], "v1.2.3");
         assert_eq!(row["in_progress"], true);
+        assert_eq!(row["override_file"], "pinned");
         assert_eq!(row["running_image"], format!("{IMAGE:?}"));
         assert_eq!(row["drift"], false);
+        assert_eq!(row["error"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_missing_override_is_a_state_not_a_failure() {
+        let f = fixture();
+        let docker = FakeDocker::new();
+        docker.script_container([Ok(None)]);
+
+        let (lines, code) = status_lines(&f, &docker).await;
+
+        assert_eq!(code, EXIT_OK);
+        let row = &lines[0];
+        assert_eq!(row["override_file"], "missing");
+        assert_eq!(row["running_image"], Value::Null);
+        assert_eq!(row["drift"], false);
+        assert_eq!(row["error"], Value::Null);
+        assert_eq!(row["deployed"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn one_bad_deployment_gets_an_error_row_and_the_others_are_reported() {
+        let f = fixture();
+        write_pinned(&f, IMAGE);
+        let gone = f.state_dir.with_file_name("gone");
+        let second = format!(
+            "[[deployment]]\nid = \"app/gone\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
+             host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
+             origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
+             rule = {{ auto = \"any\", approvers = [\"operator\"] }}\nchecks = [{{ command = [\"true\"] }}]\n",
+            gone.to_str().unwrap()
+        );
+        let fleet = fleet(&f.compose).replace("[[grant]]", &format!("{second}[[grant]]"));
+        fs::write(&f.config_file, fleet).unwrap();
+        let docker = FakeDocker::new();
+        docker.script_inspect([Ok(container(IMAGE))]);
+
+        let (lines, code) = status_lines(&f, &docker).await;
+
+        assert_eq!(code, EXIT_COULD_NOT_RUN);
+        assert_eq!(lines.len(), 2);
+        let good = lines
+            .iter()
+            .find(|row| row["deployment"] == "app/prod")
+            .unwrap();
+        assert_eq!(good["drift"], false);
+        assert_eq!(good["error"], Value::Null);
+        let bad = lines
+            .iter()
+            .find(|row| row["deployment"] == "app/gone")
+            .unwrap();
+        assert_eq!(bad["drift"], Value::Null);
+        assert_eq!(bad["in_progress"], Value::Null);
+        assert_eq!(bad["dir"], gone.to_str().unwrap());
+        assert!(
+            bad["error"].as_str().unwrap().contains("cannot be used"),
+            "{bad}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_state_directory_is_an_error_row() {
+        let f = fixture();
+        fs::remove_dir(&f.state_dir).unwrap();
+        let (lines, code) = status_lines(&f, &FakeDocker::new()).await;
+        assert_eq!(code, EXIT_COULD_NOT_RUN);
+        assert!(
+            lines[0]["error"].as_str().unwrap().contains("state"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[0]["dir"], f.compose.to_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn docker_failure_is_an_error_row() {
+        let f = fixture();
+        let docker = FakeDocker::new();
+        docker.script_container([Err("daemon gone")]);
+        let (lines, code) = status_lines(&f, &docker).await;
+        assert_eq!(code, EXIT_COULD_NOT_RUN);
+        assert!(lines[0]["error"].as_str().unwrap().contains("daemon gone"));
+        assert_eq!(lines[0]["override_file"], Value::Null);
+        assert_eq!(lines[0]["in_progress"], false);
     }
 
     #[tokio::test]
     async fn status_holds_no_container_text_beyond_a_quoted_truncated_image() {
         let f = fixture();
+        write_pinned(&f, IMAGE);
         let docker = FakeDocker::new();
-        docker.script_compose_service([Ok(ServiceConfig {
-            image: Some("SECRET=hunter2".to_owned()),
-            has_build: false,
-        })]);
         let hostile = format!("evil\n{{\"drift\":false}}{}", "x".repeat(100_000));
         let mut info = container(&hostile);
         info.status = "status-text".to_owned();
         info.health = Some("health-text".to_owned());
         docker.script_inspect([Ok(info)]);
 
-        let lines = status_lines(&f, &docker).await;
+        let (lines, _) = status_lines(&f, &docker).await;
 
         let row = &lines[0];
         assert_eq!(row["drift"], true);
         let text = row.to_string();
         assert!(text.len() < 1024, "{}", text.len());
-        for absent in ["hunter2", "status-text", "health-text"] {
+        for absent in ["status-text", "health-text"] {
             assert!(!text.contains(absent), "{text}");
         }
         assert!(

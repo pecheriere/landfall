@@ -19,7 +19,7 @@ use landfall_origin::release::ReleaseOrigin;
 use serde::Serialize;
 
 use crate::checks::{CheckFailure, CheckOptions, quote, run_checks};
-use crate::compose;
+use crate::compose::{self, Pin};
 use crate::docker::{Docker, DockerError};
 use crate::journal::{self, Priority};
 use crate::safefs::{self, RelPath, Root, SafeFsError};
@@ -470,39 +470,110 @@ pub async fn recover<D: Docker>(
     result
 }
 
-/// How a service's running image compares with the project's.
+/// What the override file in a compose directory is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideFile {
+    /// There is none.
+    Missing,
+    /// The placeholder: nothing is pinned yet.
+    Placeholder,
+    /// It pins the service's image.
+    Pinned,
+    /// It is not one the agent wrote for this service.
+    Unrecognised,
+}
+
+/// How a service's running image compares with its override.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Drift {
+    /// What the override file is.
+    pub override_file: OverrideFile,
     /// The running container's image, quoted and truncated: it is the
     /// container's word. `None` when the service has no running container.
     pub running_image: Option<String>,
-    /// Whether a container is running an image other than the one the project
-    /// resolves to, which is the override's on a service the agent deployed
-    /// (design 7.1). A service that isn't running has not drifted: stopping
-    /// one is an operator's call, and a deploy in progress stops it too.
+    /// Whether a running container differs from the override (design 7.1): it
+    /// runs another image than the one pinned, or the file isn't the agent's
+    /// to go by. With nothing pinned there is nothing to differ from, and a
+    /// service that isn't running has not drifted: stopping one is an
+    /// operator's call, and a deploy in progress stops it too.
     pub drift: bool,
 }
 
-/// Compares the running image of `service` with the one its compose project
-/// in `dir` resolves to. A caller that also sees a deploy in progress knows
-/// that a difference is expected then. What the project resolves to comes from
-/// interpolated configuration and can hold a secret, so it is not returned.
+/// Why a service's drift could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum DriftError {
+    /// The compose directory or the override can't be read.
+    #[error("reading the override: {0}")]
+    Override(#[from] SafeFsError),
+    /// Reading the override did not finish.
+    #[error("reading the override: {0}")]
+    File(#[source] FileFailure),
+    /// Docker could not say what is running.
+    #[error(transparent)]
+    Docker(#[from] DockerError),
+}
+
+/// How long reading the override may take.
+const DRIFT_READ_LIMIT: Duration = Duration::from_secs(60);
+
+/// Compares the running image of `service` with what the override in `dir`
+/// pins. It goes by the file itself and by the container's labels, without
+/// `docker compose`: what `.env` makes of the project is exactly what can have
+/// strayed from the override, and a stack the agent's user cannot read can
+/// still be reported on. A caller that also sees a deploy in progress knows
+/// that a difference is expected then.
 ///
 /// # Errors
 ///
-/// [`DockerError`] when the project or the container cannot be read.
-pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<Drift, DockerError> {
-    let resolved = docker.compose_service(dir, service).await?;
+/// [`DriftError`] when the override or the container cannot be read.
+pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<Drift, DriftError> {
+    let owned = dir.to_owned();
+    let read = tokio::task::spawn_blocking(move || {
+        let root = Root::open(&owned)?;
+        let name = RelPath::new(compose::OVERRIDE_FILE)?;
+        safefs::read_file(&root, &name, OVERRIDE_CAP)
+    });
+    let file = match tokio::time::timeout(DRIFT_READ_LIMIT, read).await {
+        Ok(Ok(file)) => file?,
+        Ok(Err(_)) => {
+            return Err(DriftError::File(FileFailure::Panicked {
+                op: "read override",
+            }));
+        }
+        Err(_) => {
+            return Err(DriftError::File(FileFailure::Deadline {
+                op: "read override",
+                after: DRIFT_READ_LIMIT,
+            }));
+        }
+    };
+    let pin = file
+        .as_deref()
+        .map(|file| compose::pinned_image(file, service));
+    let override_file = match pin {
+        None => OverrideFile::Missing,
+        Some(Pin::Nothing) => OverrideFile::Placeholder,
+        Some(Pin::Image(_)) => OverrideFile::Pinned,
+        Some(Pin::Unrecognised) => OverrideFile::Unrecognised,
+    };
     let Some(id) = docker.container(dir, service).await? else {
         return Ok(Drift {
+            override_file,
             running_image: None,
             drift: false,
         });
     };
     let running = docker.inspect(&id).await?.image;
+    let drift = match pin {
+        None | Some(Pin::Nothing) => false,
+        Some(Pin::Image(pinned)) => pinned != running,
+        Some(Pin::Unrecognised) => true,
+    };
     Ok(Drift {
-        drift: resolved.image.as_deref() != Some(running.as_str()),
+        override_file,
         running_image: Some(quote(&running)),
+        drift,
     })
 }
 
@@ -1607,8 +1678,8 @@ mod tests {
 
     use super::faults::{Fault, with_faults};
     use super::{
-        DeployError, DeployPlan, EngineOptions, Outcome, ReleaseOrigin, StepResult, drift, recover,
-        run, timestamp_id,
+        DeployError, DeployPlan, DriftError, EngineOptions, Outcome, OverrideFile, ReleaseOrigin,
+        StepResult, drift, recover, run, timestamp_id,
     };
     use crate::checks::CheckOptions;
     use crate::compose::{self, OVERRIDE_FILE, PLACEHOLDER};
@@ -3756,20 +3827,33 @@ mod tests {
         assert_eq!(ids[0], "2026-01-02T03-04-05-000000000Z");
     }
 
+    /// A fixture whose override pins `image`.
+    fn pinned_to(image: &str) -> Fixture {
+        let f = fixture("");
+        let file = compose::render_override(
+            "app",
+            image,
+            f.plan.deployment(),
+            f.plan.tag(),
+            f.plan.commit(),
+        );
+        fs::write(f.dir.join(OVERRIDE_FILE), file).unwrap();
+        f
+    }
+
     #[tokio::test]
     async fn drift_is_reported() {
-        let f = fixture("");
-        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        let f = pinned_to(PINNED);
         f.docker.script_inspect([Ok(container(OLD, true))]);
         let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
         assert!(seen.drift);
+        assert_eq!(seen.override_file, OverrideFile::Pinned);
         assert_eq!(seen.running_image, Some(format!("{OLD:?}")));
     }
 
     #[tokio::test]
     async fn no_drift_when_images_match() {
-        let f = fixture("");
-        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        let f = pinned_to(PINNED);
         f.docker.script_inspect([Ok(container(PINNED, true))]);
         let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
         assert!(!seen.drift);
@@ -3777,17 +3861,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_container_of_a_service_without_an_image_has_drifted() {
-        let f = fixture("");
-        f.docker.script_compose_service([Ok(image(None))]);
+    async fn drift_never_asks_compose() {
+        let f = pinned_to(PINNED);
         f.docker.script_inspect([Ok(container(PINNED, true))]);
-        assert!(drift(&f.docker, &f.dir, "app").await.unwrap().drift);
+        drift(&f.docker, &f.dir, "app").await.unwrap();
+        assert_eq!(changes(&f), Vec::<&str>::new());
+    }
+
+    #[tokio::test]
+    async fn nothing_pinned_is_not_drift() {
+        let f = fixture("");
+        for (file, expected) in [
+            (None, OverrideFile::Missing),
+            (Some(PLACEHOLDER), OverrideFile::Placeholder),
+        ] {
+            match file {
+                Some(text) => fs::write(f.dir.join(OVERRIDE_FILE), text).unwrap(),
+                None => fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap(),
+            }
+            f.docker.script_inspect([Ok(container(OLD, true))]);
+            let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+            assert_eq!(seen.override_file, expected);
+            assert!(!seen.drift, "{expected:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_override_the_agent_did_not_write_is_drift_and_is_not_quoted() {
+        let f = fixture("");
+        fs::write(f.dir.join(OVERRIDE_FILE), "services: {} # SECRET=hunter2\n").unwrap();
+        f.docker.script_inspect([Ok(container(PINNED, true))]);
+        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        assert_eq!(seen.override_file, OverrideFile::Unrecognised);
+        assert!(seen.drift);
+        assert!(!format!("{seen:?}").contains("hunter2"));
     }
 
     #[tokio::test]
     async fn a_stopped_service_has_not_drifted() {
-        let f = fixture("");
-        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        let f = pinned_to(PINNED);
         f.docker.script_container([Ok(None)]);
         let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
         assert!(!seen.drift);
@@ -3795,9 +3907,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hostile_image_name_is_quoted_and_truncated_by_drift() {
+    async fn a_symlinked_override_is_not_followed_by_drift() {
         let f = fixture("");
-        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        let elsewhere = f.dir.join("elsewhere");
+        fs::write(&elsewhere, PLACEHOLDER).unwrap();
+        fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, f.dir.join(OVERRIDE_FILE)).unwrap();
+        let err = drift(&f.docker, &f.dir, "app").await.unwrap_err();
+        assert!(matches!(err, DriftError::Override(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_hostile_image_name_is_quoted_and_truncated_by_drift() {
+        let f = pinned_to(PINNED);
         let hostile = format!("evil\n{}", "x".repeat(4096));
         f.docker.script_inspect([Ok(container(&hostile, true))]);
         let shown = drift(&f.docker, &f.dir, "app")
