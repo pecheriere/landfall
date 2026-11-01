@@ -123,6 +123,12 @@ pub enum Phase {
     /// the record can have been left by a write reported as failed, and the
     /// release is on its way out.
     RollingBack,
+    /// Going back, and the backup has been restored in full: the override and
+    /// the record were put back before it. What remains is to start the
+    /// previous version and check it. It may well be running by now and have
+    /// written to its data, so the service is not stopped and the backup is
+    /// not restored again. A restore that did not finish stays [`Self::RollingBack`].
+    Restored,
     /// Back, and checked. Only the marker is left to remove; restoring again
     /// would discard what the previous version wrote since.
     RolledBack,

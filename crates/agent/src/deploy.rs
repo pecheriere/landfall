@@ -456,6 +456,10 @@ pub async fn run<D: Docker>(
 ///   deployed. Without that record, it is rolled back.
 /// - [`Phase::RollingBack`]: rolled back again from the start, whatever
 ///   `deployed.json` says.
+/// - [`Phase::Restored`]: the backup is back in full, and the previous version
+///   may have been running on it since, as after a rollback whose checks failed.
+///   Only the start, the image check and the checks run again: stopping the
+///   service and restoring would discard what it wrote.
 /// - [`Phase::RolledBack`]: the previous version is back and has been checked,
 ///   so only the marker is removed. The backup is not restored again: that
 ///   would discard what the previous version wrote since.
@@ -1145,7 +1149,7 @@ impl<D: Docker> Engine<'_, D> {
             Ok(()) => {
                 // The release is in and recorded: a failure to remove old
                 // backups is in the report, and doesn't undo the deploy.
-                let _ = rec.step("prune_backups", self.prune()).await;
+                self.prune_kept(&mut rec).await;
                 Outcome::Deployed
             }
             Err(reason) => self.rollback_outcome(&mut rec, &marker, reason).await,
@@ -1173,15 +1177,15 @@ impl<D: Docker> Engine<'_, D> {
                 // The sequence writes this record once the checks have passed.
                 deployed.is_some_and(|d| d.deploy_id == marker.deploy_id)
             }
-            Phase::Preflight | Phase::RollingBack | Phase::RolledBack => false,
+            Phase::Preflight | Phase::RollingBack | Phase::Restored | Phase::RolledBack => false,
         };
         let outcome = if finished {
-            let _ = rec.step("prune_backups", self.prune()).await;
+            self.prune_kept(&mut rec).await;
             Outcome::Deployed
         } else if marker.phase == Phase::Preflight {
             self.undo_preflight(&mut rec, &marker).await
         } else if marker.phase == Phase::RolledBack {
-            self.clear_in_progress(&mut rec).await;
+            self.clear_and_prune(&mut rec).await;
             rolled_back(
                 &marker,
                 format!(
@@ -1210,6 +1214,16 @@ impl<D: Docker> Engine<'_, D> {
         marker: &mut InProgress,
     ) -> Result<(), String> {
         if let Some(backup) = self.deployment.backup() {
+            // Room for the copy about to be made, so a full disk is less
+            // likely to fail it, while the service still runs. Failing here
+            // stops nothing: the backup then finds out if there is room.
+            let room = self.options.backups_kept.saturating_sub(1);
+            let _ = rec
+                .step(
+                    "prune_before_backup",
+                    self.prune("prune before backup", room),
+                )
+                .await;
             if backup.stop() {
                 rec.must("stop", self.stop()).await?;
             }
@@ -1332,16 +1346,36 @@ impl<D: Docker> Engine<'_, D> {
         .await
     }
 
-    async fn prune(&self) -> Result<(), FileFailure> {
+    /// Removes all but the newest `keep` backups, and never the one a marker
+    /// on disk names: that is what a rollback or `recover` would restore.
+    async fn prune(&self, op: &'static str, keep: usize) -> Result<(), FileFailure> {
         let backups = self.state.backups_dir();
-        let keep = self.options.backups_kept;
-        off_thread(
-            &self.lock,
-            "prune backups",
-            self.options.backup_deadline,
-            move || safefs::prune(&backups, keep),
-        )
+        let state = self.state.clone();
+        off_thread(&self.lock, op, self.options.backup_deadline, move || {
+            let marker = state.in_progress()?;
+            let named = marker.as_ref().and_then(|m| m.backup.as_ref());
+            safefs::prune(&backups, keep, named.map(|backup| backup.id.as_str()))?;
+            Ok::<(), FileFailure>(())
+        })
         .await
+    }
+
+    /// Brings the backups down to the number kept. A failure is in the report
+    /// and changes no outcome.
+    async fn prune_kept(&self, rec: &mut Recorder) {
+        let keep = self.options.backups_kept;
+        let _ = rec
+            .step("prune_backups", self.prune("prune backups", keep))
+            .await;
+    }
+
+    /// The rollback is over: removes the marker and then, with nothing left
+    /// that may need them, the backups beyond the number kept. Failed deploys
+    /// take backups too.
+    async fn clear_and_prune(&self, rec: &mut Recorder) {
+        if self.clear_in_progress(rec).await {
+            self.prune_kept(rec).await;
+        }
     }
 
     /// The image of the service's container, as it says.
@@ -1391,7 +1425,7 @@ impl<D: Docker> Engine<'_, D> {
     ) -> Outcome {
         match self.rollback(rec, marker).await {
             Ok(()) => {
-                self.clear_in_progress(rec).await;
+                self.clear_and_prune(rec).await;
                 rolled_back(marker, reason)
             }
             // The marker stays: deploys stay blocked, and `recover` can try
@@ -1412,7 +1446,7 @@ impl<D: Docker> Engine<'_, D> {
         );
         match self.restore_previous_override(rec).await {
             Ok(()) => {
-                self.clear_in_progress(rec).await;
+                let _ = self.clear_in_progress(rec).await;
                 Outcome::NothingChanged { reason }
             }
             // The marker stays, and `recover` can try again.
@@ -1463,8 +1497,14 @@ impl<D: Docker> Engine<'_, D> {
     /// keeps a share of the lock until it ends, so that is what `recover` waits
     /// for, and this stops rather than leave the wrong override or record
     /// behind what looks like a clean rollback.
+    ///
+    /// From [`Phase::Restored`] everything up to the start is done and only the
+    /// rest runs. The marker takes that phase as soon as the restore has
+    /// returned: from then on the previous version's data is what counts, and
+    /// a failure further on can leave it running and writing for a long time.
     async fn rollback(&self, rec: &mut Recorder, marker: &InProgress) -> Result<(), String> {
-        if marker.phase != Phase::RollingBack {
+        let restored = marker.phase == Phase::Restored;
+        if !restored && marker.phase != Phase::RollingBack {
             self.mark(
                 rec,
                 ("mark_rolling_back", "mark rolling back"),
@@ -1479,14 +1519,23 @@ impl<D: Docker> Engine<'_, D> {
                     .to_owned(),
             );
         }
-        self.restore_previous_override(rec).await?;
-        rec.must("restore_deployed", self.restore_deployed())
-            .await?;
-        let mut stopped = false;
-        if let Some(backup) = &marker.backup {
-            rec.must("stop_for_restore", self.stop()).await?;
-            stopped = true;
-            rec.must("restore_backup", self.restore(backup)).await?;
+        let mut stopped = restored;
+        if !restored {
+            self.restore_previous_override(rec).await?;
+            rec.must("restore_deployed", self.restore_deployed())
+                .await?;
+            if let Some(backup) = &marker.backup {
+                rec.must("stop_for_restore", self.stop()).await?;
+                stopped = true;
+                rec.must("restore_backup", self.restore(backup)).await?;
+                self.mark(
+                    rec,
+                    ("mark_restored", "mark restored"),
+                    marker,
+                    Phase::Restored,
+                )
+                .await?;
+            }
         }
         if marker.previous_can_start {
             let since = Timestamp::now();
@@ -1544,15 +1593,16 @@ impl<D: Docker> Engine<'_, D> {
     }
 
     /// A marker that could not be removed is in the report and keeps deploys
-    /// blocked; what is running is still what the outcome says.
-    async fn clear_in_progress(&self, rec: &mut Recorder) {
+    /// blocked; what is running is still what the outcome says. Returns whether
+    /// it is gone.
+    async fn clear_in_progress(&self, rec: &mut Recorder) -> bool {
         let state = self.state.clone();
-        let _ = rec
-            .step(
-                "clear_in_progress",
-                self.file("clear in-progress", move || state.clear_in_progress()),
-            )
-            .await;
+        rec.step(
+            "clear_in_progress",
+            self.file("clear in-progress", move || state.clear_in_progress()),
+        )
+        .await
+        .is_ok()
     }
 
     /// Clears the marker of a deploy that went through, writes the report and
@@ -1573,7 +1623,7 @@ impl<D: Docker> Engine<'_, D> {
             error: String,
         }
         if outcome == Outcome::Deployed {
-            self.clear_in_progress(&mut rec).await;
+            let _ = self.clear_in_progress(&mut rec).await;
         }
         let report = DeployReport {
             deployment: rec.deployment,
@@ -2023,6 +2073,7 @@ mod tests {
                 "verify_override",
                 "pull",
                 "mark_deploying",
+                "prune_before_backup",
                 "stop",
                 "backup",
                 "record_backup",
@@ -2447,7 +2498,11 @@ mod tests {
         );
         assert_eq!(count_ups(&f), 1, "half-restored data is not started");
         assert_eq!(count_stops(&f), 2);
-        assert_ne!(f.state.in_progress().unwrap(), None);
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::RollingBack,
+            "the next recover has to restore again"
+        );
     }
 
     #[tokio::test]
@@ -3578,7 +3633,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_from_a_crash_during_a_rollback_rolls_back_again() {
+    async fn recover_from_a_crash_before_the_restore_rolls_back_again() {
         let f = fixture(STOP_TRUE);
         let earlier = earlier_release(&f);
         f.state.set_deployed(&earlier).unwrap();
@@ -3586,8 +3641,8 @@ mod tests {
         failing_check(&f, OLD);
         new_version_migrates(&f);
 
-        // The second `up` is the rollback's: the data is back by then.
-        crash_at(&f, 1, |c| matches!(c, Call::ComposeUp { .. })).await;
+        // The second stop is the rollback's, ahead of the restore.
+        crash_at(&f, 1, |c| matches!(c, Call::ComposeStop { .. })).await;
 
         assert_eq!(
             f.state.in_progress().unwrap().unwrap().phase,
@@ -3596,7 +3651,7 @@ mod tests {
 
         f.docker.script_compose_service([Ok(image(Some(OLD)))]);
         f.docker
-            .script_inspect_after_up(3, [Ok(container(OLD, true))]);
+            .script_inspect_after_up(2, [Ok(container(OLD, true))]);
         let report = recovered(&f).await.unwrap();
 
         assert!(
@@ -3609,6 +3664,300 @@ mod tests {
         assert_eq!(override_text(&f.dir), PREVIOUS);
         assert_eq!(f.state.deployed().unwrap(), Some(earlier));
         assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn recover_from_a_restore_that_failed_part_way_restores_again() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+        f.docker
+            .script_inspect_after_up(1, [Ok(container(PINNED, false))]);
+        new_version_migrates(&f);
+
+        let report = with_faults([("restore backup", vec![Fault::Fail])], deploy(&f))
+            .await
+            .unwrap();
+
+        assert!(matches!(report.outcome, Outcome::RollbackFailed { .. }));
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::RollingBack
+        );
+
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        f.docker
+            .script_inspect_after_up(2, [Ok(container(OLD, true))]);
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::RolledBack { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(step_names(&report).contains(&"restore_backup"));
+        assert_eq!(data(&f), "before");
+    }
+
+    #[tokio::test]
+    async fn recover_after_the_restore_keeps_what_the_previous_version_wrote() {
+        let f = fixture(STOP_TRUE);
+        let earlier = earlier_release(&f);
+        f.state.set_deployed(&earlier).unwrap();
+        resolves(&f, Some(OLD));
+        f.docker
+            .script_inspect_after_up(1, [Ok(container(PINNED, false))]);
+        f.docker
+            .script_inspect_after_up(2, [Ok(container(OLD, false))]);
+        new_version_migrates(&f);
+
+        // The previous version is back and fails its checks.
+        let report = deploy(&f).await.unwrap();
+        assert!(
+            matches!(&report.outcome, Outcome::RollbackFailed { rollback_reason, .. }
+                if rollback_reason.contains("check_previous")),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Restored
+        );
+        assert_eq!(data(&f), "before");
+
+        // It runs on for hours, then its dependency is fixed.
+        fs::write(f.dir.join("data/db"), "written since").unwrap();
+        let stops = count_stops(&f);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        f.docker
+            .script_inspect_after_up(3, [Ok(container(OLD, true))]);
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::RolledBack { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(data(&f), "written since");
+        assert_eq!(count_stops(&f), stops, "the service is not stopped");
+        assert_eq!(
+            step_names(&report),
+            [
+                "start_previous",
+                "verify_previous_image",
+                "check_previous",
+                "mark_rolled_back",
+                "clear_in_progress",
+                "prune_backups",
+            ]
+        );
+        assert_eq!(f.state.deployed().unwrap(), Some(earlier));
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_crash_right_after_the_restore_does_not_restore_again() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+        failing_check(&f, OLD);
+        new_version_migrates(&f);
+
+        // The second `up` is the rollback's: the data is back by then.
+        crash_at(&f, 1, |c| matches!(c, Call::ComposeUp { .. })).await;
+
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Restored
+        );
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        f.docker
+            .script_inspect_after_up(3, [Ok(container(OLD, true))]);
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::RolledBack { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(!step_names(&report).contains(&"restore_backup"));
+        assert_eq!(data(&f), "before");
+        assert_eq!(override_text(&f.dir), PREVIOUS);
+    }
+
+    #[tokio::test]
+    async fn restored_phase_of_a_first_deploy_starts_nothing() {
+        let f = fixture(STOP_TRUE);
+        fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap();
+        resolves(&f, None);
+        f.docker.script_inspect([Ok(container(PINNED, false))]);
+
+        let report = with_faults([("mark rolled back", vec![Fault::Fail])], deploy(&f))
+            .await
+            .unwrap();
+        assert!(matches!(report.outcome, Outcome::RollbackFailed { .. }));
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Restored
+        );
+
+        let (ups, stops) = (count_ups(&f), count_stops(&f));
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::FailedNoPrevious { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!((count_ups(&f), count_stops(&f)), (ups, stops));
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    /// `how_many` old backups, which sort before anything the deploy takes.
+    fn old_backups(f: &Fixture, how_many: usize) -> Vec<String> {
+        fs::create_dir_all(f.state.backups_dir()).unwrap();
+        (1..=how_many)
+            .map(|day| {
+                let name = format!("2000-01-{day:02}T00-00-00-000000000Z");
+                fs::create_dir(f.state.backups_dir().join(&name)).unwrap();
+                name
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn room_is_made_before_the_backup() {
+        let f = fixture(STOP_TRUE);
+        old_backups(&f, 5);
+        healthy_deploy(&f);
+        // How many there are when the service stops for the backup.
+        let at_stop = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&at_stop);
+        let backups_dir = f.state.backups_dir();
+        f.docker.on_call(move |call| {
+            if matches!(call, Call::ComposeStop { .. }) {
+                log.lock()
+                    .unwrap()
+                    .push(fs::read_dir(&backups_dir).unwrap().count());
+            }
+        });
+
+        let report = deploy(&f).await.unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
+        assert_eq!(
+            *at_stop.lock().unwrap(),
+            [2],
+            "one short of the number kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_prune_before_the_backup_changes_nothing() {
+        let f = fixture(STOP_TRUE);
+        old_backups(&f, 5);
+        healthy_deploy(&f);
+
+        let report = with_faults([("prune before backup", vec![Fault::Fail])], deploy(&f))
+            .await
+            .unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
+        assert!(step_failed(&report, "prune_before_backup"));
+        assert_eq!(backups(&f).len(), 3, "the prune at the end still ran");
+    }
+
+    #[tokio::test]
+    async fn a_completed_rollback_prunes_once_the_marker_is_gone() {
+        let f = fixture(STOP_TRUE);
+        old_backups(&f, 5);
+        resolves(&f, Some(OLD));
+        failing_check(&f, OLD);
+
+        // The prune before the backup fails, which leaves this one the work.
+        let report = with_faults([("prune before backup", vec![Fault::Fail])], deploy(&f))
+            .await
+            .unwrap();
+
+        assert!(matches!(report.outcome, Outcome::RolledBack { .. }));
+        assert_eq!(backups(&f).len(), 3, "{:?}", backups(&f));
+        let names = step_names(&report);
+        let clear = names
+            .iter()
+            .position(|s| *s == "clear_in_progress")
+            .unwrap();
+        assert_eq!(names[clear + 1], "prune_backups", "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_rollback_whose_marker_stays_does_not_prune_until_recover_clears_it() {
+        let f = fixture(STOP_TRUE);
+        old_backups(&f, 5);
+        resolves(&f, Some(OLD));
+        failing_check(&f, OLD);
+        let report = with_faults(
+            [
+                ("prune before backup", vec![Fault::Fail]),
+                ("clear in-progress", vec![Fault::Fail]),
+            ],
+            deploy(&f),
+        )
+        .await
+        .unwrap();
+        assert!(!step_names(&report).contains(&"prune_backups"));
+        assert_eq!(backups(&f).len(), 6);
+
+        let report = recovered(&f).await.unwrap();
+
+        assert!(step_names(&report).contains(&"prune_backups"));
+        assert_eq!(backups(&f).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_backup_a_marker_names_is_never_pruned() {
+        // A deploy that finished, with only its clean-up left. Its backup is
+        // the oldest here, and a later `recover` may yet be told to use it.
+        let f = fixture(STOP_TRUE);
+        let old = old_backups(&f, 2);
+        fs::create_dir(f.state.backups_dir().join("2030-01-01T00-00-00-000000000Z")).unwrap();
+        f.state
+            .set_in_progress(&InProgress {
+                deploy_id: DEPLOY_ID.to_owned(),
+                phase: Phase::Deploying,
+                tag: f.plan.tag().clone(),
+                digest: f.plan.digest().clone(),
+                previous_can_start: true,
+                backup: Some(RecordedBackup {
+                    id: old[0].clone(),
+                    paths: vec!["data".to_owned()],
+                }),
+                started_at: "2026-11-01T10:00:00Z".parse().unwrap(),
+            })
+            .unwrap();
+        f.state
+            .set_deployed(&Deployed {
+                deploy_id: DEPLOY_ID.to_owned(),
+                ..earlier_release(&f)
+            })
+            .unwrap();
+
+        let report = recover(
+            &f.docker,
+            &f.state,
+            &f.deployment,
+            &f.dir,
+            &EngineOptions {
+                backups_kept: 1,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
+        assert_eq!(
+            backups(&f),
+            [old[0].clone(), "2030-01-01T00-00-00-000000000Z".to_owned()],
+            "the newest, and the one named"
+        );
     }
 
     #[tokio::test]
