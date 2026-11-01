@@ -153,6 +153,13 @@ pub enum Outcome {
         /// Why the deploy failed.
         reason: String,
     },
+    /// The deploy was interrupted before it touched the service: the previous
+    /// override is back, and the service was neither stopped, started nor
+    /// checked.
+    NothingChanged {
+        /// Why the deploy did not go ahead.
+        reason: String,
+    },
     /// The deploy failed and there is no previous version to start, so the
     /// service is stopped.
     FailedNoPrevious {
@@ -175,7 +182,7 @@ impl Outcome {
     pub fn priority(&self) -> Priority {
         match self {
             Self::Deployed => Priority::Info,
-            Self::RolledBack { .. } => Priority::Warning,
+            Self::RolledBack { .. } | Self::NothingChanged { .. } => Priority::Warning,
             Self::FailedNoPrevious { .. } => Priority::Error,
             Self::RollbackFailed { .. } => Priority::Critical,
         }
@@ -375,7 +382,7 @@ pub enum DeployError {
 }
 
 /// Deploys `plan`: preflight, `in-progress.json`, a check of the project with
-/// the new override, pull, backup, override, `up`, image check and post-deploy
+/// the new override, the marker's move to [`Phase::Deploying`], pull, backup, override, `up`, image check and post-deploy
 /// checks. A failure from the backup on rolls back. The report is written
 /// before this returns, on every outcome, and the outcome goes to the journal.
 ///
@@ -419,6 +426,8 @@ pub async fn run<D: Docker>(
 
 /// Finishes an interrupted deploy, going by the [`Phase`] of its marker:
 ///
+/// - [`Phase::Preflight`]: the service was never touched, so the previous
+///   override is put back and the marker removed, and nothing else is done.
 /// - [`Phase::Deploying`], with a `deployed.json` that names this very deploy:
 ///   it passed its checks and only the clearing is left, so it is reported as
 ///   deployed. Without that record, it is rolled back.
@@ -860,6 +869,27 @@ impl<D: Docker> Engine<'_, D> {
         }
     }
 
+    /// The checks are over and the deploy goes ahead: from here on `recover`
+    /// has to assume the service was touched. A write that fails leaves nothing
+    /// but the marker; one past its deadline may yet land after a clear.
+    async fn start_deploying(&self, marker: &InProgress) -> Result<(), DeployError> {
+        let state = self.state.clone();
+        let next = InProgress {
+            phase: Phase::Deploying,
+            ..marker.clone()
+        };
+        let written = self
+            .file("mark deploying", move || state.set_in_progress(&next))
+            .await;
+        match written {
+            Ok(()) => Ok(()),
+            Err(source @ FileFailure::Deadline { .. }) => {
+                Err(self.left_blocked(None, "recording that the deploy goes ahead", source))
+            }
+            Err(source) => Err(self.abandon(self.file_error(source)).await),
+        }
+    }
+
     /// Nothing is left of a deploy that was refused but its marker.
     async fn abandon(&self, refused: DeployError) -> DeployError {
         let state = self.state.clone();
@@ -891,7 +921,7 @@ impl<D: Docker> Engine<'_, D> {
         let started_at = Timestamp::now();
         let mut marker = InProgress {
             deploy_id: timestamp_id(started_at),
-            phase: Phase::Deploying,
+            phase: Phase::Preflight,
             tag: plan.tag().clone(),
             digest: plan.digest().clone(),
             previous_can_start: preflight.previous_can_start,
@@ -908,6 +938,9 @@ impl<D: Docker> Engine<'_, D> {
             self.verify_override(plan, preflight.previous),
         )
         .await?;
+        rec.step("mark_deploying", self.start_deploying(&marker))
+            .await?;
+        marker.phase = Phase::Deploying;
         let pulled = rec
             .step("pull", async {
                 self.docker
@@ -957,11 +990,13 @@ impl<D: Docker> Engine<'_, D> {
                 // The sequence writes this record once the checks have passed.
                 deployed.is_some_and(|d| d.deploy_id == marker.deploy_id)
             }
-            Phase::RollingBack | Phase::RolledBack => false,
+            Phase::Preflight | Phase::RollingBack | Phase::RolledBack => false,
         };
         let outcome = if finished {
             let _ = rec.step("prune_backups", self.prune()).await;
             Outcome::Deployed
+        } else if marker.phase == Phase::Preflight {
+            self.undo_preflight(&mut rec, &marker).await
         } else if marker.phase == Phase::RolledBack {
             self.clear_in_progress(&mut rec).await;
             rolled_back(
@@ -1185,6 +1220,39 @@ impl<D: Docker> Engine<'_, D> {
         }
     }
 
+    /// A deploy interrupted in its preflight: only the override can be out of
+    /// place. The service was never touched, so it is left alone.
+    async fn undo_preflight(&self, rec: &mut Recorder, marker: &InProgress) -> Outcome {
+        let reason = format!(
+            "the deploy of {} was interrupted before it touched the service; recover put the previous override back",
+            marker.tag
+        );
+        match self.restore_previous_override(rec).await {
+            Ok(()) => {
+                self.clear_in_progress(rec).await;
+                Outcome::NothingChanged { reason }
+            }
+            // The marker stays, and `recover` can try again.
+            Err(rollback_reason) => Outcome::RollbackFailed {
+                reason,
+                rollback_reason,
+            },
+        }
+    }
+
+    async fn restore_previous_override(&self, rec: &mut Recorder) -> Result<(), String> {
+        let state = self.state.clone();
+        let previous = rec
+            .must("read_previous_override", async {
+                self.file("read previous override", move || state.previous_override())
+                    .await?
+                    .ok_or(FileFailure::NoPreviousOverride)
+            })
+            .await?;
+        rec.must("restore_override", self.write_override(previous))
+            .await
+    }
+
     /// Writes the marker with `phase`.
     async fn mark(
         &self,
@@ -1228,16 +1296,7 @@ impl<D: Docker> Engine<'_, D> {
                     .to_owned(),
             );
         }
-        let state = self.state.clone();
-        let previous = rec
-            .must("read_previous_override", async {
-                self.file("read previous override", move || state.previous_override())
-                    .await?
-                    .ok_or(FileFailure::NoPreviousOverride)
-            })
-            .await?;
-        rec.must("restore_override", self.write_override(previous))
-            .await?;
+        self.restore_previous_override(rec).await?;
         rec.must("restore_deployed", self.restore_deployed())
             .await?;
         let mut stopped = false;
@@ -1773,6 +1832,7 @@ mod tests {
                 "preflight",
                 "record_in_progress",
                 "verify_override",
+                "mark_deploying",
                 "pull",
                 "stop",
                 "backup",
@@ -2564,7 +2624,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_during_preflight_is_recovered_to_the_previous_override() {
+    async fn crash_during_preflight_is_recovered_without_touching_the_service() {
         let f = fixture(STOP_TRUE);
         resolves(&f, Some(OLD));
 
@@ -2572,7 +2632,7 @@ mod tests {
 
         assert_eq!(override_text(&f.dir), rendered(&f), "the new one is in");
         let marker = f.state.in_progress().unwrap().unwrap();
-        assert_eq!(marker.phase, Phase::Deploying);
+        assert_eq!(marker.phase, Phase::Preflight);
         assert_eq!(marker.backup, None);
         assert_eq!(
             f.state.previous_override().unwrap().as_deref(),
@@ -2585,18 +2645,33 @@ mod tests {
             "{refused}"
         );
 
-        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-        f.docker.script_inspect([Ok(container(OLD, true))]);
+        let calls = f.docker.calls().len();
         let report = recovered(&f).await.unwrap();
 
         assert!(
-            matches!(report.outcome, Outcome::RolledBack { .. }),
+            matches!(report.outcome, Outcome::NothingChanged { .. }),
             "{:?}",
             report.outcome
         );
+        assert_ne!(report.outcome.priority(), Priority::Critical);
+        assert_eq!(
+            f.docker.calls().len(),
+            calls,
+            "no stop, up, check or anything else"
+        );
+        assert_eq!(count_stops(&f), 0);
+        assert_eq!(count_ups(&f), 0);
+        assert_eq!(
+            step_names(&report),
+            [
+                "read_previous_override",
+                "restore_override",
+                "clear_in_progress"
+            ]
+        );
         assert_eq!(override_text(&f.dir), PREVIOUS);
-        assert_eq!(count_stops(&f), 0, "no backup to restore, no stop");
         assert_eq!(f.state.in_progress().unwrap(), None);
+        assert_eq!(reports(&f)[0]["outcome"]["kind"], "nothing_changed");
 
         // The next deploy still goes back to the right override.
         healthy_deploy(&f);
@@ -2604,6 +2679,81 @@ mod tests {
         assert_eq!(
             f.state.previous_override().unwrap().as_deref(),
             Some(PREVIOUS.as_bytes())
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_recover_that_cannot_put_the_override_back_keeps_the_marker() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+        crash_at(&f, 0, |c| matches!(c, Call::ComposeServiceChecked { .. })).await;
+
+        let report = with_faults([("write override", vec![Fault::Fail])], recovered(&f))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&report.outcome, Outcome::RollbackFailed { rollback_reason, .. }
+                if rollback_reason.contains("restore_override")),
+            "{:?}",
+            report.outcome
+        );
+        assert_ne!(f.state.in_progress().unwrap(), None);
+
+        let report = recovered(&f).await.unwrap();
+        assert!(matches!(report.outcome, Outcome::NothingChanged { .. }));
+        assert_eq!(override_text(&f.dir), PREVIOUS);
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn crash_during_the_pull_counts_as_deploying() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+
+        crash_at(&f, 0, |c| matches!(c, Call::Pull(_))).await;
+
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Deploying,
+            "on disk before the pull"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_move_to_deploying_is_a_refusal_before_the_pull() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+
+        let err = with_faults([("mark deploying", vec![Fault::Fail])], deploy(&f))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DeployError::File { .. }), "{err}");
+        assert_eq!(changes(&f), ["config", "config"], "no pull, stop or up");
+        assert_eq!(override_text(&f.dir), PREVIOUS);
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn move_to_deploying_past_its_deadline_keeps_the_marker() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+        let (release, late) = std::sync::mpsc::channel();
+
+        let err = with_faults([("mark deploying", vec![Fault::Late(late)])], deploy(&f))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DeployError::LeftBlocked { .. }), "{err}");
+        assert!(err.to_string().contains("recover"), "{err}");
+        assert_eq!(changes(&f), ["config", "config"], "no pull, stop or up");
+        assert_ne!(f.state.in_progress().unwrap(), None);
+        release.send(()).unwrap();
+        late_work_has_ended(&f).await;
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Deploying
         );
     }
 
@@ -2660,10 +2810,9 @@ mod tests {
                 "{blocked}"
             );
 
-            f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-            f.docker.script_inspect([Ok(container(OLD, true))]);
             let report = recovered(&f).await.unwrap();
-            assert!(matches!(report.outcome, Outcome::RolledBack { .. }));
+            assert!(matches!(report.outcome, Outcome::NothingChanged { .. }));
+            assert_eq!(count_ups(&f), 0);
             assert_eq!(override_text(&f.dir), PREVIOUS);
         }
     }
@@ -2701,8 +2850,6 @@ mod tests {
         late_work_has_ended(&f).await;
         assert_eq!(override_text(&f.dir), rendered(&f), "it did land");
 
-        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-        f.docker.script_inspect([Ok(container(OLD, true))]);
         recovered(&f).await.unwrap();
         assert_eq!(override_text(&f.dir), PREVIOUS);
     }
