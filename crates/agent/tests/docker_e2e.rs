@@ -1027,17 +1027,22 @@ async fn docker_failed_rollback_up_leaves_what_runs_running() {
     let first = stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
     assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
 
-    // With version B up, the compose file breaks, so every `docker compose`
-    // from here on fails: the checks, and then the rollback's `up`.
+    // With version B up, the project comes to name an external network that
+    // isn't there. That passes `config`, and `stop` would still work, so nothing
+    // but the agent's choice keeps the service running: only `up` fails.
     stack.options = quick_to_fail();
     let compose_file = stack.dir.join("compose.yaml");
     let intact = fs::read_to_string(&compose_file).unwrap();
+    let name = stack.project.name.clone();
     let broken = std::cell::Cell::new(false);
     let b_started = stack.b_started();
     let (report, _) = stack
         .deploy_watching(&rest, "v2.0.0", DIGEST_B, || {
             if !broken.get() && b_started() {
-                fs::write(&compose_file, "services: [\n").unwrap();
+                stack.edit_compose(
+                    &format!("name: {name}-net\n"),
+                    &format!("name: {name}-missing\n    external: true\n"),
+                );
                 broken.set(true);
             }
             false
