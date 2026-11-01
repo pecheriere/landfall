@@ -88,8 +88,9 @@ const QUOTE_LIMIT: usize = 200;
 /// `command`) in order, stopping at the first that fails. Only when all of
 /// them pass in the same round do the `no_log_match` checks run: each waits
 /// until its window (from the container's start) has closed, then scans the
-/// logs from the earliest start seen in this run to the window's end, so a
-/// panic before a restart counts, and a match is final. The round then looks
+/// logs from the container's creation to the window's end, so a panic before
+/// a restart counts even if nothing here saw that start, and a match is final.
+/// The logs of a container that was replaced are not scanned. The round then looks
 /// at the container again: it must be the same one, running, from the same
 /// start, with the same addresses for `http` checks.
 ///
@@ -143,7 +144,6 @@ pub async fn run_checks<D: Docker>(
                 elapsed: Duration::ZERO,
             })
             .collect(),
-        earliest: None,
         budget: Budget::new(options.deadline, checks),
     };
     // The run of the container the last passing round saw, if the round after
@@ -313,8 +313,6 @@ struct Look {
 /// What rounds pass on to each other.
 struct Progress {
     reports: Vec<CheckReport>,
-    /// The earliest start seen; the logs since then are all from this run.
-    earliest: Option<Timestamp>,
     budget: Budget,
 }
 
@@ -329,7 +327,7 @@ struct Run<'a, D> {
 
 impl<D: Docker> Run<'_, D> {
     async fn round(&self, progress: &mut Progress) -> Result<Passed, Verdict> {
-        let first = self.look(progress).await?;
+        let first = self.look(&progress.budget).await?;
 
         for (i, check) in self.checks.iter().enumerate() {
             if matches!(check, Check::NoLogMatch { .. }) {
@@ -355,9 +353,6 @@ impl<D: Docker> Run<'_, D> {
             else {
                 continue;
             };
-            let since = progress
-                .earliest
-                .map_or(first.info.started_at, |e| e.min(first.info.started_at));
             let report = &mut progress.reports[i];
             report.attempts += 1;
             let started = Instant::now();
@@ -367,7 +362,6 @@ impl<D: Docker> Run<'_, D> {
                     pattern,
                     *within_secs,
                     &first,
-                    since,
                     &mut progress.budget,
                 )
                 .await;
@@ -377,7 +371,7 @@ impl<D: Docker> Run<'_, D> {
 
         // Everything above looked at the container as it was at the start of
         // the round, and a log window can be long.
-        let last = self.look(progress).await?;
+        let last = self.look(&progress.budget).await?;
         if last.id != first.id {
             return Err(retry("container", "replaced during the checks"));
         }
@@ -404,8 +398,8 @@ impl<D: Docker> Run<'_, D> {
     }
 
     /// Finds and inspects the container, which must be running.
-    async fn look(&self, progress: &mut Progress) -> Result<Look, Verdict> {
-        let id = bounded(&progress.budget, "container", async {
+    async fn look(&self, budget: &Budget) -> Result<Look, Verdict> {
+        let id = bounded(budget, "container", async {
             match self.docker.container(self.dir, self.service).await {
                 Ok(Some(id)) => Ok(id),
                 Ok(None) => Err(retry(
@@ -416,21 +410,13 @@ impl<D: Docker> Run<'_, D> {
             }
         })
         .await?;
-        let info = bounded(&progress.budget, "container", async {
+        let info = bounded(budget, "container", async {
             self.docker
                 .inspect(&id)
                 .await
                 .map_err(|e| docker_failure("container", &e))
         })
         .await?;
-        // One that never started has no meaningful start time.
-        if info.status != "created" {
-            progress.earliest = Some(
-                progress
-                    .earliest
-                    .map_or(info.started_at, |e| e.min(info.started_at)),
-            );
-        }
         if info.status != "running" {
             return Err(retry(
                 "container",
@@ -520,7 +506,6 @@ impl<D: Docker> Run<'_, D> {
         pattern: &str,
         within_secs: u32,
         look: &Look,
-        since: Timestamp,
         budget: &mut Budget,
     ) -> Result<(), Verdict> {
         let closes = look
@@ -538,7 +523,7 @@ impl<D: Docker> Run<'_, D> {
         tokio::time::sleep(wait).await;
         let found = bounded(budget, name, async {
             self.docker
-                .logs_contain(&look.id, since, closes, pattern)
+                .logs_contain(&look.id, look.info.created, closes, pattern)
                 .await
                 .map_err(|e| docker_failure(name, &e))
         })
@@ -1145,26 +1130,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_start_seen_only_in_a_failed_round_still_counts_for_the_logs() {
+    async fn logs_from_before_the_first_look_count() {
+        // The container panicked and restarted before the agent looked at it.
         let docker = FakeDocker::new();
-        let up = running(Some("starting"), &[]);
-        let mut again = restarted(&up, 3);
-        again.health = Some("healthy".to_owned());
-        docker.script_inspect([Ok(up.clone()), Ok(again)]);
-        run_checks(
+        let mut info = running(None, &[]);
+        info.created = info
+            .started_at
+            .checked_sub(SignedDuration::from_secs(60))
+            .unwrap();
+        docker.script_inspect([Ok(info.clone())]);
+        docker.script_exec([Ok(true)]);
+        docker.script_logs_contain([Ok(true)]);
+        let failure = run_checks(
             &docker,
             dir(),
             "app",
-            &[Check::ContainerHealthy, no_log_match(1)],
+            &[command(), no_log_match(5)],
             &CheckOptions::default(),
         )
         .await
-        .unwrap();
-        for call in docker.calls() {
-            if let Call::LogsContain { since, .. } = call {
-                assert_eq!(since, up.started_at);
-            }
-        }
+        .unwrap_err();
+        assert_eq!(failure.check, "checks[1] no_log_match \"panic\"");
+        assert!(
+            docker.calls().contains(&Call::LogsContain {
+                id: crate::testing::container_id(),
+                since: info.created,
+                until: info
+                    .started_at
+                    .checked_add(SignedDuration::from_secs(5))
+                    .unwrap(),
+                needle: "panic".to_owned(),
+            })
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1580,6 +1577,43 @@ mod tests {
                 project.path(),
                 "app",
                 &[alive(), no_log_match(6)],
+                &options(30, 1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                failure.check, "checks[1] no_log_match \"panic\"",
+                "{failure}"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "docker: runs in ci.yml"]
+        async fn docker_panic_before_the_first_look_counts() {
+            let cli = DockerCli::new();
+            // Panics at once on its first start, and its second start comes
+            // whole seconds later, so the line is before any start seen below.
+            let script = "if [ -e /tmp/seen ]; then sleep 300; fi; touch /tmp/seen; echo panic; sleep 2; exit 1";
+            let project = project(&cli, "always", script).await;
+            let id = cli.container(project.path(), "app").await.unwrap().unwrap();
+            let mut restarts = String::new();
+            for _ in 0..150 {
+                let out = std::process::Command::new("docker")
+                    .args(["inspect", "--format", "{{.RestartCount}}", id.as_ref()])
+                    .output()
+                    .unwrap();
+                restarts = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+                if restarts == "1" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            assert_eq!(restarts, "1", "the container did not restart");
+            let failure = run_checks(
+                &cli,
+                project.path(),
+                "app",
+                &[alive(), no_log_match(1)],
                 &options(30, 1),
             )
             .await

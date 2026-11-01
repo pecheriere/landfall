@@ -59,6 +59,7 @@ const INSPECT_FORMAT: &str = concat!(
     "{\"image\":{{json .Config.Image}},",
     "\"status\":{{json .State.Status}},",
     "\"health\":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},",
+    "\"created\":{{json .Created}},",
     "\"started_at\":{{json .State.StartedAt}},",
     "\"networks\":[{{range $name, $net := .NetworkSettings.Networks}}",
     "[{{json $name}},{{json $net.IPAddress}},{{json $net.GlobalIPv6Address}}],{{end}}null]}"
@@ -205,6 +206,9 @@ pub struct ContainerInfo {
     pub status: String,
     /// `.State.Health.Status`, absent without a healthcheck.
     pub health: Option<String>,
+    /// When the container was created. Its log goes back this far, through
+    /// every restart.
+    pub created: Timestamp,
     /// When the container last started.
     pub started_at: Timestamp,
     /// Attached networks and the container's IP on each, if it has one.
@@ -545,6 +549,7 @@ struct InspectDoc {
     image: String,
     status: String,
     health: Option<String>,
+    created: String,
     started_at: String,
     networks: Vec<Option<(String, String, String)>>,
 }
@@ -559,6 +564,10 @@ fn bad_inspect(reason: &'static str) -> DockerError {
 fn parse_inspect(raw: &[u8]) -> Result<ContainerInfo, DockerError> {
     let doc: InspectDoc =
         serde_json::from_slice(raw).map_err(|_| bad_inspect("not the expected JSON"))?;
+    let created = doc
+        .created
+        .parse::<Timestamp>()
+        .map_err(|_| bad_inspect("unreadable creation time"))?;
     let started_at = doc
         .started_at
         .parse::<Timestamp>()
@@ -583,6 +592,7 @@ fn parse_inspect(raw: &[u8]) -> Result<ContainerInfo, DockerError> {
         image: doc.image,
         status: doc.status,
         health: doc.health,
+        created,
         started_at,
         networks,
     })
@@ -976,12 +986,13 @@ mod tests {
 
     #[test]
     fn inspect_output_parses() {
-        let raw = br#"{"image":"ghcr.io/example/app@sha256:00","status":"running","health":null,"started_at":"2026-11-01T10:00:00.123456789Z","networks":[["app_default","172.18.0.2",""],["host-only","",""],["v6","","fd00::2"],["dual","172.19.0.3","fd00::3"],null]}
+        let raw = br#"{"image":"ghcr.io/example/app@sha256:00","status":"running","health":null,"created":"2026-11-01T09:59:59.5Z","started_at":"2026-11-01T10:00:00.123456789Z","networks":[["app_default","172.18.0.2",""],["host-only","",""],["v6","","fd00::2"],["dual","172.19.0.3","fd00::3"],null]}
 "#;
         let info = parse_inspect(raw).unwrap();
         assert_eq!(info.image, "ghcr.io/example/app@sha256:00");
         assert_eq!(info.status, "running");
         assert_eq!(info.health, None);
+        assert_eq!(info.created, "2026-11-01T09:59:59.5Z".parse().unwrap());
         assert_eq!(
             info.started_at,
             "2026-11-01T10:00:00.123456789Z".parse().unwrap()
@@ -995,7 +1006,7 @@ mod tests {
         assert_eq!(info.networks["v6"], Some("fd00::2".parse().unwrap()));
         assert_eq!(info.networks["dual"], Some("172.19.0.3".parse().unwrap()));
 
-        let healthy = br#"{"image":"i","status":"running","health":"healthy","started_at":"2026-11-01T10:00:00Z","networks":[null]}"#;
+        let healthy = br#"{"image":"i","status":"running","health":"healthy","created":"2026-11-01T09:59:59Z","started_at":"2026-11-01T10:00:00Z","networks":[null]}"#;
         let info = parse_inspect(healthy).unwrap();
         assert_eq!(info.health.as_deref(), Some("healthy"));
         assert!(info.networks.is_empty());
@@ -1005,8 +1016,10 @@ mod tests {
     fn inspect_refuses_what_it_cannot_read() {
         for raw in [
             &br#"{"image":"i"}"#[..],
-            br#"{"image":"i","status":"s","health":null,"started_at":"yesterday","networks":[null]}"#,
-            br#"{"image":"i","status":"s","health":null,"started_at":"2026-11-01T10:00:00Z","networks":[["n","999.1.1.1",""],null]}"#,
+            br#"{"image":"i","status":"s","health":null,"created":"2026-11-01T10:00:00Z","started_at":"yesterday","networks":[null]}"#,
+            br#"{"image":"i","status":"s","health":null,"created":"yesterday","started_at":"2026-11-01T10:00:00Z","networks":[null]}"#,
+            br#"{"image":"i","status":"s","health":null,"started_at":"2026-11-01T10:00:00Z","networks":[null]}"#,
+            br#"{"image":"i","status":"s","health":null,"created":"2026-11-01T10:00:00Z","started_at":"2026-11-01T10:00:00Z","networks":[["n","999.1.1.1",""],null]}"#,
             b"not json",
         ] {
             assert!(matches!(
@@ -1430,6 +1443,13 @@ mod tests {
                         .unwrap()
             );
             assert!(info.started_at <= Timestamp::now());
+            assert!(
+                info.created
+                    >= before
+                        .checked_sub(jiff::SignedDuration::from_secs(5))
+                        .unwrap()
+            );
+            assert!(info.created <= info.started_at, "{info:?}");
             let net = format!("{}-net", project.name);
             assert_eq!(info.networks.len(), 1, "{:?}", info.networks);
             assert!(

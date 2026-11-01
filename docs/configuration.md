@@ -162,8 +162,10 @@ Each entry is the string `"container-healthy"` or a table with exactly one of
 - `{ no_log_match = "panicked", within_secs = 30 }`: no log line may contain
   the text during the window, which runs from the container's start for
   `within_secs` (rounded out to whole seconds); a line logged later does not
-  count. If the container restarts during the checks, the lines of its earlier
-  starts count too. It is a plain substring match, not a regex. The text is 1
+  count. The scan goes back to the container's creation, so the lines of its
+  earlier starts count too, even if it restarted before the agent first looked.
+  The logs of a container that was replaced are not scanned. It is a plain
+  substring match, not a regex. The text is 1
   to 4096 bytes on a single line; `within_secs` is from 1 to 3600. The deploy
   waits for the window to close, on top of the check deadline.
 
