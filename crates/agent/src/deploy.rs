@@ -3748,6 +3748,7 @@ mod tests {
 
         assert_eq!(report.outcome, Outcome::Deployed);
         assert!(step_failed(&report, "clear_in_progress"));
+        assert!(report.leaves_deploys_blocked());
         let blocked = deploy(&f).await.unwrap_err();
         assert!(
             matches!(blocked, DeployError::Interrupted { .. }),
@@ -3821,6 +3822,7 @@ mod tests {
 
         assert_eq!(report.outcome, Outcome::Deployed);
         assert!(step_failed(&report, "prune_backups"));
+        assert!(!report.leaves_deploys_blocked());
         assert_ne!(f.state.deployed().unwrap(), None);
         assert_eq!(f.state.in_progress().unwrap(), None);
         assert_eq!(override_text(&f.dir), rendered(&f));

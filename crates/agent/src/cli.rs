@@ -14,9 +14,7 @@ use landfall_core::ids::{DeploymentId, HostId};
 use serde::Serialize;
 
 use crate::compose::{self, ComposeError};
-use crate::deploy::{
-    self, DeployError, DeployReport, DriftError, EngineOptions, Outcome, OverrideFile,
-};
+use crate::deploy::{self, DeployError, DeployReport, DriftError, EngineOptions, OverrideFile};
 use crate::docker::{Docker, DockerCli};
 use crate::journal::{self, Priority};
 use crate::state::{Deployed, DeploymentState, Phase, StateDir, StateError};
@@ -28,8 +26,9 @@ pub const DEFAULT_STATE_DIR: &str = "/var/lib/landfall-agent";
 /// there is none to start and the service is stopped, or the deploy had in
 /// fact finished, or it had never touched the service; and its marker is gone.
 pub const EXIT_OK: u8 = 0;
-/// `recover` ran and the rollback failed. Deploys stay blocked; run it again.
-pub const EXIT_ROLLBACK_FAILED: u8 = 1;
+/// `recover` ran and deploys stay blocked: the rollback failed, or the marker
+/// could not be removed. Run it again.
+pub const EXIT_BLOCKED: u8 = 1;
 /// The command could not run: configuration, state, Docker or usage.
 pub const EXIT_COULD_NOT_RUN: u8 = 2;
 
@@ -304,10 +303,9 @@ fn recover_target<'a>(
     let deployment = config
         .deployment(id)
         .ok_or_else(|| CliError::UnknownDeployment(id.clone()))?;
-    let mut dirs = compose::resolve_dirs(config, deployment.host())?;
-    let dir = dirs
-        .remove(id)
-        .ok_or_else(|| CliError::UnknownDeployment(id.clone()))?;
+    // Only this one: another deployment's missing directory must not keep an
+    // operator from recovering this one.
+    let dir = compose::resolve_dir(deployment)?;
     let state = StateDir::open(state_dir)?.deployment(id)?;
     Ok((deployment, dir, state))
 }
@@ -315,12 +313,10 @@ fn recover_target<'a>(
 /// The exit status of a `recover` that ran.
 #[must_use]
 pub fn recover_exit_code(report: &DeployReport) -> u8 {
-    match report.outcome {
-        Outcome::Deployed
-        | Outcome::RolledBack { .. }
-        | Outcome::NothingChanged { .. }
-        | Outcome::FailedNoPrevious { .. } => EXIT_OK,
-        Outcome::RollbackFailed { .. } => EXIT_ROLLBACK_FAILED,
+    if report.leaves_deploys_blocked() {
+        EXIT_BLOCKED
+    } else {
+        EXIT_OK
     }
 }
 
@@ -416,12 +412,12 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        Cli, CliError, Command, DEFAULT_STATE_DIR, Deployed, EXIT_COULD_NOT_RUN, EXIT_OK,
-        EXIT_ROLLBACK_FAILED, block_on_bounded, execute, load_config, recover_exit_code,
-        recover_target, status_exit_code, statuses, write_status,
+        Cli, CliError, Command, DEFAULT_STATE_DIR, Deployed, EXIT_BLOCKED, EXIT_COULD_NOT_RUN,
+        EXIT_OK, block_on_bounded, execute, load_config, recover_exit_code, recover_target,
+        status_exit_code, statuses, write_status,
     };
     use crate::compose::{OVERRIDE_FILE, PLACEHOLDER, render_override};
-    use crate::deploy::{self, DeployError, EngineOptions, Outcome};
+    use crate::deploy::{self, DeployError, EngineOptions, Outcome, Step, StepResult};
     use crate::docker::{ContainerInfo, ServiceConfig};
     use crate::state::{DeploymentState, InProgress, Phase};
     use crate::testing::{FakeDocker, running};
@@ -611,7 +607,73 @@ mod tests {
             reason: reason(),
             rollback_reason: reason(),
         };
-        assert_eq!(recover_exit_code(&report(failed)), EXIT_ROLLBACK_FAILED);
+        assert_eq!(recover_exit_code(&report(failed)), EXIT_BLOCKED);
+    }
+
+    #[test]
+    fn a_marker_that_could_not_be_removed_is_not_success() {
+        let step = |name: &str, result| Step {
+            name: name.to_owned(),
+            started_at: Timestamp::UNIX_EPOCH,
+            millis: 0,
+            result,
+            detail: None,
+        };
+        let failed = || StepResult::Failed {
+            reason: "why".to_owned(),
+        };
+        let report = |steps| deploy::DeployReport {
+            deployment: "app/prod".parse().unwrap(),
+            tag: "v1.2.3".parse().unwrap(),
+            digest: DIGEST.parse().unwrap(),
+            outcome: Outcome::RolledBack {
+                reason: "why".to_owned(),
+            },
+            steps,
+            started_at: Timestamp::UNIX_EPOCH,
+            finished_at: Timestamp::UNIX_EPOCH,
+        };
+        assert_eq!(
+            recover_exit_code(&report(vec![step("clear_in_progress", failed())])),
+            EXIT_BLOCKED
+        );
+        assert_eq!(
+            recover_exit_code(&report(vec![
+                step("clear_in_progress", StepResult::Ok),
+                step("prune_backups", failed()),
+            ])),
+            EXIT_OK,
+            "a failed prune leaves nothing blocked"
+        );
+    }
+
+    #[test]
+    fn recover_is_not_blocked_by_another_deployments_missing_directory() {
+        let f = fixture();
+        let gone = f.state_dir.with_file_name("gone");
+        let second = format!(
+            "[[deployment]]\nid = \"app/gone\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
+             host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
+             origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
+             rule = {{ auto = \"any\", approvers = [\"operator\"] }}\nchecks = [{{ command = [\"true\"] }}]\n",
+            gone.to_str().unwrap()
+        );
+        fs::write(
+            &f.config_file,
+            fleet(&f.compose).replace("[[grant]]", &format!("{second}[[grant]]")),
+        )
+        .unwrap();
+        let config = load_config(&f.config_file).unwrap();
+
+        let (deployment, dir, _) =
+            recover_target(&config, &"app/prod".parse().unwrap(), &f.state_dir).unwrap();
+        assert_eq!(deployment.id().as_ref(), "app/prod");
+        assert_eq!(dir, f.compose);
+
+        let err = recover_target(&config, &"app/gone".parse().unwrap(), &f.state_dir)
+            .err()
+            .unwrap();
+        assert!(matches!(err, CliError::Compose(_)), "{err}");
     }
 
     #[test]
@@ -888,7 +950,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(report.outcome, Outcome::RollbackFailed { .. }));
-        assert_eq!(recover_exit_code(&report), EXIT_ROLLBACK_FAILED);
+        assert_eq!(recover_exit_code(&report), EXIT_BLOCKED);
     }
 
     #[tokio::test]
