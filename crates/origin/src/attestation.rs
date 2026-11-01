@@ -2,7 +2,9 @@
 
 use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
 use sigstore_verify::crypto::CertificateInfo;
-use sigstore_verify::types::{Artifact, Bundle, Sha256Hash, SignatureContent, Statement};
+use sigstore_verify::types::{
+    Artifact, Bundle, MediaType, Sha256Hash, SignatureContent, Statement,
+};
 use sigstore_verify::{SubjectAltName, VerificationPolicy, Verifier};
 use thiserror::Error;
 
@@ -131,8 +133,12 @@ const ABSENT: &str = "<absent>";
 /// Verifies `bundle_json` for `digest` against `root` and `expected`.
 ///
 /// In order: the bundle parses as a DSSE in-toto attestation of at most
-/// [`MAX_BUNDLE_BYTES`]; its statement names `digest` as a subject; the
-/// Sigstore verification passes (certificate chain to the Fulcio roots,
+/// [`MAX_BUNDLE_BYTES`], in bundle format v0.3 only (the media type is not
+/// signed, and older formats need no inclusion proof); its statement names
+/// `digest` as a subject; it has exactly one transparency log entry, a Rekor
+/// v1 entry with an inclusion proof, its signed checkpoint and an inclusion
+/// promise (signed entry timestamp), all required (Rekor v2 entries, which
+/// carry no promise, are refused); the Sigstore verification passes (certificate chain to the Fulcio roots,
 /// signed certificate timestamp, Rekor inclusion proof and checkpoint,
 /// signature over the payload); the certificate's identity satisfies
 /// the identity rules below. Only certificate claims are trusted, never the
@@ -360,7 +366,18 @@ fn parse_bundle(bundle_json: &[u8]) -> Result<Bundle, AttestationError> {
     }
     let text = std::str::from_utf8(bundle_json)
         .map_err(|e| AttestationError::Bundle(format!("not UTF-8: {e}")))?;
-    Bundle::from_json(text).map_err(|e| AttestationError::Bundle(e.to_string()))
+    let bundle = Bundle::from_json(text).map_err(|e| AttestationError::Bundle(e.to_string()))?;
+    // The media type is not signed, and older formats relax what the bundle
+    // must carry (v0.1 needs no inclusion proof). GitHub emits v0.3.
+    if bundle.media_type == MediaType::Bundle0_3 {
+        Ok(bundle)
+    } else {
+        Err(AttestationError::Bundle(format!(
+            "media type {}, only {} is accepted",
+            bundle.media_type,
+            MediaType::Bundle0_3
+        )))
+    }
 }
 
 /// Refuses a bundle whose in-toto statement does not name `digest`. The
@@ -399,14 +416,20 @@ fn check_subject(bundle: &Bundle, digest: &ImageDigest) -> Result<(), Attestatio
     }
 }
 
-/// The Rekor log index of the bundle's only transparency log entry.
+/// The Rekor log index of the bundle's only transparency log entry, which
+/// must carry both an inclusion proof and an inclusion promise.
 ///
-/// For a Rekor v1 entry, the inclusion proof authenticates a shard-local
-/// index; the log index users look an entry up by is signed only by the
-/// inclusion promise (signed entry timestamp), which the Sigstore
-/// verification checks when present. So the promise is required here.
+/// The Sigstore verification checks each only when present. The inclusion
+/// proof, with its signed checkpoint, is what proves the entry is in the
+/// log. For a Rekor v1 entry it authenticates a shard-local index; the log
+/// index users look an entry up by is signed only by the inclusion promise
+/// (signed entry timestamp). Rekor v2 entries carry no promise, so they are
+/// refused here.
 fn single_log_index(bundle: &Bundle) -> Result<u64, AttestationError> {
     match bundle.verification_material.tlog_entries.as_slice() {
+        [entry] if entry.inclusion_proof.is_none() => Err(AttestationError::Bundle(
+            "transparency log entry has no inclusion proof".to_owned(),
+        )),
         [entry] if entry.inclusion_promise.is_none() => Err(AttestationError::Bundle(
             "transparency log entry has no inclusion promise".to_owned(),
         )),
@@ -760,7 +783,7 @@ mod tests {
                 .unwrap();
         });
         assert!(
-            verify(&no_proof, &config).is_err(),
+            matches!(verify(&no_proof, &config), Err(AttestationError::Bundle(_))),
             "inclusion proof dropped"
         );
 
@@ -772,7 +795,10 @@ mod tests {
                 .unwrap();
         });
         assert!(
-            verify(&no_promise, &config).is_err(),
+            matches!(
+                verify(&no_promise, &config),
+                Err(AttestationError::Bundle(_))
+            ),
             "inclusion promise dropped"
         );
 
@@ -781,9 +807,46 @@ mod tests {
                 Value::String((REKOR_LOG_INDEX + 1).to_string());
         });
         assert!(
-            verify(&other_log_index, &config).is_err(),
+            matches!(
+                verify(&other_log_index, &config),
+                Err(AttestationError::Signature(_))
+            ),
             "log index changed"
         );
+    }
+
+    /// The fixture bundle relabelled as bundle format v0.1, which does not
+    /// require an inclusion proof. The media type is not signed.
+    fn downgraded_bundle(drop_proof: bool) -> Vec<u8> {
+        edited_bundle(|b| {
+            b["mediaType"] =
+                Value::String("application/vnd.dev.sigstore.bundle+json;version=0.1".to_owned());
+            if drop_proof {
+                b["verificationMaterial"]["tlogEntries"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("inclusionProof")
+                    .unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn downgraded_media_type_without_proof_is_refused() {
+        let config = Config::fixture();
+        assert!(matches!(
+            verify(&downgraded_bundle(true), &config),
+            Err(AttestationError::Bundle(_))
+        ));
+    }
+
+    #[test]
+    fn downgraded_media_type_is_refused() {
+        let config = Config::fixture();
+        assert!(matches!(
+            verify(&downgraded_bundle(false), &config),
+            Err(AttestationError::Bundle(_))
+        ));
     }
 
     #[test]
