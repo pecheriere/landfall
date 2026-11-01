@@ -1412,11 +1412,20 @@ mod tests {
         );
     }
 
-    /// Whether `pid` still exists, polling briefly for a reaper to finish.
-    async fn gone(pid: i32) -> bool {
-        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+    /// Whether a zombie: killed, and waiting for a reaper. A container without
+    /// an init process never reaps an orphan, so it stays one.
+    fn is_zombie(pid: i32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+    }
+
+    /// Whether `pid` has stopped running, polling briefly for it to die.
+    async fn gone(raw: i32) -> bool {
+        let pid = rustix::process::Pid::from_raw(raw).unwrap();
         for _ in 0..40 {
-            if rustix::process::test_kill_process(pid).is_err() {
+            if rustix::process::test_kill_process(pid).is_err() || is_zombie(raw) {
                 return true;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
