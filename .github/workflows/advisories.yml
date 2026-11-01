@@ -43,6 +43,8 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Build without the token, so only the test run itself sees it.
+      - run: cargo test -p landfall-origin --locked --no-run
       - run: cargo test -p landfall-origin --locked -- --ignored
         env:
           GITHUB_TOKEN: ${{ github.token }}
