@@ -1288,7 +1288,6 @@ can = ["view", "request", "approve", "rollback"]
         }
     }
 
-    /// The fixture with app/staging's check list replaced by `checks`.
     #[test]
     fn log_checks_stay_within_what_the_agent_can_run() {
         let long = "x".repeat(LOG_PATTERN_LIMIT + 1);
@@ -1314,6 +1313,7 @@ can = ["view", "request", "approve", "rollback"]
         assert!(parse_str(&with_staging_checks(&at_the_limits)).is_ok());
     }
 
+    /// The fixture with app/staging's check list replaced by `checks`.
     fn with_staging_checks(checks: &str) -> String {
         edited(
             "checks = [\"container-healthy\"]",

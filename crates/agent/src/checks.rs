@@ -89,10 +89,13 @@ const QUOTE_LIMIT: usize = 200;
 /// running, then evaluates the observing checks (`container_healthy`, `http`,
 /// `command`) in order, stopping at the first that fails. Only when all of
 /// them pass in the same round do the `no_log_match` checks run: each waits
-/// until its window (from the container's start) has closed, then scans the
-/// logs from `since` to the window's end, and a match is final. So a panic
-/// before a restart counts even if nothing here saw that start, while what a
-/// reused container logged before `since` does not. The logs of a container
+/// until its window has closed, then scans the logs from `since` to the
+/// window's end, and a match is final. The window runs for `within_secs` from
+/// the container's current start or from `since`, whichever is later, so a
+/// container that `up` left untouched is observed for all of it, and no scan
+/// is empty because its window closed before `since`. A panic before a restart
+/// counts even if nothing here saw that start, while what a reused container
+/// logged before `since` does not. The logs of a container
 /// that was replaced are not scanned. The round then looks at the container
 /// again: it must be the same one, running, from the same
 /// start, with the same addresses for `http` checks.
@@ -517,6 +520,7 @@ impl<D: Docker> Run<'_, D> {
         let closes = look
             .info
             .started_at
+            .max(self.since)
             .checked_add(SignedDuration::from_secs(i64::from(within_secs)))
             .map_err(|_| fatal(name, "the observation window is out of range"))?;
         // The window is measured on the wall clock; a clock that already
@@ -538,7 +542,7 @@ impl<D: Docker> Run<'_, D> {
             Err(fatal(
                 name,
                 format!(
-                    "the logs match {} within {within_secs} s of the start",
+                    "the logs match {} within {within_secs} s of the service coming up",
                     quote(pattern)
                 ),
             ))
@@ -975,7 +979,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn log_window_already_elapsed_does_not_wait() {
+    async fn log_window_of_an_old_start_elapsed_before_since_does_not_wait() {
         let docker = FakeDocker::new();
         let mut info = running(Some("healthy"), &[]);
         info.started_at = Timestamp::now()
@@ -1001,6 +1005,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(start.elapsed(), options.settle, "only the settle time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn untouched_container_is_observed_for_the_whole_window() {
+        // `up` left the container running: it started before `since`, and its
+        // window from that start closed before `since` too.
+        let docker = FakeDocker::new();
+        let since = Timestamp::now();
+        let mut info = running(Some("healthy"), &[]);
+        info.started_at = since.checked_sub(SignedDuration::from_secs(600)).unwrap();
+        docker.script_inspect([Ok(info)]);
+        let start = Instant::now();
+        run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[Check::ContainerHealthy, no_log_match(30)],
+            since,
+            &CheckOptions::default(),
+        )
+        .await
+        .unwrap();
+        let until = since.checked_add(SignedDuration::from_secs(30)).unwrap();
+        assert!(
+            docker.calls().contains(&Call::LogsContain {
+                id: crate::testing::container_id(),
+                since,
+                until,
+                needle: "panic".to_owned(),
+            }),
+            "{:?}",
+            docker.calls()
+        );
+        assert!(
+            start.elapsed() >= Duration::from_secs(29),
+            "waited for the window: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1780,6 +1822,39 @@ mod tests {
             )
             .await
             .unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "docker: runs in ci.yml"]
+        async fn docker_untouched_container_is_observed_for_the_whole_window() {
+            let cli = DockerCli::new();
+            // A window of 3 s from its start is over when `since` is taken, 4 s
+            // in. The line comes at 6 s, inside the 3 s from `since`.
+            let (project, _) = project(&cli, "no", "sleep 6; echo panic; sleep 300").await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let id = cli.container(project.path(), "app").await.unwrap().unwrap();
+            let started = cli.inspect(&id).await.unwrap().started_at;
+
+            // A second `up` finds nothing to change.
+            let since = Timestamp::now();
+            cli.compose_up(project.path(), "app").await.unwrap();
+            let same = cli.inspect(&id).await.unwrap().started_at;
+            assert_eq!(same, started, "the container was left untouched");
+
+            let failure = run_checks(
+                &cli,
+                project.path(),
+                "app",
+                &[alive(), no_log_match(3)],
+                since,
+                &options(30, 1),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                failure.check, "checks[1] no_log_match \"panic\"",
+                "{failure}"
+            );
         }
 
         #[tokio::test]

@@ -160,8 +160,10 @@ Each entry is the string `"container-healthy"` or a table with exactly one of
 - `{ command = ["/app", "healthcheck"] }`: a command run in the container,
   exit 0 is healthy; non-empty argv.
 - `{ no_log_match = "panicked", within_secs = 30 }`: no log line may contain
-  the text during the window, which runs from the container's start for
-  `within_secs` (rounded out to whole seconds); a line logged later does not
+  the text during the window, which runs for `within_secs` (rounded out to
+  whole seconds) from the container's current start or from just before the
+  agent brought the service up, whichever is later, so a container that `up`
+  left untouched is observed for the whole window; a line logged later does not
   count. The scan goes back to just before the agent brought the service up, so
   the lines of earlier starts since then count too, even if the container
   restarted before the agent first looked. What a reused container logged
