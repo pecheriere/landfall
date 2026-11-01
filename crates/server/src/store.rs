@@ -158,17 +158,6 @@ fn prepare_private_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Whether a `-wal` file with content sits beside the database. One that cannot
-/// be read counts: only a file known to be absent or empty rules a WAL out.
-fn has_pending_wal(path: &Path) -> bool {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    match std::fs::metadata(&wal) {
-        Ok(meta) => meta.len() > 0,
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
-    }
-}
-
 /// The controller's database. Cloning shares the connections.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -207,16 +196,16 @@ impl Store {
     /// [`StoreError`] if the file is missing or cannot be read.
     pub async fn open_read_only(path: &Path) -> Result<Self, StoreError> {
         match Self::connect_read_only(path, false).await {
-            // A database in WAL mode needs a shared-memory file beside it, which
-            // a read-only directory cannot take. If the log has no unfinished
-            // WAL, the main file is all there is, and `immutable` reads it
-            // without one. With a WAL it would miss rows, so that stays an error.
+            // A database in WAL mode needs a `-wal` file beside it, which a
+            // read-only directory cannot take. This code says that file does not
+            // exist, so the main file is all there is, and `immutable` reads it
+            // without one. With a `-wal` file the error is another, and stays an
+            // error: `immutable` would miss the rows in it.
             Err(StoreError::Database(error))
                 if error
                     .as_database_error()
                     .and_then(sqlx::error::DatabaseError::code)
-                    .is_some_and(|code| code == SQLITE_READONLY_DIRECTORY)
-                    && !has_pending_wal(path) =>
+                    .is_some_and(|code| code == SQLITE_READONLY_DIRECTORY) =>
             {
                 Self::connect_read_only(path, true).await
             }
@@ -296,6 +285,16 @@ impl Store {
     #[cfg(test)]
     pub(crate) async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Moves everything from the WAL into the main file, so copying that file
+    /// alone gives a whole backup.
+    #[cfg(test)]
+    pub(crate) async fn checkpoint_for_test(&self) {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await
+            .unwrap();
     }
 
     /// Edits the first audit row the way someone with the file could.
@@ -404,6 +403,19 @@ impl Store {
             .fetch_one(&mut *snapshot)
             .await?;
         Ok(walk.finish(highest_seq(&mut *snapshot).await?, count))
+    }
+
+    /// The `hash` of the audit row at `seq`, in lowercase hex, if there is one.
+    ///
+    /// # Errors
+    /// [`StoreError::Database`] if the log cannot be read.
+    pub async fn audit_hash_at(&self, seq: i64) -> Result<Option<String>, StoreError> {
+        let hash: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT hash FROM audit_events WHERE seq = ?")
+                .bind(seq)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(hash.map(hex::encode))
     }
 
     /// Issues a one-time enrolment code bound to `host`, valid for an hour. It
@@ -1159,33 +1171,42 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 
-    /// `immutable` would read past rows still in the WAL, so with a WAL it is
-    /// not tried: a copy taken while the controller ran cannot verify in place
-    /// from a read-only directory, and says so rather than verify old rows.
+    /// `immutable` would read past rows still in the WAL. The fallback is safe
+    /// because its error code only comes when there is no `-wal` file: with one,
+    /// full or empty, a read-only directory gives another error and no fallback,
+    /// so a copy taken while the controller ran says so rather than verify old
+    /// rows.
     #[tokio::test]
     async fn a_read_only_copy_with_a_wal_is_not_read_without_it() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("controller.db");
         let running = Store::open(&source).await.unwrap();
         append_events(&running, 3).await;
-        let copies = dir.path().join("copies");
-        fs::create_dir(&copies).unwrap();
-        let copy = copies.join("controller.db");
-        fs::copy(&source, &copy).unwrap();
-        fs::copy(
-            dir.path().join("controller.db-wal"),
-            copies.join("controller.db-wal"),
-        )
-        .unwrap();
-        set_mode(&copy, 0o400);
-        set_mode(&copies, 0o500);
+        let wal = fs::read(dir.path().join("controller.db-wal")).unwrap();
+        assert!(wal.len() > 1);
+        for (name, wal) in [("full", wal.as_slice()), ("empty", &[])] {
+            let copies = dir.path().join(format!("copies-{name}"));
+            fs::create_dir(&copies).unwrap();
+            let copy = copies.join("controller.db");
+            fs::copy(&source, &copy).unwrap();
+            fs::write(copies.join("controller.db-wal"), wal).unwrap();
+            set_mode(&copy, 0o400);
+            set_mode(&copies, 0o500);
+            let mode_binds = fs::File::create(copies.join("probe")).is_err();
 
-        let opened = Store::open_read_only(&copy).await;
-        set_mode(&copies, 0o700);
-        // Running as root, the directory's mode binds nothing and the WAL is read.
-        match opened {
-            Ok(store) => assert_eq!(store.verify_audit().await.unwrap().rows, 3),
-            Err(error) => assert!(matches!(error, StoreError::Database(_)), "{error}"),
+            let opened = Store::open_read_only(&copy).await;
+            set_mode(&copies, 0o700);
+            // Root ignores the mode, and the plain read-only open then works.
+            if mode_binds {
+                let error = opened.unwrap_err();
+                let StoreError::Database(error) = &error else {
+                    panic!("{name}: {error}");
+                };
+                let code = error
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code);
+                assert_eq!(code.as_deref(), Some("14"), "{name}");
+            }
         }
         running.close().await;
     }

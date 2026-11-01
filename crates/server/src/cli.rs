@@ -18,7 +18,7 @@ use crate::store::{Store, StoreError};
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
-/// `audit verify` ran and the log is not intact.
+/// `audit verify` ran and the log is not intact, or has no row at `--at`.
 pub const EXIT_TAMPERED: u8 = 1;
 /// The command could not run: usage, configuration, database or network.
 pub const EXIT_COULD_NOT_RUN: u8 = 2;
@@ -26,8 +26,8 @@ pub const EXIT_COULD_NOT_RUN: u8 = 2;
 const EXIT_STATUS: &str = "\
 Exit status:
   0  success
-  1  audit verify ran and the audit log is not intact
-  2  could not run: usage, configuration, database or network";
+  1  audit verify ran and the audit log is not intact, or has no row at --at
+  2 could not run: usage, configuration, database or network";
 
 /// Watches releases, verifies their origin and coordinates deploys.
 #[derive(Debug, Parser)]
@@ -56,8 +56,8 @@ enum AuditCommand {
     /// Walk the hash chain without writing to the database, and print as JSON
     /// the row count, the first bad row and the head: the last row's `seq` and
     /// `hash`. The chain alone cannot show rows cut from the end or an old
-    /// backup restored: keep the printed head elsewhere, and check later that
-    /// the log still holds that row with that hash.
+    /// backup restored: keep the printed head elsewhere, and check later with
+    /// `--at` that the log still holds that row with that hash.
     Verify(AuditVerifyArgs),
 }
 
@@ -94,6 +94,10 @@ struct AuditVerifyArgs {
     /// The database file, which must exist.
     #[arg(long, value_name = "FILE")]
     db: PathBuf,
+    /// Also print the `hash` of the row at this `seq`, to compare with a head
+    /// kept from earlier. A log with no such row exits 1.
+    #[arg(long, value_name = "SEQ")]
+    at: Option<i64>,
 }
 
 /// Why a command could not run.
@@ -194,15 +198,22 @@ async fn enrol_code(args: EnrolCodeArgs, out: &mut impl Write) -> Result<u8, Cli
 async fn audit_verify(args: AuditVerifyArgs, out: &mut impl Write) -> Result<u8, CliError> {
     let store = Store::open_read_only(&args.db).await?;
     let report = store.verify_audit().await?;
-    let line = json!({
+    let mut line = json!({
         "rows": report.rows,
         "empty": report.rows == 0,
         "first_bad": report.first_bad,
         "head_seq": report.head_seq,
         "head_hash": report.head_hash,
     });
+    let mut row_missing = false;
+    if let Some(seq) = args.at {
+        let hash = store.audit_hash_at(seq).await?;
+        row_missing = hash.is_none();
+        line["at_seq"] = json!(seq);
+        line["at_hash"] = json!(hash);
+    }
     writeln!(out, "{line}").map_err(CliError::Output)?;
-    Ok(if report.first_bad.is_some() {
+    Ok(if report.first_bad.is_some() || row_missing {
         EXIT_TAMPERED
     } else {
         EXIT_OK
@@ -304,6 +315,56 @@ mod tests {
         assert_eq!(printed["first_bad"], serde_json::Value::Null);
         assert_eq!(printed["head_seq"], 1);
         assert_eq!(printed["head_hash"].as_str().unwrap().len(), 64);
+    }
+
+    /// What the printed head is for: saved now, compared after the log has
+    /// grown, and after it has been rolled back to before the saved row.
+    #[tokio::test]
+    async fn audit_verify_at_compares_a_saved_head_with_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        let db = path.to_str().unwrap();
+        let older = dir.path().join("older.db");
+        let store = Store::open(&path).await.unwrap();
+        let issue = async |host: &str| {
+            let host: HostId = host.parse().unwrap();
+            store.issue_enrol_code(&host, false).await.unwrap();
+        };
+        let verify = async |db: &str, at: &[&str]| {
+            let mut args = vec!["landfall-server", "audit", "verify", "--db", db];
+            args.extend_from_slice(at);
+            let mut out = Vec::new();
+            let code = execute(parse(&args), &mut out).await.unwrap();
+            (
+                code,
+                serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            )
+        };
+        issue("host-a").await;
+        store.checkpoint_for_test().await;
+        std::fs::copy(&path, &older).unwrap();
+        issue("host-b").await;
+
+        let (code, saved) = verify(db, &[]).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(saved["head_seq"], 2);
+        assert!(saved.get("at_seq").is_none(), "{saved}");
+        issue("host-c").await;
+
+        // The log has grown: the head moved, and the saved row is still there.
+        let (code, later) = verify(db, &["--at", "2"]).await;
+        assert_eq!(code, EXIT_OK);
+        assert_eq!(later["head_seq"], 3);
+        assert_ne!(later["head_hash"], saved["head_hash"]);
+        assert_eq!(later["at_seq"], 2);
+        assert_eq!(later["at_hash"], saved["head_hash"]);
+
+        // An old backup verifies clean, but no longer holds the saved row.
+        let (code, restored) = verify(older.to_str().unwrap(), &["--at", "2"]).await;
+        assert_eq!(code, EXIT_TAMPERED);
+        assert_eq!(restored["first_bad"], serde_json::Value::Null);
+        assert_eq!(restored["at_seq"], 2);
+        assert_eq!(restored["at_hash"], serde_json::Value::Null);
     }
 
     #[tokio::test]

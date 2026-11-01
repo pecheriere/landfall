@@ -21,7 +21,7 @@
 //! - a complete new history forged by someone who can write the whole database.
 //!
 //! Only a head kept elsewhere shows these: `audit verify` prints the last row's
-//! `seq` and `hash`, and a later run must still hold that row with that hash.
+//! `seq` and `hash`, and `audit verify --at <seq>` later must print that hash.
 
 use landfall_core::ids::{DeploymentId, HostId};
 use sha2::{Digest, Sha256};
