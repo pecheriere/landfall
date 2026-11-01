@@ -5,11 +5,19 @@
 //! here checks a path and then opens it. Each component is opened relative to
 //! its parent's file descriptor with `O_NOFOLLOW`, and what to do is decided
 //! from the descriptor (`fstat`), so a swap makes an open fail rather than
-//! lead outside the tree. An earlier `lstat` only avoids opening a device or
-//! socket at all, since opening one can have side effects.
+//! lead outside the tree. An earlier `lstat` only keeps a walk from opening a
+//! device or socket, since opening one can have side effects: without a race a
+//! device is never opened. In the window between the `lstat` and the open one
+//! may be opened, `O_RDONLY|O_NONBLOCK|O_NOCTTY`, and is then refused by
+//! `fstat` before any read.
 //!
 //! Symlinks are copied as symlinks and never followed. Devices, sockets and
-//! FIFOs are refused, naming the path. Hard links become separate files.
+//! FIFOs are refused, naming the path.
+//!
+//! A copy is not a perfect image. Extended attributes, ACLs and file
+//! capabilities are not preserved. A sparse file is written out in full and a
+//! hard link becomes a separate file, so a backup can use more disk than its
+//! source; running out of space is an error that ends in cleanup.
 //!
 //! New entries stay private to the agent (`0600`, `0700`) while they fill up.
 //! Their metadata is applied afterwards on the descriptor, in this order:
@@ -18,10 +26,30 @@
 //! error that leaves them unset. The kernel can also drop set-gid without an
 //! error, so the mode is read back and a difference is an error too.
 //!
-//! The limits a hostile tree could otherwise exploit: recursion stops at
-//! [`MAX_DEPTH`] with a typed error, only the chain of parent directories
-//! stays open, and data moves through one fixed buffer, never allocated from
-//! a size the container controls.
+//! A symlink has no descriptor to read through, but on Linux an `O_PATH` one
+//! can carry its owner and times. That needs Linux 5.8 for `utimensat` with
+//! `AT_EMPTY_PATH`; on an older kernel copying a symlink fails, so a backup
+//! fails before a deploy rather than a rollback failing after one. Linux is
+//! the agent's production target. Elsewhere those two calls go by name, where
+//! a writer swapping the name at that instant could give the swapped-in entry
+//! the owner and times.
+//!
+//! The limits a hostile tree could otherwise exploit differ by direction,
+//! since refusing is safe for a backup and not for a rollback:
+//!
+//! - A copy stops with a typed error past [`MAX_DEPTH`] levels or past
+//!   [`MAX_DIR_ENTRIES`] entries in one directory. Its memory is bounded by
+//!   those two numbers.
+//! - A removal finishes whatever the depth or size. It reads names in batches
+//!   of at most 4096, and at [`MAX_DEPTH`] levels it moves the
+//!   directory there up to the top of the removal, to be taken apart from
+//!   there, so a chain gets shorter on each pass. Its stack, descriptors and
+//!   memory stay bounded by those two numbers. It ends when nothing adds to
+//!   the tree faster than it removes, which is why a service is stopped first.
+//!
+//! Either way only a chain of parent directories stays open, and data moves
+//! through one fixed buffer, never allocated from a size the container
+//! controls.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr};
@@ -44,6 +72,15 @@ use rustix::io::Errno;
 /// [`SafeFsError::TooDeep`], so a deep tree can neither overflow the stack
 /// nor use up file descriptors.
 pub const MAX_DEPTH: usize = 256;
+
+/// How many entries one directory may hold in a copy. Past this a walk stops
+/// with [`SafeFsError::TooManyEntries`], since its names are held in memory.
+pub const MAX_DIR_ENTRIES: usize = 1_000_000;
+
+/// How many names a removal reads from a directory before removing them.
+const REMOVAL_BATCH: usize = 4096;
+/// What a directory too deep to descend into is renamed to, plus a number.
+const DEEP_PREFIX: &str = ".landfall-deep-";
 
 const COPY_BUFFER: usize = 64 * 1024;
 const PARTIAL_SUFFIX: &[u8] = b".partial";
@@ -134,6 +171,20 @@ pub enum SafeFsError {
         path: PathBuf,
         /// The limit.
         limit: usize,
+    },
+    /// A directory holds more than [`MAX_DIR_ENTRIES`] entries.
+    #[error("{} holds more than {limit} entries", quoted(path))]
+    TooManyEntries {
+        /// The directory.
+        path: PathBuf,
+        /// The limit.
+        limit: usize,
+    },
+    /// An entry the agent had just created is no longer what it created.
+    #[error("{} was replaced while it was being created", quoted(path))]
+    Replaced {
+        /// The path.
+        path: PathBuf,
     },
     /// Something is already where a new entry has to go.
     #[error("{} already exists", quoted(path))]
@@ -235,6 +286,19 @@ fn with_cleanup(original: SafeFsError, cleanup: Result<(), SafeFsError>) -> Safe
         Err(cleanup) => SafeFsError::CleanupFailed {
             original: Box::new(original),
             cleanup: Box::new(cleanup),
+        },
+    }
+}
+
+/// The error for an entry already seen, where its disappearing is `Missing`.
+fn entry_err(op: &'static str, path: &Path) -> impl FnOnce(Errno) -> SafeFsError {
+    let path = path.to_owned();
+    move |errno| match errno {
+        Errno::NOENT => SafeFsError::Missing { path },
+        other => SafeFsError::Io {
+            op,
+            path,
+            source: other.into(),
         },
     }
 }
@@ -433,6 +497,10 @@ fn remove_file(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<(), S
 /// `fsync`, `renameat`, and an `fsync` of the directory. A crash leaves the
 /// old content or the new. A symlink at `name` is replaced, not followed.
 ///
+/// This assumes no hostile writer in the parent directory beyond what could
+/// edit `compose.yaml` anyway: one there could still replace the file or
+/// remove it after the rename. What it cannot do is redirect the write.
+///
 /// # Errors
 ///
 /// [`SafeFsError::InvalidMode`] when `mode` holds more than permission bits,
@@ -530,12 +598,25 @@ pub fn read_file(root: &Root, name: &RelPath, cap: usize) -> Result<Option<Vec<u
 /// [`SafeFsError::SpecialFile`] for a device, socket or FIFO,
 /// [`SafeFsError::NotADirectory`] when a parent of a path is not a real
 /// directory, [`SafeFsError::TooDeep`] past [`MAX_DEPTH`],
-/// [`SafeFsError::OverlappingPaths`] when one path contains another,
+/// [`SafeFsError::TooManyEntries`] past [`MAX_DIR_ENTRIES`] in a directory,
+/// [`SafeFsError::SymlinkRefused`] when an entry becomes a symlink as it is
+/// opened, [`SafeFsError::OverlappingPaths`] when one path contains another,
 /// [`SafeFsError::AlreadyExists`] when `dest` exists, and [`SafeFsError::Io`].
 pub fn snapshot(
     source: &Root,
     paths: &[RelPath],
     dest: &Path,
+) -> Result<SnapshotStats, SafeFsError> {
+    snapshot_limited(source, paths, dest, MAX_DIR_ENTRIES)
+}
+
+/// [`snapshot`] with the limit on directory size as an argument, so that a
+/// test need not create a million files.
+fn snapshot_limited(
+    source: &Root,
+    paths: &[RelPath],
+    dest: &Path,
+    max_entries: usize,
 ) -> Result<SnapshotStats, SafeFsError> {
     check_overlap(paths)?;
     require_absolute(dest)?;
@@ -568,19 +649,26 @@ pub fn snapshot(
         Err(Errno::NOENT) => {}
         Err(errno) => return Err(io_err("inspect", dest)(errno)),
     }
-    remove_entry(parent.as_fd(), &partial_name, &partial_path, 0)?;
+    remove_entry(parent.as_fd(), &partial_name, &partial_path)?;
     mkdirat(&parent, &partial_name, Mode::RWXU).map_err(io_err("create", &partial_path))?;
 
     let copied = open_dir(parent.as_fd(), &partial_name)
         .map_err(walk_err(&partial_path))
         .and_then(|partial| {
-            let stats = copy_paths(source, partial.as_fd(), &partial_path, paths, Removal::None)?;
+            let stats = copy_paths(
+                source,
+                partial.as_fd(),
+                &partial_path,
+                paths,
+                Removal::None,
+                max_entries,
+            )?;
             renameat(&parent, &partial_name, &parent, &dest_name)
                 .map_err(io_err("rename to", dest))?;
             Ok(stats)
         });
     let stats = copied.map_err(|err| {
-        let cleanup = remove_entry(parent.as_fd(), &partial_name, &partial_path, 0);
+        let cleanup = remove_entry(parent.as_fd(), &partial_name, &partial_path);
         with_cleanup(err, cleanup)
     })?;
     fsync(&parent).map_err(io_err("sync", parent_path))?;
@@ -593,15 +681,18 @@ pub fn snapshot(
 /// a container swapped for something else, is recreated from the snapshot;
 /// a parent that is a real directory keeps its owner and mode.
 ///
-/// Nothing is removed unless the snapshot holds every path.
+/// Nothing is removed unless the snapshot holds every path. What is removed
+/// can be of any depth and size, so a tree a container planted cannot stop a
+/// rollback; see the module documentation.
 ///
 /// # Errors
 ///
 /// [`SafeFsError::Missing`] when the snapshot lacks a path,
-/// [`SafeFsError::TooDeep`] when what is to be removed goes past
-/// [`MAX_DEPTH`], [`SafeFsError::OverlappingPaths`] when one path contains
-/// another, and [`SafeFsError::Io`]. A failure part-way leaves the paths
-/// already restored in place and the rest removed or as they were.
+/// [`SafeFsError::OverlappingPaths`] when one path contains another,
+/// [`SafeFsError::TooDeep`] and [`SafeFsError::TooManyEntries`] for a snapshot
+/// past the limits, which [`snapshot`] does not make, and [`SafeFsError::Io`].
+/// A failure part-way leaves the paths already restored in place and the rest
+/// removed or as they were.
 pub fn restore(snapshot: &Path, target: &Root, paths: &[RelPath]) -> Result<(), SafeFsError> {
     check_overlap(paths)?;
     let snapshot = Root::open(snapshot)?;
@@ -621,6 +712,7 @@ pub fn restore(snapshot: &Path, target: &Root, paths: &[RelPath]) -> Result<(), 
         &target.path,
         paths,
         Removal::First,
+        MAX_DIR_ENTRIES,
     )?;
     Ok(())
 }
@@ -635,7 +727,8 @@ pub fn restore(snapshot: &Path, target: &Root, paths: &[RelPath]) -> Result<(), 
 ///
 /// # Errors
 ///
-/// [`SafeFsError::TooDeep`] and [`SafeFsError::Io`], from reading `backups`
+/// [`SafeFsError::TooManyEntries`] when `backups` holds more than
+/// [`MAX_DIR_ENTRIES`] entries and [`SafeFsError::Io`], from reading `backups`
 /// or removing an entry.
 pub fn prune(backups: &Path, keep: usize) -> Result<(), SafeFsError> {
     let root = match Root::open(backups) {
@@ -644,10 +737,10 @@ pub fn prune(backups: &Path, keep: usize) -> Result<(), SafeFsError> {
         Err(err) => return Err(err),
     };
     let mut complete = Vec::new();
-    for name in read_names(root.fd.as_fd(), backups)? {
+    for name in read_all_names(root.fd.as_fd(), backups, MAX_DIR_ENTRIES)? {
         let path = backups.join(name_path(&name));
         if name.as_bytes().ends_with(PARTIAL_SUFFIX) {
-            remove_entry(root.fd.as_fd(), &name, &path, 0)?;
+            remove_entry(root.fd.as_fd(), &name, &path)?;
             continue;
         }
         let seen =
@@ -659,7 +752,7 @@ pub fn prune(backups: &Path, keep: usize) -> Result<(), SafeFsError> {
     complete.sort_unstable_by(|a, b| b.cmp(a));
     for name in complete.iter().skip(keep) {
         let path = backups.join(name_path(name));
-        remove_entry(root.fd.as_fd(), name, &path, 0)?;
+        remove_entry(root.fd.as_fd(), name, &path)?;
     }
     fsync(&root.fd).map_err(io_err("sync", backups))
 }
@@ -689,53 +782,136 @@ fn check_overlap(paths: &[RelPath]) -> Result<(), SafeFsError> {
     Ok(())
 }
 
-/// Reads a directory's entry names, closing its stream before returning so
-/// that a walk only ever holds its chain of parents. Reading first also keeps
-/// a removal from changing the directory under its own stream.
-fn read_names(dir: BorrowedFd<'_>, path: &Path) -> Result<Vec<CString>, SafeFsError> {
+/// Reads up to `stop_after` of a directory's entry names, closing its stream
+/// before returning so that a walk only ever holds its chain of parents. Each
+/// call reads from the start, on a stream of its own.
+fn read_names(
+    dir: BorrowedFd<'_>,
+    path: &Path,
+    stop_after: usize,
+) -> Result<Vec<CString>, SafeFsError> {
     let mut names = Vec::new();
     for entry in Dir::read_from(dir).map_err(io_err("list", path))? {
         let entry = entry.map_err(io_err("list", path))?;
         let name = entry.file_name();
         if name != c"." && name != c".." {
             names.push(name.to_owned());
+            if names.len() >= stop_after {
+                break;
+            }
         }
     }
     Ok(names)
 }
 
-/// Removes whatever `name` is, without following it. An absent entry is fine.
-/// `depth` counts from where the removal started.
+/// Reads all of a directory's entry names, refusing more than `limit`.
+fn read_all_names(
+    dir: BorrowedFd<'_>,
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<CString>, SafeFsError> {
+    let names = read_names(dir, path, limit.saturating_add(1))?;
+    if names.len() > limit {
+        return Err(SafeFsError::TooManyEntries {
+            path: path.to_owned(),
+            limit,
+        });
+    }
+    Ok(names)
+}
+
+/// Removes whatever `name` is, without following it, at any depth and size.
+/// An absent entry is fine.
 ///
 /// A directory swapped for a symlink mid-walk fails the open, and the symlink
 /// is what gets removed. One swapped the other way fails the `unlinkat`.
-fn remove_entry(
+fn remove_entry(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<(), SafeFsError> {
+    let Some(dir) = open_or_unlink(parent, name, path)? else {
+        return Ok(());
+    };
+    let mut deep_moved = 0;
+    empty_dir(dir.as_fd(), dir.as_fd(), path, 1, &mut deep_moved)?;
+    drop(dir);
+    remove_dir(parent, name, path)
+}
+
+/// Opens `name` if it is a real directory. Anything else is removed here, and
+/// there is nothing more to do.
+fn open_or_unlink(
     parent: BorrowedFd<'_>,
     name: &CStr,
     path: &Path,
-    depth: usize,
-) -> Result<(), SafeFsError> {
+) -> Result<Option<OwnedFd>, SafeFsError> {
     match open_dir(parent, name) {
-        Ok(dir) => {
-            if depth > MAX_DEPTH {
-                return Err(SafeFsError::TooDeep {
-                    path: path.to_owned(),
-                    limit: MAX_DEPTH,
-                });
-            }
-            for child in read_names(dir.as_fd(), path)? {
-                let child_path = path.join(name_path(&child));
-                remove_entry(dir.as_fd(), &child, &child_path, depth + 1)?;
-            }
-            drop(dir);
-            match unlinkat(parent, name, AtFlags::REMOVEDIR) {
-                Ok(()) | Err(Errno::NOENT) => Ok(()),
-                Err(errno) => Err(io_err("remove directory", path)(errno)),
+        Ok(dir) => Ok(Some(dir)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::NOTDIR | Errno::LOOP) => remove_file(parent, name, path).map(|()| None),
+        Err(errno) => Err(io_err("open directory", path)(errno)),
+    }
+}
+
+fn remove_dir(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<(), SafeFsError> {
+    match unlinkat(parent, name, AtFlags::REMOVEDIR) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(errno) => Err(io_err("remove directory", path)(errno)),
+    }
+}
+
+/// Removes everything in `dir`, a batch of names at a time. `top` is the
+/// directory the removal started in and `depth` how far below it `dir` is.
+///
+/// A directory at [`MAX_DEPTH`] is moved into `top` instead of descended into.
+/// That leaves its parents empty, and `top`, which reads its names again until
+/// there are none, finds it there, now near the top of the walk. So nothing
+/// has to be remembered, whatever the number of such directories, and a crash
+/// leaves them inside what was being removed.
+fn empty_dir(
+    top: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    path: &Path,
+    depth: usize,
+    deep_moved: &mut u64,
+) -> Result<(), SafeFsError> {
+    loop {
+        let batch = read_names(dir, path, REMOVAL_BATCH)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for child in &batch {
+            let child_path = path.join(name_path(child));
+            let Some(child_dir) = open_or_unlink(dir, child, &child_path)? else {
+                continue;
+            };
+            if depth >= MAX_DEPTH {
+                drop(child_dir);
+                move_to_top(top, dir, child, &child_path, deep_moved)?;
+            } else {
+                empty_dir(top, child_dir.as_fd(), &child_path, depth + 1, deep_moved)?;
+                drop(child_dir);
+                remove_dir(dir, child, &child_path)?;
             }
         }
-        Err(Errno::NOENT) => Ok(()),
-        Err(Errno::NOTDIR | Errno::LOOP) => remove_file(parent, name, path),
-        Err(errno) => Err(io_err("open directory", path)(errno)),
+    }
+}
+
+/// Moves `name` into `top` under a name not in use. A taken name can have been
+/// planted, so the next one is tried; an empty directory or a stray file being
+/// replaced by this is fine, as all of `top` is being removed.
+fn move_to_top(
+    top: BorrowedFd<'_>,
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    path: &Path,
+    deep_moved: &mut u64,
+) -> Result<(), SafeFsError> {
+    loop {
+        let fresh = format!("{DEEP_PREFIX}{deep_moved}");
+        *deep_moved = deep_moved.saturating_add(1);
+        match renameat(dir, name, top, fresh.as_str()) {
+            Ok(()) | Err(Errno::NOENT) => return Ok(()),
+            Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOTDIR | Errno::ISDIR) => {}
+            Err(errno) => return Err(io_err("move up", path)(errno)),
+        }
     }
 }
 
@@ -781,12 +957,14 @@ fn copy_paths(
     dst_label: &Path,
     paths: &[RelPath],
     removal: Removal,
+    max_entries: usize,
 ) -> Result<SnapshotStats, SafeFsError> {
     let mut copier = Copier {
         src_label: &source.path,
         dst_label,
         buf: vec![0; COPY_BUFFER],
         stats: SnapshotStats::default(),
+        max_entries,
     };
     // Parents created here get their metadata last: creating an entry would
     // change a directory's time, and a restrictive mode could block the next.
@@ -796,7 +974,7 @@ fn copy_paths(
             copier.descend(source.fd.as_fd(), dst, path, &mut created)?;
         if removal == Removal::First {
             let label = dst_label.join(path.as_path());
-            remove_entry(dst_parent.as_fd(), &path.name, &label, path.depth())?;
+            remove_entry(dst_parent.as_fd(), &path.name, &label)?;
         }
         copier.copy_entry(
             src_parent.as_fd(),
@@ -824,12 +1002,13 @@ fn copy_paths(
 }
 
 /// One copy run: the labels errors are named with, the one buffer data moves
-/// through, and what has been copied so far.
+/// through, what has been copied so far and how large a directory may be.
 struct Copier<'a> {
     src_label: &'a Path,
     dst_label: &'a Path,
     buf: Vec<u8>,
     stats: SnapshotStats,
+    max_entries: usize,
 }
 
 impl<'a> Copier<'a> {
@@ -881,13 +1060,8 @@ impl<'a> Copier<'a> {
                 limit: MAX_DEPTH,
             });
         }
-        let seen =
-            statat(src_parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|errno| match errno {
-                Errno::NOENT => SafeFsError::Missing {
-                    path: src_path.clone(),
-                },
-                other => io_err("inspect", &src_path)(other),
-            })?;
+        let seen = statat(src_parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(entry_err("inspect", &src_path))?;
         match FileType::from_raw_mode(seen.st_mode) {
             FileType::Symlink => {
                 return self.copy_symlink(src_parent, dst_parent, name, rel, &seen);
@@ -898,8 +1072,13 @@ impl<'a> Copier<'a> {
         // The `lstat` above only chose the route. From here the descriptor
         // decides: `O_NOFOLLOW` fails on a symlink swapped in, `O_NONBLOCK`
         // keeps a FIFO swapped in from blocking the open.
-        let fd =
-            openat(src_parent, name, OPEN_ANY, Mode::empty()).map_err(io_err("open", &src_path))?;
+        #[cfg(test)]
+        seam::run(seam::Point::LstatToOpen, name);
+        let fd = match openat(src_parent, name, OPEN_ANY, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::LOOP) => return Err(SafeFsError::SymlinkRefused { path: src_path }),
+            Err(errno) => return Err(entry_err("open", &src_path)(errno)),
+        };
         let opened = fstat(&fd).map_err(io_err("inspect", &src_path))?;
         match FileType::from_raw_mode(opened.st_mode) {
             FileType::RegularFile => self.copy_file(fd, dst_parent, name, rel, &opened),
@@ -952,7 +1131,7 @@ impl<'a> Copier<'a> {
         let (src_path, dst_path) = (self.src_label.join(rel), self.dst_label.join(rel));
         mkdirat(dst_parent, name, Mode::RWXU).map_err(io_err("create", &dst_path))?;
         let dst = open_dir(dst_parent, name).map_err(walk_err(&dst_path))?;
-        for child in read_names(src.as_fd(), &src_path)? {
+        for child in read_all_names(src.as_fd(), &src_path, self.max_entries)? {
             let child_rel = rel.join(name_path(&child));
             self.copy_entry(src.as_fd(), dst.as_fd(), &child, &child_rel, depth + 1)?;
         }
@@ -962,9 +1141,8 @@ impl<'a> Copier<'a> {
         Ok(())
     }
 
-    /// A symlink has no descriptor to work on, so everything here goes by
-    /// name relative to the parent, with `SYMLINK_NOFOLLOW`. `readlinkat`
-    /// fails if the entry is no longer a symlink.
+    /// `readlinkat` fails if the entry is no longer a symlink, so what is read
+    /// is a link target, never a file's content.
     fn copy_symlink(
         &mut self,
         src_parent: BorrowedFd<'_>,
@@ -974,27 +1152,12 @@ impl<'a> Copier<'a> {
         stat: &Stat,
     ) -> Result<(), SafeFsError> {
         let (src_path, dst_path) = (self.src_label.join(rel), self.dst_label.join(rel));
-        let target = readlinkat(src_parent, name, Vec::new()).map_err(io_err("read", &src_path))?;
+        let target =
+            readlinkat(src_parent, name, Vec::new()).map_err(entry_err("read", &src_path))?;
         symlinkat(target.as_c_str(), dst_parent, name).map_err(io_err("create", &dst_path))?;
-        let created = statat(dst_parent, name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(io_err("inspect", &dst_path))?;
-        if created.st_uid != stat.st_uid || created.st_gid != stat.st_gid {
-            chownat(
-                dst_parent,
-                name,
-                Some(Uid::from_raw(stat.st_uid)),
-                Some(Gid::from_raw(stat.st_gid)),
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .map_err(io_err("set owner of", &dst_path))?;
-        }
-        utimensat(
-            dst_parent,
-            name,
-            &timestamps(stat),
-            AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .map_err(io_err("set times of", &dst_path))?;
+        #[cfg(test)]
+        seam::run(seam::Point::SymlinkCreated, name);
+        apply_symlink_metadata(dst_parent, name, stat, &dst_path)?;
         self.stats.symlinks += 1;
         Ok(())
     }
@@ -1037,6 +1200,63 @@ fn apply_metadata(fd: BorrowedFd<'_>, from: &Stat, path: &Path) -> Result<(), Sa
     futimens(fd, &timestamps(from)).map_err(io_err("set times of", path))
 }
 
+/// Sets owner and times on a symlink just created, on a descriptor of it, so
+/// that an entry swapped in at that name receives neither.
+#[cfg(target_os = "linux")]
+fn apply_symlink_metadata(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    from: &Stat,
+    path: &Path,
+) -> Result<(), SafeFsError> {
+    let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let link = openat(parent, name, flags, Mode::empty()).map_err(io_err("open", path))?;
+    let current = fstat(&link).map_err(io_err("inspect", path))?;
+    if FileType::from_raw_mode(current.st_mode) != FileType::Symlink {
+        return Err(SafeFsError::Replaced {
+            path: path.to_owned(),
+        });
+    }
+    let flags = AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW;
+    set_symlink_metadata(link.as_fd(), c"", flags, &current, from, path)
+}
+
+/// Sets owner and times on a symlink just created, by name. A writer swapping
+/// the name right now would give the entry swapped in the owner and times. The
+/// agent's production target is Linux, which closes this window.
+#[cfg(not(target_os = "linux"))]
+fn apply_symlink_metadata(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+    from: &Stat,
+    path: &Path,
+) -> Result<(), SafeFsError> {
+    let flags = AtFlags::SYMLINK_NOFOLLOW;
+    let current = statat(parent, name, flags).map_err(io_err("inspect", path))?;
+    set_symlink_metadata(parent, name, flags, &current, from, path)
+}
+
+fn set_symlink_metadata(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    flags: AtFlags,
+    current: &Stat,
+    from: &Stat,
+    path: &Path,
+) -> Result<(), SafeFsError> {
+    if current.st_uid != from.st_uid || current.st_gid != from.st_gid {
+        chownat(
+            dir,
+            name,
+            Some(Uid::from_raw(from.st_uid)),
+            Some(Gid::from_raw(from.st_gid)),
+            flags,
+        )
+        .map_err(io_err("set owner of", path))?;
+    }
+    utimensat(dir, name, &timestamps(from), flags).map_err(io_err("set times of", path))
+}
+
 fn timestamps(stat: &Stat) -> Timestamps {
     Timestamps {
         last_access: Timespec {
@@ -1058,9 +1278,45 @@ fn fit<T, U: TryFrom<T> + Default>(value: T) -> U {
     U::try_from(value).unwrap_or_default()
 }
 
+/// Lets a test act at a point where a racing container could, so that what a
+/// race would do happens every time. Compiled out of production.
+#[cfg(test)]
+mod seam {
+    use std::cell::RefCell;
+    use std::ffi::CStr;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Point {
+        /// A source entry has been seen with `lstat` and is about to be opened.
+        LstatToOpen,
+        /// A symlink has been created and its metadata is about to be set.
+        SymlinkCreated,
+    }
+
+    type Hook = Box<dyn FnMut(Point, &CStr)>;
+
+    thread_local! {
+        // Per thread, as each test runs on its own and others run alongside.
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn set(hook: impl FnMut(Point, &CStr) + 'static) {
+        HOOK.set(Some(Box::new(hook)));
+    }
+
+    pub(super) fn run(point: Point, name: &CStr) {
+        HOOK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(point, name);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File, Permissions};
+    use std::os::fd::AsFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1068,12 +1324,17 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
 
+    use rustix::fs::{
+        AtFlags, CWD, Mode, OFlags, Timespec, Timestamps, mkdirat, openat, utimensat,
+    };
+
     use super::{
-        MAX_DEPTH, RelPath, Root, SafeFsError, prune, read_file, restore, snapshot, temp_name,
-        write_atomic,
+        MAX_DEPTH, REMOVAL_BATCH, RelPath, Root, SafeFsError, move_to_top, prune, read_file,
+        restore, seam, snapshot, snapshot_limited, temp_name, write_atomic,
     };
 
     const SECRET: &[u8] = b"sentinel content, must not be copied";
+    const SENTINEL_MTIME: i64 = 1_500_000_000;
 
     fn rel(path: &str) -> RelPath {
         RelPath::new(path).unwrap()
@@ -1116,10 +1377,22 @@ mod tests {
         let dir = base.join("sentinel");
         mkdir(&dir, 0o755);
         write(&dir.join("keep"), SECRET, 0o644);
+        let secs = u64::try_from(SENTINEL_MTIME).unwrap();
+        set_mtime(&dir.join("keep"), secs);
+        set_mtime(&dir, secs);
         dir
     }
 
+    /// Owner is compared with the sentinel's parent, which nothing under test
+    /// is pointed at, because a new entry's group depends on the platform.
     fn assert_sentinel_untouched(dir: &Path) {
+        let parent = fs::symlink_metadata(dir.parent().unwrap()).unwrap();
+        for entry in [dir.to_owned(), dir.join("keep")] {
+            let seen = fs::symlink_metadata(&entry).unwrap();
+            assert_eq!(seen.mtime(), SENTINEL_MTIME, "{entry:?}");
+            assert_eq!(seen.uid(), parent.uid(), "{entry:?}");
+            assert_eq!(seen.gid(), parent.gid(), "{entry:?}");
+        }
         assert_eq!(mode(dir), 0o755);
         assert_eq!(fs::read(dir.join("keep")).unwrap(), SECRET);
         assert_eq!(mode(&dir.join("keep")), 0o644);
@@ -1476,6 +1749,266 @@ mod tests {
         swapper.join().unwrap();
 
         assert_sentinel_untouched(&outside);
+    }
+
+    /// A source tree with one file, and a snapshot's destination, where
+    /// `swap` replaces that file between `lstat` and open.
+    fn snapshot_with_swap_in_open_window(
+        tmp: &Path,
+        swap: impl Fn(&Path) + 'static,
+    ) -> Result<PathBuf, SafeFsError> {
+        let compose = tmp.join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let file = data.join("file");
+        write(&file, b"ordinary", 0o644);
+
+        seam::set(move |point, name| {
+            if point == seam::Point::LstatToOpen && name == c"file" {
+                swap(&file);
+            }
+        });
+        let dest = tmp.join("snap");
+        snapshot(&root(&compose), &[rel("data")], &dest).map(|_| dest)
+    }
+
+    #[test]
+    fn swap_to_symlink_in_open_window_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = sentinel(tmp.path());
+        let keep = outside.join("keep");
+
+        let result = snapshot_with_swap_in_open_window(tmp.path(), move |file| {
+            fs::remove_file(file).unwrap();
+            symlink(&keep, file).unwrap();
+        });
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, SafeFsError::SymlinkRefused { .. }), "{err}");
+        assert!(err.to_string().contains("data/file"), "{err}");
+        assert!(!tmp.path().join("snap").exists());
+        assert!(!tmp.path().join("snap.partial").exists());
+        assert_sentinel_untouched(&outside);
+    }
+
+    #[test]
+    fn swap_to_fifo_in_open_window_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = snapshot_with_swap_in_open_window(tmp.path(), |file| {
+            fs::remove_file(file).unwrap();
+            mkfifo(file);
+        });
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, SafeFsError::SpecialFile { .. }), "{err}");
+        assert!(err.to_string().contains("data/file"), "{err}");
+        assert!(!tmp.path().join("snap").exists());
+        assert!(!tmp.path().join("snap.partial").exists());
+    }
+
+    #[test]
+    fn entry_vanishing_in_open_window_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let result = snapshot_with_swap_in_open_window(tmp.path(), |file| {
+            fs::remove_file(file).unwrap();
+        });
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, SafeFsError::Missing { .. }), "{err}");
+        assert!(err.to_string().contains("data/file"), "{err}");
+        assert!(!tmp.path().join("snap.partial").exists());
+    }
+
+    /// Makes `levels` nested directories, one at a time by descriptor, since
+    /// a path to the bottom of a long chain is too long to be used whole.
+    fn plant_chain(base: &Path, levels: usize) {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut current = openat(CWD, base, flags, Mode::empty()).unwrap();
+        for _ in 0..levels {
+            mkdirat(&current, c"d", Mode::RWXU).unwrap();
+            current = openat(&current, c"d", flags, Mode::empty()).unwrap();
+        }
+    }
+
+    /// A snapshot of `data` with one file, then `plant` changing `data`.
+    fn restore_after(plant: impl FnOnce(&Path)) {
+        let tmp = tempfile::tempdir().unwrap();
+        let compose = tmp.path().join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        write(&data.join("kept"), b"original", 0o644);
+        let dest = tmp.path().join("snap");
+        snapshot(&root(&compose), &[rel("data")], &dest).unwrap();
+
+        plant(&data);
+        restore(&dest, &root(&compose), &[rel("data")]).unwrap();
+
+        assert_eq!(fs::read(data.join("kept")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(&data).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn restore_succeeds_over_a_tree_deeper_than_the_limit() {
+        restore_after(|data| plant_chain(data, MAX_DEPTH + 5));
+    }
+
+    #[test]
+    fn restore_succeeds_over_a_chain_needing_several_passes() {
+        restore_after(|data| plant_chain(data, MAX_DEPTH * 3 + 7));
+    }
+
+    #[test]
+    fn restore_clears_deep_directories_side_by_side() {
+        restore_after(|data| {
+            for name in ["one", "two"] {
+                let branch = data.join(name);
+                mkdir(&branch, 0o755);
+                plant_chain(&branch, MAX_DEPTH + 5);
+            }
+        });
+    }
+
+    /// The names a deep directory would move to are taken, by a file and by a
+    /// directory with something in it: it takes the next, and they stay for
+    /// the removal to reach in its own time.
+    #[test]
+    fn a_deep_directory_moves_past_planted_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().join("top");
+        mkdir(&top, 0o755);
+        write(&top.join(".landfall-deep-0"), b"planted", 0o644);
+        fs::create_dir_all(top.join(".landfall-deep-1/full")).unwrap();
+        fs::create_dir_all(top.join("below/deep/inside")).unwrap();
+        let (top_root, below_root) = (root(&top), root(&top.join("below")));
+
+        let mut moved = 0;
+        move_to_top(
+            top_root.fd.as_fd(),
+            below_root.fd.as_fd(),
+            c"deep",
+            &top.join("below/deep"),
+            &mut moved,
+        )
+        .unwrap();
+
+        assert_eq!(moved, 3);
+        assert!(top.join(".landfall-deep-2/inside").is_dir());
+        assert!(!top.join("below/deep").exists());
+        assert_eq!(fs::read(top.join(".landfall-deep-0")).unwrap(), b"planted");
+        assert!(top.join(".landfall-deep-1/full").is_dir());
+    }
+
+    #[test]
+    fn restore_clears_a_directory_larger_than_a_batch() {
+        restore_after(|data| {
+            let added = data.join("added");
+            mkdir(&added, 0o755);
+            for index in 0..=REMOVAL_BATCH {
+                File::create(added.join(index.to_string())).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn directory_over_the_entry_limit_is_refused_naming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compose = tmp.path().join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        for index in 0..4 {
+            File::create(data.join(index.to_string())).unwrap();
+        }
+        let compose_root = root(&compose);
+        let dest = tmp.path().join("snap");
+
+        let err = snapshot_limited(&compose_root, &[rel("data")], &dest, 3).unwrap_err();
+        assert!(matches!(err, SafeFsError::TooManyEntries { .. }), "{err}");
+        assert!(err.to_string().contains("data"), "{err}");
+        assert!(!dest.exists());
+        assert!(!tmp.path().join("snap.partial").exists());
+
+        snapshot_limited(&compose_root, &[rel("data")], &dest, 4).unwrap();
+        assert_eq!(fs::read_dir(dest.join("data")).unwrap().count(), 4);
+    }
+
+    #[test]
+    fn symlink_times_survive_the_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let compose = tmp.path().join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        symlink("elsewhere", data.join("link")).unwrap();
+        let time = Timespec {
+            tv_sec: 1_600_000_000,
+            tv_nsec: 0,
+        };
+        let times = Timestamps {
+            last_access: time,
+            last_modification: time,
+        };
+        let flags = AtFlags::SYMLINK_NOFOLLOW;
+        utimensat(CWD, data.join("link"), &times, flags).unwrap();
+
+        let dest = tmp.path().join("snap");
+        snapshot(&root(&compose), &[rel("data")], &dest).unwrap();
+        assert_eq!(mtime(&dest.join("data/link")), 1_600_000_000);
+
+        fs::remove_file(data.join("link")).unwrap();
+        restore(&dest, &root(&compose), &[rel("data")]).unwrap();
+        assert_eq!(mtime(&data.join("link")), 1_600_000_000);
+    }
+
+    /// An entry swapped in for a new symlink, a hard link to an outside file
+    /// here, must not receive the symlink's owner and times.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_replaced_before_its_metadata_is_set_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = sentinel(tmp.path());
+        let compose = tmp.path().join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        symlink("elsewhere", data.join("link")).unwrap();
+
+        let created = tmp.path().join("snap.partial/data/link");
+        let keep = outside.join("keep");
+        seam::set(move |point, name| {
+            if point == seam::Point::SymlinkCreated && name == c"link" {
+                fs::remove_file(&created).unwrap();
+                fs::hard_link(&keep, &created).unwrap();
+            }
+        });
+        let dest = tmp.path().join("snap");
+        let err = snapshot(&root(&compose), &[rel("data")], &dest).unwrap_err();
+
+        assert!(matches!(err, SafeFsError::Replaced { .. }), "{err}");
+        assert!(!dest.exists());
+        assert_sentinel_untouched(&outside);
+    }
+
+    /// Only Linux: other filesystems, like APFS, refuse such a name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_round_trip() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let compose = tmp.path().join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let name = OsStr::from_bytes(b"caf\xe9");
+        write(&data.join(name), b"content", 0o644);
+
+        let dest = tmp.path().join("snap");
+        snapshot(&root(&compose), &[rel("data")], &dest).unwrap();
+        assert_eq!(fs::read(dest.join("data").join(name)).unwrap(), b"content");
+
+        fs::remove_file(data.join(name)).unwrap();
+        restore(&dest, &root(&compose), &[rel("data")]).unwrap();
+        assert_eq!(fs::read(data.join(name)).unwrap(), b"content");
     }
 
     #[test]
