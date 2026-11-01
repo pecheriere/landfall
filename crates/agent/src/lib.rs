@@ -2,6 +2,7 @@
 //! host. The binary in `main.rs` is a thin command-line front end.
 
 pub mod checks;
+pub mod cli;
 pub mod compose;
 pub mod deploy;
 pub mod docker;

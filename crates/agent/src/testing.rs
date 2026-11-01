@@ -11,13 +11,9 @@
 //! daemon.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use jiff::Timestamp;
 
@@ -28,79 +24,20 @@ use crate::docker::{ContainerId, ContainerInfo, Docker, DockerCli, DockerError, 
 pub const TEST_IMAGE: &str =
     "busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec";
 
-/// A compose project on a real Docker daemon with a unique name, removed on
-/// drop with its network and containers (one-offs included).
-#[derive(Debug)]
-pub struct ComposeProject {
-    /// The project's name.
-    pub name: String,
-    dir: tempfile::TempDir,
-}
+#[path = "../tests/support/compose_project.rs"]
+mod compose_project;
+
+pub use compose_project::ComposeProject;
 
 impl ComposeProject {
-    /// Pulls [`TEST_IMAGE`] and writes a project with the YAML of `services`
-    /// (indented by two spaces). Services may join the network `net`, which
-    /// Docker knows as `<name>-net`.
+    /// Pulls [`TEST_IMAGE`] and [creates](Self::create) a project.
     ///
     /// # Panics
     ///
     /// When any of that fails: this is test setup.
     pub async fn new(cli: &DockerCli, services: &str) -> Self {
-        // Tests start together and a clock may tick in microseconds: only the
-        // counter tells them apart. The time tells this run from an earlier
-        // one that had the same process id and left something behind.
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let name = format!("landfall-test-{}-{nanos}-{serial}", std::process::id());
         cli.pull(TEST_IMAGE).await.unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("compose.yaml"),
-            format!("name: {name}\nservices:\n{services}networks:\n  net:\n    name: {name}-net\n"),
-        )
-        .unwrap();
-        Self { name, dir }
-    }
-
-    /// The compose directory.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        self.dir.path()
-    }
-
-    /// The ids of the project's containers, one-offs included.
-    ///
-    /// # Panics
-    ///
-    /// When the Docker client cannot be run.
-    #[must_use]
-    pub fn all_containers(&self) -> Vec<String> {
-        let out = Command::new("docker")
-            .args(["ps", "-a", "-q", "--no-trunc", "--filter"])
-            .arg(format!("label=com.docker.compose.project={}", self.name))
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-}
-
-impl Drop for ComposeProject {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["compose", "-p", &self.name, "down"])
-            .args(["--volumes", "--remove-orphans", "--timeout", "1"])
-            // By name and from elsewhere: a test may leave a project behind
-            // that compose refuses to load.
-            .current_dir(self.dir.path().parent().unwrap_or(Path::new("/")))
-            .output();
+        Self::create(services)
     }
 }
 
@@ -513,7 +450,9 @@ impl Docker for FakeDocker {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use super::{Arc, Call, Docker, FakeDocker, Ordering, Path, container_id, running};
+    use std::sync::atomic::Ordering;
+
+    use super::{Arc, Call, Docker, FakeDocker, Path, container_id, running};
 
     #[tokio::test]
     async fn on_call_runs_during_the_call_and_may_use_the_fake() {

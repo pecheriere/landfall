@@ -2216,6 +2216,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     const FOREIGN_GID: u32 = 2345;
 
+    /// Whether this test can run: it needs root. Where root is required, as
+    /// it is in CI, not having it is a failure.
     #[cfg(target_os = "linux")]
     #[expect(
         clippy::print_stderr,
@@ -2224,6 +2226,10 @@ mod tests {
     fn can_chown(test: &str) -> bool {
         let root = rustix::process::geteuid().is_root();
         if !root {
+            assert!(
+                std::env::var_os("LANDFALL_TEST_REQUIRE_ROOT").is_none(),
+                "{test} must run as root here"
+            );
             eprintln!("{test}: skipped, it needs root to give a file another owner");
         }
         root

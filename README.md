@@ -79,6 +79,29 @@ The host needs a synchronised clock (NTP). The transparency log's integrated
 time must not be in the future, so a clock running behind refuses a fresh
 release with "integrated time … in the future".
 
+## Running the agent
+
+The agent's engine deploys, checks and rolls back, and its binary reports and
+repairs; the controller that will drive it is still to come.
+
+```sh
+landfall-agent status --config fleet.toml --host home-1 [--state-dir <dir>]
+landfall-agent recover --config fleet.toml --deployment app/prod [--state-dir <dir>]
+```
+
+`status` prints one JSON object per deployment of the host: its directory, what
+is deployed, whether a deploy is unfinished, the running image and whether it has
+drifted. `recover` rolls back an interrupted deploy, and exits 0 on success, 1
+if the rollback failed and 2 if it could not run. The state directory defaults to
+`/var/lib/landfall-agent`.
+
+A host needs Linux 5.8 or later, a unique uid for the agent, and five
+capabilities (`CAP_CHOWN`, `CAP_FOWNER`, `CAP_DAC_OVERRIDE`,
+`CAP_DAC_READ_SEARCH`, `CAP_FSETID`), and each stack needs
+`COMPOSE_FILE=compose.yaml:compose.landfall.yaml` in its `.env`. The Docker socket
+it uses is root-equivalent. See [`docs/operations.md`](docs/operations.md) for
+these, the systemd unit, and what to do when a deploy goes wrong.
+
 ## Development
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup and the checks every

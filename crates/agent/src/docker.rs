@@ -3,9 +3,9 @@
 //! Commands are argument vectors, never a shell. Their environment loses
 //! `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME` and `COMPOSE_PROFILES`, so the
 //! stack's `.env` decides. Every call has a timeout and every captured
-//! output a cap. Each runs in its own process group, which a timeout kills
-//! whole: `docker compose` is a plugin run by the `docker` client, and a
-//! timed-out call must not keep working under the rollback that follows it.
+//! output a cap. Each runs in its own process group, which a timeout, or
+//! dropping the call, kills whole: `docker compose` is a plugin run by the `docker` client, and a
+//! call given up on must not keep working under the rollback that follows it.
 //!
 //! Two kinds of output are secret-bearing and treated as such. The JSON of
 //! `docker compose config` holds interpolated secrets: only the service's
@@ -22,6 +22,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::str::FromStr;
@@ -110,14 +111,17 @@ pub enum DockerError {
         stderr: String,
     },
     /// The command failed and, because its output can echo secrets or
-    /// container logs, only its exit status is reported. Run the command by
-    /// hand, in the compose directory for `docker compose`, to see why.
-    #[error("{command}: {status} (output withheld; run it by hand to see why)")]
+    /// container logs, only its exit status is reported, with the command to
+    /// run by hand to see why.
+    #[error("{command}: {status} (output withheld; to see why, run by hand: {argv})")]
     FailedQuietly {
         /// The command.
         command: &'static str,
         /// The exit status.
         status: String,
+        /// The command line, which holds nothing from the configuration but
+        /// names validated before they got here.
+        argv: String,
     },
     /// The command was killed after an error or timeout, but did not exit
     /// within a few seconds (a process stuck in the kernel). It may still be
@@ -396,6 +400,7 @@ impl DockerCli {
         cmd: Command,
         limit: Duration,
     ) -> Result<Captured, DockerError> {
+        let argv = format!("{} in the compose directory", shown_argv(&cmd));
         let captured = Self::capture(label, cmd, limit).await?;
         if captured.status.success() {
             Ok(captured)
@@ -403,8 +408,21 @@ impl DockerCli {
             Err(DockerError::FailedQuietly {
                 command: label,
                 status: captured.status.to_string(),
+                argv,
             })
         }
+    }
+
+    /// The compose project's name in `dir`. Commands given it don't load the
+    /// project: compose refuses one where the service has no image, which is
+    /// the state before a first deploy and the one a failed first deploy goes
+    /// back to, possibly with its container still running.
+    async fn project_name(&self, label: &'static str, dir: &Path) -> Result<String, DockerError> {
+        let config = self.compose(dir, &["config", "--no-consistency", "--format", "json"]);
+        let captured = Self::run_compose(label, config, self.timeout).await?;
+        let project = parse_project_name(&captured.stdout)?;
+        not_a_flag(label, &project)?;
+        Ok(project)
     }
 
     /// [`capture`](Self::capture), failing on a non-zero exit with the
@@ -427,30 +445,104 @@ impl DockerCli {
     }
 }
 
+/// The command line of `cmd` as an operator can type it, for an error that
+/// withholds the output. It is printed, so it holds nothing that comes from
+/// the stack's configuration: an argument with characters no flag or validated
+/// name has, and the project name, which compose interpolates, are shown as
+/// placeholders.
+fn shown_argv(cmd: &Command) -> String {
+    let mut shown = String::from("docker");
+    let mut after_project = false;
+    for arg in cmd.as_std().get_args() {
+        let plain = arg.to_str().filter(|arg| {
+            !arg.is_empty()
+                && arg
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+        });
+        shown.push(' ');
+        match plain {
+            _ if after_project => shown.push_str("<project>"),
+            Some(arg) => shown.push_str(arg),
+            None => shown.push_str("<value>"),
+        }
+        after_project = arg == "-p";
+    }
+    shown
+}
+
+/// A running command. Dropping it before it has been reaped, which is what
+/// dropping a call's future does, kills its whole process group: `kill_on_drop`
+/// only reaches the direct child.
+struct GroupChild(Child);
+
+impl GroupChild {
+    fn group(&self) -> Option<Pid> {
+        // `id` is `None` once the child has been reaped. Until then its pid,
+        // which is also the group's id, cannot have been reused.
+        self.0
+            .id()
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(Pid::from_raw)
+    }
+
+    fn kill_group(&self) {
+        if let Some(group) = self.group() {
+            // The group may be gone already.
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        self.kill_group();
+    }
+}
+
+impl Deref for GroupChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for GroupChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
 /// Kills the child's whole process group and waits, for a few seconds, for
 /// the child to be gone.
-async fn kill_group(label: &'static str, child: &mut Child) -> Result<(), DockerError> {
-    let group = child
-        .id()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .and_then(Pid::from_raw);
-    if let Some(group) = group {
-        // The group may be gone already.
-        let _ = kill_process_group(group, Signal::KILL);
-    }
+async fn kill_group(label: &'static str, child: &mut GroupChild) -> Result<(), DockerError> {
+    child.kill_group();
     // Covers a child that was not (or no longer) the leader of a group.
     let _ = child.start_kill();
-    match tokio::time::timeout(KILL_WAIT, child.wait()).await {
+    await_killed(label, child.wait(), KILL_WAIT).await
+}
+
+/// Waits for a killed command to be gone. A process stuck in the kernel does
+/// not go, however it is killed, and the caller must not wait for it forever.
+async fn await_killed<T>(
+    label: &'static str,
+    exit: impl Future<Output = T>,
+    limit: Duration,
+) -> Result<(), DockerError> {
+    match tokio::time::timeout(limit, exit).await {
         Ok(_) => Ok(()),
         Err(_) => Err(DockerError::Unkillable { command: label }),
     }
 }
 
-fn spawn(label: &'static str, cmd: &mut Command) -> Result<Child, DockerError> {
-    cmd.spawn().map_err(|source| DockerError::Spawn {
-        command: label,
-        source,
-    })
+fn spawn(label: &'static str, cmd: &mut Command) -> Result<GroupChild, DockerError> {
+    cmd.spawn()
+        .map(GroupChild)
+        .map_err(|source| DockerError::Spawn {
+            command: label,
+            source,
+        })
 }
 
 /// Refuses a name or reference that a client could read as a flag.
@@ -771,13 +863,7 @@ impl Docker for DockerCli {
     async fn compose_stop(&self, dir: &Path, service: &str) -> Result<(), DockerError> {
         const LABEL: &str = "docker compose stop";
         not_a_flag(LABEL, service)?;
-        // By project name, which doesn't load the project: compose refuses
-        // one where the service has no image, and that is the state a failed
-        // first deploy goes back to with its container still running.
-        let config = self.compose(dir, &["config", "--no-consistency", "--format", "json"]);
-        let captured = Self::run_compose(LABEL, config, self.timeout).await?;
-        let project = parse_project_name(&captured.stdout)?;
-        not_a_flag(LABEL, &project)?;
+        let project = self.project_name(LABEL, dir).await?;
         let cmd = self.compose(dir, &["-p", &project, "stop", "--", service]);
         Self::run_compose(LABEL, cmd, self.long_timeout)
             .await
@@ -791,9 +877,10 @@ impl Docker for DockerCli {
     ) -> Result<Option<ContainerId>, DockerError> {
         const LABEL: &str = "docker compose ps";
         not_a_flag(LABEL, service)?;
+        let project = self.project_name(LABEL, dir).await?;
         // Without `--all`: that also lists the one-off containers of
         // `compose run`, and a service is only ever up as a long-running one.
-        let cmd = self.compose(dir, &["ps", "--quiet", "--", service]);
+        let cmd = self.compose(dir, &["-p", &project, "ps", "--quiet", "--", service]);
         let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
         parse_container(&captured.stdout)
     }
@@ -875,6 +962,7 @@ impl Docker for DockerCli {
             "--",
         ])
         .arg(id.as_ref());
+        let argv = shown_argv(&cmd);
         let mut child = spawn(LABEL, &mut cmd)?;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let needle = needle.as_bytes();
@@ -913,6 +1001,7 @@ impl Docker for DockerCli {
                     Ok(Ok(status)) => Err(DockerError::FailedQuietly {
                         command: LABEL,
                         status: status.to_string(),
+                        argv,
                     }),
                     Ok(Err(source)) => Err(DockerError::Io {
                         command: LABEL,
@@ -1205,6 +1294,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_call_kills_the_whole_process_group() {
+        let stub = Stub::new(
+            "sleep 30 &\necho $! > \"$(dirname \"$0\")/grandchild.tmp\"\nmv \"$(dirname \"$0\")/grandchild.tmp\" \"$(dirname \"$0\")/grandchild\"\nwait",
+        );
+        let cli = stub.cli();
+        let mut call = Box::pin(cli.compose_up(stub.dir.path(), "app"));
+        let pid = loop {
+            tokio::select! {
+                result = &mut call => panic!("the call ended: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {
+                    if let Ok(text) = fs::read_to_string(stub.path("grandchild")) {
+                        break text.trim().parse::<i32>().unwrap();
+                    }
+                }
+            }
+        };
+        drop(call);
+        assert!(gone(pid).await, "the grandchild is still running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_command_that_outlives_its_kill_is_reported() {
+        let err = await_killed("docker pull", std::future::pending::<()>(), KILL_WAIT)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DockerError::Unkillable {
+                    command: "docker pull"
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withheld_failure_names_the_command_to_rerun() {
+        let stub = Stub::new("echo 'SECRET=hunter2' >&2\nexit 1");
+        let err = stub
+            .cli()
+            .compose_up(stub.dir.path(), "app")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("docker compose up -d --no-deps -- app in the compose directory"),
+            "{text}"
+        );
+        assert!(!text.contains("hunter2"), "{text}");
+
+        let err = stub
+            .cli()
+            .logs_contain(&id(), Timestamp::UNIX_EPOCH, Timestamp::UNIX_EPOCH, "x")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(
+                "docker logs --since 1970-01-01T00:00:00Z --until 1970-01-01T00:00:00Z -- 0123456789ab"
+            ),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_withheld_failure_leaves_out_the_project_name_and_odd_arguments() {
+        let stub = Stub::new(
+            "case \"$2\" in config) echo '{\"name\":\"s3cretproject\",\"services\":{}}';; *) exit 1;; esac",
+        );
+        let err = stub
+            .cli()
+            .compose_stop(stub.dir.path(), "app")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("docker compose -p <project> stop -- app"),
+            "{text}"
+        );
+        assert!(!text.contains("s3cretproject"), "{text}");
+
+        let err = stub
+            .cli()
+            .compose_up(stub.dir.path(), "a$(b) c")
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("-- <value> in the"), "{text}");
+        assert!(!text.contains("$(b)"), "{text}");
+    }
+
+    #[tokio::test]
     async fn oversized_output_is_refused() {
         let stub = Stub::new("head -c 17000000 /dev/zero");
         let err = stub.cli().pull("example").await.unwrap_err();
@@ -1247,11 +1429,13 @@ mod tests {
 
     #[tokio::test]
     async fn container_lookup_leaves_out_one_off_containers() {
-        let stub = Stub::new("echo \"$@\" > \"$(dirname \"$0\")/seen\"\necho 0123456789ab");
+        let stub = Stub::new(
+            "case \"$2\" in config) echo '{\"name\":\"stack\"}';; *) echo \"$@\" > \"$(dirname \"$0\")/seen\"; echo 0123456789ab;; esac",
+        );
         let found = stub.cli().container(stub.dir.path(), "app").await.unwrap();
         assert_eq!(found, Some(id()));
         let seen = fs::read_to_string(stub.path("seen")).unwrap();
-        assert_eq!(seen.trim(), "compose ps --quiet -- app");
+        assert_eq!(seen.trim(), "compose -p stack ps --quiet -- app");
     }
 
     #[tokio::test]
@@ -1521,7 +1705,7 @@ mod tests {
 
         #[tokio::test]
         #[ignore = "docker: runs in ci.yml"]
-        async fn docker_config_and_stop_work_on_a_service_without_an_image() {
+        async fn docker_config_ps_and_stop_work_on_a_service_without_an_image() {
             let cli = DockerCli::new();
             let project = project(&cli).await;
             cli.compose_up(project.path(), "plain").await.unwrap();
@@ -1543,6 +1727,13 @@ mod tests {
             let svc = cli.compose_service(project.path(), "plain").await.unwrap();
             assert_eq!(svc.image, None);
             assert!(!svc.has_build);
+            assert_eq!(
+                cli.container(project.path(), "plain")
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                Some(&id)
+            );
 
             cli.compose_stop(project.path(), "plain").await.unwrap();
             assert_eq!(cli.inspect(&id).await.unwrap().status, "exited");

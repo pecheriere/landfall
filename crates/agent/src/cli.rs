@@ -1,0 +1,725 @@
+//! The command line behind the `landfall-agent` binary: `status` and
+//! `recover`. Results go to stdout as JSON and failures to the journal, with
+//! the exit status saying which: 0 success, 1 rollback failed, 2 could not run
+//! (usage included, which is clap's own status).
+
+use std::future::Future;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use clap::{Args, Parser, Subcommand};
+use landfall_core::config::{self, Config, ConfigError, Deployment};
+use landfall_core::ids::{DeploymentId, HostId};
+use serde::Serialize;
+
+use crate::compose::{self, ComposeError};
+use crate::deploy::{self, DeployError, DeployReport, EngineOptions, Outcome};
+use crate::docker::{Docker, DockerCli, DockerError};
+use crate::journal::{self, Priority};
+use crate::state::{Deployed, DeploymentState, StateDir, StateError};
+
+/// Where the agent keeps its state unless told otherwise.
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/landfall-agent";
+
+/// The command succeeded. For `recover`: the previous version is back, or
+/// there is none to start and the service is stopped, or the deploy had in
+/// fact finished.
+pub const EXIT_OK: u8 = 0;
+/// `recover` ran and the rollback failed. Deploys stay blocked; run it again.
+pub const EXIT_ROLLBACK_FAILED: u8 = 1;
+/// The command could not run: configuration, state, Docker or usage.
+pub const EXIT_COULD_NOT_RUN: u8 = 2;
+
+/// How long the process waits, on the way out, for file work that has outlived
+/// its deadline. Dropping a runtime would wait for it without end, and a hung
+/// disk must not keep the agent from reporting its exit status.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
+const EXIT_STATUS: &str = "\
+Exit status:
+  0  success
+  1  recover ran and the rollback failed; deploys stay blocked, run it again
+  2  could not run: usage, configuration, state or Docker";
+
+/// Runs on each host: verifies and deploys releases, checks health, rolls back.
+#[derive(Debug, Parser)]
+#[command(name = "landfall-agent", version, about, after_help = EXIT_STATUS)]
+pub struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Print one JSON object per deployment of a host: its compose directory,
+    /// what is recorded as deployed, whether a deploy is unfinished, the
+    /// running image and whether it has drifted from the project's.
+    Status(StatusArgs),
+    /// Finish an interrupted deploy by rolling it back, and print its report.
+    Recover(RecoverArgs),
+}
+
+#[derive(Debug, Args)]
+struct StatusArgs {
+    /// The fleet configuration file.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+    /// The host to report on.
+    #[arg(long, value_name = "ID")]
+    host: HostId,
+    /// The agent's state directory.
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct RecoverArgs {
+    /// The fleet configuration file.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+    /// The deployment to recover.
+    #[arg(long, value_name = "ID")]
+    deployment: DeploymentId,
+    /// The agent's state directory.
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+}
+
+/// Why a command could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum CliError {
+    /// The configuration file could not be read.
+    #[error("cannot read configuration {}: {source}", .path.display())]
+    ReadConfig {
+        /// The file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+    /// The configuration file is not valid.
+    #[error("configuration {}: {source}", .path.display())]
+    Config {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        source: ConfigError,
+    },
+    /// The configuration has no such deployment.
+    #[error("deployment {0} is not in the configuration")]
+    UnknownDeployment(DeploymentId),
+    /// The configuration has no deployment on the host.
+    #[error("the configuration has no deployment on host {0}")]
+    NoDeployments(HostId),
+    /// The compose directories could not be resolved.
+    #[error(transparent)]
+    Compose(#[from] ComposeError),
+    /// The agent's state could not be read.
+    #[error(transparent)]
+    State(#[from] StateError),
+    /// Docker could not tell what is running.
+    #[error("deployment {deployment}: {source}")]
+    Docker {
+        /// The deployment.
+        deployment: DeploymentId,
+        /// The failure.
+        source: DockerError,
+    },
+    /// The recovery did not start.
+    #[error(transparent)]
+    Deploy(#[from] DeployError),
+    /// The async runtime could not start.
+    #[error("cannot start the async runtime: {0}")]
+    Runtime(#[source] io::Error),
+    /// The result could not be written to stdout.
+    #[error("cannot write the result: {0}")]
+    Output(#[source] io::Error),
+}
+
+/// What `status` prints for one deployment. The only thing in it a container
+/// has a say in is `running_image`, which is quoted and truncated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeploymentStatus {
+    /// The deployment.
+    pub deployment: DeploymentId,
+    /// The resolved compose directory.
+    pub dir: PathBuf,
+    /// What is recorded as deployed, if anything.
+    pub deployed: Option<Deployed>,
+    /// Whether a deploy started and did not finish.
+    pub in_progress: bool,
+    /// The running container's image, quoted and truncated.
+    pub running_image: Option<String>,
+    /// Whether the running image differs from the project's.
+    pub drift: bool,
+}
+
+/// One deployment to report on, with what the state directory says of it.
+struct Target<'a> {
+    deployment: &'a Deployment,
+    dir: PathBuf,
+    deployed: Option<Deployed>,
+    in_progress: bool,
+}
+
+fn load_config(path: &Path) -> Result<Config, CliError> {
+    let bytes = std::fs::read(path).map_err(|source| CliError::ReadConfig {
+        path: path.to_owned(),
+        source,
+    })?;
+    config::parse(&bytes).map_err(|source| CliError::Config {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Reads what the host's deployments need from the disk, before any Docker
+/// call runs.
+fn status_targets<'a>(
+    config: &'a Config,
+    host: &'a HostId,
+    state_dir: &Path,
+) -> Result<Vec<Target<'a>>, CliError> {
+    let mut dirs = compose::resolve_dirs(config, host)?;
+    let state = StateDir::open(state_dir)?;
+    let mut targets = Vec::new();
+    for deployment in config.deployments_for_host(host) {
+        let id = deployment.id();
+        let dir = dirs
+            .remove(id)
+            .ok_or_else(|| CliError::UnknownDeployment(id.clone()))?;
+        let record = state.deployment(id)?;
+        targets.push(Target {
+            deployment,
+            dir,
+            deployed: record.deployed()?,
+            in_progress: record.in_progress()?.is_some(),
+        });
+    }
+    if targets.is_empty() {
+        return Err(CliError::NoDeployments(host.clone()));
+    }
+    Ok(targets)
+}
+
+async fn statuses<D: Docker>(
+    docker: &D,
+    targets: Vec<Target<'_>>,
+) -> Result<Vec<DeploymentStatus>, CliError> {
+    let mut rows = Vec::with_capacity(targets.len());
+    for target in targets {
+        let id = target.deployment.id();
+        let service = target.deployment.compose().service();
+        let seen = deploy::drift(docker, &target.dir, service)
+            .await
+            .map_err(|source| CliError::Docker {
+                deployment: id.clone(),
+                source,
+            })?;
+        rows.push(DeploymentStatus {
+            deployment: id.clone(),
+            dir: target.dir,
+            deployed: target.deployed,
+            in_progress: target.in_progress,
+            running_image: seen.running_image,
+            drift: seen.drift,
+        });
+    }
+    Ok(rows)
+}
+
+/// Finds what `recover` works on.
+fn recover_target<'a>(
+    config: &'a Config,
+    id: &DeploymentId,
+    state_dir: &Path,
+) -> Result<(&'a Deployment, PathBuf, DeploymentState), CliError> {
+    let deployment = config
+        .deployment(id)
+        .ok_or_else(|| CliError::UnknownDeployment(id.clone()))?;
+    let mut dirs = compose::resolve_dirs(config, deployment.host())?;
+    let dir = dirs
+        .remove(id)
+        .ok_or_else(|| CliError::UnknownDeployment(id.clone()))?;
+    let state = StateDir::open(state_dir)?.deployment(id)?;
+    Ok((deployment, dir, state))
+}
+
+/// The exit status of a `recover` that ran.
+#[must_use]
+pub fn recover_exit_code(report: &DeployReport) -> u8 {
+    match report.outcome {
+        Outcome::Deployed
+        | Outcome::RolledBack { .. }
+        | Outcome::NothingChanged { .. }
+        | Outcome::FailedNoPrevious { .. } => EXIT_OK,
+        Outcome::RollbackFailed { .. } => EXIT_ROLLBACK_FAILED,
+    }
+}
+
+/// Runs `future` to its end on a runtime of its own, then gives what is left
+/// on the runtime's blocking threads `wait` to finish. A thread that has not
+/// finished by then is abandoned, to die with the process.
+fn block_on_bounded<F: Future>(future: F, wait: Duration) -> Result<F::Output, CliError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(CliError::Runtime)?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_timeout(wait);
+    Ok(output)
+}
+
+fn write_status(out: &mut impl Write, rows: &[DeploymentStatus]) -> io::Result<()> {
+    for row in rows {
+        serde_json::to_writer(&mut *out, row)?;
+        writeln!(out)?;
+    }
+    out.flush()
+}
+
+fn write_report(out: &mut impl Write, report: &DeployReport) -> io::Result<()> {
+    serde_json::to_writer_pretty(&mut *out, report)?;
+    writeln!(out)?;
+    out.flush()
+}
+
+/// Runs the command on real Docker, writing its result to `out`.
+fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
+    let docker = DockerCli::new();
+    match cli.command {
+        Command::Status(args) => {
+            let config = load_config(&args.config)?;
+            let targets = status_targets(&config, &args.host, &args.state_dir)?;
+            let rows = block_on_bounded(statuses(&docker, targets), SHUTDOWN_WAIT)??;
+            write_status(out, &rows).map_err(CliError::Output)?;
+            Ok(EXIT_OK)
+        }
+        Command::Recover(args) => {
+            let config = load_config(&args.config)?;
+            let (deployment, dir, state) =
+                recover_target(&config, &args.deployment, &args.state_dir)?;
+            let options = EngineOptions::default();
+            let report = block_on_bounded(
+                deploy::recover(&docker, &state, deployment, &dir, &options),
+                SHUTDOWN_WAIT,
+            )??;
+            write_report(out, &report).map_err(CliError::Output)?;
+            Ok(recover_exit_code(&report))
+        }
+    }
+}
+
+/// Runs the command and returns the process's exit status. A failure goes to
+/// the journal.
+#[must_use]
+pub fn run(cli: Cli) -> u8 {
+    #[derive(Serialize)]
+    struct Failed {
+        event: &'static str,
+        error: String,
+    }
+    match execute(cli, &mut io::stdout().lock()) {
+        Ok(code) => code,
+        Err(error) => {
+            journal::emit(
+                Priority::Error,
+                &Failed {
+                    event: "agent_command_failed",
+                    error: error.to_string(),
+                },
+            );
+            EXIT_COULD_NOT_RUN
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use clap::error::ErrorKind;
+    use clap::{CommandFactory, Parser};
+    use jiff::Timestamp;
+    use serde_json::Value;
+
+    use super::{
+        Cli, CliError, Command, DEFAULT_STATE_DIR, Deployed, EXIT_COULD_NOT_RUN, EXIT_OK,
+        EXIT_ROLLBACK_FAILED, block_on_bounded, execute, load_config, recover_exit_code,
+        recover_target, status_targets, statuses, write_status,
+    };
+    use crate::compose::{OVERRIDE_FILE, PLACEHOLDER};
+    use crate::deploy::{self, DeployError, EngineOptions, Outcome};
+    use crate::docker::{ContainerInfo, ServiceConfig};
+    use crate::state::{DeploymentState, InProgress, Phase};
+    use crate::testing::{FakeDocker, running};
+    use std::time::Duration;
+
+    const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const IMAGE: &str = "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        compose: std::path::PathBuf,
+        state_dir: std::path::PathBuf,
+        config_file: std::path::PathBuf,
+    }
+
+    /// A fleet with deployment `app/prod` on `home-1`, its directories and
+    /// its configuration file.
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let compose = root.join("compose");
+        fs::create_dir(&compose).unwrap();
+        let state_dir = root.join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let config_file = root.join("fleet.toml");
+        fs::write(&config_file, fleet(&compose)).unwrap();
+        Fixture {
+            _tmp: tmp,
+            compose,
+            state_dir,
+            config_file,
+        }
+    }
+
+    fn fleet(compose: &std::path::Path) -> String {
+        format!(
+            "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
+             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+             [[deployment]]\nid = \"app/prod\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
+             host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
+             origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
+             rule = {{ auto = \"any\", approvers = [\"operator\"] }}\nchecks = [{{ command = [\"true\"] }}]\n\
+             [[grant]]\nprincipal = \"operator\"\ndeployments = [\"app/prod\"]\ncan = [\"approve\"]\n",
+            compose.to_str().unwrap()
+        )
+    }
+
+    fn container(image: &str) -> ContainerInfo {
+        let mut info = running(None, &[]);
+        image.clone_into(&mut info.image);
+        info
+    }
+
+    fn deployed() -> Deployed {
+        Deployed {
+            deploy_id: "previous".to_owned(),
+            tag: "v1.2.3".parse().unwrap(),
+            version: semver::Version::new(1, 2, 3),
+            digest: DIGEST.parse().unwrap(),
+            commit: COMMIT.parse().unwrap(),
+            deployed_at: Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    fn marker() -> InProgress {
+        InProgress {
+            deploy_id: "interrupted".to_owned(),
+            phase: Phase::Deploying,
+            tag: "v1.2.4".parse().unwrap(),
+            digest: DIGEST.parse().unwrap(),
+            previous_can_start: true,
+            backup: None,
+            started_at: Timestamp::now(),
+        }
+    }
+
+    fn state_of(f: &Fixture) -> DeploymentState {
+        crate::state::StateDir::open(&f.state_dir)
+            .unwrap()
+            .deployment(&"app/prod".parse().unwrap())
+            .unwrap()
+    }
+
+    /// Runs `status` on the fake and returns the lines it prints, parsed.
+    async fn status_lines(f: &Fixture, docker: &FakeDocker) -> Vec<Value> {
+        let config = load_config(&f.config_file).unwrap();
+        let host = "home-1".parse().unwrap();
+        let targets = status_targets(&config, &host, &f.state_dir).unwrap();
+        let rows = statuses(docker, targets).await.unwrap();
+        let mut out = Vec::new();
+        write_status(&mut out, &rows).unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn usage_errors_exit_with_could_not_run() {
+        for args in [
+            &["landfall-agent", "nonsense"][..],
+            &["landfall-agent", "status", "--host", "home-1"],
+            &["landfall-agent", "recover", "--config", "fleet.toml"],
+            &[
+                "landfall-agent",
+                "status",
+                "--config",
+                "f",
+                "--host",
+                "No Such",
+            ],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_ne!(err.kind(), ErrorKind::DisplayHelp);
+            assert_eq!(err.exit_code(), i32::from(EXIT_COULD_NOT_RUN), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn state_dir_has_a_default() {
+        let cli = Cli::try_parse_from([
+            "landfall-agent",
+            "recover",
+            "--config",
+            "fleet.toml",
+            "--deployment",
+            "app/prod",
+        ])
+        .unwrap();
+        let Command::Recover(args) = cli.command else {
+            panic!("not recover");
+        };
+        assert_eq!(args.state_dir.to_str(), Some(DEFAULT_STATE_DIR));
+    }
+
+    #[test]
+    fn help_documents_the_exit_status() {
+        let help = Cli::command().render_long_help().to_string();
+        for line in ["0  success", "1  recover ran", "2  could not run"] {
+            assert!(help.contains(line), "{line:?} missing from:\n{help}");
+        }
+    }
+
+    #[test]
+    fn exit_codes_follow_the_outcome() {
+        let report = |outcome| deploy::DeployReport {
+            deployment: "app/prod".parse().unwrap(),
+            tag: "v1.2.3".parse().unwrap(),
+            digest: DIGEST.parse().unwrap(),
+            outcome,
+            steps: Vec::new(),
+            started_at: Timestamp::UNIX_EPOCH,
+            finished_at: Timestamp::UNIX_EPOCH,
+        };
+        let reason = || "why".to_owned();
+        for outcome in [
+            Outcome::Deployed,
+            Outcome::RolledBack { reason: reason() },
+            Outcome::NothingChanged { reason: reason() },
+            Outcome::FailedNoPrevious { reason: reason() },
+        ] {
+            assert_eq!(recover_exit_code(&report(outcome)), EXIT_OK);
+        }
+        let failed = Outcome::RollbackFailed {
+            reason: reason(),
+            rollback_reason: reason(),
+        };
+        assert_eq!(recover_exit_code(&report(failed)), EXIT_ROLLBACK_FAILED);
+    }
+
+    #[test]
+    fn a_missing_configuration_could_not_run() {
+        let f = fixture();
+        let cli = Cli::try_parse_from([
+            "landfall-agent",
+            "status",
+            "--config",
+            f.state_dir.join("absent").to_str().unwrap(),
+            "--host",
+            "home-1",
+        ])
+        .unwrap();
+        let err = execute(cli, &mut Vec::new()).unwrap_err();
+        assert!(matches!(err, CliError::ReadConfig { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_host_without_deployments_could_not_run() {
+        let f = fixture();
+        let config = load_config(&f.config_file).unwrap();
+        let err = status_targets(&config, &"home-2".parse().unwrap(), &f.state_dir)
+            .err()
+            .unwrap();
+        assert!(matches!(err, CliError::NoDeployments(_)), "{err}");
+    }
+
+    #[test]
+    fn recover_refuses_an_unknown_deployment() {
+        let f = fixture();
+        let config = load_config(&f.config_file).unwrap();
+        let err = recover_target(&config, &"app/other".parse().unwrap(), &f.state_dir)
+            .err()
+            .unwrap();
+        assert!(matches!(err, CliError::UnknownDeployment(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_deployment_as_json() {
+        let f = fixture();
+        state_of(&f).set_deployed(&deployed()).unwrap();
+        state_of(&f).set_in_progress(&marker()).unwrap();
+        let docker = FakeDocker::new();
+        docker.script_compose_service([Ok(ServiceConfig {
+            image: Some(IMAGE.to_owned()),
+            has_build: false,
+        })]);
+        docker.script_inspect([Ok(container(IMAGE))]);
+
+        let lines = status_lines(&f, &docker).await;
+
+        assert_eq!(lines.len(), 1);
+        let row = &lines[0];
+        assert_eq!(row["deployment"], "app/prod");
+        assert_eq!(row["dir"], f.compose.to_str().unwrap());
+        assert_eq!(row["deployed"]["tag"], "v1.2.3");
+        assert_eq!(row["in_progress"], true);
+        assert_eq!(row["running_image"], format!("{IMAGE:?}"));
+        assert_eq!(row["drift"], false);
+    }
+
+    #[tokio::test]
+    async fn status_holds_no_container_text_beyond_a_quoted_truncated_image() {
+        let f = fixture();
+        let docker = FakeDocker::new();
+        docker.script_compose_service([Ok(ServiceConfig {
+            image: Some("SECRET=hunter2".to_owned()),
+            has_build: false,
+        })]);
+        let hostile = format!("evil\n{{\"drift\":false}}{}", "x".repeat(100_000));
+        let mut info = container(&hostile);
+        info.status = "status-text".to_owned();
+        info.health = Some("health-text".to_owned());
+        docker.script_inspect([Ok(info)]);
+
+        let lines = status_lines(&f, &docker).await;
+
+        let row = &lines[0];
+        assert_eq!(row["drift"], true);
+        let text = row.to_string();
+        assert!(text.len() < 1024, "{}", text.len());
+        for absent in ["hunter2", "status-text", "health-text"] {
+            assert!(!text.contains(absent), "{text}");
+        }
+        assert!(
+            row["running_image"]
+                .as_str()
+                .unwrap()
+                .starts_with("\"evil\\n"),
+            "{text}"
+        );
+    }
+
+    /// The compose directory after an agent died mid-deploy.
+    fn interrupted(f: &Fixture) -> DeploymentState {
+        let state = state_of(f);
+        fs::write(f.compose.join(OVERRIDE_FILE), "# half way\n").unwrap();
+        state.set_previous_override(PLACEHOLDER.as_bytes()).unwrap();
+        state.set_previous_deployed(None).unwrap();
+        state.set_in_progress(&marker()).unwrap();
+        state
+    }
+
+    fn engine_options() -> EngineOptions {
+        let mut options = EngineOptions::default();
+        options.checks.interval = Duration::from_millis(1);
+        options.checks.deadline = Duration::from_millis(500);
+        options.checks.settle = Duration::from_millis(1);
+        options
+    }
+
+    #[tokio::test]
+    async fn recover_that_rolls_back_exits_ok() {
+        let f = fixture();
+        let state = interrupted(&f);
+        let config = load_config(&f.config_file).unwrap();
+        let docker = FakeDocker::new();
+        docker.script_compose_service([Ok(ServiceConfig {
+            image: Some(IMAGE.to_owned()),
+            has_build: false,
+        })]);
+        docker.script_inspect([Ok(container(IMAGE))]);
+        docker.script_exec([Ok(true)]);
+
+        let report = deploy::recover(
+            &docker,
+            &state,
+            &config.deployments()[0],
+            &f.compose,
+            &engine_options(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(report.outcome, Outcome::RolledBack { .. }));
+        assert_eq!(recover_exit_code(&report), EXIT_OK);
+    }
+
+    #[tokio::test]
+    async fn recover_whose_rollback_fails_exits_1() {
+        let f = fixture();
+        let state = interrupted(&f);
+        let config = load_config(&f.config_file).unwrap();
+        let docker = FakeDocker::new();
+        docker.script_compose_up([Err("daemon gone")]);
+
+        let report = deploy::recover(
+            &docker,
+            &state,
+            &config.deployments()[0],
+            &f.compose,
+            &engine_options(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(report.outcome, Outcome::RollbackFailed { .. }));
+        assert_eq!(recover_exit_code(&report), EXIT_ROLLBACK_FAILED);
+    }
+
+    #[tokio::test]
+    async fn recover_with_nothing_interrupted_could_not_run() {
+        let f = fixture();
+        let config = load_config(&f.config_file).unwrap();
+        let err = deploy::recover(
+            &FakeDocker::new(),
+            &state_of(&f),
+            &config.deployments()[0],
+            &f.compose,
+            &engine_options(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DeployError::NothingToRecover(_)), "{err}");
+    }
+
+    #[test]
+    fn a_hung_blocking_thread_does_not_hold_up_the_exit() {
+        // Held until the test ends: the thread never finishes on its own.
+        let (_hold, hung) = mpsc::channel::<()>();
+        let started = Instant::now();
+        let output = block_on_bounded(
+            async {
+                drop(tokio::task::spawn_blocking(move || {
+                    let _ = hung.recv();
+                }));
+                7
+            },
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(output, 7);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+}

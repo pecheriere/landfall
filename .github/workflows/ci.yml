@@ -17,6 +17,8 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Plain `cargo test` has no time limit of its own.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,8 +30,22 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-features --locked
-      - name: Docker driver against the real Docker
-        run: cargo test -p landfall-agent --locked -- --ignored docker
+      - name: Docker driver and deploy engine against the real Docker
+        run: cargo test -p landfall-agent --all-features --locked -- --ignored docker
+      # Built as the runner's user, so nothing in target/ ends up root's; only
+      # the test binaries run as root. Without root these tests skip, which
+      # LANDFALL_TEST_REQUIRE_ROOT turns into a failure, and a filter matching
+      # nothing would pass, hence the count: one binary with safefs's, one with
+      # the end-to-end test.
+      - name: Foreign-owner tests as root
+        shell: bash
+        env:
+          LANDFALL_TEST_REQUIRE_ROOT: "1"
+        run: |
+          cargo test -p landfall-agent --all-features --locked \
+            --config "target.'cfg(unix)'.runner = ['sudo', '-E']" \
+            -- --include-ignored foreign_owner | tee "$RUNNER_TEMP/foreign-owner.txt"
+          test "$(grep -Ec '^test result: ok\. [1-9]' "$RUNNER_TEMP/foreign-owner.txt")" = 2
       - run: cargo doc --workspace --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings

@@ -105,6 +105,9 @@ it cannot make a host run a release that is not maintainer-signed, attested and 
 group (Docker socket access is root-equivalent; stated plainly in the docs), with systemd sandboxing
 (`ProtectSystem=strict`, `ReadWritePaths=` limited to the managed compose directories, its state and
 its backup directory, `NoNewPrivileges`). Not a container, so it can't be stopped by its own deploys.
+Files in backed-up directories belong to the users containers run as, so it holds `CAP_CHOWN`,
+`CAP_FOWNER`, `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` and `CAP_FSETID` as ambient capabilities, and its
+uid must not be shared with any container's. Linux 5.8 or later. See `docs/operations.md`.
 
 landfall never deploys landfall: the controller and agents are upgraded by hand in v0.
 
@@ -261,7 +264,23 @@ Each step recorded with timings and outcome:
    declared**, start, re-run checks, record, notify. A failed rollback is the loudest state:
    notified as critical and logged to the host journal.
 
-Rollback target is always the previously healthy digest.
+Rollback target is always the previously healthy digest. A rollback runs the deployment's checks on it
+too, and starts the service even if an operator had stopped it before the deploy.
+
+**First deploy.** With no override yet, the agent writes a placeholder that names no service, so a
+`COMPOSE_FILE` naming it works, and treats it as the previous state. If the base compose file gives the
+service an image, rollback starts that. If not, there is nothing to start: rollback stops the service, and
+the outcome is "failed, no previous version", not the critical failed rollback. Declared backup paths must
+exist by then: a missing one fails the backup.
+
+**Interrupted deploy.** Before changing anything the agent records that a deploy is in progress. While
+that record exists further deploys are refused, naming `landfall-agent recover`, which runs the rollback
+path, or finishes the deploy if it had already been recorded as done. So power loss never leaves a
+half-deployed service looking healthy. A failed rollback leaves the record in place, for the same reason.
+
+**One deployment per compose directory on a host** (validation rule 8 of the configuration): overrides and
+backups are per directory. The agent resolves each directory once at start-up and refuses to run if two
+deployments resolve to one directory.
 
 ### 7.3 Backup safety
 Backup directories are writable by the container, and the agent is root-equivalent. Snapshot and
@@ -270,7 +289,7 @@ crate) and preserve ownership and modes. Special files are refused.
 
 ### 7.4 Checks
 Checks are Rust types with typed parameters; configuration chooses and parameterises them, never adds
-code. v0: Docker healthcheck (fails if the image defines none), HTTP probe of the container on a Docker network and port,
+code. v0: Docker healthcheck (fails if the image defines none), HTTP probe of the container's address on a named Docker network and a required port, from the host, with no proxy and no redirects,
 command exit status inside the container, "no log line matching X in the first N seconds". Each check
 reports a short reason string used verbatim in the "why" view.
 

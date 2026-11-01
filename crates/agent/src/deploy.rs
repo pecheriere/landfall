@@ -470,6 +470,42 @@ pub async fn recover<D: Docker>(
     result
 }
 
+/// How a service's running image compares with the project's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Drift {
+    /// The running container's image, quoted and truncated: it is the
+    /// container's word. `None` when the service has no running container.
+    pub running_image: Option<String>,
+    /// Whether a container is running an image other than the one the project
+    /// resolves to, which is the override's on a service the agent deployed
+    /// (design 7.1). A service that isn't running has not drifted: stopping
+    /// one is an operator's call, and a deploy in progress stops it too.
+    pub drift: bool,
+}
+
+/// Compares the running image of `service` with the one its compose project
+/// in `dir` resolves to. A caller that also sees a deploy in progress knows
+/// that a difference is expected then. What the project resolves to comes from
+/// interpolated configuration and can hold a secret, so it is not returned.
+///
+/// # Errors
+///
+/// [`DockerError`] when the project or the container cannot be read.
+pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<Drift, DockerError> {
+    let resolved = docker.compose_service(dir, service).await?;
+    let Some(id) = docker.container(dir, service).await? else {
+        return Ok(Drift {
+            running_image: None,
+            drift: false,
+        });
+    };
+    let running = docker.inspect(&id).await?.image;
+    Ok(Drift {
+        drift: resolved.image.as_deref() != Some(running.as_str()),
+        running_image: Some(quote(&running)),
+    })
+}
+
 /// The largest override the agent reads. It writes far less; the file is in a
 /// directory others can write to.
 const OVERRIDE_CAP: usize = 1024 * 1024;
@@ -1571,8 +1607,8 @@ mod tests {
 
     use super::faults::{Fault, with_faults};
     use super::{
-        DeployError, DeployPlan, EngineOptions, Outcome, ReleaseOrigin, StepResult, recover, run,
-        timestamp_id,
+        DeployError, DeployPlan, EngineOptions, Outcome, ReleaseOrigin, StepResult, drift, recover,
+        run, timestamp_id,
     };
     use crate::checks::CheckOptions;
     use crate::compose::{self, OVERRIDE_FILE, PLACEHOLDER};
@@ -3718,6 +3754,59 @@ mod tests {
             );
         }
         assert_eq!(ids[0], "2026-01-02T03-04-05-000000000Z");
+    }
+
+    #[tokio::test]
+    async fn drift_is_reported() {
+        let f = fixture("");
+        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        f.docker.script_inspect([Ok(container(OLD, true))]);
+        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        assert!(seen.drift);
+        assert_eq!(seen.running_image, Some(format!("{OLD:?}")));
+    }
+
+    #[tokio::test]
+    async fn no_drift_when_images_match() {
+        let f = fixture("");
+        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        f.docker.script_inspect([Ok(container(PINNED, true))]);
+        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        assert!(!seen.drift);
+        assert_eq!(seen.running_image, Some(format!("{PINNED:?}")));
+    }
+
+    #[tokio::test]
+    async fn a_container_of_a_service_without_an_image_has_drifted() {
+        let f = fixture("");
+        f.docker.script_compose_service([Ok(image(None))]);
+        f.docker.script_inspect([Ok(container(PINNED, true))]);
+        assert!(drift(&f.docker, &f.dir, "app").await.unwrap().drift);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_service_has_not_drifted() {
+        let f = fixture("");
+        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        f.docker.script_container([Ok(None)]);
+        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        assert!(!seen.drift);
+        assert_eq!(seen.running_image, None);
+    }
+
+    #[tokio::test]
+    async fn a_hostile_image_name_is_quoted_and_truncated_by_drift() {
+        let f = fixture("");
+        f.docker.script_compose_service([Ok(image(Some(PINNED)))]);
+        let hostile = format!("evil\n{}", "x".repeat(4096));
+        f.docker.script_inspect([Ok(container(&hostile, true))]);
+        let shown = drift(&f.docker, &f.dir, "app")
+            .await
+            .unwrap()
+            .running_image
+            .unwrap();
+        assert!(shown.starts_with("\"evil\\n"), "{shown}");
+        assert!(shown.len() < 512, "{}", shown.len());
     }
 
     /// Against a real Docker daemon, as in `checks.rs`.
