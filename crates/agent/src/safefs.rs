@@ -40,12 +40,14 @@
 //! - A copy stops with a typed error past [`MAX_DEPTH`] levels or past
 //!   [`MAX_DIR_ENTRIES`] entries in one directory. Its memory is bounded by
 //!   those two numbers.
-//! - A removal finishes whatever the depth or size. It reads names in batches
-//!   of at most 4096, and at [`MAX_DEPTH`] levels it moves the
-//!   directory there up to the top of the removal, to be taken apart from
-//!   there, so a chain gets shorter on each pass. Its stack, descriptors and
-//!   memory stay bounded by those two numbers. It ends when nothing adds to
-//!   the tree faster than it removes, which is why a service is stopped first.
+//! - A removal is not stopped by depth or size. It reads names in batches of
+//!   at most 4096, and at [`MAX_DEPTH`] levels it moves the directory there up
+//!   to the top of the removal, to be taken apart from there, so a chain gets
+//!   shorter on each pass. Its stack, descriptors and memory stay bounded by
+//!   those two numbers. It always ends, unless something adds to the tree
+//!   faster than it removes, which is why a service is stopped first: a pass
+//!   over a directory either removes something, or finds it empty next time,
+//!   or ends in [`SafeFsError::RemovalStalled`].
 //!
 //! Either way only a chain of parent directories stays open, and data moves
 //! through one fixed buffer, never allocated from a size the container
@@ -68,9 +70,9 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 
-/// How deep a tree may go below its root. Past this a walk stops with
-/// [`SafeFsError::TooDeep`], so a deep tree can neither overflow the stack
-/// nor use up file descriptors.
+/// How deep a walk goes below where it started, so that a deep tree can neither
+/// overflow the stack nor use up file descriptors. Past this a copy stops with
+/// [`SafeFsError::TooDeep`], and a removal moves the directory up and goes on.
 pub const MAX_DEPTH: usize = 256;
 
 /// How many entries one directory may hold in a copy. Past this a walk stops
@@ -179,6 +181,14 @@ pub enum SafeFsError {
         path: PathBuf,
         /// The limit.
         limit: usize,
+    },
+    /// A removal found a directory it could not get any emptier: a pass over
+    /// it removed nothing and it still holds entries, or the directory an
+    /// entry had to move to is gone.
+    #[error("{} cannot be removed: no progress is possible", quoted(path))]
+    RemovalStalled {
+        /// The directory or entry.
+        path: PathBuf,
     },
     /// An entry the agent had just created is no longer what it created.
     #[error("{} was replaced while it was being created", quoted(path))]
@@ -559,6 +569,8 @@ pub fn read_file(root: &Root, name: &RelPath, cap: usize) -> Result<Option<Vec<u
         FileType::Symlink => return Err(SafeFsError::SymlinkRefused { path }),
         _ => return Err(SafeFsError::NotRegularFile { path }),
     }
+    #[cfg(test)]
+    seam::run(seam::Point::LstatToOpen, &name.name);
     let fd = match openat(&parent, &name.name, OPEN_ANY, Mode::empty()) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Ok(None),
@@ -600,8 +612,11 @@ pub fn read_file(root: &Root, name: &RelPath, cap: usize) -> Result<Option<Vec<u
 /// directory, [`SafeFsError::TooDeep`] past [`MAX_DEPTH`],
 /// [`SafeFsError::TooManyEntries`] past [`MAX_DIR_ENTRIES`] in a directory,
 /// [`SafeFsError::SymlinkRefused`] when an entry becomes a symlink as it is
-/// opened, [`SafeFsError::OverlappingPaths`] when one path contains another,
-/// [`SafeFsError::AlreadyExists`] when `dest` exists, and [`SafeFsError::Io`].
+/// opened, [`SafeFsError::Replaced`] when a new symlink is swapped for
+/// something else, [`SafeFsError::OverlappingPaths`] when one path contains
+/// another, [`SafeFsError::AlreadyExists`] when `dest` exists,
+/// [`SafeFsError::RemovalStalled`] when a leftover `.partial` cannot be
+/// removed, and [`SafeFsError::Io`].
 pub fn snapshot(
     source: &Root,
     paths: &[RelPath],
@@ -689,6 +704,8 @@ fn snapshot_limited(
 ///
 /// [`SafeFsError::Missing`] when the snapshot lacks a path,
 /// [`SafeFsError::OverlappingPaths`] when one path contains another,
+/// [`SafeFsError::Replaced`] when a new symlink is swapped for something else,
+/// [`SafeFsError::RemovalStalled`] when what is there cannot be removed,
 /// [`SafeFsError::TooDeep`] and [`SafeFsError::TooManyEntries`] for a snapshot
 /// past the limits, which [`snapshot`] does not make, and [`SafeFsError::Io`].
 /// A failure part-way leaves the paths already restored in place and the rest
@@ -728,8 +745,9 @@ pub fn restore(snapshot: &Path, target: &Root, paths: &[RelPath]) -> Result<(), 
 /// # Errors
 ///
 /// [`SafeFsError::TooManyEntries`] when `backups` holds more than
-/// [`MAX_DIR_ENTRIES`] entries and [`SafeFsError::Io`], from reading `backups`
-/// or removing an entry.
+/// [`MAX_DIR_ENTRIES`] entries, [`SafeFsError::RemovalStalled`] when an entry
+/// cannot be removed, and [`SafeFsError::Io`], from reading `backups` or
+/// removing an entry.
 pub fn prune(backups: &Path, keep: usize) -> Result<(), SafeFsError> {
     let root = match Root::open(backups) {
         Ok(root) => root,
@@ -826,33 +844,44 @@ fn read_all_names(
 /// A directory swapped for a symlink mid-walk fails the open, and the symlink
 /// is what gets removed. One swapped the other way fails the `unlinkat`.
 fn remove_entry(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<(), SafeFsError> {
-    let Some(dir) = open_or_unlink(parent, name, path)? else {
-        return Ok(());
-    };
-    let mut deep_moved = 0;
-    empty_dir(dir.as_fd(), dir.as_fd(), path, 1, &mut deep_moved)?;
-    drop(dir);
-    remove_dir(parent, name, path)
+    if let Found::Dir(dir) = open_or_unlink(parent, name, path)? {
+        let mut deep_moved = 0;
+        empty_dir(dir.as_fd(), dir.as_fd(), path, 1, &mut deep_moved)?;
+        drop(dir);
+        remove_dir(parent, name, path)?;
+    }
+    Ok(())
 }
 
-/// Opens `name` if it is a real directory. Anything else is removed here, and
-/// there is nothing more to do.
-fn open_or_unlink(
-    parent: BorrowedFd<'_>,
-    name: &CStr,
-    path: &Path,
-) -> Result<Option<OwnedFd>, SafeFsError> {
+/// What a removal found at a name.
+enum Found {
+    /// A real directory, still to be emptied and removed.
+    Dir(OwnedFd),
+    /// Anything else, which is now removed.
+    Removed,
+    /// Nothing: something else removed it first.
+    Absent,
+}
+
+/// Opens `name` if it is a real directory, and removes it if it is not.
+fn open_or_unlink(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<Found, SafeFsError> {
     match open_dir(parent, name) {
-        Ok(dir) => Ok(Some(dir)),
-        Err(Errno::NOENT) => Ok(None),
-        Err(Errno::NOTDIR | Errno::LOOP) => remove_file(parent, name, path).map(|()| None),
+        Ok(dir) => Ok(Found::Dir(dir)),
+        Err(Errno::NOENT) => Ok(Found::Absent),
+        Err(Errno::NOTDIR | Errno::LOOP) => match unlinkat(parent, name, AtFlags::empty()) {
+            Ok(()) => Ok(Found::Removed),
+            Err(Errno::NOENT) => Ok(Found::Absent),
+            Err(errno) => Err(io_err("remove", path)(errno)),
+        },
         Err(errno) => Err(io_err("open directory", path)(errno)),
     }
 }
 
-fn remove_dir(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<(), SafeFsError> {
+/// Says whether this call is what removed it.
+fn remove_dir(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<bool, SafeFsError> {
     match unlinkat(parent, name, AtFlags::REMOVEDIR) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
         Err(errno) => Err(io_err("remove directory", path)(errno)),
     }
 }
@@ -865,6 +894,10 @@ fn remove_dir(parent: BorrowedFd<'_>, name: &CStr, path: &Path) -> Result<(), Sa
 /// there are none, finds it there, now near the top of the walk. So nothing
 /// has to be remembered, whatever the number of such directories, and a crash
 /// leaves them inside what was being removed.
+///
+/// So that this always ends, a pass that removed nothing has to be followed by
+/// an empty directory. One such pass is not an error in itself: all the names
+/// it read can have been removed by something else first.
 fn empty_dir(
     top: BorrowedFd<'_>,
     dir: BorrowedFd<'_>,
@@ -872,43 +905,69 @@ fn empty_dir(
     depth: usize,
     deep_moved: &mut u64,
 ) -> Result<(), SafeFsError> {
+    let mut removed_any = true;
     loop {
         let batch = read_names(dir, path, REMOVAL_BATCH)?;
         if batch.is_empty() {
             return Ok(());
         }
+        if !removed_any {
+            return Err(SafeFsError::RemovalStalled {
+                path: path.to_owned(),
+            });
+        }
+        removed_any = false;
         for child in &batch {
             let child_path = path.join(name_path(child));
-            let Some(child_dir) = open_or_unlink(dir, child, &child_path)? else {
-                continue;
+            #[cfg(test)]
+            seam::run(seam::Point::RemovalOpen, child);
+            removed_any |= match open_or_unlink(dir, child, &child_path)? {
+                Found::Removed => true,
+                Found::Absent => false,
+                Found::Dir(child_dir) if depth >= MAX_DEPTH => {
+                    drop(child_dir);
+                    move_to_top(top, dir, child, &child_path, deep_moved)?
+                }
+                Found::Dir(child_dir) => {
+                    empty_dir(top, child_dir.as_fd(), &child_path, depth + 1, deep_moved)?;
+                    drop(child_dir);
+                    remove_dir(dir, child, &child_path)?
+                }
             };
-            if depth >= MAX_DEPTH {
-                drop(child_dir);
-                move_to_top(top, dir, child, &child_path, deep_moved)?;
-            } else {
-                empty_dir(top, child_dir.as_fd(), &child_path, depth + 1, deep_moved)?;
-                drop(child_dir);
-                remove_dir(dir, child, &child_path)?;
-            }
         }
     }
 }
 
-/// Moves `name` into `top` under a name not in use. A taken name can have been
-/// planted, so the next one is tried; an empty directory or a stray file being
-/// replaced by this is fine, as all of `top` is being removed.
+/// Moves `name` into `top` under a name not in use, and says whether this call
+/// is what moved it. A taken name can have been planted, so the next one is
+/// tried; an empty directory or a stray file being replaced by this is fine,
+/// as all of `top` is being removed.
+///
+/// `ENOENT` has two meanings here: `name` is gone, which is what was wanted,
+/// or `top` is gone, and then `name` can never move.
 fn move_to_top(
     top: BorrowedFd<'_>,
     dir: BorrowedFd<'_>,
     name: &CStr,
     path: &Path,
     deep_moved: &mut u64,
-) -> Result<(), SafeFsError> {
+) -> Result<bool, SafeFsError> {
+    #[cfg(test)]
+    seam::run(seam::Point::MoveUp, name);
     loop {
         let fresh = format!("{DEEP_PREFIX}{deep_moved}");
         *deep_moved = deep_moved.saturating_add(1);
         match renameat(dir, name, top, fresh.as_str()) {
-            Ok(()) | Err(Errno::NOENT) => return Ok(()),
+            Ok(()) => return Ok(true),
+            Err(Errno::NOENT) => {
+                return match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(_) => Err(SafeFsError::RemovalStalled {
+                        path: path.to_owned(),
+                    }),
+                    Err(Errno::NOENT) => Ok(false),
+                    Err(errno) => Err(io_err("inspect", path)(errno)),
+                };
+            }
             Err(Errno::NOTEMPTY | Errno::EXIST | Errno::NOTDIR | Errno::ISDIR) => {}
             Err(errno) => return Err(io_err("move up", path)(errno)),
         }
@@ -1157,7 +1216,7 @@ impl<'a> Copier<'a> {
         symlinkat(target.as_c_str(), dst_parent, name).map_err(io_err("create", &dst_path))?;
         #[cfg(test)]
         seam::run(seam::Point::SymlinkCreated, name);
-        apply_symlink_metadata(dst_parent, name, stat, &dst_path)?;
+        apply_symlink_metadata(dst_parent, name, target.as_c_str(), stat, &dst_path)?;
         self.stats.symlinks += 1;
         Ok(())
     }
@@ -1206,17 +1265,14 @@ fn apply_metadata(fd: BorrowedFd<'_>, from: &Stat, path: &Path) -> Result<(), Sa
 fn apply_symlink_metadata(
     parent: BorrowedFd<'_>,
     name: &CStr,
+    target: &CStr,
     from: &Stat,
     path: &Path,
 ) -> Result<(), SafeFsError> {
     let flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let link = openat(parent, name, flags, Mode::empty()).map_err(io_err("open", path))?;
     let current = fstat(&link).map_err(io_err("inspect", path))?;
-    if FileType::from_raw_mode(current.st_mode) != FileType::Symlink {
-        return Err(SafeFsError::Replaced {
-            path: path.to_owned(),
-        });
-    }
+    check_new_symlink(link.as_fd(), c"", target, &current, path)?;
     let flags = AtFlags::EMPTY_PATH | AtFlags::SYMLINK_NOFOLLOW;
     set_symlink_metadata(link.as_fd(), c"", flags, &current, from, path)
 }
@@ -1228,12 +1284,36 @@ fn apply_symlink_metadata(
 fn apply_symlink_metadata(
     parent: BorrowedFd<'_>,
     name: &CStr,
+    target: &CStr,
     from: &Stat,
     path: &Path,
 ) -> Result<(), SafeFsError> {
     let flags = AtFlags::SYMLINK_NOFOLLOW;
     let current = statat(parent, name, flags).map_err(io_err("inspect", path))?;
+    check_new_symlink(parent, name, target, &current, path)?;
     set_symlink_metadata(parent, name, flags, &current, from, path)
+}
+
+/// Confirms that an entry is the symlink just created, not one swapped in: it
+/// has the target just written, and no other name that would also be changed.
+fn check_new_symlink(
+    dir: BorrowedFd<'_>,
+    name: &CStr,
+    target: &CStr,
+    current: &Stat,
+    path: &Path,
+) -> Result<(), SafeFsError> {
+    let replaced = || SafeFsError::Replaced {
+        path: path.to_owned(),
+    };
+    if FileType::from_raw_mode(current.st_mode) != FileType::Symlink || current.st_nlink != 1 {
+        return Err(replaced());
+    }
+    let written = readlinkat(dir, name, Vec::new()).map_err(io_err("read", path))?;
+    if written.as_c_str() != target {
+        return Err(replaced());
+    }
+    Ok(())
 }
 
 fn set_symlink_metadata(
@@ -1291,6 +1371,10 @@ mod seam {
         LstatToOpen,
         /// A symlink has been created and its metadata is about to be set.
         SymlinkCreated,
+        /// A removal has read a name and is about to open it.
+        RemovalOpen,
+        /// A removal is about to move a directory up.
+        MoveUp,
     }
 
     type Hook = Box<dyn FnMut(Point, &CStr)>;
@@ -1329,8 +1413,9 @@ mod tests {
     };
 
     use super::{
-        MAX_DEPTH, REMOVAL_BATCH, RelPath, Root, SafeFsError, move_to_top, prune, read_file,
-        restore, seam, snapshot, snapshot_limited, temp_name, write_atomic,
+        MAX_DEPTH, REMOVAL_BATCH, RelPath, Root, SafeFsError, empty_dir, move_to_top, prune,
+        read_file, remove_entry, restore, seam, snapshot, snapshot_limited, temp_name,
+        write_atomic,
     };
 
     const SECRET: &[u8] = b"sentinel content, must not be copied";
@@ -1389,9 +1474,9 @@ mod tests {
         let parent = fs::symlink_metadata(dir.parent().unwrap()).unwrap();
         for entry in [dir.to_owned(), dir.join("keep")] {
             let seen = fs::symlink_metadata(&entry).unwrap();
-            assert_eq!(seen.mtime(), SENTINEL_MTIME, "{entry:?}");
             assert_eq!(seen.uid(), parent.uid(), "{entry:?}");
             assert_eq!(seen.gid(), parent.gid(), "{entry:?}");
+            assert_eq!(seen.mtime(), SENTINEL_MTIME, "{entry:?}");
         }
         assert_eq!(mode(dir), 0o755);
         assert_eq!(fs::read(dir.join("keep")).unwrap(), SECRET);
@@ -1900,6 +1985,101 @@ mod tests {
         assert!(top.join(".landfall-deep-1/full").is_dir());
     }
 
+    /// A directory at the depth limit, in a directory `top` of its own, with
+    /// that directory opened and `top` already removed if `remove_top`.
+    fn deep_child(tmp: &Path, remove_top: bool) -> (Root, Root, PathBuf) {
+        let top = tmp.join("top");
+        mkdir(&top, 0o755);
+        let dir = tmp.join("dir");
+        fs::create_dir_all(dir.join("deep/inside")).unwrap();
+        let (top_root, dir_root) = (root(&top), root(&dir));
+        if remove_top {
+            fs::remove_dir(&top).unwrap();
+        }
+        (top_root, dir_root, dir)
+    }
+
+    #[test]
+    fn removal_errors_when_the_top_directory_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (top, dir, dir_path) = deep_child(tmp.path(), true);
+        let (top, dir) = (top.fd.as_fd(), dir.fd.as_fd());
+        let deep = dir_path.join("deep");
+
+        let err = move_to_top(top, dir, c"deep", &deep, &mut 0).unwrap_err();
+        assert!(matches!(err, SafeFsError::RemovalStalled { .. }), "{err}");
+
+        let err = empty_dir(top, dir, &dir_path, MAX_DEPTH, &mut 0).unwrap_err();
+        assert!(matches!(err, SafeFsError::RemovalStalled { .. }), "{err}");
+        assert!(err.to_string().contains("deep"), "{err}");
+        assert!(deep.join("inside").is_dir());
+    }
+
+    #[test]
+    fn deep_directory_vanishing_before_its_move_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (top, dir, dir_path) = deep_child(tmp.path(), false);
+        let deep = dir_path.join("deep");
+        let gone = deep.clone();
+        seam::set(move |point, name| {
+            if point == seam::Point::MoveUp && name == c"deep" {
+                fs::remove_dir_all(&gone).unwrap();
+            }
+        });
+
+        let (top_fd, dir_fd) = (top.fd.as_fd(), dir.fd.as_fd());
+        let moved = move_to_top(top_fd, dir_fd, c"deep", &deep, &mut 0).unwrap();
+        assert!(!moved);
+
+        fs::create_dir_all(&deep).unwrap();
+        empty_dir(top_fd, dir_fd, &dir_path, MAX_DEPTH, &mut 0).unwrap();
+        assert_eq!(fs::read_dir(&dir_path).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(top.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn entry_vanishing_during_removal_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        mkdir(&dir, 0o755);
+        write(&dir.join("file"), b"x", 0o644);
+        let file = dir.join("file");
+        seam::set(move |point, _| {
+            if point == seam::Point::RemovalOpen {
+                fs::remove_file(&file).unwrap();
+            }
+        });
+
+        remove_entry(root(tmp.path()).fd.as_fd(), c"dir", &dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// Every name listed is gone when it is opened, yet the directory never
+    /// empties. This would spin forever if a pass removing nothing were
+    /// accepted, so the hook gives up by panicking.
+    #[test]
+    fn removal_errors_when_a_pass_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dir");
+        mkdir(&dir, 0o755);
+        write(&dir.join("0"), b"x", 0o644);
+        let listed = dir.clone();
+        let mut renames = 0;
+        seam::set(move |point, name| {
+            if point == seam::Point::RemovalOpen {
+                renames += 1;
+                assert!(renames < 100, "the removal does not stop");
+                let from = listed.join(name.to_str().unwrap());
+                fs::rename(from, listed.join(renames.to_string())).unwrap();
+            }
+        });
+
+        let err = remove_entry(root(tmp.path()).fd.as_fd(), c"dir", &dir).unwrap_err();
+
+        assert!(matches!(err, SafeFsError::RemovalStalled { .. }), "{err}");
+        assert!(err.to_string().contains("dir"), "{err}");
+    }
+
     #[test]
     fn restore_clears_a_directory_larger_than_a_batch() {
         restore_after(|data| {
@@ -1960,17 +2140,160 @@ mod tests {
         assert_eq!(mtime(&data.join("link")), 1_600_000_000);
     }
 
-    /// An entry swapped in for a new symlink, a hard link to an outside file
-    /// here, must not receive the symlink's owner and times.
-    #[cfg(target_os = "linux")]
+    /// A snapshot of one symlink, where `swap` replaces the new copy of it
+    /// before its metadata is set.
+    fn snapshot_with_new_symlink_swapped(
+        tmp: &Path,
+        swap: impl Fn(&Path) + 'static,
+    ) -> Result<(), SafeFsError> {
+        let compose = tmp.join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        symlink("elsewhere", data.join("link")).unwrap();
+
+        let created = tmp.join("snap.partial/data/link");
+        seam::set(move |point, name| {
+            if point == seam::Point::SymlinkCreated && name == c"link" {
+                fs::remove_file(&created).unwrap();
+                swap(&created);
+            }
+        });
+        let dest = tmp.join("snap");
+        let result = snapshot(&root(&compose), &[rel("data")], &dest).map(|_| ());
+        assert_eq!(result.is_err(), !dest.exists());
+        result
+    }
+
+    /// An entry swapped in for a new symlink, here a hard link to an outside
+    /// file, must not receive the symlink's owner and times.
     #[test]
     fn symlink_replaced_before_its_metadata_is_set_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = sentinel(tmp.path());
+        let keep = outside.join("keep");
+
+        let err = snapshot_with_new_symlink_swapped(tmp.path(), move |created| {
+            fs::hard_link(&keep, created).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, SafeFsError::Replaced { .. }), "{err}");
+        assert_sentinel_untouched(&outside);
+    }
+
+    #[test]
+    fn symlink_replaced_by_another_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let err = snapshot_with_new_symlink_swapped(tmp.path(), |created| {
+            symlink("planted", created).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, SafeFsError::Replaced { .. }), "{err}");
+    }
+
+    /// A hard link to another symlink with the same target looks like the new
+    /// one in every way but its link count. Only Linux: there, `link` makes a
+    /// hard link to the symlink itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_replaced_by_a_hard_link_to_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        symlink("elsewhere", &other).unwrap();
+
+        let err = snapshot_with_new_symlink_swapped(tmp.path(), move |created| {
+            fs::hard_link(&other, created).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, SafeFsError::Replaced { .. }), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    const FOREIGN_UID: u32 = 1234;
+    #[cfg(target_os = "linux")]
+    const FOREIGN_GID: u32 = 2345;
+
+    #[cfg(target_os = "linux")]
+    #[expect(
+        clippy::print_stderr,
+        reason = "a test skipped for lack of privileges has to say so; libtest has no runtime skip"
+    )]
+    fn can_chown(test: &str) -> bool {
+        let root = rustix::process::geteuid().is_root();
+        if !root {
+            eprintln!("{test}: skipped, it needs root to give a file another owner");
+        }
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owner(path: &Path) -> (u32, u32) {
+        let seen = fs::symlink_metadata(path).unwrap();
+        (seen.uid(), seen.gid())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_owner_survives_the_round_trip() {
+        use std::os::unix::fs::{chown, lchown};
+
+        if !can_chown("foreign_owner_survives_the_round_trip") {
+            return;
+        }
+        let foreign = (FOREIGN_UID, FOREIGN_GID);
+        let ids = (Some(FOREIGN_UID), Some(FOREIGN_GID));
+        let tmp = tempfile::tempdir().unwrap();
+        let compose = tmp.path().join("compose");
+        let data = compose.join("data");
+        fs::create_dir_all(&data).unwrap();
+        let (file, tool, link) = (data.join("file"), data.join("tool"), data.join("link"));
+        write(&file, b"x", 0o640);
+        write(&tool, b"x", 0o644);
+        symlink("elsewhere", &link).unwrap();
+        chown(&file, ids.0, ids.1).unwrap();
+        chown(&tool, ids.0, ids.1).unwrap();
+        lchown(&link, ids.0, ids.1).unwrap();
+        chown(&data, ids.0, ids.1).unwrap();
+        // After the `chown`, which would clear it.
+        fs::set_permissions(&tool, Permissions::from_mode(0o4755)).unwrap();
+
+        let dest = tmp.path().join("snap");
+        snapshot(&root(&compose), &[rel("data")], &dest).unwrap();
+        for name in ["data", "data/file", "data/tool", "data/link"] {
+            assert_eq!(owner(&dest.join(name)), foreign, "{name}");
+        }
+        assert_eq!(mode(&dest.join("data/tool")), 0o4755);
+
+        fs::remove_dir_all(&data).unwrap();
+        restore(&dest, &root(&compose), &[rel("data")]).unwrap();
+        for path in [&data, &file, &tool, &link] {
+            assert_eq!(owner(path), foreign, "{path:?}");
+        }
+        assert_eq!(mode(&tool), 0o4755);
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("elsewhere"));
+    }
+
+    /// With a foreign owner to hand on, a swapped-in entry receiving it would
+    /// show: this is what makes the owner check of the sentinel able to fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn foreign_owner_does_not_reach_an_entry_swapped_in() {
+        use std::os::unix::fs::lchown;
+
+        if !can_chown("foreign_owner_does_not_reach_an_entry_swapped_in") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let outside = sentinel(tmp.path());
         let compose = tmp.path().join("compose");
         let data = compose.join("data");
         fs::create_dir_all(&data).unwrap();
-        symlink("elsewhere", data.join("link")).unwrap();
+        let link = data.join("link");
+        symlink("elsewhere", &link).unwrap();
+        lchown(&link, Some(FOREIGN_UID), Some(FOREIGN_GID)).unwrap();
 
         let created = tmp.path().join("snap.partial/data/link");
         let keep = outside.join("keep");
@@ -1980,12 +2303,11 @@ mod tests {
                 fs::hard_link(&keep, &created).unwrap();
             }
         });
-        let dest = tmp.path().join("snap");
-        let err = snapshot(&root(&compose), &[rel("data")], &dest).unwrap_err();
+        let result = snapshot(&root(&compose), &[rel("data")], &tmp.path().join("snap"));
 
-        assert!(matches!(err, SafeFsError::Replaced { .. }), "{err}");
-        assert!(!dest.exists());
         assert_sentinel_untouched(&outside);
+        let err = result.unwrap_err();
+        assert!(matches!(err, SafeFsError::Replaced { .. }), "{err}");
     }
 
     /// Only Linux: other filesystems, like APFS, refuse such a name.
@@ -2183,6 +2505,50 @@ mod tests {
         assert_eq!(read_file(&compose_root, &rel("no/such"), 5).unwrap(), None);
         let err = read_file(&compose_root, &rel("file"), 4).unwrap_err();
         assert!(matches!(err, SafeFsError::TooLarge { .. }), "{err}");
+    }
+
+    /// Reads a file that `swap` replaces between `lstat` and open.
+    fn read_with_swap_in_open_window(
+        tmp: &Path,
+        swap: impl Fn(&Path) + 'static,
+    ) -> Result<Option<Vec<u8>>, SafeFsError> {
+        let compose = tmp.join("compose");
+        mkdir(&compose, 0o755);
+        let file = compose.join("file");
+        write(&file, b"ordinary", 0o644);
+        seam::set(move |point, name| {
+            if point == seam::Point::LstatToOpen && name == c"file" {
+                fs::remove_file(&file).unwrap();
+                swap(&file);
+            }
+        });
+        read_file(&root(&compose), &rel("file"), 1024)
+    }
+
+    #[test]
+    fn read_file_refuses_a_fifo_swapped_in_the_open_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = read_with_swap_in_open_window(tmp.path(), mkfifo).unwrap_err();
+        assert!(matches!(err, SafeFsError::NotRegularFile { .. }), "{err}");
+    }
+
+    #[test]
+    fn read_file_refuses_a_symlink_swapped_in_the_open_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = sentinel(tmp.path());
+        let keep = outside.join("keep");
+        let err = read_with_swap_in_open_window(tmp.path(), move |file| {
+            symlink(&keep, file).unwrap();
+        })
+        .unwrap_err();
+        assert!(matches!(err, SafeFsError::SymlinkRefused { .. }), "{err}");
+    }
+
+    #[test]
+    fn read_file_of_an_entry_vanishing_in_the_open_window_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = read_with_swap_in_open_window(tmp.path(), |_| {}).unwrap();
+        assert_eq!(content, None);
     }
 
     #[test]
