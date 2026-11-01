@@ -1,0 +1,12 @@
+object 7160f743d0664e041913065355d7bcd291ad2a01
+type commit
+tag v1.2.3
+tagger maintainer <maintainer@example.invalid> 1767225600 +0000
+
+release v1.2.3
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg+WWveuEA80hkPhbSMGT8uUskVk
+ieKxxLqVkIxkLHM4YAAAAEZmlsZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx
+OQAAAEDz66hTCAbAPOL9aMyMKwajz6DGn007d82gbO5/DfH+AvNfBEqyxSIryNjC/BoduH
+Wa2o7XHomKcas+ys3p++8G
+-----END SSH SIGNATURE-----

@@ -1,0 +1,12 @@
+object 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+type tree
+tag v1.2.3
+tagger maintainer <maintainer@example.invalid> 1767225600 +0000
+
+release v1.2.3
+-----BEGIN SSH SIGNATURE-----
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg+WWveuEA80hkPhbSMGT8uUskVk
+ieKxxLqVkIxkLHM4YAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5
+AAAAQEday0JhLoxOy3Zblxwsn+3nZuo7b7MgFsbzyYYb08tgvBoRdtE4o8QGQrj7oEp2t1
+sErxkCMn0e8o9xZovG7A0=
+-----END SSH SIGNATURE-----

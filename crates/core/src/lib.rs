@@ -7,3 +7,4 @@ mod hex;
 pub mod ids;
 pub mod intent;
 pub mod rule;
+pub mod tag;

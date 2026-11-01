@@ -36,6 +36,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod raw;
+mod signer;
+
+pub use signer::SignerKey;
 
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 
@@ -67,6 +70,14 @@ pub enum ConfigError {
     /// Rule 1: two deployments share an id.
     #[error("deployment id {0} is defined more than once")]
     DuplicateDeployment(DeploymentId),
+    /// A `[signers]` value is not a usable tag-signing key.
+    #[error("signer {signer}: {reason}")]
+    InvalidSigner {
+        /// The signer's name in `[signers]`.
+        signer: PrincipalId,
+        /// Why the key is refused.
+        reason: String,
+    },
     /// Rule 2: an origin signer is not in `[signers]`.
     #[error("deployment {deployment}: origin signer {signer} is not in [signers]")]
     UnknownSigner {
@@ -75,6 +86,11 @@ pub enum ConfigError {
         /// The unknown signer.
         signer: PrincipalId,
     },
+    /// Rule 2: `origin.signers` is listed although `origin.signed_tags` is off.
+    #[error(
+        "deployment {0}: origin.signers is set but origin.signed_tags is false; remove the signers or turn signed_tags on"
+    )]
+    SignersWithoutSignedTags(DeploymentId),
     /// Rule 2: an origin has no signers.
     #[error("deployment {0}: origin.signers is empty; list at least one signer")]
     NoSigners(DeploymentId),
@@ -206,8 +222,8 @@ impl fmt::Display for Chain<'_> {
 /// and has no mutators, so every value in it passed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Trusted tag-signing keys, by name (SSH public key text).
-    signers: BTreeMap<PrincipalId, String>,
+    /// Trusted tag-signing keys, by name.
+    signers: BTreeMap<PrincipalId, SignerKey>,
     /// Passkey approvers, by name.
     approvers: BTreeMap<PrincipalId, Approver>,
     /// Every deployment, in file order.
@@ -219,6 +235,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// The tag-signing key named `id` in `[signers]`.
+    #[must_use]
+    pub fn signer(&self, id: &PrincipalId) -> Option<&SignerKey> {
+        self.signers.get(id)
+    }
+
     /// The deployment with this id.
     #[must_use]
     pub fn deployment(&self, id: &DeploymentId) -> Option<&Deployment> {
@@ -293,7 +315,10 @@ pub struct Origin {
     workflow: String,
     /// Which tags are releases.
     tags: TagPattern,
-    /// Trusted signers, each a key of `[signers]`; non-empty.
+    /// Whether the release tag must carry a trusted signer's signature.
+    signed_tags: bool,
+    /// Trusted signers, each a key of `[signers]`; non-empty exactly when
+    /// `signed_tags` is on.
     signers: Vec<PrincipalId>,
 }
 
@@ -427,7 +452,7 @@ macro_rules! getters {
 
 getters!(Config, c {
     /// Trusted tag-signing keys, by name.
-    signers: &BTreeMap<PrincipalId, String> => &c.signers,
+    signers: &BTreeMap<PrincipalId, SignerKey> => &c.signers,
     /// Passkey approvers, by name.
     approvers: &BTreeMap<PrincipalId, Approver> => &c.approvers,
     /// Every deployment, in file order.
@@ -483,7 +508,10 @@ getters!(Origin, o {
     workflow: &str => &o.workflow,
     /// Which tags are releases.
     tags: &TagPattern => &o.tags,
-    /// Trusted signers; each exists in `[signers]`, never empty.
+    /// Whether the release tag must be signed by one of `signers`.
+    signed_tags: bool => o.signed_tags,
+    /// Trusted signers; each exists in `[signers]`; empty exactly when
+    /// `signed_tags` is off.
     signers: &[PrincipalId] => &o.signers,
 });
 getters!(Rule, r {
@@ -542,8 +570,11 @@ pub fn parse(bytes: &[u8]) -> Result<Config, ConfigError> {
 /// Rules 2 to 6 for one deployment (the chain check in rule 6 is separate).
 fn validate_deployment(config: &Config, d: &Deployment) -> Result<(), ConfigError> {
     // Rule 2.
-    if d.origin.signers.is_empty() {
+    if d.origin.signed_tags && d.origin.signers.is_empty() {
         return Err(ConfigError::NoSigners(d.id.clone()));
+    }
+    if !d.origin.signed_tags && !d.origin.signers.is_empty() {
+        return Err(ConfigError::SignersWithoutSignedTags(d.id.clone()));
     }
     if let Some(signer) = d
         .origin
@@ -710,7 +741,7 @@ mod tests {
 
     const EXAMPLE: &str = r#"
 [signers]
-maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly"
+maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPllr3rhAPNIZD4W0jBk/LlLJFZIniscS6lZCMZCxzOG"
 
 [approvers]
 operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
@@ -752,6 +783,105 @@ can = ["view", "request", "approve", "rollback"]
     fn edited(from: &str, to: &str) -> String {
         assert!(EXAMPLE.contains(from), "fixture lacks {from:?}");
         EXAMPLE.replacen(from, to, 1)
+    }
+
+    fn fixture_key(file: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/tag/{file}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    }
+
+    fn with_signer(value: &str) -> String {
+        EXAMPLE.replacen(
+            &format!("maintainer = {:?}", fixture_key("signer.pub").trim_end()),
+            &format!("maintainer = {value:?}"),
+            1,
+        )
+    }
+
+    #[test]
+    fn signer_keys_are_parsed() {
+        let config = parse_str(EXAMPLE).unwrap();
+        let maintainer: PrincipalId = "maintainer".parse().unwrap();
+        let key = config.signer(&maintainer).unwrap();
+        assert_eq!(
+            key.fingerprint(),
+            "SHA256:gdcqb1DcL2Rv7xn5I2LqM0wcjbk377gXNansYwAXoDQ"
+        );
+        assert!(config.signer(&"nobody".parse().unwrap()).is_none());
+
+        // The comment is ignored: the same key with one is the same key.
+        let commented = with_signer(&format!(
+            "{} laptop key",
+            fixture_key("signer.pub").trim_end()
+        ));
+        let other = parse_str(&commented).unwrap();
+        assert_eq!(other.signer(&maintainer), Some(key));
+    }
+
+    #[test]
+    fn non_ed25519_signer_is_rejected() {
+        let err = parse_str(&with_signer(&fixture_key("ecdsa.pub"))).unwrap_err();
+        let ConfigError::InvalidSigner { signer, reason } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(signer.to_string(), "maintainer");
+        assert!(reason.contains("ecdsa-sha2-nistp256"), "{reason}");
+    }
+
+    #[test]
+    fn garbage_signer_is_rejected() {
+        for garbage in [
+            "",
+            "not a key",
+            "ssh-ed25519",
+            "ssh-ed25519 AAAA",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly",
+        ] {
+            let err = parse_str(&with_signer(garbage)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidSigner { signer, .. } if signer.to_string() == "maintainer"),
+                "{garbage:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_tags_defaults_to_true() {
+        let config = parse_str(EXAMPLE).unwrap();
+        let prod = config.deployment(&id("app/prod")).unwrap();
+        assert!(prod.origin().signed_tags());
+    }
+
+    #[test]
+    fn unsigned_deployment_needs_no_signers() {
+        let text = edited(
+            "tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
+            "tags = \"v*\", signed_tags = false }\nrule = { auto = \"patch\"",
+        );
+        let config = parse_str(&text).unwrap();
+        let prod = config.deployment(&id("app/prod")).unwrap();
+        assert!(!prod.origin().signed_tags());
+        assert_eq!(prod.origin().signers(), &[]);
+        // signed_tags on (the default) still needs signers.
+        let err = parse_str(&edited(
+            "signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
+            "signed_tags = true }\nrule = { auto = \"patch\"",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::NoSigners(_)), "{err}");
+    }
+
+    #[test]
+    fn signers_with_signed_tags_off_is_rejected() {
+        let err = parse_str(&edited(
+            "signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
+            "signers = [\"maintainer\"], signed_tags = false }\nrule = { auto = \"patch\"",
+        ))
+        .unwrap_err();
+        assert_eq!(err, ConfigError::SignersWithoutSignedTags(id("app/prod")));
     }
 
     #[test]

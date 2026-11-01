@@ -13,7 +13,7 @@ Every table is strict: an unknown key is an error, never ignored.
 
 ```toml
 [signers]
-maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly"
+maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPllr3rhAPNIZD4W0jBk/LlLJFZIniscS6lZCMZCxzOG"
 
 [approvers]
 operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
@@ -49,6 +49,20 @@ can = ["view", "request", "approve", "rollback"]
 A table of `name = "<ssh public key>"`. Names are `[a-z0-9][a-z0-9-]{0,62}`.
 These are the keys allowed to sign release tags.
 
+Only `ssh-ed25519` keys are supported; any other key type is a configuration
+error naming the signer. The value is the contents of the key's `.pub` file
+(for example `~/.ssh/id_ed25519.pub`); a trailing comment is ignored. Sign
+release tags with `git tag -s` and `gpg.format = ssh`.
+
+### `origin.signed_tags = false`
+
+With `signed_tags = false` landfall does not check who signed the tag. The
+build attestation alone then binds the image to the release workflow and
+commit, not to a maintainer, so a stolen GitHub token or a compromised
+workflow can produce a deployable release. Leave `signed_tags` on unless you
+accept that. Listing `origin.signers` while it is `false` is an error, never
+silently ignored.
+
 ## `[approvers]`
 
 A table of `name = { credential_id, public_key }`, both opaque base64url text
@@ -66,7 +80,8 @@ pattern as signers.
 | `compose.service` | string | required | Service name, `[a-z0-9][a-z0-9_.-]*`. |
 | `origin.workflow` | string | required | Release workflow, exactly `.github/workflows/<name>.yml` or `.yaml`, with `<name>` non-empty `[A-Za-z0-9._-]+` (no subdirectory). |
 | `origin.tags` | string | required, no default | Release tag pattern: a prefix of up to 32 `[A-Za-z0-9._/-]` and a final `*`, for example `v*` or `*`. The prefix must not end with a digit or `.` (with `v1*`, `v12.0.0` would read as `2.0.0`). The rest of the tag must be strict semver without build metadata. |
-| `origin.signers` | list | required | Keys of `[signers]` trusted for this deployment; at least one. |
+| `origin.signed_tags` | bool | `true` | Whether the release tag must be signed by a maintainer key. Leave it on (see below). |
+| `origin.signers` | list | required unless `signed_tags = false` | Keys of `[signers]` trusted for this deployment; at least one. Must be absent or empty when `signed_tags` is `false`. |
 | `rule.auto` | `"patch"`, `"minor"` or `"any"` | none | Deploy without a human when the new version is higher than the running one and differs by at most this part. |
 | `rule.approve` | `"patch"`, `"minor"` or `"any"` | none | Versions up to this level need a passkey approval. |
 | `rule.approvers` | list | required | Keys of `[approvers]` who may approve; at least one. |
@@ -123,7 +138,8 @@ listed action on each listed deployment of every one of its grants.
 The file is refused, with an error naming the deployment and the value, when:
 
 1. two deployments share an `id`;
-2. `origin.signers` is empty or names a signer not in `[signers]`;
+2. `origin.signers` is empty (with `signed_tags` on), is set while `signed_tags` is `false`, or names a signer not in `[signers]`;
+   a `[signers]` value is not an `ssh-ed25519` public key;
 3. `rule.approvers` is empty or names someone not in `[approvers]`. It is
    required for every deployment, even fully automatic ones: first deploys and
    downgrades are manual and always need an approval;
