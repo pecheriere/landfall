@@ -279,9 +279,9 @@ to be running, and at its end, after any log windows, to be the same container f
 with the same addresses. After the first passing round the agent waits a settle time (10 s) and
 requires a second passing round on that same container and start; any change starts over within the
 deadline. Every deploy therefore takes at least the settle time, and a crash slower than the settle
-time is not caught without a longer `no_log_match` window. Logs are scanned from the container's
-creation, so a panic in an earlier incarnation counts even if the agent never saw it; a replaced
-container's logs are not scanned.
+time is not caught without a longer `no_log_match` window. Logs are scanned from just before the
+agent's own `up` or restart, so a panic in an earlier incarnation counts even if the agent never saw
+it, while old lines of a reused container do not; a replaced container's logs are not scanned.
 
 ## 8. Identity and grants
 

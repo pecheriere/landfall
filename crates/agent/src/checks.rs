@@ -82,16 +82,19 @@ const QUOTE_LIMIT: usize = 200;
 
 /// Runs `checks` against the service's container until they have passed in
 /// two rounds on one run of the container, or `options.deadline` passes.
+/// `since` is the caller's time just before it brought the service up (with
+/// `up`, or a restart where there is none).
 ///
 /// A round looks up the container, inspects it once and requires it to be
 /// running, then evaluates the observing checks (`container_healthy`, `http`,
 /// `command`) in order, stopping at the first that fails. Only when all of
 /// them pass in the same round do the `no_log_match` checks run: each waits
 /// until its window (from the container's start) has closed, then scans the
-/// logs from the container's creation to the window's end, so a panic before
-/// a restart counts even if nothing here saw that start, and a match is final.
-/// The logs of a container that was replaced are not scanned. The round then looks
-/// at the container again: it must be the same one, running, from the same
+/// logs from `since` to the window's end, and a match is final. So a panic
+/// before a restart counts even if nothing here saw that start, while what a
+/// reused container logged before `since` does not. The logs of a container
+/// that was replaced are not scanned. The round then looks at the container
+/// again: it must be the same one, running, from the same
 /// start, with the same addresses for `http` checks.
 ///
 /// After the first passing round, the run waits `options.settle` and requires
@@ -109,6 +112,7 @@ pub async fn run_checks<D: Docker>(
     dir: &Path,
     service: &str,
     checks: &[Check],
+    since: Timestamp,
     options: &CheckOptions,
 ) -> Result<CheckSummary, CheckFailure> {
     let client = if checks.iter().any(|c| matches!(c, Check::Http { .. })) {
@@ -132,6 +136,7 @@ pub async fn run_checks<D: Docker>(
         service,
         checks,
         client: client.as_ref(),
+        since,
         http_timeout: options.http_timeout,
     };
     let mut progress = Progress {
@@ -322,6 +327,7 @@ struct Run<'a, D> {
     service: &'a str,
     checks: &'a [Check],
     client: Option<&'a reqwest::Client>,
+    since: Timestamp,
     http_timeout: Duration,
 }
 
@@ -523,7 +529,7 @@ impl<D: Docker> Run<'_, D> {
         tokio::time::sleep(wait).await;
         let found = bounded(budget, name, async {
             self.docker
-                .logs_contain(&look.id, look.info.created, closes, pattern)
+                .logs_contain(&look.id, self.since, closes, pattern)
                 .await
                 .map_err(|e| docker_failure(name, &e))
         })
@@ -609,6 +615,11 @@ mod tests {
         }
     }
 
+    /// For the tests that do not look at where a log scan starts.
+    fn before_up() -> Timestamp {
+        Timestamp::UNIX_EPOCH
+    }
+
     fn http(port: u16, expect: u16) -> Check {
         Check::Http {
             path: "/health".to_owned(),
@@ -658,6 +669,7 @@ mod tests {
             dir(),
             "app",
             &[Check::ContainerHealthy],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -676,6 +688,7 @@ mod tests {
             dir(),
             "app",
             &[Check::ContainerHealthy],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -696,9 +709,16 @@ mod tests {
         ]);
         let options = CheckOptions::default();
         let start = Instant::now();
-        let summary = run_checks(&docker, dir(), "app", &[Check::ContainerHealthy], &options)
-            .await
-            .unwrap();
+        let summary = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[Check::ContainerHealthy],
+            before_up(),
+            &options,
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.checks[0].attempts, 4);
         assert_eq!(start.elapsed(), options.interval * 2 + options.settle);
     }
@@ -717,6 +737,7 @@ mod tests {
             dir(),
             "app",
             &[Check::ContainerHealthy],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -734,6 +755,7 @@ mod tests {
             dir(),
             "app",
             &[Check::ContainerHealthy, http(port, 200)],
+            before_up(),
             &short(),
         )
         .await
@@ -755,6 +777,7 @@ mod tests {
             dir(),
             "app",
             &[Check::ContainerHealthy, http(port, 200)],
+            before_up(),
             &short(),
         )
         .await
@@ -772,9 +795,16 @@ mod tests {
         .await;
         let docker = FakeDocker::new();
         docker.script_inspect([Ok(running(None, &[("app", Some(LOCALHOST))]))]);
-        let failure = run_checks(&docker, dir(), "app", &[http(port, 200)], &short())
-            .await
-            .unwrap_err();
+        let failure = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[http(port, 200)],
+            before_up(),
+            &short(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(failure.reason, "expected 200, got 302");
         let seen = seen.lock().unwrap();
         assert!(!seen.is_empty());
@@ -791,6 +821,7 @@ mod tests {
             dir(),
             "app",
             &[http(8080, 200)],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -813,6 +844,7 @@ mod tests {
             dir(),
             "app",
             &[http(8080, 200)],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -849,6 +881,7 @@ mod tests {
             dir(),
             "app",
             &[Check::Command { argv: argv.clone() }],
+            before_up(),
             &options,
         )
         .await
@@ -871,6 +904,7 @@ mod tests {
             &[Check::Command {
                 argv: vec!["true".to_owned()],
             }],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -897,6 +931,7 @@ mod tests {
                     within_secs: 20,
                 },
             ],
+            started,
             &CheckOptions::default(),
         )
         .await
@@ -931,6 +966,7 @@ mod tests {
                     within_secs: 5,
                 },
             ],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -959,6 +995,7 @@ mod tests {
                     within_secs: 30,
                 },
             ],
+            before_up(),
             &options,
         )
         .await
@@ -984,6 +1021,7 @@ mod tests {
                 },
                 Check::ContainerHealthy,
             ],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1015,6 +1053,7 @@ mod tests {
                     argv: vec!["probe".to_owned()],
                 },
             ],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1039,9 +1078,16 @@ mod tests {
             ..CheckOptions::default()
         };
         let start = Instant::now();
-        let failure = run_checks(&docker, dir(), "app", &[Check::ContainerHealthy], &options)
-            .await
-            .unwrap_err();
+        let failure = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[Check::ContainerHealthy],
+            before_up(),
+            &options,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(failure.reason, "health is \"starting\"");
         assert_eq!(start.elapsed(), Duration::from_secs(25));
         assert_eq!(inspects(&docker), 3, "at 0 s, 10 s and 20 s");
@@ -1083,6 +1129,7 @@ mod tests {
             dir(),
             "app",
             &[command(), no_log_match(5)],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1105,6 +1152,7 @@ mod tests {
             dir(),
             "app",
             &[command(), no_log_match(5)],
+            up.started_at,
             &CheckOptions::default(),
         )
         .await
@@ -1125,16 +1173,16 @@ mod tests {
                 (up.started_at, up.started_at.checked_add(five).unwrap()),
                 (up.started_at, again.started_at.checked_add(five).unwrap()),
             ],
-            "from the earliest start to the end of the current window"
+            "from since to the end of the current window"
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn logs_from_before_the_first_look_count() {
+    async fn logs_are_scanned_from_since() {
         // The container panicked and restarted before the agent looked at it.
         let docker = FakeDocker::new();
-        let mut info = running(None, &[]);
-        info.created = info
+        let info = running(None, &[]);
+        let since = info
             .started_at
             .checked_sub(SignedDuration::from_secs(60))
             .unwrap();
@@ -1146,6 +1194,7 @@ mod tests {
             dir(),
             "app",
             &[command(), no_log_match(5)],
+            since,
             &CheckOptions::default(),
         )
         .await
@@ -1154,7 +1203,7 @@ mod tests {
         assert!(
             docker.calls().contains(&Call::LogsContain {
                 id: crate::testing::container_id(),
-                since: info.created,
+                since,
                 until: info
                     .started_at
                     .checked_add(SignedDuration::from_secs(5))
@@ -1179,6 +1228,7 @@ mod tests {
             dir(),
             "app",
             &[command()],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1194,9 +1244,16 @@ mod tests {
         let mut moved = up.clone();
         moved.networks.insert("app".to_owned(), None);
         docker.script_inspect([Ok(up.clone()), Ok(moved), Ok(up)]);
-        let summary = run_checks(&docker, dir(), "app", &[http(port, 200)], &short())
-            .await
-            .unwrap();
+        let summary = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[http(port, 200)],
+            before_up(),
+            &short(),
+        )
+        .await
+        .unwrap();
         assert_eq!(summary.checks[0].attempts, 3);
         assert_eq!(seen.lock().unwrap().len(), 3);
     }
@@ -1214,7 +1271,7 @@ mod tests {
         docker.script_exec([Ok(true)]);
         let options = CheckOptions::default();
         let start = Instant::now();
-        let failure = run_checks(&docker, dir(), "app", &[command()], &options)
+        let failure = run_checks(&docker, dir(), "app", &[command()], before_up(), &options)
             .await
             .unwrap_err();
         assert!(failure.reason.contains("keeps restarting"), "{failure}");
@@ -1230,7 +1287,7 @@ mod tests {
         docker.script_exec([Ok(true)]);
         let options = CheckOptions::default();
         let start = Instant::now();
-        let summary = run_checks(&docker, dir(), "app", &[command()], &options)
+        let summary = run_checks(&docker, dir(), "app", &[command()], before_up(), &options)
             .await
             .unwrap();
         assert_eq!(summary.checks[0].attempts, 3);
@@ -1244,7 +1301,7 @@ mod tests {
         docker.script_exec([Ok(true), Ok(false), Ok(true)]);
         let options = CheckOptions::default();
         let start = Instant::now();
-        let summary = run_checks(&docker, dir(), "app", &[command()], &options)
+        let summary = run_checks(&docker, dir(), "app", &[command()], before_up(), &options)
             .await
             .unwrap();
         assert_eq!(summary.checks[0].attempts, 4);
@@ -1260,7 +1317,7 @@ mod tests {
             deadline: Duration::from_secs(10),
             ..CheckOptions::default()
         };
-        let failure = run_checks(&docker, dir(), "app", &[command()], &options)
+        let failure = run_checks(&docker, dir(), "app", &[command()], before_up(), &options)
             .await
             .unwrap_err();
         assert!(failure.reason.contains("too close"), "{failure}");
@@ -1279,6 +1336,7 @@ mod tests {
             dir(),
             "app",
             &[command()],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1296,7 +1354,7 @@ mod tests {
             ..CheckOptions::default()
         };
         let start = Instant::now();
-        let failure = run_checks(&docker, dir(), "app", &[command()], &options)
+        let failure = run_checks(&docker, dir(), "app", &[command()], before_up(), &options)
             .await
             .unwrap_err();
         assert_eq!(start.elapsed(), options.deadline);
@@ -1322,9 +1380,16 @@ mod tests {
             ..CheckOptions::default()
         };
         let start = Instant::now();
-        let failure = run_checks(&docker, dir(), "app", &[Check::ContainerHealthy], &options)
-            .await
-            .unwrap_err();
+        let failure = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[Check::ContainerHealthy],
+            before_up(),
+            &options,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(start.elapsed(), options.deadline);
         assert_eq!(failure.reason, "health is \"starting\"");
     }
@@ -1351,6 +1416,7 @@ mod tests {
             dir(),
             "app",
             &[command(), no_log_match(300)],
+            before_up(),
             &options,
         )
         .await
@@ -1374,6 +1440,7 @@ mod tests {
             dir(),
             "app",
             &[command(), no_log_match(100)],
+            before_up(),
             &options,
         )
         .await
@@ -1397,9 +1464,16 @@ mod tests {
             Ok(restarting),
             Ok(running(None, &[("app", Some(LOCALHOST))])),
         ]);
-        run_checks(&docker, dir(), "app", &[http(port, 200)], &short())
-            .await
-            .unwrap();
+        run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[http(port, 200)],
+            before_up(),
+            &short(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1413,6 +1487,7 @@ mod tests {
             dir(),
             "app",
             &[http(8080, 200)],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1427,9 +1502,16 @@ mod tests {
         drop(listener);
         let docker = FakeDocker::new();
         docker.script_inspect([Ok(running(None, &[("app", Some(LOCALHOST))]))]);
-        let failure = run_checks(&docker, dir(), "app", &[http(port, 200)], &short())
-            .await
-            .unwrap_err();
+        let failure = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[http(port, 200)],
+            before_up(),
+            &short(),
+        )
+        .await
+        .unwrap_err();
         assert!(failure.reason.contains("cannot connect"), "{failure}");
         assert!(failure.reason.contains("firewall"), "{failure}");
     }
@@ -1445,9 +1527,16 @@ mod tests {
             deadline: Duration::from_millis(200),
             ..short()
         };
-        let failure = run_checks(&docker, dir(), "app", &[http(port, 200)], &options)
-            .await
-            .unwrap_err();
+        let failure = run_checks(
+            &docker,
+            dir(),
+            "app",
+            &[http(port, 200)],
+            before_up(),
+            &options,
+        )
+        .await
+        .unwrap_err();
         assert!(failure.reason.contains("no answer within"), "{failure}");
         drop(listener);
     }
@@ -1462,6 +1551,7 @@ mod tests {
             dir(),
             "--help",
             &[Check::ContainerHealthy],
+            before_up(),
             &CheckOptions::default(),
         )
         .await
@@ -1478,14 +1568,20 @@ mod tests {
         use crate::docker::DockerCli;
         use crate::testing::{ComposeProject, TEST_IMAGE};
 
-        /// A project with a service `app` running `script`.
-        async fn project(cli: &DockerCli, restart: &str, script: &str) -> ComposeProject {
+        /// A project with a service `app` running `script`, and the time just
+        /// before it was brought up.
+        async fn project(
+            cli: &DockerCli,
+            restart: &str,
+            script: &str,
+        ) -> (ComposeProject, Timestamp) {
             let services = format!(
                 "  app:\n    image: {TEST_IMAGE}\n    restart: '{restart}'\n    command: [sh, -c, '{script}']\n    stop_grace_period: 1s\n"
             );
             let project = ComposeProject::new(cli, &services).await;
+            let since = Timestamp::now();
             cli.compose_up(project.path(), "app").await.unwrap();
-            project
+            (project, since)
         }
 
         fn alive() -> Check {
@@ -1507,12 +1603,13 @@ mod tests {
         #[ignore = "docker: runs in ci.yml"]
         async fn docker_healthy_container_passes() {
             let cli = DockerCli::new();
-            let project = project(&cli, "no", "sleep 300").await;
+            let (project, since) = project(&cli, "no", "sleep 300").await;
             let summary = run_checks(
                 &cli,
                 project.path(),
                 "app",
                 &[alive(), no_log_match(2)],
+                since,
                 &options(30, 2),
             )
             .await
@@ -1525,12 +1622,13 @@ mod tests {
         #[ignore = "docker: runs in ci.yml"]
         async fn docker_container_that_exits_inside_the_window_fails() {
             let cli = DockerCli::new();
-            let project = project(&cli, "no", "sleep 2").await;
+            let (project, since) = project(&cli, "no", "sleep 2").await;
             let failure = run_checks(
                 &cli,
                 project.path(),
                 "app",
                 &[alive(), no_log_match(5)],
+                since,
                 &options(10, 1),
             )
             .await
@@ -1542,12 +1640,13 @@ mod tests {
         #[ignore = "docker: runs in ci.yml"]
         async fn docker_crash_loop_inside_the_window_fails() {
             let cli = DockerCli::new();
-            let project = project(&cli, "always", "sleep 2; exit 1").await;
+            let (project, since) = project(&cli, "always", "sleep 2; exit 1").await;
             run_checks(
                 &cli,
                 project.path(),
                 "app",
                 &[alive(), no_log_match(4)],
+                since,
                 &options(20, 1),
             )
             .await
@@ -1558,10 +1657,17 @@ mod tests {
         #[ignore = "docker: runs in ci.yml"]
         async fn docker_crash_loop_without_a_log_window_fails() {
             let cli = DockerCli::new();
-            let project = project(&cli, "always", "sleep 2; exit 1").await;
-            run_checks(&cli, project.path(), "app", &[alive()], &options(20, 4))
-                .await
-                .unwrap_err();
+            let (project, since) = project(&cli, "always", "sleep 2; exit 1").await;
+            run_checks(
+                &cli,
+                project.path(),
+                "app",
+                &[alive()],
+                since,
+                &options(20, 4),
+            )
+            .await
+            .unwrap_err();
         }
 
         #[tokio::test]
@@ -1571,12 +1677,13 @@ mod tests {
             // Panics once, on its first start, then stays up: the file
             // survives a restart of the container.
             let script = "if [ -e /tmp/seen ]; then sleep 300; fi; touch /tmp/seen; sleep 3; echo panic; exit 1";
-            let project = project(&cli, "always", script).await;
+            let (project, since) = project(&cli, "always", script).await;
             let failure = run_checks(
                 &cli,
                 project.path(),
                 "app",
                 &[alive(), no_log_match(6)],
+                since,
                 &options(30, 1),
             )
             .await
@@ -1594,7 +1701,7 @@ mod tests {
             // Panics at once on its first start, and its second start comes
             // whole seconds later, so the line is before any start seen below.
             let script = "if [ -e /tmp/seen ]; then sleep 300; fi; touch /tmp/seen; echo panic; sleep 2; exit 1";
-            let project = project(&cli, "always", script).await;
+            let (project, since) = project(&cli, "always", script).await;
             let id = cli.container(project.path(), "app").await.unwrap().unwrap();
             let mut restarts = String::new();
             for _ in 0..150 {
@@ -1614,6 +1721,7 @@ mod tests {
                 project.path(),
                 "app",
                 &[alive(), no_log_match(1)],
+                since,
                 &options(30, 1),
             )
             .await
@@ -1626,14 +1734,65 @@ mod tests {
 
         #[tokio::test]
         #[ignore = "docker: runs in ci.yml"]
+        async fn docker_old_log_lines_of_a_reused_container_do_not_count() {
+            let cli = DockerCli::new();
+            // Logs the line on its first start only; the file survives a stop.
+            let script = "if [ ! -e /tmp/seen ]; then touch /tmp/seen; echo panic; fi; sleep 300";
+            let (project, first_up) = project(&cli, "no", script).await;
+            let id = cli.container(project.path(), "app").await.unwrap().unwrap();
+            let mut logged = false;
+            for _ in 0..150 {
+                logged = cli
+                    .logs_contain(&id, first_up, Timestamp::now(), "panic")
+                    .await
+                    .unwrap();
+                if logged {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(logged, "the container did not log the line");
+
+            // Scans are to the second: `since` must be in a later one.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let since = Timestamp::now();
+            cli.compose_stop(project.path(), "app").await.unwrap();
+            cli.compose_up(project.path(), "app").await.unwrap();
+            assert_eq!(
+                cli.container(project.path(), "app").await.unwrap(),
+                Some(id.clone()),
+                "the container was not reused"
+            );
+            assert!(
+                cli.logs_contain(&id, first_up, Timestamp::now(), "panic")
+                    .await
+                    .unwrap(),
+                "the old line is still in its log"
+            );
+
+            run_checks(
+                &cli,
+                project.path(),
+                "app",
+                &[alive(), no_log_match(1)],
+                since,
+                &options(30, 1),
+            )
+            .await
+            .unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "docker: runs in ci.yml"]
         async fn docker_line_in_the_window_fails_and_a_later_one_does_not() {
             let cli = DockerCli::new();
-            let inside = project(&cli, "no", "sleep 1; echo panic; sleep 300").await;
+            let (inside, since) = project(&cli, "no", "sleep 1; echo panic; sleep 300").await;
             let failure = run_checks(
                 &cli,
                 inside.path(),
                 "app",
                 &[alive(), no_log_match(3)],
+                since,
                 &options(30, 1),
             )
             .await
@@ -1644,12 +1803,13 @@ mod tests {
             );
 
             // Logged before the second round scans, but after the window.
-            let later = project(&cli, "no", "sleep 5; echo panic; sleep 300").await;
+            let (later, since) = project(&cli, "no", "sleep 5; echo panic; sleep 300").await;
             run_checks(
                 &cli,
                 later.path(),
                 "app",
                 &[alive(), no_log_match(2)],
+                since,
                 &options(30, 6),
             )
             .await

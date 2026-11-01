@@ -234,13 +234,11 @@ pub fn container_id() -> ContainerId {
 /// A running container that has just started, attached to `networks`.
 #[must_use]
 pub fn running(health: Option<&str>, networks: &[(&str, Option<IpAddr>)]) -> ContainerInfo {
-    let now = Timestamp::now();
     ContainerInfo {
         image: "ghcr.io/example/app@sha256:00".to_owned(),
         status: "running".to_owned(),
         health: health.map(str::to_owned),
-        created: now,
-        started_at: now,
+        started_at: Timestamp::now(),
         networks: networks
             .iter()
             .map(|(name, ip)| ((*name).to_owned(), *ip))
