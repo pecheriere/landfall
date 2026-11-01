@@ -159,11 +159,23 @@ mod tests {
         "2026-11-01T00:00:00Z".parse().unwrap()
     }
 
+    /// The error, for an assertion message; a trust root is not printed.
+    fn outcome(result: &Result<super::TrustRoot, TrustError>) -> String {
+        match result {
+            Ok(_) => "a trust root".to_owned(),
+            Err(error) => error.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn offline_with_empty_cache_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let result = load_trusted_root_at(dir.path(), Refresh::Offline, fixed_now()).await;
-        assert!(matches!(result, Err(TrustError::Cache(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(TrustError::Cache(_))),
+            "{}",
+            outcome(&result)
+        );
     }
 
     #[tokio::test]
@@ -172,7 +184,11 @@ mod tests {
         let missing = dir.path().join("absent");
         for refresh in [Refresh::Online, Refresh::Offline] {
             let result = load_trusted_root(&missing, refresh).await;
-            assert!(matches!(result, Err(TrustError::Cache(_))), "{result:?}");
+            assert!(
+                matches!(result, Err(TrustError::Cache(_))),
+                "{}",
+                outcome(&result)
+            );
         }
         assert!(!missing.exists(), "the cache directory was created");
     }
@@ -183,7 +199,11 @@ mod tests {
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         let result = load_trusted_root_at(&file, Refresh::Offline, fixed_now()).await;
-        assert!(matches!(result, Err(TrustError::Cache(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(TrustError::Cache(_))),
+            "{}",
+            outcome(&result)
+        );
     }
 
     #[tokio::test]
@@ -201,7 +221,11 @@ mod tests {
             .checked_add(SignedDuration::from_hours(30 * 24))
             .unwrap();
         let stale = load_trusted_root_at(dir.path(), Refresh::Offline, later).await;
-        assert!(matches!(stale, Err(TrustError::Expired(_))), "{stale:?}");
+        assert!(
+            matches!(stale, Err(TrustError::Expired(_))),
+            "{}",
+            outcome(&stale)
+        );
 
         let repo: RepoName = "dani-garcia/vaultwarden".parse().unwrap();
         let tag: ReleaseTag = "1.37.4".parse().unwrap();
