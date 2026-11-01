@@ -7,6 +7,7 @@ pub mod cli;
 pub mod report;
 pub mod serve;
 pub mod store;
+pub mod watcher;
 
 use std::time::Duration;
 

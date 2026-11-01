@@ -6,12 +6,16 @@
 //! `origin.signed_tags = false`, the tag ref is simply followed to its
 //! commit); the image index for the tag is found in the registry; its
 //! digest is the release's single candidate digest (the exactly-one-digest
-//! rule runs over the candidates it is given, and today that is the one the
-//! registry tag resolves to: discovering every attested digest of a release
-//! is tracked in issue #11); a build-provenance bundle for that digest
-//! verifies and its Fulcio identity names the deployment's repository,
-//! workflow, tag and the release commit; the host's platform is in the
-//! index. The first failing step is the error, and it names the step.
+//! rule runs over the candidates it is given, and here that is the one the
+//! registry tag resolves to: the controller also looks for every other attested
+//! digest of the release, through [`crate::candidates`]); a build-provenance
+//! bundle for that digest verifies and its Fulcio identity names the
+//! deployment's repository, workflow, tag and the release commit; the host's
+//! platform is in the index. The first failing step is the error, and it names
+//! the step.
+//!
+//! The controller has no platform to ask for, since a host's is its own, so it
+//! calls [`verify_release_origin`], which is all of this but the last step.
 
 use landfall_core::config::{Config, SignerKey};
 use landfall_core::ids::{CommitSha, DeploymentId, PrincipalId, ReleaseTag, RepoName, TagError};
@@ -78,6 +82,14 @@ pub enum ReleaseError {
     /// The index does not serve the wanted platform.
     #[error("platform")]
     Platform(#[source] PlatformError),
+    /// A list of tags, or the material of a candidate in one, could not be read
+    /// or was refused for what it holds. Nothing is known about what it would
+    /// have said, so this is never a refusal of the release: it is tried again.
+    #[error("release listing")]
+    Listing(#[source] FetchError),
+    /// There is no Sigstore trust root to verify against.
+    #[error("no trust root")]
+    NoTrustRoot,
 }
 
 impl ReleaseError {
@@ -89,7 +101,7 @@ impl ReleaseError {
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         match self {
-            Self::UnknownDeployment(_) => false,
+            Self::UnknownDeployment(_) | Self::Listing(_) | Self::NoTrustRoot => false,
             Self::TagObject(e) | Self::TagCommit(e) | Self::Index(e) | Self::Bundle(e) => {
                 !e.is_unavailable()
             }
@@ -98,6 +110,26 @@ impl ReleaseError {
             | Self::Digest(_)
             | Self::Attestation(_)
             | Self::Platform(_) => true,
+        }
+    }
+
+    /// The fetch that failed, if that is what this is: for telling a rate limit
+    /// or an outage from the rest.
+    #[must_use]
+    pub fn fetch_error(&self) -> Option<&FetchError> {
+        match self {
+            Self::TagObject(e)
+            | Self::TagCommit(e)
+            | Self::Index(e)
+            | Self::Bundle(e)
+            | Self::Listing(e) => Some(e),
+            Self::UnknownDeployment(_)
+            | Self::TagPattern(_)
+            | Self::TagSignature(_)
+            | Self::Digest(_)
+            | Self::Attestation(_)
+            | Self::Platform(_)
+            | Self::NoTrustRoot => None,
         }
     }
 }
@@ -133,6 +165,23 @@ pub async fn verify_release(
     deployment: &DeploymentId,
     tag: &ReleaseTag,
     platform: &Platform,
+) -> Result<ReleaseOrigin, ReleaseError> {
+    let origin = verify_release_origin(fetcher, root, config, deployment, tag).await?;
+    require_platform(&origin.platforms, platform).map_err(ReleaseError::Platform)?;
+    Ok(origin)
+}
+
+/// [`verify_release`] for no host in particular: every step but the platform.
+///
+/// # Errors
+///
+/// The [`ReleaseError`] of the first step that fails.
+pub async fn verify_release_origin(
+    fetcher: &Fetcher,
+    root: &TrustRoot,
+    config: &Config,
+    deployment: &DeploymentId,
+    tag: &ReleaseTag,
 ) -> Result<ReleaseOrigin, ReleaseError> {
     let d = config
         .deployment(deployment)
@@ -200,8 +249,6 @@ pub async fn verify_release(
     };
     let attestation =
         verify_bundle(&bundle, digest, root, &expected).map_err(ReleaseError::Attestation)?;
-
-    require_platform(&platforms, platform).map_err(ReleaseError::Platform)?;
 
     Ok(ReleaseOrigin {
         commit,
@@ -692,6 +739,45 @@ checks = ["container-healthy"]
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The controller has no platform of its own, so it has none to miss: the
+    /// release that fails only that step passes without it.
+    #[tokio::test]
+    async fn the_origin_alone_asks_for_no_platform() {
+        let (github, registry) = servers().await;
+        mount_unsigned_release(&github, &registry).await;
+        mount_bundles(
+            &registry,
+            VW_REPO,
+            &VW_DIGEST.parse().unwrap(),
+            &[(BUNDLE, SLSA_PROVENANCE)],
+        )
+        .await;
+
+        let origin = super::verify_release_origin(
+            &fetcher(&github, &registry),
+            &root(),
+            &unsigned_config(121_898_717),
+            &deployment(),
+            &VW_TAG.parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(origin.attestation.digest.as_ref(), VW_DIGEST);
+        assert_eq!(origin.platforms.len(), 4);
+    }
+
+    #[test]
+    fn a_failed_fetch_can_be_told_from_the_rest() {
+        let fetch = || FetchError::NotFound {
+            url: "https://example.test".to_owned(),
+        };
+        assert!(ReleaseError::Listing(fetch()).fetch_error().is_some());
+        assert!(!ReleaseError::Listing(fetch()).is_refusal());
+        assert!(ReleaseError::Index(fetch()).fetch_error().is_some());
+        assert!(ReleaseError::NoTrustRoot.fetch_error().is_none());
+        assert!(!ReleaseError::NoTrustRoot.is_refusal());
     }
 
     #[tokio::test]

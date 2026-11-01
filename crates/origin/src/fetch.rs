@@ -30,6 +30,10 @@ use thiserror::Error;
 
 use crate::attestation::{MAX_BUNDLE_BYTES, SLSA_PROVENANCE};
 
+mod listing;
+
+pub use self::listing::{ListedTag, MAX_LISTED_TAGS};
+
 /// Cap on a GitHub API response for a tag ref or tag object.
 pub const TAG_OBJECT_LIMIT: usize = 64 * 1024;
 /// Cap on an image index or manifest, and on a registry token response.
@@ -278,6 +282,17 @@ pub enum FetchError {
         digest: ImageDigest,
         /// How many bundles refer to it.
         count: usize,
+    },
+    /// A paginated list goes on past what is read of it, so whatever it holds
+    /// further on is unknown.
+    #[error("{url}: the list goes on past {limit} {what}")]
+    ListCap {
+        /// The first page's URL.
+        url: String,
+        /// The cap.
+        limit: usize,
+        /// What is counted: `tags` or `pages`.
+        what: &'static str,
     },
 }
 
@@ -757,6 +772,11 @@ impl Fetcher {
 
     /// A GET to the GitHub API, with the token when there is one.
     async fn github_get(&self, url: &Url) -> Result<Vec<u8>, FetchError> {
+        Ok(self.github_fetch(url, TAG_OBJECT_LIMIT).await?.body)
+    }
+
+    /// [`github_get`](Self::github_get) with its headers, and a cap of `limit`.
+    async fn github_fetch(&self, url: &Url, limit: usize) -> Result<Fetched, FetchError> {
         let mut request = self
             .client
             .get(url.clone())
@@ -765,9 +785,7 @@ impl Fetcher {
         if let Some(token) = &self.github_token {
             request = request.header(AUTHORIZATION, token.clone());
         }
-        Ok(send(request, Service::GitHubApi, url, TAG_OBJECT_LIMIT)
-            .await?
-            .body)
+        send(request, Service::GitHubApi, url, limit).await
     }
 
     /// A GET to the registry, with its pull token when there is one; never

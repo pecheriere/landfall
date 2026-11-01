@@ -49,6 +49,8 @@ pub enum EventKind {
     ReleaseSeen,
     /// The rules decided about a release.
     RuleDecision,
+    /// A release or a deployment could not be decided about yet, and why.
+    ReleaseHeld,
     /// A deploy was queued for a host.
     DeployQueued,
     /// A host claimed a deploy.
@@ -86,6 +88,7 @@ impl EventKind {
             Self::HostEnrolled => "host_enrolled",
             Self::ReleaseSeen => "release_seen",
             Self::RuleDecision => "rule_decision",
+            Self::ReleaseHeld => "release_held",
             Self::DeployQueued => "deploy_queued",
             Self::DeployClaimed => "deploy_claimed",
             Self::DeployFinished => "deploy_finished",

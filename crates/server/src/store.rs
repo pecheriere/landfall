@@ -6,6 +6,7 @@
 
 mod agent;
 mod deploys;
+mod releases;
 
 use std::fmt;
 use std::fs::{OpenOptions, Permissions};
@@ -27,6 +28,9 @@ use tokio::sync::watch;
 
 pub use self::agent::NONCE_LIFETIME_SECS;
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
+pub use self::releases::{
+    FinishedDeploy, Hold, ReleaseDecision, Seen, StoredRelease, WatchView, WatchedRunning,
+};
 use crate::audit::{AuditEvent, AuditReport, EventKind, GENESIS, MAX_DETAIL_BYTES, RowFields};
 
 /// How long an enrolment code stays valid, in seconds.
@@ -209,13 +213,19 @@ impl fmt::Debug for EnrolCode {
 
 /// The schema, built into the binary: the image holds no other files.
 fn migrator() -> Migrator {
-    Migrator::with_migrations(vec![Migration::new(
-        1,
-        "init".into(),
-        MigrationType::Simple,
-        include_str!("../migrations/0001_init.sql").into_sql_str(),
-        false,
-    )])
+    let migration = |version, name: &'static str, sql: &'static str| {
+        Migration::new(
+            version,
+            name.into(),
+            MigrationType::Simple,
+            sql.into_sql_str(),
+            false,
+        )
+    };
+    Migrator::with_migrations(vec![
+        migration(1, "init", include_str!("../migrations/0001_init.sql")),
+        migration(2, "watcher", include_str!("../migrations/0002_watcher.sql")),
+    ])
 }
 
 /// Creates the database file private to this user, or makes an existing one

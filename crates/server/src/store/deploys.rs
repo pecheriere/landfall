@@ -64,7 +64,10 @@ fn wire_deploy_id(id: i64) -> Result<DeployId, StoreError> {
 }
 
 /// A stored text column parsed into its validated type.
-fn parsed<T: std::str::FromStr>(row: &SqliteRow, column: &'static str) -> Result<T, StoreError> {
+pub(super) fn parsed<T: std::str::FromStr>(
+    row: &SqliteRow,
+    column: &'static str,
+) -> Result<T, StoreError> {
     row.try_get::<String, _>(column)?
         .parse()
         .map_err(|_| StoreError::Corrupt(column))
@@ -399,6 +402,14 @@ impl Store {
         }
         let release_changed = old_tag != tag || old_digest != digest;
         let drift_changed = old_drift != state.drift;
+        let now = self.clock.now()?;
+        let healthy_since = if tag.is_none() || state.drift {
+            None
+        } else if release_changed || old_drift {
+            Some(now)
+        } else {
+            stored.as_ref().and_then(|s| s.healthy_since)
+        };
         let event = |kind, detail| AuditEvent {
             kind,
             deployment: Some(state.deployment.clone()),
@@ -424,12 +435,14 @@ impl Store {
         }
         sqlx::query(
             "INSERT INTO running_states
-                 (deployment, host, tag, digest, drift, phase, busy, inconsistent, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 (deployment, host, tag, digest, drift, phase, busy, inconsistent, updated_at,
+                  healthy_since)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (deployment) DO UPDATE SET
                  host = excluded.host, tag = excluded.tag, digest = excluded.digest,
                  drift = excluded.drift, phase = excluded.phase, busy = excluded.busy,
-                 inconsistent = excluded.inconsistent, updated_at = excluded.updated_at",
+                 inconsistent = excluded.inconsistent, updated_at = excluded.updated_at,
+                 healthy_since = excluded.healthy_since",
         )
         .bind(state.deployment.as_ref())
         .bind(host.as_ref())
@@ -439,7 +452,8 @@ impl Store {
         .bind(phase)
         .bind(busy)
         .bind(inconsistent)
-        .bind(self.clock.now()?)
+        .bind(now)
+        .bind(healthy_since)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -455,6 +469,7 @@ struct StoredRunning {
     phase: String,
     busy: bool,
     inconsistent: bool,
+    healthy_since: Option<i64>,
 }
 
 /// The audit row for a signed report that was refused. `reason` is the
@@ -478,7 +493,7 @@ async fn stored_running(
     state: &RunningState,
 ) -> Result<Option<StoredRunning>, StoreError> {
     let row = sqlx::query(
-        "SELECT host, tag, digest, drift, phase, busy, inconsistent
+        "SELECT host, tag, digest, drift, phase, busy, inconsistent, healthy_since
          FROM running_states WHERE deployment = ?",
     )
     .bind(state.deployment.as_ref())
@@ -493,5 +508,6 @@ async fn stored_running(
         phase: row.try_get("phase")?,
         busy: row.try_get("busy")?,
         inconsistent: row.try_get("inconsistent")?,
+        healthy_since: row.try_get("healthy_since")?,
     }))
 }

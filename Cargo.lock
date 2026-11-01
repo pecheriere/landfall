@@ -1502,6 +1502,7 @@ name = "landfall-origin"
 version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
+ "futures-util",
  "jiff",
  "landfall-core",
  "reqwest",
@@ -1528,8 +1529,10 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jiff",
  "landfall-core",
  "landfall-origin",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.1",

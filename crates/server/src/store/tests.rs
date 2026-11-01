@@ -466,6 +466,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
             "enrol_codes",
             "hosts",
             "nonces",
+            "release_holds",
             "releases",
             "running_states"
         ]
@@ -474,7 +475,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(applied, 1);
+    assert_eq!(applied, 2);
     assert_eq!(chain(&store).await, (2, None));
 }
 

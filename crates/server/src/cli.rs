@@ -3,20 +3,27 @@
 //! audit log failed verification, 2 could not run (usage included, which is
 //! clap's own status).
 
+use std::ffi::OsString;
+use std::fs::DirBuilder;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
 use landfall_core::config::{self, Config, ConfigError};
 use landfall_core::ids::HostId;
+use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::watch;
 
 use crate::agent_api::{ApiState, Limits};
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
+use crate::watcher::{self, LiveSource};
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -75,6 +82,13 @@ struct ServeArgs {
     /// TLS-terminating proxy.
     #[arg(long, value_name = "ADDR")]
     listen: SocketAddr,
+    /// The directory of the Sigstore trust root's TUF cache, created if it is
+    /// missing. Defaults to `<db>.tuf`, beside the database. Releases are verified
+    /// against this: with none that verifies, the watcher verifies nothing and
+    /// records why. `GITHUB_TOKEN`, when set and not empty, is sent to the GitHub
+    /// API only, for its higher rate limit.
+    #[arg(long, value_name = "DIR")]
+    trust_cache: Option<PathBuf>,
     /// How many connections are served at once. More wait to be accepted.
     #[arg(
         long,
@@ -169,6 +183,20 @@ pub enum CliError {
         /// The underlying error.
         source: io::Error,
     },
+    /// `GITHUB_TOKEN` is set but cannot be used. The value is never shown.
+    #[error("GITHUB_TOKEN is set but is not valid UTF-8 text or not a valid HTTP header value")]
+    GitHubToken,
+    /// The trust cache directory could not be created.
+    #[error("cannot create the trust cache {}: {source}", .path.display())]
+    TrustCache {
+        /// The directory.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+    /// The HTTP client for releases could not be set up.
+    #[error("cannot set up fetching releases: {0}")]
+    Fetcher(#[source] FetchError),
     /// The signal handlers could not be installed.
     #[error("cannot watch for signals: {0}")]
     Signals(#[source] io::Error),
@@ -191,9 +219,54 @@ fn load_config(path: &Path) -> Result<Config, CliError> {
     })
 }
 
+/// The GitHub token in `GITHUB_TOKEN`'s value: `None` when unset or empty.
+fn github_token(value: Option<OsString>) -> Result<Option<String>, CliError> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => value
+            .into_string()
+            .map(Some)
+            .map_err(|_| CliError::GitHubToken),
+    }
+}
+
+/// The fetcher for GitHub and the registry. `token` goes to GitHub only.
+fn release_fetcher(token: Option<&str>) -> Result<Fetcher, CliError> {
+    let fetcher =
+        Fetcher::new(Endpoints::public().map_err(CliError::Fetcher)?).map_err(CliError::Fetcher)?;
+    match token {
+        None => Ok(fetcher),
+        Some(token) => fetcher
+            .with_github_token(token)
+            .map_err(|_| CliError::GitHubToken),
+    }
+}
+
+/// The trust cache's directory, made if it is missing, private to this user.
+fn trust_cache_dir(args: &ServeArgs) -> Result<PathBuf, CliError> {
+    let path = args.trust_cache.clone().unwrap_or_else(|| {
+        let mut path = args.db.clone().into_os_string();
+        path.push(".tuf");
+        PathBuf::from(path)
+    });
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&path)
+        .map_err(|source| CliError::TrustCache {
+            path: path.clone(),
+            source,
+        })?;
+    Ok(path)
+}
+
 async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let config = load_config(&args.config)?;
+    let token = github_token(std::env::var_os("GITHUB_TOKEN"))?;
+    let fetcher = release_fetcher(token.as_deref())?;
     let store = Store::open(&args.db).await?;
+    let cache_dir = trust_cache_dir(&args)?;
     let serve_error = |source| CliError::Serve {
         addr: args.listen,
         source,
@@ -201,6 +274,18 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let listener = TcpListener::bind(args.listen).await.map_err(serve_error)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
+
+    let watched = Arc::new(config.clone());
+    let source = Arc::new(LiveSource::new(fetcher, Arc::clone(&watched), cache_dir));
+    let (stop_watcher, stop_watching) = watch::channel(false);
+    let watching = tokio::spawn(watcher::run(
+        store.clone(),
+        watched,
+        source,
+        watcher::TICK_INTERVAL,
+        stop_watching,
+    ));
+
     let state = ApiState::new(store, config, Limits::default());
     let app = crate::router(state.clone());
     let shutdown = async move {
@@ -209,8 +294,12 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
             _ = interrupt.recv() => {}
         }
         state.begin_shutdown();
+        stop_watcher.send_replace(true);
     };
     crate::serve::run(listener, app, args.serve_options(), shutdown).await;
+    // Told to stop as the serving began to, it lets go at once. If the watcher
+    // had already stopped, that was a panic and it was logged by the runtime.
+    drop(watching.await);
     Ok(EXIT_OK)
 }
 
@@ -508,6 +597,51 @@ mod tests {
         ]);
         assert!(execute(verify, &mut Vec::new()).await.is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_github_token_is_optional_but_must_be_usable() {
+        assert_eq!(github_token(None).unwrap(), None);
+        assert_eq!(github_token(Some(OsString::new())).unwrap(), None);
+        assert_eq!(
+            github_token(Some("t".into())).unwrap().as_deref(),
+            Some("t")
+        );
+        let not_utf8 = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
+        assert!(matches!(
+            github_token(Some(not_utf8)),
+            Err(CliError::GitHubToken)
+        ));
+        assert!(matches!(
+            release_fetcher(Some("bad\ntoken")),
+            Err(CliError::GitHubToken)
+        ));
+    }
+
+    #[test]
+    fn the_trust_cache_defaults_to_beside_the_database_and_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("controller.db");
+        let args = |cache: Option<PathBuf>| ServeArgs {
+            config: "c".into(),
+            db: db.clone(),
+            listen: "127.0.0.1:0".parse().unwrap(),
+            trust_cache: cache,
+            max_connections: 1,
+            max_connections_per_source: 1,
+        };
+
+        let default = trust_cache_dir(&args(None)).unwrap();
+        assert_eq!(default, dir.path().join("controller.db.tuf"));
+        let mode = std::fs::metadata(&default).unwrap();
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&mode.permissions()) & 0o077,
+            0
+        );
+
+        let named = dir.path().join("a/b");
+        assert_eq!(trust_cache_dir(&args(Some(named.clone()))).unwrap(), named);
+        assert!(named.is_dir());
     }
 
     #[tokio::test]

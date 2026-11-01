@@ -15,18 +15,21 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-origin` (`crates/origin`): release origin verification that needs
   the Sigstore stack or the network: build-provenance bundles and their
   Fulcio certificate identity, the TUF trust root, and the fetchers for
-  signed tag objects (GitHub API), image indexes and bundles (GHCR), and
-  `verify_release`, which composes them for one release.
+  signed tag objects, a repository's tags (GitHub API), image indexes, bundles
+  and referrer tags (GHCR), `verify_release`, which composes them for one
+  release, and `candidates`, which finds every digest attested for it.
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI. A library plus a thin binary;
   modules: `store` (the only code that touches SQLite: migrations, transactions,
   appending to and verifying the audit log, enrolment codes, hosts, nonces,
-  deploys, running state), `audit` (audit events and the hash-chain encoding),
-  `report` (bounding a deploy report before it is stored), `agent_api` (the
-  routes agents call: signed-request extractor, handlers, problem answers, rate
-  limit), `serve` (the accept loop, with header timeouts and a connection cap),
-  `cli` (`serve`, `enrol-code`, `audit verify`, behind the thin `main.rs`).
+  deploys, running state, release decisions and holds), `audit` (audit events and
+  the hash-chain encoding), `report` (bounding a deploy report before it is
+  stored), `agent_api` (the routes agents call: signed-request extractor,
+  handlers, problem answers, rate limit), `watcher` (release discovery, origin
+  verification, rule decisions and queueing, behind a `ReleaseSource` trait),
+  `serve` (the accept loop, with header timeouts and a connection cap), `cli`
+  (`serve`, `enrol-code`, `audit verify`, behind the thin `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:

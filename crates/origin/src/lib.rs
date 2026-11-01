@@ -7,9 +7,11 @@
 //! builds the Sigstore trust root they are verified against, through TUF.
 //! [`fetch`] gets the material to verify: signed tag objects from the GitHub
 //! API, image index digests and Sigstore bundles from the registry.
-//! [`release`] composes them into the verification of one release.
+//! [`release`] composes them into the verification of one release, and
+//! [`candidates`] finds every digest attested for it.
 
 pub mod attestation;
+pub mod candidates;
 pub mod fetch;
 pub mod release;
 pub mod trust;

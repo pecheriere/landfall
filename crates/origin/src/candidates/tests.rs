@@ -1,0 +1,311 @@
+//! Candidates against a mock registry and the real attestation fixture, which
+//! verifies for one digest, tag and commit of one project.
+
+use std::time::Duration;
+
+use landfall_core::config::{self, Config};
+use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
+use serde_json::json;
+use wiremock::matchers::{method, path, path_regex};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use super::{AttestedDigests, CandidateCache, attested_digests};
+use crate::attestation::SLSA_PROVENANCE;
+use crate::fetch::OCI_INDEX;
+use crate::release::ReleaseError;
+use crate::test_support::{fetcher, mount_bundles, mount_manifest, referrers_index, referrers_tag};
+use crate::trust::TrustRoot;
+
+const BUNDLE: &[u8] = include_bytes!("../../tests/fixtures/attestation/bundle.json");
+const TRUSTED_ROOT: &str = include_str!("../../tests/fixtures/attestation/trusted_root.json");
+const REPO: &str = "dani-garcia/vaultwarden";
+const TAG: &str = "1.37.4";
+const COMMIT: &str = "7c188967e7a467b19b2757bc3326f9cf3ccae327";
+const DIGEST: &str = "sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055";
+const TAGS: &str = "/v2/dani-garcia/vaultwarden/tags/list";
+
+fn config(repo_id: u64) -> Config {
+    let text = format!(
+        r#"
+[approvers]
+operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}
+
+[[deployment]]
+id = "app/prod"
+repo = {{ name = "{REPO}", id = {repo_id}, owner_id = 725423 }}
+host = "host-1"
+compose = {{ dir = "/srv/app", service = "app" }}
+origin = {{ workflow = ".github/workflows/release.yml", tags = "*", signed_tags = false }}
+rule = {{ approvers = ["operator"] }}
+checks = ["container-healthy"]
+"#
+    );
+    config::parse(text.as_bytes()).unwrap()
+}
+
+fn deployment() -> DeploymentId {
+    "app/prod".parse().unwrap()
+}
+
+fn real_digest() -> ImageDigest {
+    DIGEST.parse().unwrap()
+}
+
+fn other_digest(c: char) -> ImageDigest {
+    format!("sha256:{}", c.to_string().repeat(64))
+        .parse()
+        .unwrap()
+}
+
+struct Mocks {
+    github: MockServer,
+    registry: MockServer,
+}
+
+impl Mocks {
+    /// The registry lists `digests`, with the real bundle attached to the real
+    /// digest.
+    async fn listing(digests: &[&ImageDigest]) -> Self {
+        let registry = MockServer::start().await;
+        mount_bundles(
+            &registry,
+            REPO,
+            &real_digest(),
+            &[(BUNDLE, SLSA_PROVENANCE)],
+        )
+        .await;
+        let tags: Vec<String> = digests.iter().map(|d| referrers_tag(d)).collect();
+        Mock::given(method("GET"))
+            .and(path(TAGS))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "tags": tags })))
+            .mount(&registry)
+            .await;
+        Self {
+            github: MockServer::start().await,
+            registry,
+        }
+    }
+
+    async fn ask(
+        &self,
+        cache: &CandidateCache,
+        tag: &str,
+    ) -> Result<AttestedDigests, ReleaseError> {
+        self.ask_config(&config(121_898_717), cache, tag).await
+    }
+
+    async fn ask_config(
+        &self,
+        config: &Config,
+        cache: &CandidateCache,
+        tag: &str,
+    ) -> Result<AttestedDigests, ReleaseError> {
+        let tag: ReleaseTag = tag.parse().unwrap();
+        let commit: CommitSha = COMMIT.parse().unwrap();
+        attested_digests(
+            &fetcher(&self.github, &self.registry),
+            &TrustRoot::from_json(TRUSTED_ROOT),
+            config,
+            (&deployment(), &tag, &commit),
+            cache,
+        )
+        .await
+    }
+
+    /// How many times a bundle was downloaded.
+    async fn bundle_fetches(&self) -> usize {
+        self.registry
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().contains("/blobs/"))
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn a_candidate_that_verifies_counts() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    let answer = mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
+    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.ignored, []);
+}
+
+#[tokio::test]
+async fn a_verified_result_is_kept_and_not_verified_again() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    let cache = CandidateCache::default();
+    for _ in 0..3 {
+        let answer = mocks.ask(&cache, TAG).await.unwrap();
+        assert_eq!(answer.verified, [real_digest()]);
+    }
+    assert_eq!(mocks.bundle_fetches().await, 1);
+}
+
+#[tokio::test]
+async fn a_candidate_that_does_not_verify_is_ignored_and_says_why() {
+    // The real bundle, attached to a digest it does not attest.
+    let wrong = other_digest('a');
+    let mocks = Mocks::listing(&[&real_digest(), &wrong]).await;
+    mount_bundles(&mocks.registry, REPO, &wrong, &[(BUNDLE, SLSA_PROVENANCE)]).await;
+
+    let answer = mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
+    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.ignored.len(), 1, "{answer:?}");
+    assert_eq!(answer.ignored[0].digest, wrong);
+    assert!(answer.ignored[0].reason.contains("attests"), "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_candidate_with_nothing_attached_is_ignored() {
+    // The referrer tag is listed and its manifest is a 404.
+    let empty = other_digest('b');
+    let mocks = Mocks::listing(&[&real_digest(), &empty]).await;
+    let answer = mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
+    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.ignored.len(), 1, "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_candidate_with_no_provenance_bundle_is_looked_at_again() {
+    let empty = other_digest('b');
+    let mocks = Mocks::listing(&[&empty]).await;
+    mount_manifest(
+        &mocks.registry,
+        (REPO, &referrers_tag(&empty)),
+        OCI_INDEX,
+        referrers_index(&[]),
+        None,
+    )
+    .await;
+    let cache = CandidateCache::default();
+    assert_eq!(mocks.ask(&cache, TAG).await.unwrap().ignored.len(), 1);
+    // It may be being published right now.
+    assert_eq!(mocks.ask(&cache, TAG).await.unwrap().ignored.len(), 1);
+}
+
+#[tokio::test]
+async fn a_candidate_whose_material_cannot_be_read_fails_closed() {
+    // It might have verified, so the answer is not "there is only one".
+    let unread = other_digest('c');
+    let mocks = Mocks::listing(&[&real_digest(), &unread]).await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v2/{REPO}/manifests/{}$",
+            referrers_tag(&unread)
+        )))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&mocks.registry)
+        .await;
+
+    let error = mocks
+        .ask(&CandidateCache::default(), TAG)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ReleaseError::Listing(_)), "{error:?}");
+    assert!(!error.is_refusal(), "{error:?}");
+}
+
+#[tokio::test]
+async fn an_unreadable_list_fails_closed() {
+    let registry = MockServer::start().await;
+    mount_bundles(
+        &registry,
+        REPO,
+        &real_digest(),
+        &[(BUNDLE, SLSA_PROVENANCE)],
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(TAGS))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&registry)
+        .await;
+    let mocks = Mocks {
+        github: MockServer::start().await,
+        registry,
+    };
+
+    let error = mocks
+        .ask(&CandidateCache::default(), TAG)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ReleaseError::Listing(_)), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_bundle_for_another_release_is_fetched_once_across_releases() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    let cache = CandidateCache::default();
+
+    // It names 1.37.4's ref, so it is not these releases'.
+    for tag in ["2.0.0", "2.0.1", "2.0.2"] {
+        let answer = mocks.ask(&cache, tag).await.unwrap();
+        assert_eq!(answer.verified, [], "{tag}");
+    }
+    assert_eq!(mocks.bundle_fetches().await, 1);
+
+    // It is still looked at for the release it names.
+    let answer = mocks.ask(&cache, TAG).await.unwrap();
+    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(mocks.bundle_fetches().await, 2);
+}
+
+#[tokio::test]
+async fn a_bundle_of_another_repository_is_ruled_out_for_every_release() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    let cache = CandidateCache::default();
+    let other_repo_id = config(1);
+    for tag in [TAG, "2.0.0"] {
+        let answer = mocks.ask_config(&other_repo_id, &cache, tag).await.unwrap();
+        assert_eq!(answer.verified, [], "{tag}");
+    }
+    assert_eq!(mocks.bundle_fetches().await, 1);
+}
+
+/// The attestation fixture's release on the real registry: every referrer tag of
+/// the image is looked at, and two digests verify, since the project's one
+/// workflow attests two image variants per tag: `1.37.4`, the digest the fixture
+/// holds, and `1.37.4-alpine`. The exactly-one rule therefore refuses this release.
+#[tokio::test]
+#[ignore = "network: runs nightly in advisories.yml"]
+async fn live_the_fixture_release_has_its_two_variants_attested() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let root = crate::trust::load_trusted_root(cache_dir.path(), crate::trust::Refresh::Online)
+        .await
+        .unwrap();
+    let fetcher = crate::fetch::Fetcher::new(crate::fetch::Endpoints::public().unwrap()).unwrap();
+    let tag: ReleaseTag = TAG.parse().unwrap();
+    let commit: CommitSha = COMMIT.parse().unwrap();
+    let cache = CandidateCache::default();
+    let target = (&deployment(), &tag, &commit);
+    let config = config(121_898_717);
+
+    let answer = attested_digests(&fetcher, &root, &config, target, &cache)
+        .await
+        .unwrap();
+    let alpine: ImageDigest =
+        "sha256:19ea2b669945d842dadc3d500f2d6a795866a003330f59a47b9634658bae98bb"
+            .parse()
+            .unwrap();
+    assert_eq!(answer.verified, [alpine, real_digest()]);
+
+    // What verified is known now, and what named another release is ruled out.
+    let started = std::time::Instant::now();
+    let again = attested_digests(&fetcher, &root, &config, target, &cache)
+        .await
+        .unwrap();
+    assert_eq!(again.verified, answer.verified);
+    assert!(started.elapsed() < Duration::from_secs(60));
+}
+
+#[tokio::test]
+async fn what_ruled_a_candidate_out_is_forgotten_in_time() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    let cache = CandidateCache::with_lifetime(Duration::ZERO);
+    for tag in ["2.0.0", "2.0.1"] {
+        mocks.ask(&cache, tag).await.unwrap();
+    }
+    assert_eq!(mocks.bundle_fetches().await, 2);
+}
