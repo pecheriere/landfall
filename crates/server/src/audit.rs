@@ -55,10 +55,19 @@ pub enum EventKind {
     DeployClaimed,
     /// A host reported a deploy finished, with its steps.
     DeployFinished,
-    /// A host's configuration hash differs from the controller's.
+    /// A host refused a deploy because its own configuration or state does not
+    /// allow it, with its reason. This is the signal of a controller asking for
+    /// something a host won't allow, so it has its own kind: treat it as an
+    /// alert.
+    DeployRefused,
+    /// A host's configuration hash began or stopped differing from the
+    /// controller's.
     ConfigDrift,
-    /// A host reported a deployment's running state changed outside landfall.
+    /// A host reported that a deployment began or stopped differing from what
+    /// the agent deployed.
     RunningDrift,
+    /// A host reported a different release deployed for a deployment.
+    RunningChanged,
 }
 
 impl EventKind {
@@ -73,8 +82,10 @@ impl EventKind {
             Self::DeployQueued => "deploy_queued",
             Self::DeployClaimed => "deploy_claimed",
             Self::DeployFinished => "deploy_finished",
+            Self::DeployRefused => "deploy_refused",
             Self::ConfigDrift => "config_drift",
             Self::RunningDrift => "running_drift",
+            Self::RunningChanged => "running_changed",
         }
     }
 }

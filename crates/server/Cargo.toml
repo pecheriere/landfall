@@ -17,18 +17,22 @@ axum.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 landfall-core.workspace = true
 landfall-origin.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { workspace = true, features = ["util"] }
 
 [dev-dependencies]
+futures-core.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros"] }
-tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

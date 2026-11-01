@@ -2,11 +2,16 @@
 -- controller's own clock. STRICT tables: a value of the wrong type is an error,
 -- not a conversion.
 
--- Hosts with an enrolled Ed25519 key.
+-- Hosts with an enrolled Ed25519 key. A key belongs to one host: whoever holds a
+-- key enrolled twice could sign as either.
+-- `drifted_config_hash` is the hash the host last reported when it differed
+-- from the controller's, and NULL when the two agree, so a host polling with a
+-- wrong configuration is recorded once and not on every poll.
 CREATE TABLE hosts (
-    id          TEXT PRIMARY KEY,
-    public_key  BLOB NOT NULL CHECK (length(public_key) = 32),
-    enrolled_at INTEGER NOT NULL
+    id                  TEXT PRIMARY KEY,
+    public_key          BLOB NOT NULL UNIQUE CHECK (length(public_key) = 32),
+    enrolled_at         INTEGER NOT NULL,
+    drifted_config_hash BLOB CHECK (length(drifted_config_hash) = 32)
 ) STRICT;
 
 -- One-time enrolment codes, stored only as a SHA-256 and deleted when used. No
@@ -39,19 +44,23 @@ CREATE TABLE releases (
 ) STRICT;
 
 -- `host` is the deployment's host in the configuration, whether or not it has
--- enrolled yet, so it does not reference `hosts`.
+-- enrolled yet, so it does not reference `hosts`. `id` is the wire's `DeployId`:
+-- AUTOINCREMENT, so an id is never used twice, even after rows are deleted.
+-- `reason` and `rollback_reason` are the agent's text, quoted and bounded.
 CREATE TABLE deploys (
-    id          TEXT PRIMARY KEY,
-    deployment  TEXT NOT NULL,
-    host        TEXT NOT NULL,
-    tag         TEXT NOT NULL,
-    digest      TEXT NOT NULL,
-    commit_sha  TEXT NOT NULL,
-    state       TEXT NOT NULL CHECK (state IN ('queued', 'claimed', 'finished')),
-    outcome     TEXT,
-    created_at  INTEGER NOT NULL,
-    claimed_at  INTEGER,
-    finished_at INTEGER,
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    deployment      TEXT NOT NULL,
+    host            TEXT NOT NULL,
+    tag             TEXT NOT NULL,
+    digest          TEXT NOT NULL,
+    commit_sha      TEXT NOT NULL,
+    state           TEXT NOT NULL CHECK (state IN ('queued', 'claimed', 'finished')),
+    outcome         TEXT,
+    reason          TEXT,
+    rollback_reason TEXT,
+    created_at      INTEGER NOT NULL,
+    claimed_at      INTEGER,
+    finished_at     INTEGER,
     CHECK ((state = 'finished') = (outcome IS NOT NULL)),
     FOREIGN KEY (deployment, tag) REFERENCES releases (deployment, tag)
 ) STRICT;
@@ -62,17 +71,32 @@ CREATE UNIQUE INDEX one_active_deploy_per_deployment
 
 CREATE INDEX deploys_by_host ON deploys (host, state);
 
--- The steps an agent reported for a deploy. `started_at` is the agent's own
--- timestamp, kept as it was reported.
+-- The steps an agent reported for a deploy, its text quoted and bounded. At most
+-- `report::MAX_STORED_STEPS` for a deploy. `failure` is NULL for a step that did
+-- what it should; `detail` is JSON, when the step had more to say.
 CREATE TABLE deploy_steps (
-    deploy_id  TEXT NOT NULL REFERENCES deploys (id),
-    position   INTEGER NOT NULL,
-    name       TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    millis     INTEGER NOT NULL,
-    result     TEXT NOT NULL,
-    detail     TEXT,
+    deploy_id INTEGER NOT NULL REFERENCES deploys (id),
+    position  INTEGER NOT NULL,
+    name      TEXT NOT NULL,
+    millis    INTEGER NOT NULL,
+    failure   TEXT,
+    detail    TEXT,
     PRIMARY KEY (deploy_id, position)
+) STRICT;
+
+-- What each host last said about its deployments, only for deployments the
+-- configuration gives it. `tag` and `digest` are both NULL for a deployment that
+-- has never been deployed.
+CREATE TABLE running_states (
+    deployment TEXT PRIMARY KEY,
+    host       TEXT NOT NULL,
+    tag        TEXT,
+    digest     TEXT,
+    drift      INTEGER NOT NULL CHECK (drift IN (0, 1)),
+    phase      TEXT NOT NULL,
+    busy       INTEGER NOT NULL CHECK (busy IN (0, 1)),
+    updated_at INTEGER NOT NULL,
+    CHECK ((tag IS NULL) = (digest IS NULL))
 ) STRICT;
 
 -- The hash-chained log; `audit.rs` documents the hash. AUTOINCREMENT because

@@ -1,9 +1,14 @@
 //! The landfall controller: watches releases, verifies their origin, keeps
 //! state and the audit log, and coordinates the agents.
 
+pub mod agent_api;
 pub mod audit;
 pub mod cli;
+pub mod report;
+pub mod serve;
 pub mod store;
+
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
@@ -14,30 +19,48 @@ use axum::routing::get;
 /// anything about a release.
 pub use landfall_origin as origin;
 
+use crate::agent_api::ApiState;
 use crate::store::Store;
+
+/// How long a health check may take: unauthenticated, and only worth anything
+/// if it answers quickly.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Answers 200 when the store answers, and 503 when it does not.
 async fn healthz(State(store): State<Store>) -> StatusCode {
-    match store.ping().await {
-        Ok(()) => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    match tokio::time::timeout(HEALTH_TIMEOUT, store.ping()).await {
+        Ok(Ok(())) => StatusCode::OK,
+        Ok(Err(_)) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
 /// The controller's HTTP routes.
-pub fn router(store: Store) -> Router {
-    Router::new()
+pub fn router(state: ApiState) -> Router {
+    let health = Router::new()
         .route("/healthz", get(healthz))
-        .with_state(store)
+        .with_state(state.store().clone());
+    health.merge(agent_api::router(state))
 }
 
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
     use axum::http::Request;
+    use landfall_core::config;
     use tower::ServiceExt as _;
 
     use super::*;
+    use crate::agent_api::Limits;
+
+    const CONFIG: &str = r#"
+[approvers]
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+"#;
+
+    fn app(store: Store) -> Router {
+        let config = config::parse(CONFIG.as_bytes()).unwrap();
+        router(ApiState::new(store, config, Limits::default()))
+    }
 
     fn get_healthz() -> Request<Body> {
         Request::builder()
@@ -49,7 +72,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_follows_the_store() {
         let store = Store::open_in_memory().await.unwrap();
-        let app = router(store.clone());
+        let app = app(store.clone());
         let answer = app.clone().oneshot(get_healthz()).await.unwrap();
         assert_eq!(answer.status(), StatusCode::OK);
 
@@ -65,7 +88,18 @@ mod tests {
             .uri("/nothing")
             .body(Body::empty())
             .unwrap();
-        let answer = router(store).oneshot(request).await.unwrap();
+        let answer = app(store).oneshot(request).await.unwrap();
         assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_agent_api_is_served() {
+        let store = Store::open_in_memory().await.unwrap();
+        let request = Request::builder()
+            .uri("/agent/v1/nonce")
+            .body(Body::empty())
+            .unwrap();
+        let answer = app(store).oneshot(request).await.unwrap();
+        assert_eq!(answer.status(), StatusCode::OK);
     }
 }

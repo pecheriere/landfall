@@ -324,6 +324,36 @@ pub struct EnrolRequest {
     pub public_key: VerifyingKey,
 }
 
+/// `GET /agent/v1/nonce`: a nonce to sign the next request under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NonceResponse {
+    /// The nonce: single-use, and valid for 5 minutes by the controller's clock.
+    pub nonce: Nonce,
+}
+
+/// The most bytes the controller reads of a request body. A larger one is
+/// refused before it is parsed, so an agent must keep what it sends under this,
+/// reports included: a refused report would be retried forever.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// The content type of a [`Problem`].
+pub const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
+
+/// An error answer from the controller (RFC 9457).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Problem {
+    /// Stable, machine-readable, and what a client should act on. Hostile in
+    /// the agent: quote and bound it with [`crate::text::shown`] before showing
+    /// it.
+    pub code: String,
+    /// For people; may change. Hostile in the agent like `code`.
+    pub title: String,
+    /// The HTTP status.
+    pub status: u16,
+}
+
 /// A controller-assigned deploy identifier. Reports are idempotent by it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -575,9 +605,9 @@ mod tests {
 
     use super::{
         DeployId, DeployReportBody, DeployWork, DeployedRelease, EnrolCode, EnrolRequest, HeldBack,
-        MAX_REPORTED_CHECKS, Nonce, Phase, ReportedCheck, ReportedDetail, ReportedOutcome,
-        ReportedStep, RequestSignature, RunningState, SignatureError, SigningKey, VerifyingKey,
-        WorkRequest, WorkResponse, sign, signing_bytes, verify,
+        MAX_REPORTED_CHECKS, Nonce, NonceResponse, Phase, Problem, ReportedCheck, ReportedDetail,
+        ReportedOutcome, ReportedStep, RequestSignature, RunningState, SignatureError, SigningKey,
+        VerifyingKey, WorkRequest, WorkResponse, sign, signing_bytes, verify,
     };
     use crate::hex;
     use crate::ids::HostId;
@@ -937,6 +967,12 @@ mod tests {
             check(&outcome);
         }
         check(&step(None, None));
+        check(&NonceResponse { nonce: nonce(1) });
+        check(&Problem {
+            code: "bad_nonce".to_owned(),
+            title: "the nonce is unknown, used or expired".to_owned(),
+            status: 401,
+        });
 
         // EnrolRequest has no equality (its code is a secret): compare the
         // wire form after a round trip.

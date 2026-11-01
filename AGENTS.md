@@ -21,9 +21,12 @@ passkey approvals. Agents drive it through a typed API. Design:
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI. A library plus a thin binary;
   modules: `store` (the only code that touches SQLite: migrations, transactions,
-  appending to and verifying the audit log, enrolment codes), `audit` (audit
-  events and the hash-chain encoding), `cli` (`serve`, `enrol-code`, `audit
-  verify`, behind the thin `main.rs`).
+  appending to and verifying the audit log, enrolment codes, hosts, nonces,
+  deploys, running state), `audit` (audit events and the hash-chain encoding),
+  `report` (bounding a deploy report before it is stored), `agent_api` (the
+  routes agents call: signed-request extractor, handlers, problem answers, rate
+  limit), `serve` (the accept loop, with header timeouts and a connection cap),
+  `cli` (`serve`, `enrol-code`, `audit verify`, behind the thin `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:

@@ -14,6 +14,8 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::agent_api::{ApiState, Limits};
+use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 
 /// The command succeeded.
@@ -162,7 +164,7 @@ fn load_config(path: &Path) -> Result<Config, CliError> {
 }
 
 async fn serve(args: ServeArgs) -> Result<u8, CliError> {
-    load_config(&args.config)?;
+    let config = load_config(&args.config)?;
     let store = Store::open(&args.db).await?;
     let serve_error = |source| CliError::Serve {
         addr: args.listen,
@@ -171,15 +173,16 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let listener = TcpListener::bind(args.listen).await.map_err(serve_error)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
-    axum::serve(listener, crate::router(store))
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = terminate.recv() => {}
-                _ = interrupt.recv() => {}
-            }
-        })
-        .await
-        .map_err(serve_error)?;
+    let state = ApiState::new(store, config, Limits::default());
+    let app = crate::router(state.clone());
+    let shutdown = async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        state.begin_shutdown();
+    };
+    crate::serve::run(listener, app, ServeOptions::default(), shutdown).await;
     Ok(EXIT_OK)
 }
 
