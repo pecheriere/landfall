@@ -8,6 +8,7 @@
 //! whom. Nothing outside the signed bytes is trusted, and a failure names
 //! what was expected and what was found.
 
+use serde::Serialize;
 use ssh_key::SshSig;
 use thiserror::Error;
 
@@ -21,7 +22,7 @@ const NAMESPACE: &str = "git";
 const SIGNATURE_START: &[u8] = b"-----BEGIN SSH SIGNATURE-----";
 
 /// What a valid maintainer signature on a release tag proves.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SignedTag {
     /// The signed tag name, equal to the expected one.
     pub tag: ReleaseTag,

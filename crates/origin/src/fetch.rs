@@ -50,10 +50,10 @@ const MAX_TAG_DEPTH: usize = 4;
 
 const GITHUB_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
-const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+pub(crate) const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const DOCKER_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
-const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
-const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+pub(crate) const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+pub(crate) const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
 /// The annotation on a bundle's referrer manifest and its descriptor naming
 /// the predicate type of the attestation inside.
 const PREDICATE_TYPE_ANNOTATION: &str = "dev.sigstore.bundle.predicateType";
@@ -822,7 +822,7 @@ fn checked_sha1(parts: &[&[u8]]) -> Option<String> {
 }
 
 /// Lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     bytes
         .iter()
@@ -1078,16 +1078,16 @@ mod tests {
     use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
     use reqwest::Url;
     use serde_json::json;
-    use sha1_checked::Digest as _;
-    use sha1_checked::Sha1;
-    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::MockServer;
 
     use super::{
-        BUNDLE_TYPE, DOCKER_LIST, Endpoints, FetchError, Fetcher, MANIFEST_LIMIT, MAX_TAG_DEPTH,
-        OCI_INDEX, OCI_MANIFEST, Platform, SLSA_PROVENANCE, TAG_OBJECT_LIMIT, checked_sha1, hex,
+        DOCKER_LIST, Endpoints, FetchError, Fetcher, MANIFEST_LIMIT, MAX_TAG_DEPTH, OCI_INDEX,
+        OCI_MANIFEST, Platform, SLSA_PROVENANCE, TAG_OBJECT_LIMIT, checked_sha1,
+    };
+    use crate::test_support::{
+        bundle_manifest, fetcher, fetcher_for, mount_token, payload_and_signature, referrers_index,
+        referrers_tag, sha256, tag_object_id,
     };
 
     const VALID_TAG: &[u8] = include_bytes!("../../core/tests/fixtures/tag/valid.tag");
@@ -1095,7 +1095,7 @@ mod tests {
     const RELEASE_COMMIT: &str = "7160f743d0664e041913065355d7bcd291ad2a01";
     const IMAGE: &str = "example/app";
     const GITHUB_TOKEN: &str = "github-test-token";
-    const REGISTRY_TOKEN: &str = "registry-test-token";
+    const SBOM: &str = "https://spdx.dev/Document/v2.3";
 
     fn repo() -> RepoName {
         "example/app".parse().unwrap()
@@ -1105,47 +1105,8 @@ mod tests {
         "v1.2.3".parse().unwrap()
     }
 
-    fn sha256(bytes: &[u8]) -> String {
-        format!("sha256:{}", hex(&Sha256::digest(bytes)))
-    }
-
-    fn tag_object_id(raw: &[u8]) -> String {
-        let mut hasher = Sha1::new();
-        hasher.update(format!("tag {}\0", raw.len()).as_bytes());
-        hasher.update(raw);
-        hex(&hasher.finalize())
-    }
-
-    const SBOM: &str = "https://spdx.dev/Document/v2.3";
-
-    fn fetcher_for(github: &str, registry: &str) -> Fetcher {
-        Fetcher::new(Endpoints::plain_http(
-            Url::parse(github).unwrap(),
-            Url::parse(registry).unwrap(),
-        ))
-        .unwrap()
-    }
-
-    fn fetcher(github: &MockServer, registry: &MockServer) -> Fetcher {
-        fetcher_for(&github.uri(), &registry.uri())
-    }
-
-    /// The valid fixture split the way GitHub serves it.
-    fn payload_and_signature(raw: &[u8]) -> (String, String) {
-        let text = std::str::from_utf8(raw).unwrap();
-        let at = text.find("-----BEGIN SSH SIGNATURE-----").unwrap();
-        (text[..at].to_owned(), text[at..].to_owned())
-    }
-
     async fn mount_ref(server: &MockServer, kind: &str, sha: &str) {
-        Mock::given(method("GET"))
-            .and(path("/repos/example/app/git/ref/tags/v1.2.3"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "ref": "refs/tags/v1.2.3",
-                "object": { "sha": sha, "type": kind },
-            })))
-            .mount(server)
-            .await;
+        crate::test_support::mount_ref(server, IMAGE, "v1.2.3", kind, sha).await;
     }
 
     async fn mount_tag(
@@ -1154,35 +1115,7 @@ mod tests {
         target: (&str, &str),
         signed: Option<(&str, &str)>,
     ) {
-        let verification = match signed {
-            Some((payload, signature)) => json!({
-                "verified": false, "reason": "unknown_key",
-                "payload": payload, "signature": signature,
-            }),
-            None => json!({
-                "verified": false, "reason": "unsigned", "payload": null, "signature": null,
-            }),
-        };
-        Mock::given(method("GET"))
-            .and(path(format!("/repos/example/app/git/tags/{sha}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "sha": sha,
-                "tag": "v1.2.3",
-                "object": { "sha": target.0, "type": target.1 },
-                "verification": verification,
-            })))
-            .mount(server)
-            .await;
-    }
-
-    async fn mount_token(server: &MockServer) {
-        Mock::given(method("GET"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "token": REGISTRY_TOKEN })),
-            )
-            .mount(server)
-            .await;
+        crate::test_support::mount_tag(server, (IMAGE, "v1.2.3"), sha, target, signed).await;
     }
 
     async fn mount_manifest(
@@ -1192,23 +1125,22 @@ mod tests {
         body: Vec<u8>,
         header_digest: Option<&str>,
     ) {
-        let mut response = ResponseTemplate::new(200).set_body_raw(body, media_type);
-        if let Some(digest) = header_digest {
-            response = response.insert_header("docker-content-digest", digest);
-        }
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{IMAGE}/manifests/{reference}")))
-            .respond_with(response)
-            .mount(server)
-            .await;
+        crate::test_support::mount_manifest(
+            server,
+            (IMAGE, reference),
+            media_type,
+            body,
+            header_digest,
+        )
+        .await;
     }
 
     async fn mount_blob(server: &MockServer, digest: &str, body: Vec<u8>) {
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/{IMAGE}/blobs/{digest}")))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(body, BUNDLE_TYPE))
-            .mount(server)
-            .await;
+        crate::test_support::mount_blob(server, IMAGE, digest, body).await;
+    }
+
+    async fn mount_bundles(server: &MockServer, digest: &ImageDigest, bundles: &[(&[u8], &str)]) {
+        crate::test_support::mount_bundles(server, IMAGE, digest, bundles).await;
     }
 
     /// A multi-arch index shaped like the one buildx pushes to GHCR: two
@@ -1235,99 +1167,6 @@ mod tests {
 
     fn release_digest() -> ImageDigest {
         sha256(b"the release index").parse().unwrap()
-    }
-
-    fn referrers_tag(digest: &ImageDigest) -> String {
-        digest.as_ref().replace(':', "-")
-    }
-
-    /// A referrer manifest holding `bundle` as its one layer, shaped like the
-    /// ones `actions/attest-build-provenance` pushes, annotated with
-    /// `predicate`.
-    fn bundle_manifest(subject: &ImageDigest, bundle: &[u8], predicate: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": OCI_MANIFEST,
-            "artifactType": BUNDLE_TYPE,
-            "config": {
-                "mediaType": "application/vnd.oci.empty.v1+json",
-                "digest": sha256(b"{}"),
-                "size": 2,
-            },
-            "layers": [
-                { "mediaType": BUNDLE_TYPE, "digest": sha256(bundle), "size": bundle.len() },
-            ],
-            "subject": { "mediaType": OCI_INDEX, "digest": subject.as_ref(), "size": 3161 },
-            "annotations": {
-                "dev.sigstore.bundle.content": "dsse-envelope",
-                "dev.sigstore.bundle.predicateType": predicate,
-            },
-        }))
-        .unwrap()
-    }
-
-    /// A referrers index listing each manifest, its descriptor annotated with
-    /// the predicate type given (none when `None`), as GHCR serves it.
-    fn referrers_index(entries: &[(&[u8], Option<&str>)]) -> Vec<u8> {
-        let manifests: Vec<_> = entries
-            .iter()
-            .map(|(manifest, predicate)| {
-                let mut descriptor = json!({
-                    "mediaType": OCI_MANIFEST,
-                    "digest": sha256(manifest),
-                    "size": manifest.len(),
-                    "artifactType": BUNDLE_TYPE,
-                });
-                if let Some(predicate) = predicate {
-                    descriptor["annotations"] = json!({
-                        "dev.sigstore.bundle.content": "dsse-envelope",
-                        "dev.sigstore.bundle.predicateType": predicate,
-                    });
-                }
-                descriptor
-            })
-            .collect();
-        serde_json::to_vec(&json!({
-            "schemaVersion": 2,
-            "mediaType": OCI_INDEX,
-            "manifests": manifests,
-        }))
-        .unwrap()
-    }
-
-    /// Mounts the token, the referrers index and every manifest and blob,
-    /// each `(bundle, predicate type)` in a manifest and descriptor annotated
-    /// with that predicate type.
-    async fn mount_bundles(server: &MockServer, digest: &ImageDigest, bundles: &[(&[u8], &str)]) {
-        mount_token(server).await;
-        let manifests: Vec<Vec<u8>> = bundles
-            .iter()
-            .map(|(bundle, predicate)| bundle_manifest(digest, bundle, predicate))
-            .collect();
-        for (manifest, (bundle, _)) in manifests.iter().zip(bundles) {
-            mount_manifest(
-                server,
-                &sha256(manifest),
-                OCI_MANIFEST,
-                manifest.clone(),
-                None,
-            )
-            .await;
-            mount_blob(server, &sha256(bundle), bundle.to_vec()).await;
-        }
-        let entries: Vec<(&[u8], Option<&str>)> = manifests
-            .iter()
-            .zip(bundles)
-            .map(|(manifest, (_, predicate))| (manifest.as_slice(), Some(*predicate)))
-            .collect();
-        mount_manifest(
-            server,
-            &referrers_tag(digest),
-            OCI_INDEX,
-            referrers_index(&entries),
-            None,
-        )
-        .await;
     }
 
     #[tokio::test]

@@ -91,6 +91,20 @@ Release tags themselves (whatever the pattern) are at most 128 bytes of
 component (leading, trailing or doubled `/`), not starting with `-`, no
 component starting with `.` or ending with `.lock`, not ending with `.`.
 
+### Release images
+
+A deployment's image is `ghcr.io/<owner>/<repo>`, the `repo.name` in
+lowercase, tagged with the release's version without the tag pattern's
+prefix: release tag `v1.2.3` is looked up as `ghcr.io/example/app:1.2.3`, what
+`docker/metadata-action` produces with `type=semver,pattern={{version}}`. The
+image must be a multi-arch index with a GitHub build-provenance attestation
+(`actions/attest-build-provenance` with `push-to-registry: true`) made by
+`origin.workflow` on the tag push. The registry tag is only a lookup hint: the
+attestation binds the digest to the release.
+
+To check a deployment's `repo` and `origin` against a real release, run
+[`landfall verify`](../README.md#verifying-a-release).
+
 ### `origin.signed_tags = false`
 
 With `signed_tags = false` landfall does not check who signed the tag. The

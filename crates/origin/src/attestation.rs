@@ -1,6 +1,7 @@
 //! GitHub build-provenance bundles: Sigstore verification and Fulcio identity.
 
 use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
+use serde::Serialize;
 use sigstore_verify::crypto::CertificateInfo;
 use sigstore_verify::types::{
     Artifact, Bundle, MediaType, Sha256Hash, SignatureContent, Statement,
@@ -29,7 +30,7 @@ pub struct Expected<'a> {
 }
 
 /// The facts a verified bundle establishes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedAttestation {
     /// The image index digest the bundle attests.
     pub digest: ImageDigest,

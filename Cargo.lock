@@ -1244,6 +1244,11 @@ name = "landfall-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "landfall-core",
+ "landfall-origin",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

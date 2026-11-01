@@ -34,6 +34,25 @@ file is documented in [`docs/configuration.md`](docs/configuration.md).
 | `landfall-agent` | every target host (systemd service) | verifies, deploys, checks, rolls back |
 | `landfall` | anywhere | command-line client |
 
+## Verifying a release
+
+`landfall verify` runs the origin checks a host runs before deploying, against
+one release, and prints what it verified as JSON (tag signer and key
+fingerprint, release commit, image index digest, certificate identity, workflow
+run, transparency-log entry, platforms):
+
+```sh
+landfall verify --config fleet.toml --deployment app/prod --tag v1.2.3 \
+  [--platform linux/arm64] [--cache-dir <dir>] [--offline]
+```
+
+A refused release exits non-zero with the failing step and its reason on
+stderr. `--platform` defaults to the running machine's on Linux and is required
+elsewhere. The Sigstore trust root is refreshed through TUF into `--cache-dir`
+(default `$XDG_CACHE_HOME/landfall/tuf` or `~/.cache/landfall/tuf`);
+`--offline` uses that cache without refreshing it and fails when it is missing
+or expired.
+
 ## Development
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup and the checks every

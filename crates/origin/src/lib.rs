@@ -7,9 +7,14 @@
 //! builds the Sigstore trust root they are verified against, through TUF.
 //! [`fetch`] gets the material to verify: signed tag objects from the GitHub
 //! API, image index digests and Sigstore bundles from the registry.
+//! [`release`] composes them into the verification of one release.
 
 pub mod attestation;
 pub mod fetch;
+pub mod release;
 pub mod trust;
+
+#[cfg(test)]
+mod test_support;
 
 pub use landfall_core::release::Platform;

@@ -30,6 +30,7 @@ print_stderr = "deny"
 
 [workspace.dependencies]
 landfall-core = { path = "crates/core", version = "0.0.0" }
+landfall-origin = { path = "crates/origin", version = "0.0.0" }
 clap = { version = "4.6.7", features = ["derive"] }
 semver = "1.0.28"
 sha2 = "0.11.1"

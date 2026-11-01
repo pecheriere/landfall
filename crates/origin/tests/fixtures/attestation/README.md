@@ -28,6 +28,13 @@ the build trigger `push` and the runner environment `github-hosted`.
   The project attests the same digest for three registries; this is the GHCR
   one.
 - `index-digest.txt`: the multi-arch image index digest the bundle attests.
+- `index.json`: the image index itself, the exact bytes the registry serves
+  for the release tag (their sha256 is the index digest). It lists
+  `linux/amd64`, `linux/arm64`, `linux/arm/v7` and `linux/arm/v6`, each with
+  a buildx attestation manifest. With it, `crates/origin/src/release.rs`
+  verifies the whole release offline against mock GitHub and registry
+  servers (as a deployment with `signed_tags = false`: the project's tags are
+  not signed by a key in these fixtures).
 - `trusted_root.json`: a snapshot of the Sigstore public-good trusted root
   (the first line of `gh attestation trusted-root`), so the test runs offline.
 
@@ -39,6 +46,11 @@ token=$(curl -s 'https://ghcr.io/token?scope=repository:dani-garcia/vaultwarden:
 curl -sI -H "Authorization: Bearer $token" \
   -H 'Accept: application/vnd.oci.image.index.v1+json' \
   https://ghcr.io/v2/dani-garcia/vaultwarden/manifests/1.37.4 | grep -i docker-content-digest
+
+# Index: the same request's body; its sha256 is the digest above.
+curl -s -H "Authorization: Bearer $token" \
+  -H 'Accept: application/vnd.oci.image.index.v1+json' \
+  https://ghcr.io/v2/dani-garcia/vaultwarden/manifests/1.37.4 > index.json
 
 # Bundle: the GHCR attestation for that digest.
 gh api /repos/dani-garcia/vaultwarden/attestations/sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055 \
