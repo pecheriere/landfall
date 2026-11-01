@@ -123,6 +123,9 @@ All must pass:
    tag -s` with an SSH key produces; OpenPGP later). The signed tag names
    a commit; that commit is "the release commit". A stolen GitHub token or a compromised workflow
    therefore cannot produce a deployable release.
+   This check is on by default and can be turned off per deployment (`origin.signed_tags = false`)
+   for projects that don't sign their tags. The release commit is then the commit the tag ref points
+   to, and that deployment loses the protection above against a stolen token or compromised workflow.
 2. **Attestation found by digest, digest found by tag.** The controller resolves the image's semver tag
    in the registry to a digest as a lookup hint only. Nothing trusts the mutable tag: the binding is
    step 3.
