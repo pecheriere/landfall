@@ -571,14 +571,19 @@ pub enum OverrideFile {
 pub struct Drift {
     /// What the override file is.
     pub override_file: OverrideFile,
-    /// The running container's image, quoted and truncated: it is the
-    /// container's word. `None` when the service has no running container.
+    /// The running container's image, only if it is the one pinned, quoted and
+    /// truncated. Any other image can come from interpolated configuration
+    /// (`image: ${IMG}`) and hold a secret, so it is not repeated.
     pub running_image: Option<String>,
+    /// Whether the running container runs the pinned image. `None` when the
+    /// service has no running container.
+    pub running_image_matches: Option<bool>,
     /// Whether a running container differs from the override (design 7.1): it
-    /// runs another image than the one pinned, or the file isn't the agent's
-    /// to go by. With nothing pinned there is nothing to differ from, and a
-    /// service that isn't running has not drifted: stopping one is an
-    /// operator's call, and a deploy in progress stops it too.
+    /// runs another image than the one pinned, the file isn't the agent's to go
+    /// by, or the file is gone while a deploy is on record. With nothing pinned
+    /// and nothing on record there is nothing to differ from, and a service
+    /// that isn't running has not drifted: stopping one is an operator's call,
+    /// and a deploy in progress stops it too.
     pub drift: bool,
 }
 
@@ -600,8 +605,8 @@ pub enum DriftError {
 const DRIFT_READ_LIMIT: Duration = Duration::from_secs(60);
 
 /// Compares the running image of `service` with what the override in `dir`
-/// pins. It goes by the file itself and by the container's labels, without
-/// `docker compose`: what `.env` makes of the project is exactly what can have
+/// pins; `recorded` says a deploy of it is on record. It goes by the file itself
+/// and by the container's labels, without `docker compose`: what `.env` makes of the project is exactly what can have
 /// strayed from the override, and a stack the agent's user cannot read can
 /// still be reported on. A caller that also sees a deploy in progress knows
 /// that a difference is expected then.
@@ -609,7 +614,12 @@ const DRIFT_READ_LIMIT: Duration = Duration::from_secs(60);
 /// # Errors
 ///
 /// [`DriftError`] when the override or the container cannot be read.
-pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<Drift, DriftError> {
+pub async fn drift<D: Docker>(
+    docker: &D,
+    dir: &Path,
+    service: &str,
+    recorded: bool,
+) -> Result<Drift, DriftError> {
     let owned = dir.to_owned();
     let file = on_thread_within(DRIFT_READ_LIMIT, move || read_override_file(&owned))
         .await
@@ -629,18 +639,22 @@ pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<D
         return Ok(Drift {
             override_file,
             running_image: None,
+            running_image_matches: None,
             drift: false,
         });
     };
     let running = docker.inspect(&id).await?.image;
+    let matches = matches!(pin, Some(Pin::Image(pinned)) if pinned == running);
     let drift = match pin {
-        None | Some(Pin::Nothing) => false,
-        Some(Pin::Image(pinned)) => pinned != running,
+        None => recorded,
+        Some(Pin::Nothing) => false,
+        Some(Pin::Image(_)) => !matches,
         Some(Pin::Unrecognised) => true,
     };
     Ok(Drift {
         override_file,
-        running_image: Some(quote(&running)),
+        running_image: matches.then(|| quote(&running)),
+        running_image_matches: Some(matches),
         drift,
     })
 }
@@ -4532,18 +4546,20 @@ mod tests {
     async fn drift_is_reported() {
         let f = pinned_to(PINNED);
         f.docker.script_inspect([Ok(container(OLD, true))]);
-        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
         assert!(seen.drift);
         assert_eq!(seen.override_file, OverrideFile::Pinned);
-        assert_eq!(seen.running_image, Some(format!("{OLD:?}")));
+        assert_eq!(seen.running_image_matches, Some(false));
+        assert_eq!(seen.running_image, None, "it can hold a secret");
     }
 
     #[tokio::test]
     async fn no_drift_when_images_match() {
         let f = pinned_to(PINNED);
         f.docker.script_inspect([Ok(container(PINNED, true))]);
-        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
         assert!(!seen.drift);
+        assert_eq!(seen.running_image_matches, Some(true));
         assert_eq!(seen.running_image, Some(format!("{PINNED:?}")));
     }
 
@@ -4551,7 +4567,7 @@ mod tests {
     async fn drift_never_asks_compose() {
         let f = pinned_to(PINNED);
         f.docker.script_inspect([Ok(container(PINNED, true))]);
-        drift(&f.docker, &f.dir, "app").await.unwrap();
+        drift(&f.docker, &f.dir, "app", true).await.unwrap();
         assert_eq!(changes(&f), Vec::<&str>::new());
         assert_eq!(
             f.docker.count(|c| matches!(c, Call::Container { .. })),
@@ -4561,7 +4577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nothing_pinned_is_not_drift() {
+    async fn nothing_pinned_and_nothing_on_record_is_not_drift() {
         let f = fixture("");
         for (file, expected) in [
             (None, OverrideFile::Missing),
@@ -4572,10 +4588,29 @@ mod tests {
                 None => fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap(),
             }
             f.docker.script_inspect([Ok(container(OLD, true))]);
-            let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+            let seen = drift(&f.docker, &f.dir, "app", false).await.unwrap();
             assert_eq!(seen.override_file, expected);
             assert!(!seen.drift, "{expected:?}");
+            assert_eq!(seen.running_image, None, "{expected:?}");
+            assert_eq!(seen.running_image_matches, Some(false), "{expected:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_missing_override_with_a_deploy_on_record_is_drift() {
+        let f = fixture("");
+        fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap();
+        f.docker.script_inspect([Ok(container(OLD, true))]);
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
+        assert_eq!(seen.override_file, OverrideFile::Missing);
+        assert!(seen.drift);
+        assert_eq!(seen.running_image, None);
+
+        // Nothing running, nothing to differ.
+        f.docker.script_container([Ok(None)]);
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
+        assert!(!seen.drift);
+        assert_eq!(seen.running_image_matches, None);
     }
 
     #[tokio::test]
@@ -4583,7 +4618,7 @@ mod tests {
         let f = fixture("");
         fs::write(f.dir.join(OVERRIDE_FILE), "services: {} # SECRET=hunter2\n").unwrap();
         f.docker.script_inspect([Ok(container(PINNED, true))]);
-        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
         assert_eq!(seen.override_file, OverrideFile::Unrecognised);
         assert!(seen.drift);
         assert!(!format!("{seen:?}").contains("hunter2"));
@@ -4593,9 +4628,10 @@ mod tests {
     async fn a_stopped_service_has_not_drifted() {
         let f = pinned_to(PINNED);
         f.docker.script_container([Ok(None)]);
-        let seen = drift(&f.docker, &f.dir, "app").await.unwrap();
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
         assert!(!seen.drift);
         assert_eq!(seen.running_image, None);
+        assert_eq!(seen.running_image_matches, None);
     }
 
     #[tokio::test]
@@ -4605,22 +4641,29 @@ mod tests {
         fs::write(&elsewhere, PLACEHOLDER).unwrap();
         fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap();
         std::os::unix::fs::symlink(&elsewhere, f.dir.join(OVERRIDE_FILE)).unwrap();
-        let err = drift(&f.docker, &f.dir, "app").await.unwrap_err();
+        let err = drift(&f.docker, &f.dir, "app", true).await.unwrap_err();
         assert!(matches!(err, DriftError::Override(_)), "{err}");
     }
 
     #[tokio::test]
-    async fn a_hostile_image_name_is_quoted_and_truncated_by_drift() {
-        let f = pinned_to(PINNED);
-        let hostile = format!("evil\n{}", "x".repeat(4096));
-        f.docker.script_inspect([Ok(container(&hostile, true))]);
-        let shown = drift(&f.docker, &f.dir, "app")
-            .await
-            .unwrap()
-            .running_image
-            .unwrap();
-        assert!(shown.starts_with("\"evil\\n"), "{shown}");
+    async fn a_long_pinned_image_is_quoted_and_truncated_by_drift() {
+        let long = format!("ghcr.io/example/{}", "x".repeat(4096));
+        let f = pinned_to(&long);
+        f.docker.script_inspect([Ok(container(&long, true))]);
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
+        let shown = seen.running_image.unwrap();
+        assert!(shown.starts_with("\"ghcr.io/example/"), "{shown}");
         assert!(shown.len() < 512, "{}", shown.len());
+    }
+
+    #[tokio::test]
+    async fn an_image_that_is_not_the_pinned_one_is_never_shown() {
+        let f = pinned_to(PINNED);
+        f.docker
+            .script_inspect([Ok(container("registry.example/app:hunter2", true))]);
+        let seen = drift(&f.docker, &f.dir, "app", true).await.unwrap();
+        assert!(!format!("{seen:?}").contains("hunter2"), "{seen:?}");
+        assert_eq!(seen.running_image_matches, Some(false));
     }
 
     /// Against a real Docker daemon, as in `checks.rs`.

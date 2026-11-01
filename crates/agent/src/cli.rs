@@ -19,14 +19,14 @@ use crate::deploy::{
 };
 use crate::docker::{Docker, DockerCli};
 use crate::journal::{self, Priority};
-use crate::state::{Deployed, DeploymentState, StateDir, StateError};
+use crate::state::{Deployed, DeploymentState, Phase, StateDir, StateError};
 
 /// Where the agent keeps its state unless told otherwise.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/landfall-agent";
 
 /// The command succeeded. For `recover`: the previous version is back, or
 /// there is none to start and the service is stopped, or the deploy had in
-/// fact finished.
+/// fact finished, or it had never touched the service; and its marker is gone.
 pub const EXIT_OK: u8 = 0;
 /// `recover` ran and the rollback failed. Deploys stay blocked; run it again.
 pub const EXIT_ROLLBACK_FAILED: u8 = 1;
@@ -44,7 +44,8 @@ const LOCAL_READ_LIMIT: Duration = Duration::from_secs(60);
 const EXIT_STATUS: &str = "\
 Exit status:
   0  success
-  1  recover ran and the rollback failed; deploys stay blocked, run it again
+  1  recover ran and deploys stay blocked: the rollback failed, or its marker
+     could not be removed; run it again
   2  could not run: usage, configuration, state or Docker; for status, some
      deployment could not be read (its line has the error)";
 
@@ -59,9 +60,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Print one JSON object per deployment of a host: its compose directory,
-    /// what is recorded as deployed, whether a deploy is unfinished, what the
-    /// override file is, the running image and whether it has drifted from the
-    /// override, or the error that kept it from being read.
+    /// what is recorded as deployed, whether a deploy is unfinished and in what
+    /// phase, what the override file is, whether the running image is the one
+    /// pinned, and whether it has drifted from the override, or the error that
+    /// kept it from being read.
     Status(StatusArgs),
     /// Finish an interrupted deploy by rolling it back, and print its report.
     Recover(RecoverArgs),
@@ -148,7 +150,8 @@ pub enum CliError {
 
 /// What `status` prints for one deployment. What could not be found out is
 /// `null`, and `error` says why. The only thing in it a container has a say in
-/// is `running_image`, which is quoted and truncated.
+/// is `running_image`, which is quoted and truncated, and shown only when it
+/// is the image pinned: any other can hold an interpolated secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeploymentStatus {
     /// The deployment.
@@ -159,10 +162,16 @@ pub struct DeploymentStatus {
     pub deployed: Option<Deployed>,
     /// Whether a deploy started and did not finish.
     pub in_progress: Option<bool>,
+    /// How far an unfinished deploy got; `null` without one.
+    pub phase: Option<Phase>,
     /// What the override file is.
     pub override_file: Option<OverrideFile>,
-    /// The running container's image, quoted and truncated.
+    /// The running container's image, quoted and truncated, if it is the one
+    /// pinned.
     pub running_image: Option<String>,
+    /// Whether the running container runs the pinned image; `null` when none
+    /// is running.
+    pub running_image_matches: Option<bool>,
     /// Whether the running image differs from the override.
     pub drift: Option<bool>,
     /// Why this deployment could not be read in full.
@@ -202,12 +211,14 @@ async fn fill_status<D: Docker>(
     let (state_dir, state_id) = (state_dir.to_owned(), id.clone());
     let (deployed, in_progress) = on_thread(move || {
         let record = StateDir::open(&state_dir)?.deployment(&state_id)?;
-        Ok((record.deployed()?, record.in_progress()?.is_some()))
+        Ok((record.deployed()?, record.in_progress()?))
     })
     .await?;
+    let recorded = deployed.is_some();
     row.deployed = deployed;
-    row.in_progress = Some(in_progress);
-    let seen = deploy::drift(docker, &row.dir, deployment.compose().service())
+    row.in_progress = Some(in_progress.is_some());
+    row.phase = in_progress.map(|marker| marker.phase);
+    let seen = deploy::drift(docker, &row.dir, deployment.compose().service(), recorded)
         .await
         .map_err(|source| CliError::Drift {
             deployment: id.clone(),
@@ -215,6 +226,7 @@ async fn fill_status<D: Docker>(
         })?;
     row.override_file = Some(seen.override_file);
     row.running_image = seen.running_image;
+    row.running_image_matches = seen.running_image_matches;
     row.drift = Some(seen.drift);
     Ok(())
 }
@@ -234,8 +246,10 @@ async fn statuses<D: Docker>(
             dir: PathBuf::from(deployment.compose().dir()),
             deployed: None,
             in_progress: None,
+            phase: None,
             override_file: None,
             running_image: None,
+            running_image_matches: None,
             drift: None,
             error: None,
         };
@@ -659,8 +673,10 @@ mod tests {
         assert_eq!(row["dir"], f.compose.to_str().unwrap());
         assert_eq!(row["deployed"]["tag"], "v1.2.3");
         assert_eq!(row["in_progress"], true);
+        assert_eq!(row["phase"], "deploying");
         assert_eq!(row["override_file"], "pinned");
         assert_eq!(row["running_image"], format!("{IMAGE:?}"));
+        assert_eq!(row["running_image_matches"], true);
         assert_eq!(row["drift"], false);
         assert_eq!(row["error"], Value::Null);
     }
@@ -676,7 +692,9 @@ mod tests {
         assert_eq!(code, EXIT_OK);
         let row = &lines[0];
         assert_eq!(row["override_file"], "missing");
+        assert_eq!(row["phase"], Value::Null);
         assert_eq!(row["running_image"], Value::Null);
+        assert_eq!(row["running_image_matches"], Value::Null);
         assert_eq!(row["drift"], false);
         assert_eq!(row["error"], Value::Null);
         assert_eq!(row["deployed"], Value::Null);
@@ -763,18 +781,46 @@ mod tests {
 
         let row = &lines[0];
         assert_eq!(row["drift"], true);
+        assert_eq!(row["running_image"], Value::Null);
+        assert_eq!(row["running_image_matches"], false);
         let text = row.to_string();
         assert!(text.len() < 1024, "{}", text.len());
-        for absent in ["status-text", "health-text"] {
+        for absent in ["status-text", "health-text", "evil"] {
             assert!(!text.contains(absent), "{text}");
         }
-        assert!(
-            row["running_image"]
-                .as_str()
-                .unwrap()
-                .starts_with("\"evil\\n"),
-            "{text}"
-        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_phase_of_an_unfinished_deploy() {
+        let f = fixture();
+        write_pinned(&f, IMAGE);
+        let docker = FakeDocker::new();
+        docker.script_inspect([Ok(container(IMAGE))]);
+        for (phase, shown) in [
+            (Phase::Preflight, "preflight"),
+            (Phase::RollingBack, "rolling_back"),
+            (Phase::Restored, "restored"),
+            (Phase::RolledBack, "rolled_back"),
+        ] {
+            state_of(&f)
+                .set_in_progress(&InProgress { phase, ..marker() })
+                .unwrap();
+            let (lines, _) = status_lines(&f, &docker).await;
+            assert_eq!(lines[0]["phase"], shown);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_override_with_a_deploy_on_record_is_reported_as_drift() {
+        let f = fixture();
+        state_of(&f).set_deployed(&deployed()).unwrap();
+        let docker = FakeDocker::new();
+        docker.script_inspect([Ok(container(IMAGE))]);
+
+        let (lines, _) = status_lines(&f, &docker).await;
+
+        assert_eq!(lines[0]["override_file"], "missing");
+        assert_eq!(lines[0]["drift"], true);
     }
 
     /// The compose directory after an agent died mid-deploy.
