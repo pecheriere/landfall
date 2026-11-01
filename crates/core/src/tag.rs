@@ -53,18 +53,22 @@ pub enum TagVerifyError {
         found: String,
     },
     /// The signed tag has another name than the release being verified.
-    #[error("signed tag is named {found:?}, expected a different one")]
+    #[error("signed tag is named {found:?}, expected {expected:?}")]
     WrongTag {
+        /// The tag name being verified.
+        expected: String,
         /// The tag name inside the signed object.
         found: String,
     },
     /// The signature does not match the bytes it covers.
     #[error("tag signature does not verify")]
     BadSignature,
-    /// The signature is valid but its key is not among the trusted signers.
-    #[error("tag is signed by {fingerprint}, which is not a trusted signer")]
+    /// The signature claims a key that is not among the trusted signers. The
+    /// signature has not been checked at that point, so the fingerprint is
+    /// only what the object says.
+    #[error("tag signature claims key {fingerprint}, which is not a trusted signer")]
     UnknownSigner {
-        /// Fingerprint of the signing key.
+        /// Fingerprint of the key the signature claims.
         fingerprint: String,
     },
     /// The signature was made for another purpose than signing git objects.
@@ -101,6 +105,7 @@ pub fn verify_tag(
     }
     if headers.tag != expected_tag.as_ref() as &str {
         return Err(TagVerifyError::WrongTag {
+            expected: expected_tag.to_string(),
             found: shown(headers.tag),
         });
     }
@@ -302,6 +307,7 @@ mod tests {
         assert_eq!(
             verify(VALID, "v1.2.4"),
             Err(TagVerifyError::WrongTag {
+                expected: "v1.2.4".to_owned(),
                 found: "v1.2.3".to_owned()
             })
         );

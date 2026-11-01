@@ -78,6 +78,14 @@ pub enum ConfigError {
         /// Why the key is refused.
         reason: String,
     },
+    /// Two `[signers]` names hold the same key.
+    #[error("signers {first} and {second} hold the same key")]
+    DuplicateSignerKey {
+        /// The first name, in name order.
+        first: PrincipalId,
+        /// The second name.
+        second: PrincipalId,
+    },
     /// Rule 2: an origin signer is not in `[signers]`.
     #[error("deployment {deployment}: origin signer {signer} is not in [signers]")]
     UnknownSigner {
@@ -849,6 +857,26 @@ can = ["view", "request", "approve", "rollback"]
     }
 
     #[test]
+    fn duplicate_signer_keys_are_rejected() {
+        let key = fixture_key("signer.pub");
+        let text = EXAMPLE.replacen(
+            "[approvers]",
+            &format!(
+                "backup = {:?}\n\n[approvers]",
+                format!("{} spare", key.trim_end())
+            ),
+            1,
+        );
+        assert_eq!(
+            parse_str(&text).unwrap_err(),
+            ConfigError::DuplicateSignerKey {
+                first: "backup".parse().unwrap(),
+                second: "maintainer".parse().unwrap(),
+            }
+        );
+    }
+
+    #[test]
     fn signed_tags_defaults_to_true() {
         let config = parse_str(EXAMPLE).unwrap();
         let prod = config.deployment(&id("app/prod")).unwrap();
@@ -865,6 +893,12 @@ can = ["view", "request", "approve", "rollback"]
         let prod = config.deployment(&id("app/prod")).unwrap();
         assert!(!prod.origin().signed_tags());
         assert_eq!(prod.origin().signers(), &[]);
+        // An explicit empty list is accepted too.
+        let explicit = edited(
+            "tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
+            "tags = \"v*\", signed_tags = false, signers = [] }\nrule = { auto = \"patch\"",
+        );
+        assert!(parse_str(&explicit).is_ok());
         // signed_tags on (the default) still needs signers.
         let err = parse_str(&edited(
             "signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",

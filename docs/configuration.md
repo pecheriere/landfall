@@ -54,15 +54,6 @@ error naming the signer. The value is the contents of the key's `.pub` file
 (for example `~/.ssh/id_ed25519.pub`); a trailing comment is ignored. Sign
 release tags with `git tag -s` and `gpg.format = ssh`.
 
-### `origin.signed_tags = false`
-
-With `signed_tags = false` landfall does not check who signed the tag. The
-build attestation alone then binds the image to the release workflow and
-commit, not to a maintainer, so a stolen GitHub token or a compromised
-workflow can produce a deployable release. Leave `signed_tags` on unless you
-accept that. Listing `origin.signers` while it is `false` is an error, never
-silently ignored.
-
 ## `[approvers]`
 
 A table of `name = { credential_id, public_key }`, both opaque base64url text
@@ -99,6 +90,15 @@ Release tags themselves (whatever the pattern) are at most 128 bytes of
 `[A-Za-z0-9._/+-]` and must be valid git ref names: no `..`, no empty
 component (leading, trailing or doubled `/`), not starting with `-`, no
 component starting with `.` or ending with `.lock`, not ending with `.`.
+
+### `origin.signed_tags = false`
+
+With `signed_tags = false` landfall does not check who signed the tag. The
+build attestation alone then binds the image to the release workflow and
+commit, not to a maintainer, so a stolen GitHub token or a compromised
+workflow can produce a deployable release. Leave `signed_tags` on unless you
+accept that. Listing `origin.signers` while it is `false` is an error, never
+silently ignored.
 
 ### Checks
 

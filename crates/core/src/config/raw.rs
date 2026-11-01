@@ -33,6 +33,16 @@ pub(super) fn build(text: &str, hash: String) -> Result<Config, ConfigError> {
             }),
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut seen: Vec<(&PrincipalId, &SignerKey)> = Vec::new();
+    for (name, key) in &signers {
+        if let Some((first, _)) = seen.iter().find(|(_, other)| *other == key) {
+            return Err(ConfigError::DuplicateSignerKey {
+                first: (*first).clone(),
+                second: name.clone(),
+            });
+        }
+        seen.push((name, key));
+    }
     let deployments = raw
         .deployments
         .into_iter()
