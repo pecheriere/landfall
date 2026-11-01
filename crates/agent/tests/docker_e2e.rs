@@ -170,14 +170,16 @@ impl Stack {
     ) -> Result<DeployReport, DeployError> {
         let deployment = self.deployment(rest);
         let plan = plan(&deployment, tag, digest);
-        deploy::run(
+        // Boxed: the engine's future is large, and clippy's limit is on what
+        // every caller here would otherwise hold on its stack.
+        Box::pin(deploy::run(
             &self.docker,
             &self.state,
             &deployment,
             &self.dir,
             &plan,
             &self.options,
-        )
+        ))
         .await
     }
 

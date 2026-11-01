@@ -60,3 +60,12 @@ sha1-checked = { version = "0.10.0", default-features = false }
 wiremock = "0.6.5"
 # Process identity (uid) and no-follow directory-fd walking without unsafe code.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "fs"] }
+# The controller's store. Queries are plain SQL with bound parameters: no
+# `macros` feature, so nothing about the schema is checked or embedded at build
+# time beyond the migration text itself.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+tower = { version = "0.5.3", default-features = false }
+# Enrolment codes. The operating system's generator, nothing seeded.
+getrandom = "0.4.3"
+hex = "0.4.3"
