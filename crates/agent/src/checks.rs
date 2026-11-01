@@ -75,6 +75,19 @@ pub struct CheckFailure {
     pub check: String,
     /// Why it failed.
     pub reason: String,
+    /// What each check took up to then, in configuration order. Empty when no
+    /// run began.
+    pub checks: Vec<CheckReport>,
+}
+
+impl CheckFailure {
+    fn new(check: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            check: check.into(),
+            reason: reason.into(),
+            checks: Vec::new(),
+        }
+    }
 }
 
 /// The longest piece of container- or server-supplied text a reason quotes.
@@ -125,9 +138,8 @@ pub async fn run_checks<D: Docker>(
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(options.http_timeout)
                 .build()
-                .map_err(|e| CheckFailure {
-                    check: "http client".to_owned(),
-                    reason: quote(&e.without_url().to_string()),
+                .map_err(|e| {
+                    CheckFailure::new("http client", quote(&e.without_url().to_string()))
                 })?,
         )
     } else {
@@ -154,19 +166,35 @@ pub async fn run_checks<D: Docker>(
             .collect(),
         budget: Budget::new(options.deadline, checks),
     };
+    match rounds(&run, &mut progress, options).await {
+        Ok(image) => Ok(CheckSummary {
+            checks: progress.reports,
+            image,
+        }),
+        Err(failure) => Err(CheckFailure {
+            checks: progress.reports,
+            ..failure
+        }),
+    }
+}
+
+/// Rounds until two have passed on one run of the container, as [`run_checks`]
+/// says, or one has failed for good. Returns the image the last one saw.
+async fn rounds<D: Docker>(
+    run: &Run<'_, D>,
+    progress: &mut Progress,
+    options: &CheckOptions,
+) -> Result<String, CheckFailure> {
     // The run of the container the last passing round saw, if the round after
     // it is the one that may confirm it.
     let mut settling: Option<Incarnation> = None;
     let mut last_failure: Option<CheckFailure> = None;
     loop {
-        match run.round(&mut progress).await {
+        match run.round(progress).await {
             Ok(passed) => {
                 let previous = settling.take();
                 if previous.as_ref() == Some(&passed.incarnation) {
-                    return Ok(CheckSummary {
-                        checks: progress.reports,
-                        image: passed.image,
-                    });
+                    return Ok(passed.image);
                 }
                 last_failure = None;
                 if progress.budget.remaining() <= options.settle {
@@ -201,24 +229,15 @@ fn too_late_to_settle(restarted: bool, settle: Duration) -> CheckFailure {
             "the checks passed, but too close to the deadline to wait {settle:?} and confirm it"
         )
     };
-    CheckFailure {
-        check: "container".to_owned(),
-        reason,
-    }
+    CheckFailure::new("container", reason)
 }
 
 fn retry(check: impl Into<String>, reason: impl Into<String>) -> Verdict {
-    Verdict::Retry(CheckFailure {
-        check: check.into(),
-        reason: reason.into(),
-    })
+    Verdict::Retry(CheckFailure::new(check, reason))
 }
 
 fn fatal(check: impl Into<String>, reason: impl Into<String>) -> Verdict {
-    Verdict::Fatal(CheckFailure {
-        check: check.into(),
-        reason: reason.into(),
-    })
+    Verdict::Fatal(CheckFailure::new(check, reason))
 }
 
 /// A failed Docker call: worth retrying, unless the driver refused the
@@ -292,10 +311,10 @@ async fn bounded<T>(
     tokio::time::timeout(budget.remaining(), work)
         .await
         .unwrap_or_else(|_| {
-            Err(Verdict::OutOfTime(CheckFailure {
-                check: check.to_owned(),
-                reason: "no answer before the deadline".to_owned(),
-            }))
+            Err(Verdict::OutOfTime(CheckFailure::new(
+                check,
+                "no answer before the deadline",
+            )))
         })
 }
 
@@ -892,6 +911,12 @@ mod tests {
         .unwrap_err();
         assert_eq!(failure.check, "checks[0] command \"/bin/check\"");
         assert_eq!(failure.reason, "exited with a non-zero status");
+        assert_eq!(
+            failure.checks.len(),
+            1,
+            "what it took goes with the failure"
+        );
+        assert!(failure.checks[0].attempts > 1, "{:?}", failure.checks);
         let execs = docker.count(|c| matches!(c, Call::Exec { argv: a, .. } if *a == argv));
         assert_eq!(execs, 3, "at 0 s, 10 s and 20 s");
     }

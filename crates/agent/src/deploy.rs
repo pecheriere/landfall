@@ -18,11 +18,11 @@ use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_origin::release::ReleaseOrigin;
 use serde::Serialize;
 
-use crate::checks::{CheckFailure, CheckOptions, quote, run_checks};
+use crate::checks::{CheckOptions, CheckReport, quote, run_checks};
 use crate::compose::{self, Pin};
 use crate::docker::{Docker, DockerError};
 use crate::journal::{self, Priority};
-use crate::safefs::{self, RelPath, Root, SafeFsError};
+use crate::safefs::{self, RelPath, Root, SafeFsError, SnapshotStats};
 use crate::state::{
     DeployLock, Deployed, DeploymentState, InProgress, Phase, RecordedBackup, StateError,
 };
@@ -202,6 +202,46 @@ pub enum StepResult {
     },
 }
 
+/// What one post-deploy check took.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CheckTiming {
+    /// The check's description.
+    pub check: String,
+    /// How many times it was evaluated.
+    pub attempts: u32,
+    /// Time spent evaluating it, without the pauses between rounds.
+    pub millis: u64,
+}
+
+impl From<&CheckReport> for CheckTiming {
+    fn from(report: &CheckReport) -> Self {
+        Self {
+            check: report.check.clone(),
+            attempts: report.attempts,
+            millis: millis(report.elapsed),
+        }
+    }
+}
+
+/// More about what a step did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StepDetail {
+    /// A run of the post-deploy checks, whether it passed or not.
+    Checks {
+        /// One per check, in configuration order.
+        checks: Vec<CheckTiming>,
+    },
+    /// A backup that completed.
+    Backup {
+        /// What it copied.
+        stats: SnapshotStats,
+    },
+}
+
+/// The step that removes the marker: if it failed, deploys stay blocked.
+const CLEAR_STEP: &str = "clear_in_progress";
+
 /// One recorded step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Step {
@@ -213,6 +253,9 @@ pub struct Step {
     pub millis: u64,
     /// How it ended.
     pub result: StepResult,
+    /// More about it, for the steps that have more to say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<StepDetail>,
 }
 
 /// The record of a deploy, or a recovery, that started.
@@ -232,6 +275,19 @@ pub struct DeployReport {
     pub started_at: Timestamp,
     /// When it ended.
     pub finished_at: Timestamp,
+}
+
+impl DeployReport {
+    /// Whether the deployment's marker is still there, so that deploys stay
+    /// refused until `recover` succeeds: the rollback failed, or the service is
+    /// as the outcome says and only the marker could not be removed.
+    #[must_use]
+    pub fn leaves_deploys_blocked(&self) -> bool {
+        matches!(self.outcome, Outcome::RollbackFailed { .. })
+            || self.steps.iter().any(|step| {
+                step.name == CLEAR_STEP && matches!(step.result, StepResult::Failed { .. })
+            })
+    }
 }
 
 /// A file operation of the engine that did not finish well.
@@ -741,6 +797,10 @@ fn timestamp_id(time: Timestamp) -> String {
     )
 }
 
+fn millis(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn rel_paths(paths: &[String]) -> Result<Vec<RelPath>, SafeFsError> {
     paths.iter().map(|p| RelPath::new(p)).collect()
 }
@@ -771,6 +831,15 @@ impl Recorder {
         name: &'static str,
         work: impl Future<Output = Result<T, E>>,
     ) -> Result<T, E> {
+        self.step_detailed(name, async { (work.await, None) }).await
+    }
+
+    /// [`Self::step`] for work that also has details to record.
+    async fn step_detailed<T, E: Display>(
+        &mut self,
+        name: &'static str,
+        work: impl Future<Output = (Result<T, E>, Option<StepDetail>)>,
+    ) -> Result<T, E> {
         #[derive(Serialize)]
         struct StepEvent<'a> {
             event: &'static str,
@@ -780,17 +849,18 @@ impl Recorder {
         }
         let started_at = Timestamp::now();
         let clock = Instant::now();
-        let outcome = work.await;
+        let (outcome, detail) = work.await;
         let step = Step {
             name: name.to_owned(),
             started_at,
-            millis: u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
+            millis: millis(clock.elapsed()),
             result: match &outcome {
                 Ok(_) => StepResult::Ok,
                 Err(error) => StepResult::Failed {
                     reason: error.to_string(),
                 },
             },
+            detail,
         };
         let priority = if outcome.is_ok() {
             Priority::Info
@@ -817,7 +887,16 @@ impl Recorder {
         name: &'static str,
         work: impl Future<Output = Result<T, E>>,
     ) -> Result<T, String> {
-        self.step(name, work)
+        self.must_detailed(name, async { (work.await, None) }).await
+    }
+
+    /// [`Self::must`] for work that also has details to record.
+    async fn must_detailed<T, E: Display>(
+        &mut self,
+        name: &'static str,
+        work: impl Future<Output = (Result<T, E>, Option<StepDetail>)>,
+    ) -> Result<T, String> {
+        self.step_detailed(name, work)
             .await
             .map_err(|error| format!("{name}: {error}"))
     }
@@ -1228,7 +1307,15 @@ impl<D: Docker> Engine<'_, D> {
                 rec.must("stop", self.stop()).await?;
             }
             let id = timestamp_id(Timestamp::now());
-            rec.must("backup", self.backup(backup, &id)).await?;
+            rec.must_detailed("backup", async {
+                let copied = self.backup(backup, &id).await;
+                let detail = copied
+                    .as_ref()
+                    .ok()
+                    .map(|stats| StepDetail::Backup { stats: *stats });
+                (copied, detail)
+            })
+            .await?;
             let mut with_backup = marker.clone();
             with_backup.backup = Some(RecordedBackup {
                 id,
@@ -1252,7 +1339,7 @@ impl<D: Docker> Engine<'_, D> {
         rec.must("up", self.up()).await?;
         rec.must("verify_image", self.verify_pinned(plan.image()))
             .await?;
-        rec.must("checks", self.check_pinned(plan.image(), since))
+        rec.must_detailed("checks", self.check_pinned(plan.image(), since))
             .await?;
         let state = self.state.clone();
         let deployed = Deployed {
@@ -1279,9 +1366,15 @@ impl<D: Docker> Engine<'_, D> {
     }
 
     /// Runs the checks, from `since`, the time just before the service was
-    /// brought up, and returns the image the final round saw.
-    async fn checks(&self, since: Timestamp) -> Result<String, CheckFailure> {
-        run_checks(
+    /// brought up. Returns the image the final round saw, and what each check
+    /// took, either way.
+    async fn checks(&self, since: Timestamp) -> (Result<String, String>, Option<StepDetail>) {
+        let detail = |reports: &[CheckReport]| {
+            Some(StepDetail::Checks {
+                checks: reports.iter().map(CheckTiming::from).collect(),
+            })
+        };
+        match run_checks(
             self.docker,
             self.dir,
             self.service(),
@@ -1290,34 +1383,54 @@ impl<D: Docker> Engine<'_, D> {
             &self.options.checks,
         )
         .await
-        .map(|summary| summary.image)
+        {
+            Ok(summary) => (Ok(summary.image), detail(&summary.checks)),
+            Err(failure) => {
+                let detail = detail(&failure.checks);
+                (Err(failure.to_string()), detail)
+            }
+        }
     }
 
     /// The checks, and the pinned image still running when they ended.
-    async fn check_pinned(&self, pinned: &str, since: Timestamp) -> Result<(), String> {
-        let image = self.checks(since).await.map_err(|e| e.to_string())?;
-        if image == pinned {
-            Ok(())
-        } else {
-            Err(not_pinned(pinned))
-        }
+    async fn check_pinned(
+        &self,
+        pinned: &str,
+        since: Timestamp,
+    ) -> (Result<(), String>, Option<StepDetail>) {
+        let (image, detail) = self.checks(since).await;
+        let checked = image.and_then(|image| {
+            if image == pinned {
+                Ok(())
+            } else {
+                Err(not_pinned(pinned))
+            }
+        });
+        (checked, detail)
     }
 
     /// The checks, and the previous image still running when they ended. As
     /// in [`Self::verify_previous`], neither image is named.
-    async fn check_previous(&self, resolved: &str, since: Timestamp) -> Result<(), String> {
-        let image = self.checks(since).await.map_err(|e| e.to_string())?;
-        if image == resolved {
-            Ok(())
-        } else {
-            Err(WRONG_PREVIOUS_IMAGE.to_owned())
-        }
+    async fn check_previous(
+        &self,
+        resolved: &str,
+        since: Timestamp,
+    ) -> (Result<(), String>, Option<StepDetail>) {
+        let (image, detail) = self.checks(since).await;
+        let checked = image.and_then(|image| {
+            if image == resolved {
+                Ok(())
+            } else {
+                Err(WRONG_PREVIOUS_IMAGE.to_owned())
+            }
+        });
+        (checked, detail)
     }
 
     /// A snapshot failure of any kind is a failed backup. That includes a
     /// missing path: a container that keeps running could otherwise make a
     /// backup incomplete by deleting a file.
-    async fn backup(&self, backup: &Backup, id: &str) -> Result<(), FileFailure> {
+    async fn backup(&self, backup: &Backup, id: &str) -> Result<SnapshotStats, FileFailure> {
         let paths = rel_paths(backup.paths())?;
         let dir = self.dir.to_owned();
         let backups = self.state.backups_dir();
@@ -1339,8 +1452,7 @@ impl<D: Docker> Engine<'_, D> {
                     }
                 }
                 let source = Root::open(&dir)?;
-                safefs::snapshot(&source, &paths, &dest)?;
-                Ok(())
+                Ok(safefs::snapshot(&source, &paths, &dest)?)
             },
         )
         .await
@@ -1543,7 +1655,7 @@ impl<D: Docker> Engine<'_, D> {
             let resolved = rec
                 .must("verify_previous_image", self.verify_previous())
                 .await?;
-            rec.must("check_previous", self.check_previous(&resolved, since))
+            rec.must_detailed("check_previous", self.check_previous(&resolved, since))
                 .await?;
         } else if !stopped {
             rec.must("stop_service", self.stop()).await?;
@@ -1598,7 +1710,7 @@ impl<D: Docker> Engine<'_, D> {
     async fn clear_in_progress(&self, rec: &mut Recorder) -> bool {
         let state = self.state.clone();
         rec.step(
-            "clear_in_progress",
+            CLEAR_STEP,
             self.file("clear in-progress", move || state.clear_in_progress()),
         )
         .await
@@ -1788,7 +1900,7 @@ mod tests {
     use super::faults::{Fault, with_faults};
     use super::{
         DeployError, DeployPlan, DriftError, EngineOptions, Outcome, OverrideFile, ReleaseOrigin,
-        StepResult, drift, recover, run, timestamp_id,
+        StepDetail, StepResult, drift, recover, run, timestamp_id,
     };
     use crate::checks::CheckOptions;
     use crate::compose::{self, OVERRIDE_FILE, PLACEHOLDER};
@@ -2444,6 +2556,102 @@ mod tests {
             "{refused}"
         );
         assert!(refused.to_string().contains("recover"), "{refused}");
+    }
+
+    /// Whatever the failed `up` left is what runs: the agent adds no stop.
+    #[tokio::test]
+    async fn a_failed_up_of_the_previous_version_stops_nothing() {
+        let f = fixture("");
+        resolves(&f, Some(OLD));
+        failing_check(&f, OLD);
+        f.docker.script_compose_up([Ok(()), Err("daemon gone")]);
+
+        let report = deploy(&f).await.unwrap();
+
+        assert!(
+            matches!(&report.outcome, Outcome::RollbackFailed { rollback_reason, .. }
+                if rollback_reason.contains("start_previous")),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(count_stops(&f), 0);
+        assert_ne!(f.state.in_progress().unwrap(), None);
+        assert!(report.leaves_deploys_blocked());
+    }
+
+    /// With a backup the service was stopped to restore it, before the `up`.
+    /// That is the one stop on this path, and none follows the failure.
+    #[tokio::test]
+    async fn a_failed_up_after_a_restore_adds_no_stop_after_it() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+        failing_check(&f, OLD);
+        f.docker.script_compose_up([Ok(()), Err("daemon gone")]);
+
+        let report = deploy(&f).await.unwrap();
+
+        assert!(matches!(report.outcome, Outcome::RollbackFailed { .. }));
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Restored
+        );
+        assert_eq!(
+            changes(&f).last(),
+            Some(&"up"),
+            "the failed up is the last thing done to the service"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_report_says_what_the_backup_copied_and_what_each_check_took() {
+        let f = fixture(STOP_TRUE);
+        healthy_deploy(&f);
+
+        let report = deploy(&f).await.unwrap();
+
+        let detail = |name: &str| {
+            report
+                .steps
+                .iter()
+                .find(|step| step.name == name)
+                .and_then(|step| step.detail.clone())
+        };
+        let Some(StepDetail::Backup { stats }) = detail("backup") else {
+            panic!("{report:?}");
+        };
+        assert_eq!((stats.files, stats.bytes), (1, 6));
+        let Some(StepDetail::Checks { checks }) = detail("checks") else {
+            panic!("{report:?}");
+        };
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].attempts, 2, "a pass and its confirmation");
+        assert!(checks[0].check.starts_with("checks[0]"), "{checks:?}");
+        assert_eq!(detail("up"), None);
+
+        let json = serde_json::to_value(&report).unwrap();
+        let steps = json["steps"].as_array().unwrap();
+        let shown = steps.iter().find(|step| step["name"] == "checks").unwrap();
+        assert_eq!(shown["detail"]["kind"], "checks");
+        assert_eq!(shown["detail"]["checks"][0]["attempts"], 2);
+        let plain = steps.iter().find(|step| step["name"] == "up").unwrap();
+        assert!(plain.get("detail").is_none(), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_of_the_checks_still_reports_what_they_took() {
+        let f = fixture("");
+        resolves(&f, Some(OLD));
+        failing_check(&f, OLD);
+
+        let report = deploy(&f).await.unwrap();
+
+        for name in ["checks", "check_previous"] {
+            let step = report.steps.iter().find(|step| step.name == name).unwrap();
+            let Some(StepDetail::Checks { checks }) = &step.detail else {
+                panic!("{step:?}");
+            };
+            assert!(checks[0].attempts >= 1, "{name}: {checks:?}");
+        }
     }
 
     #[tokio::test]
