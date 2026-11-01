@@ -724,11 +724,13 @@ checks = ["container-healthy"]
 
         // Material that was served and failed a check is a refusal.
         assert!(ReleaseError::TagSignature(TagVerifyError::NotSigned).is_refusal());
-        let missing_bundle = FetchError::Bundles {
+        let bundles = |count| FetchError::Bundles {
             digest: VW_DIGEST.parse().unwrap(),
-            count: 0,
+            count,
         };
-        assert!(ReleaseError::Bundle(missing_bundle).is_refusal());
+        assert!(ReleaseError::Bundle(bundles(2)).is_refusal());
+        // A release still being published has no provenance bundle yet.
+        assert!(!ReleaseError::Bundle(bundles(0)).is_refusal());
         assert!(!ReleaseError::UnknownDeployment(deployment()).is_refusal());
     }
 

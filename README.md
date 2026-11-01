@@ -53,7 +53,7 @@ reason go to stderr:
 |---|---|
 | 0 | the release is verified |
 | 1 | the release is refused: a verification check failed |
-| 2 | the release could not be verified: configuration, usage, network, rate limit or trust root error; it may verify on a later try |
+| 2 | the release could not be verified: configuration, usage, network, rate limit or trust root error, or no provenance bundle published yet; it may verify on a later try |
 
 `--platform` defaults to the running machine's on Linux and is required
 elsewhere. The Sigstore trust root is refreshed through TUF into `--cache-dir`
