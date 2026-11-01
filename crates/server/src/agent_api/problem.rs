@@ -1,11 +1,12 @@
-//! Error answers: `application/problem+json` with stable codes.
+//! Error answers: `application/problem+json` with the codes in
+//! [`landfall_core::protocol::ProblemCode`].
 
 use std::io::{self, Write as _};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use landfall_core::protocol::{PROBLEM_CONTENT_TYPE, Problem};
+use landfall_core::protocol::{PROBLEM_CONTENT_TYPE, Problem, ProblemCode};
 
 use crate::store::StoreError;
 
@@ -20,9 +21,8 @@ pub(crate) fn log(line: &str) {
     drop(writeln!(io::stderr(), "landfall-server: {line}"));
 }
 
-/// Every way the API refuses a request. The codes are a wire contract: they
-/// never change. No variant carries anything the client sent, so no answer can
-/// repeat it.
+/// Every way the API refuses a request. No variant carries anything the client
+/// sent, so no answer can repeat it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApiProblem {
     /// A signature header is missing, repeated or malformed.
@@ -30,7 +30,8 @@ pub(crate) enum ApiProblem {
     /// The nonce is unknown, used or expired: fetch another.
     BadNonce,
     /// The host is unknown or the signature does not verify. One code for both,
-    /// so that the answer does not say which hosts exist.
+    /// reached in the same order with the body read first, so that the answer
+    /// does not say which hosts exist.
     BadSignature,
     /// The enrolment code is unknown, used, expired or for another host.
     InvalidCode,
@@ -48,6 +49,8 @@ pub(crate) enum ApiProblem {
     RateLimited,
     /// Too many nonces are outstanding.
     NoncesExhausted,
+    /// The database is busy with another writer.
+    Busy,
     /// The host has no such deploy.
     UnknownDeploy,
     /// The deploy was never handed to this host.
@@ -57,76 +60,81 @@ pub(crate) enum ApiProblem {
 }
 
 impl ApiProblem {
-    fn parts(self) -> (StatusCode, &'static str, &'static str) {
+    fn parts(self) -> (StatusCode, ProblemCode, &'static str) {
         match self {
             Self::Unsigned => (
                 StatusCode::UNAUTHORIZED,
-                "unsigned",
+                ProblemCode::Unsigned,
                 "the request's signature headers are missing or malformed",
             ),
             Self::BadNonce => (
                 StatusCode::UNAUTHORIZED,
-                "bad_nonce",
+                ProblemCode::BadNonce,
                 "the nonce is unknown, used or expired",
             ),
             Self::BadSignature => (
                 StatusCode::UNAUTHORIZED,
-                "bad_signature",
+                ProblemCode::BadSignature,
                 "the request's signature does not verify",
             ),
             Self::InvalidCode => (
                 StatusCode::FORBIDDEN,
-                "invalid_code",
+                ProblemCode::InvalidCode,
                 "the enrolment code is not valid for this host",
             ),
             Self::AlreadyEnrolled => (
                 StatusCode::CONFLICT,
-                "already_enrolled",
+                ProblemCode::AlreadyEnrolled,
                 "the host has a key, and this code does not allow replacing it",
             ),
             Self::KeyInUse => (
                 StatusCode::CONFLICT,
-                "key_in_use",
+                ProblemCode::KeyInUse,
                 "this public key is enrolled to another host",
             ),
             Self::BadRequest => (
                 StatusCode::BAD_REQUEST,
-                "bad_request",
+                ProblemCode::BadRequest,
                 "the body is not a valid request",
             ),
             Self::BodyTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "body_too_large",
+                ProblemCode::BodyTooLarge,
                 "the body is over the limit",
             ),
             Self::SlowRequest => (
                 StatusCode::REQUEST_TIMEOUT,
-                "slow_request",
+                ProblemCode::SlowRequest,
                 "the request took too long",
             ),
             Self::RateLimited => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
+                ProblemCode::RateLimited,
                 "too many requests from this source",
             ),
             Self::NoncesExhausted => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "nonces_exhausted",
+                ProblemCode::NoncesExhausted,
                 "too many nonces are outstanding",
+            ),
+            Self::Busy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ProblemCode::Busy,
+                "the database is busy",
             ),
             Self::UnknownDeploy => (
                 StatusCode::NOT_FOUND,
-                "unknown_deploy",
+                ProblemCode::UnknownDeploy,
                 "this host has no such deploy",
             ),
             Self::NotClaimed => (
                 StatusCode::CONFLICT,
-                "not_claimed",
+                ProblemCode::NotClaimed,
                 "this deploy was never handed out",
             ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
+                ProblemCode::Internal,
                 "the controller failed",
             ),
         }
@@ -137,7 +145,7 @@ impl IntoResponse for ApiProblem {
     fn into_response(self) -> Response {
         let (status, code, title) = self.parts();
         let problem = Problem {
-            code: code.to_owned(),
+            code: code.as_str().to_owned(),
             title: title.to_owned(),
             status: status.as_u16(),
         };
@@ -151,7 +159,7 @@ impl IntoResponse for ApiProblem {
             header::CONTENT_TYPE,
             HeaderValue::from_static(PROBLEM_CONTENT_TYPE),
         );
-        if matches!(self, Self::RateLimited | Self::NoncesExhausted) {
+        if matches!(self, Self::RateLimited | Self::NoncesExhausted | Self::Busy) {
             headers.insert(
                 header::RETRY_AFTER,
                 HeaderValue::from_static(RETRY_AFTER_SECS),
@@ -170,6 +178,7 @@ impl From<StoreError> for ApiProblem {
             StoreError::NonceTableFull => Self::NoncesExhausted,
             StoreError::UnknownDeploy => Self::UnknownDeploy,
             StoreError::NotClaimed => Self::NotClaimed,
+            busy if busy.is_busy() => Self::Busy,
             other => {
                 log(&format!("agent API: {other}"));
                 Self::Internal

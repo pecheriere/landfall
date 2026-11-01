@@ -199,6 +199,78 @@ async fn shutting_down_ends_a_long_poll_at_once() {
 }
 
 #[tokio::test]
+async fn a_new_long_poll_ends_the_old_one_empty() {
+    let h = Harness::with_limits(Limits {
+        long_poll: Duration::from_secs(30),
+        ..test_limits()
+    })
+    .await;
+    let a = h.enrolled(A, 1).await;
+    let b = h.enrolled(B, 2).await;
+
+    // The first ends because of the second, and for no other reason: shutdown
+    // comes only after it has answered. Host B's poll is not touched by either.
+    let first = async {
+        let answer = h.work(A, &a, Vec::new()).await;
+        h.state.begin_shutdown();
+        answer
+    };
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.work(A, &a, Vec::new()).await
+    };
+    let other = h.work(B, &b, Vec::new());
+    let (first, second, other) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(first, second, other)
+    })
+    .await
+    .expect("the first poll should end when the second arrives");
+    assert_eq!(first.work().work, None);
+    assert_eq!(first.work().held_back, []);
+    assert_eq!(second.work().work, None);
+    assert_eq!(other.work().work, None);
+}
+
+#[tokio::test]
+async fn idle_and_busy_together_is_stored_as_not_busy_and_audited_once() {
+    let h = Harness::new().await;
+    let a = h.enrolled(A, 1).await;
+    let mut lying = running("app/prod", false);
+    lying.busy = true;
+    h.work(A, &a, vec![running("app/prod", false)]).await;
+    let base = h.audit_kinds().await.len();
+    let tail = |kinds: Vec<String>| kinds[base..].to_vec();
+
+    h.work(A, &a, vec![lying.clone()]).await;
+    h.work(A, &a, vec![lying.clone()]).await;
+    assert_eq!(tail(h.audit_kinds().await), ["running_inconsistent"]);
+    let busy: bool = sqlx::query_scalar("SELECT busy FROM running_states")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert!(!busy);
+
+    // It stops, which is not news; saying it again later is.
+    h.work(A, &a, vec![running("app/prod", false)]).await;
+    h.work(A, &a, vec![lying]).await;
+    assert_eq!(
+        tail(h.audit_kinds().await),
+        ["running_inconsistent", "running_inconsistent"]
+    );
+
+    // Busy in any other phase is what busy means.
+    let mut deploying = running("app/prod", false);
+    deploying.phase = Phase::Deploying;
+    deploying.busy = true;
+    h.work(A, &a, vec![deploying]).await;
+    let busy: bool = sqlx::query_scalar("SELECT busy FROM running_states")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert!(busy);
+}
+
+#[tokio::test]
 async fn claimed_work_is_redelivered_after_a_reconnect() {
     let h = Harness::new().await;
     let a = h.enrolled(A, 1).await;

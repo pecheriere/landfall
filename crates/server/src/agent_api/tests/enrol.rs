@@ -84,13 +84,15 @@ async fn a_code_is_valid_until_just_before_it_expires() {
 }
 
 #[tokio::test]
-async fn an_unknown_code_is_refused() {
+async fn an_unknown_code_is_refused_and_leaves_the_audit_log_alone() {
     let h = Harness::new().await;
     let answer = h
         .enrol_with("host-a", &signing_key(1), EnrolCode::from_bytes([7; 32]))
         .await;
     assert_eq!(answer.status, StatusCode::FORBIDDEN);
     assert_eq!(answer.code(), "invalid_code");
+    // It could come from anyone, who could then fill the log.
+    assert_eq!(h.audit_kinds().await, Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -113,6 +115,18 @@ async fn reenrol_needs_replace() {
         h.store.host_key(&host("host-a")).await.unwrap(),
         Some(first.verifying_key()),
     );
+    // Whoever holds the code can be held to this, so it is on the record.
+    assert_eq!(
+        h.audit_kinds().await.last().map(String::as_str),
+        Some("enrol_refused")
+    );
+    let detail = h.last_audit_detail().await;
+    assert_eq!(detail["reason"], "already_enrolled");
+    assert_eq!(
+        detail["public_key"],
+        hex::encode(signing_key(2).verifying_key().as_bytes())
+    );
+    assert_eq!(h.store.verify_audit().await.unwrap().first_bad, None);
 
     // The operator is stopped too, until they say --replace.
     assert!(
@@ -162,6 +176,13 @@ async fn a_key_enrolled_to_another_host_is_refused() {
     assert_eq!(answer.status, StatusCode::CONFLICT);
     assert_eq!(answer.code(), "key_in_use");
     assert_eq!(h.store.host_key(&host("host-b")).await.unwrap(), None);
+    assert_eq!(
+        h.audit_kinds().await.last().map(String::as_str),
+        Some("enrol_refused")
+    );
+    let detail = h.last_audit_detail().await;
+    assert_eq!(detail["reason"], "key_in_use");
+    assert_eq!(detail["holder"], "host-a");
 
     // Refused, so the code is still good for a key of its own.
     let answer = h.enrol_with("host-b", &signing_key(2), code).await;

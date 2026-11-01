@@ -123,6 +123,25 @@ pub enum StoreError {
     Corrupt(&'static str),
 }
 
+impl StoreError {
+    /// Whether this is only another writer in the way, gone by the time a retry
+    /// comes: `SQLITE_BUSY`, with any extended code, or no connection free.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        /// `SQLITE_BUSY`, in the low byte of every extended result code.
+        const SQLITE_BUSY: i32 = 5;
+        let Self::Database(error) = self else {
+            return false;
+        };
+        matches!(error, sqlx::Error::PoolTimedOut)
+            || error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .and_then(|code| code.parse::<i32>().ok())
+                .is_some_and(|code| code & 0xff == SQLITE_BUSY)
+    }
+}
+
 /// The controller's clock, as unix seconds. A trait so that tests can move time
 /// past an expiry.
 pub trait Clock: fmt::Debug + Send + Sync {
@@ -323,13 +342,24 @@ impl Store {
         Ok(Self::from_pool(pool))
     }
 
+    /// This database again, on connections that give up on a lock at once: for
+    /// a test to see what happens when another writer is in the way.
+    #[cfg(test)]
+    pub(crate) async fn open_impatient(path: &Path) -> Result<Self, StoreError> {
+        Self::connect_waiting(path, Duration::ZERO).await
+    }
+
     async fn connect(path: &Path) -> Result<Self, StoreError> {
+        Self::connect_waiting(path, BUSY_TIMEOUT).await
+    }
+
+    async fn connect_waiting(path: &Path, busy_timeout: Duration) -> Result<Self, StoreError> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true)
-            .busy_timeout(BUSY_TIMEOUT);
+            .busy_timeout(busy_timeout);
         let pool = SqlitePoolOptions::new()
             .max_connections(MAX_CONNECTIONS)
             .connect_with(options)

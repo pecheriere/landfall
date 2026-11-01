@@ -102,12 +102,97 @@ async fn report_for_another_hosts_deploy_is_refused() {
         .await
         .unwrap();
     assert_eq!(state, "claimed");
-    assert_eq!(h.audit_kinds().await, before);
+
+    // A signer can be held to this: on the record, under its name.
+    let kinds = h.audit_kinds().await;
+    assert_eq!(kinds[..before.len()], before);
+    assert_eq!(kinds[before.len()..], ["report_refused"]);
+    let row =
+        sqlx::query("SELECT host, deployment, detail FROM audit_events ORDER BY seq DESC LIMIT 1")
+            .fetch_one(h.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("host"), B);
+    assert_eq!(row.get::<String, _>("deployment"), "app/prod");
+    let detail = h.last_audit_detail().await;
+    assert_eq!(detail["deploy_id"], id.0);
+    assert_eq!(detail["reason"], "another host's deploy");
+    assert_eq!(h.store.verify_audit().await.unwrap().first_bad, None);
 
     // The answer is the one for a deploy that does not exist: no probing.
     let missing = h.report(B, &b, &deployed_report(DeployId(999))).await;
     assert_eq!(missing.status, answer.status);
     assert_eq!(missing.body, answer.body);
+    assert_eq!(h.last_audit_detail().await["reason"], "no such deploy");
+}
+
+/// The configuration has no cap on checks, and a refused report leaves the
+/// deploy claimed, which blocks the host. So any number is accepted, and what is
+/// stored is bounded.
+#[tokio::test]
+async fn a_step_with_many_checks_finishes_the_deploy() {
+    let h = Harness::new().await;
+    let (a, id) = claimed(&h).await;
+    let check = ReportedCheck {
+        check: "c".to_owned(),
+        attempts: 1,
+        millis: 1,
+    };
+    let report = DeployReportBody {
+        deploy_id: id,
+        outcome: ReportedOutcome::Deployed {},
+        steps: vec![step(
+            "checks",
+            None,
+            Some(ReportedDetail::Checks {
+                checks: vec![check; MAX_STORED_CHECKS + 1],
+            }),
+        )],
+    };
+    let answer = h.report(A, &a, &report).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{answer:?}");
+    let state: String = sqlx::query_scalar("SELECT state FROM deploys")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "finished");
+    assert_eq!(h.last_audit_detail().await["checks_dropped"], 1);
+}
+
+#[tokio::test]
+async fn a_long_reason_is_kept_in_the_tables_and_short_in_the_log() {
+    let h = Harness::new().await;
+    let (a, id) = claimed(&h).await;
+    let long = format!("{}cause", "x".repeat(900));
+    let report = DeployReportBody {
+        deploy_id: id,
+        outcome: ReportedOutcome::RolledBack {
+            reason: long.clone(),
+        },
+        steps: vec![step("checks", Some(&long), None)],
+    };
+    assert_eq!(
+        h.report(A, &a, &report).await.status,
+        StatusCode::NO_CONTENT
+    );
+    let quoted = format!("{long:?}");
+    let reason: String = sqlx::query_scalar("SELECT reason FROM deploys")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(reason, quoted);
+    let failure: String = sqlx::query_scalar("SELECT failure FROM deploy_steps")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(failure, quoted);
+
+    let audit = h.last_audit_detail().await;
+    assert_eq!(audit["reason"], format!("\"{}\"...", "x".repeat(64)));
+    assert_eq!(
+        audit["steps"][0]["failure"],
+        format!("\"{}\"...", "x".repeat(64))
+    );
 }
 
 #[tokio::test]

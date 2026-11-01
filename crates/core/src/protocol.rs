@@ -333,8 +333,9 @@ pub struct NonceResponse {
 }
 
 /// The most bytes the controller reads of a request body. A larger one is
-/// refused before it is parsed, so an agent must keep what it sends under this,
-/// reports included: a refused report would be retried forever.
+/// refused before it is parsed. This is the only size limit on a report, so the
+/// agent trims a report to fit before sending it: refused for its size, it would
+/// never get through.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// The content type of a [`Problem`].
@@ -344,14 +345,134 @@ pub const PROBLEM_CONTENT_TYPE: &str = "application/problem+json";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Problem {
-    /// Stable, machine-readable, and what a client should act on. Hostile in
-    /// the agent: quote and bound it with [`crate::text::shown`] before showing
-    /// it.
+    /// Stable, machine-readable, and what a client should act on: see
+    /// [`ProblemCode::parse`]. Hostile in the agent: quote and bound it with
+    /// [`crate::text::shown`] before showing it.
     pub code: String,
     /// For people; may change. Hostile in the agent like `code`.
     pub title: String,
     /// The HTTP status.
     pub status: u16,
+}
+
+/// What a client should do about a [`Problem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Disposition {
+    /// Try again later, with a fresh nonce: the refusal is about now, and not
+    /// about the request.
+    Retry,
+    /// The same request will be refused every time. Retrying cannot help.
+    Final,
+}
+
+/// The stable codes in a [`Problem`]. They are a wire contract: a code never
+/// changes its meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProblemCode {
+    /// A signature header is missing, repeated or malformed.
+    Unsigned,
+    /// The nonce is unknown, used or expired: fetch another.
+    BadNonce,
+    /// The host is unknown or the signature does not verify.
+    BadSignature,
+    /// The enrolment code is unknown, used, expired or for another host.
+    InvalidCode,
+    /// The host has a key and the code does not allow replacing it.
+    AlreadyEnrolled,
+    /// Another host has this public key.
+    KeyInUse,
+    /// The body is not the request this endpoint takes.
+    BadRequest,
+    /// The body is over [`MAX_BODY_BYTES`].
+    BodyTooLarge,
+    /// The request took too long.
+    SlowRequest,
+    /// This source is asking too often.
+    RateLimited,
+    /// Too many nonces are outstanding.
+    NoncesExhausted,
+    /// The database is busy with another writer.
+    Busy,
+    /// The host has no such deploy.
+    UnknownDeploy,
+    /// The deploy was never handed to this host.
+    NotClaimed,
+    /// The controller failed.
+    Internal,
+}
+
+impl ProblemCode {
+    /// The code as the wire has it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsigned => "unsigned",
+            Self::BadNonce => "bad_nonce",
+            Self::BadSignature => "bad_signature",
+            Self::InvalidCode => "invalid_code",
+            Self::AlreadyEnrolled => "already_enrolled",
+            Self::KeyInUse => "key_in_use",
+            Self::BadRequest => "bad_request",
+            Self::BodyTooLarge => "body_too_large",
+            Self::SlowRequest => "slow_request",
+            Self::RateLimited => "rate_limited",
+            Self::NoncesExhausted => "nonces_exhausted",
+            Self::Busy => "busy",
+            Self::UnknownDeploy => "unknown_deploy",
+            Self::NotClaimed => "not_claimed",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The code named by `text`, or `None` for one this build does not know.
+    /// Agent and controller are upgraded together, so that means the answer did
+    /// not come from a controller: treat it as [`Disposition::Retry`].
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        [
+            Self::Unsigned,
+            Self::BadNonce,
+            Self::BadSignature,
+            Self::InvalidCode,
+            Self::AlreadyEnrolled,
+            Self::KeyInUse,
+            Self::BadRequest,
+            Self::BodyTooLarge,
+            Self::SlowRequest,
+            Self::RateLimited,
+            Self::NoncesExhausted,
+            Self::Busy,
+            Self::UnknownDeploy,
+            Self::NotClaimed,
+            Self::Internal,
+        ]
+        .into_iter()
+        .find(|code| code.as_str() == text)
+    }
+
+    /// What a client should do about this code.
+    #[must_use]
+    pub const fn disposition(self) -> Disposition {
+        match self {
+            Self::BadNonce
+            | Self::SlowRequest
+            | Self::RateLimited
+            | Self::NoncesExhausted
+            | Self::Busy
+            | Self::Internal => Disposition::Retry,
+            Self::Unsigned
+            | Self::BadSignature
+            | Self::InvalidCode
+            | Self::AlreadyEnrolled
+            | Self::KeyInUse
+            | Self::BadRequest
+            | Self::BodyTooLarge
+            | Self::UnknownDeploy
+            | Self::NotClaimed => Disposition::Final,
+        }
+    }
 }
 
 /// A controller-assigned deploy identifier. Reports are idempotent by it.
@@ -513,9 +634,6 @@ pub enum ReportedOutcome {
     },
 }
 
-/// The most checks one [`ReportedDetail::Checks`] may list.
-pub const MAX_REPORTED_CHECKS: usize = 64;
-
 /// What one post-deploy check took.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -528,30 +646,16 @@ pub struct ReportedCheck {
     pub millis: u64,
 }
 
-/// Serde adapter: a list of at most [`MAX_REPORTED_CHECKS`] checks.
-mod bounded_checks {
-    use super::{Deserialize, Deserializer, MAX_REPORTED_CHECKS, ReportedCheck};
-
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Vec<ReportedCheck>, D::Error> {
-        let checks = Vec::<ReportedCheck>::deserialize(d)?;
-        if checks.len() > MAX_REPORTED_CHECKS {
-            return Err(serde::de::Error::custom("too many checks"));
-        }
-        Ok(checks)
-    }
-}
-
 /// More about a step, for the steps that have more to say.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum ReportedDetail {
-    /// A run of the post-deploy checks, at most [`MAX_REPORTED_CHECKS`].
+    /// A run of the post-deploy checks. Their number is not limited here: the
+    /// configuration does not limit it, and refusing the report would leave the
+    /// deploy unfinished. The controller bounds what it stores.
     Checks {
         /// One per check, in configuration order.
-        #[serde(deserialize_with = "bounded_checks::deserialize")]
         checks: Vec<ReportedCheck>,
     },
     /// A backup that completed.
@@ -605,7 +709,7 @@ mod tests {
 
     use super::{
         DeployId, DeployReportBody, DeployWork, DeployedRelease, EnrolCode, EnrolRequest, HeldBack,
-        MAX_REPORTED_CHECKS, Nonce, NonceResponse, Phase, Problem, ReportedCheck, ReportedDetail,
+        Nonce, NonceResponse, Phase, Problem, ProblemCode, ReportedCheck, ReportedDetail,
         ReportedOutcome, ReportedStep, RequestSignature, RunningState, SignatureError, SigningKey,
         VerifyingKey, WorkRequest, WorkResponse, sign, signing_bytes, verify,
     };
@@ -1121,21 +1225,47 @@ mod tests {
     }
 
     #[test]
-    fn too_many_checks_are_refused() {
+    fn the_number_of_checks_is_not_limited_at_parse() {
         let check = ReportedCheck {
             check: "c".to_owned(),
             attempts: 1,
             millis: 1,
         };
-        for (count, ok) in [
-            (MAX_REPORTED_CHECKS, true),
-            (MAX_REPORTED_CHECKS + 1, false),
+        let detail = ReportedDetail::Checks {
+            checks: vec![check; 1000],
+        };
+        let wire = serde_json::to_value(&detail).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ReportedDetail>(wire).unwrap(),
+            detail
+        );
+    }
+
+    /// Pinned: a client decides by these, so a change is a wire change.
+    #[test]
+    fn problem_codes_are_pinned_with_what_to_do_about_them() {
+        use super::Disposition::{Final, Retry};
+        for (code, text, disposition) in [
+            (ProblemCode::Unsigned, "unsigned", Final),
+            (ProblemCode::BadNonce, "bad_nonce", Retry),
+            (ProblemCode::BadSignature, "bad_signature", Final),
+            (ProblemCode::InvalidCode, "invalid_code", Final),
+            (ProblemCode::AlreadyEnrolled, "already_enrolled", Final),
+            (ProblemCode::KeyInUse, "key_in_use", Final),
+            (ProblemCode::BadRequest, "bad_request", Final),
+            (ProblemCode::BodyTooLarge, "body_too_large", Final),
+            (ProblemCode::SlowRequest, "slow_request", Retry),
+            (ProblemCode::RateLimited, "rate_limited", Retry),
+            (ProblemCode::NoncesExhausted, "nonces_exhausted", Retry),
+            (ProblemCode::Busy, "busy", Retry),
+            (ProblemCode::UnknownDeploy, "unknown_deploy", Final),
+            (ProblemCode::NotClaimed, "not_claimed", Final),
+            (ProblemCode::Internal, "internal", Retry),
         ] {
-            let detail = ReportedDetail::Checks {
-                checks: vec![check.clone(); count],
-            };
-            let wire = serde_json::to_value(&detail).unwrap();
-            assert_eq!(serde_json::from_value::<ReportedDetail>(wire).is_ok(), ok);
+            assert_eq!(code.as_str(), text);
+            assert_eq!(ProblemCode::parse(text), Some(code));
+            assert_eq!(code.disposition(), disposition, "{text}");
         }
+        assert_eq!(ProblemCode::parse("nonsense"), None);
     }
 }

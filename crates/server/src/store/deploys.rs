@@ -80,8 +80,9 @@ fn deploy_work(row: &SqliteRow) -> Result<DeployWork, StoreError> {
     })
 }
 
-/// The stable name of a phase. `Phase` may grow: an unknown one is stored as
-/// that rather than refused, since it describes the host and decides nothing.
+/// The stable name of a phase. A phase this build does not know gets
+/// `bad_request` at parse, so the last arm is only for `Phase` being
+/// non-exhaustive: agent and controller are upgraded together.
 fn phase_name(phase: Phase) -> &'static str {
     match phase {
         Phase::Idle => "idle",
@@ -215,7 +216,8 @@ impl Store {
     }
 
     /// Records `report` for `host`, finishing the deploy. Idempotent by deploy
-    /// id: a repeat changes nothing and records nothing, whatever it says.
+    /// id: a repeat changes nothing and records nothing, whatever it says. A
+    /// refusal is audited, with `host` as the signer it can be held to.
     ///
     /// # Errors
     /// [`StoreError::UnknownDeploy`] if `host` has no such deploy;
@@ -226,20 +228,46 @@ impl Store {
         host: &HostId,
         report: &BoundedReport,
     ) -> Result<ReportAck, StoreError> {
-        let id = stored_deploy_id(report.deploy_id)?;
         let mut tx = self.begin().await?;
-        let row =
-            sqlx::query("SELECT deployment, tag, state FROM deploys WHERE id = ? AND host = ?")
-                .bind(id)
-                .bind(host.as_ref())
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(StoreError::UnknownDeploy)?;
+        let row = match stored_deploy_id(report.deploy_id) {
+            Ok(id) => {
+                sqlx::query("SELECT id, deployment, host, tag, state FROM deploys WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+            Err(_) => None,
+        };
+        let Some(row) = row else {
+            let refused = refused_report(host, report.deploy_id, None, "no such deploy");
+            self.append(&mut tx, &refused).await?;
+            tx.commit().await?;
+            return Err(StoreError::UnknownDeploy);
+        };
+        let deployment: DeploymentId = parsed(&row, "deployment")?;
+        if row.try_get::<String, _>("host")? != host.as_ref() {
+            let refused = refused_report(
+                host,
+                report.deploy_id,
+                Some(deployment),
+                "another host's deploy",
+            );
+            self.append(&mut tx, &refused).await?;
+            tx.commit().await?;
+            return Err(StoreError::UnknownDeploy);
+        }
         match row.try_get::<String, _>("state")?.as_str() {
             "claimed" => {}
-            "queued" => return Err(StoreError::NotClaimed),
+            "queued" => {
+                let refused =
+                    refused_report(host, report.deploy_id, Some(deployment), "never handed out");
+                self.append(&mut tx, &refused).await?;
+                tx.commit().await?;
+                return Err(StoreError::NotClaimed);
+            }
             _ => return Ok(ReportAck::AlreadyRecorded),
         }
+        let id: i64 = row.try_get("id")?;
         sqlx::query(
             "UPDATE deploys
              SET state = 'finished', outcome = ?, reason = ?, rollback_reason = ?, finished_at = ?
@@ -273,7 +301,7 @@ impl Store {
             } else {
                 EventKind::DeployFinished
             },
-            deployment: Some(parsed(&row, "deployment")?),
+            deployment: Some(deployment),
             host: Some(host.clone()),
             detail: report.audit_detail(&tag),
         };
@@ -288,7 +316,8 @@ impl Store {
     /// gives this host, once each. Writes and audits only what changed, so a
     /// host polling in the same state costs no write. `phase` and `busy` are
     /// kept but not audited: they move throughout a deploy, whose own events
-    /// are in the log.
+    /// are in the log. Idle and busy together cannot be: it is stored as not
+    /// busy, and audited once until the host stops saying it.
     ///
     /// # Errors
     /// A clock or database failure.
@@ -349,16 +378,20 @@ impl Store {
         let tag = state.deployed.as_ref().map(|d| d.tag.as_ref());
         let digest = state.deployed.as_ref().map(|d| d.digest.as_ref());
         let phase = phase_name(state.phase);
+        let inconsistent = state.phase == Phase::Idle && state.busy;
+        let busy = state.busy && !inconsistent;
         let stored = stored_running(tx, state).await?;
         let (old_tag, old_digest, old_drift) = stored.as_ref().map_or((None, None, false), |s| {
             (s.tag.as_deref(), s.digest.as_deref(), s.drift)
         });
+        let was_inconsistent = stored.as_ref().is_some_and(|s| s.inconsistent);
         let same = stored.as_ref().is_some_and(|s| {
             s.tag.as_deref() == tag
                 && s.digest.as_deref() == digest
                 && s.drift == state.drift
                 && s.phase == phase
-                && s.busy == state.busy
+                && s.busy == busy
+                && s.inconsistent == inconsistent
                 && s.host == host.as_ref()
         });
         if same {
@@ -382,14 +415,21 @@ impl Store {
             self.append(tx, &event(EventKind::RunningDrift, detail))
                 .await?;
         }
+        if inconsistent && !was_inconsistent {
+            let detail = json!({
+                "reason": "the agent reported idle and busy together; stored as not busy",
+            });
+            self.append(tx, &event(EventKind::RunningInconsistent, detail))
+                .await?;
+        }
         sqlx::query(
             "INSERT INTO running_states
-                 (deployment, host, tag, digest, drift, phase, busy, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 (deployment, host, tag, digest, drift, phase, busy, inconsistent, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (deployment) DO UPDATE SET
                  host = excluded.host, tag = excluded.tag, digest = excluded.digest,
                  drift = excluded.drift, phase = excluded.phase, busy = excluded.busy,
-                 updated_at = excluded.updated_at",
+                 inconsistent = excluded.inconsistent, updated_at = excluded.updated_at",
         )
         .bind(state.deployment.as_ref())
         .bind(host.as_ref())
@@ -397,7 +437,8 @@ impl Store {
         .bind(digest)
         .bind(state.drift)
         .bind(phase)
-        .bind(state.busy)
+        .bind(busy)
+        .bind(inconsistent)
         .bind(self.clock.now()?)
         .execute(&mut **tx)
         .await?;
@@ -413,6 +454,23 @@ struct StoredRunning {
     drift: bool,
     phase: String,
     busy: bool,
+    inconsistent: bool,
+}
+
+/// The audit row for a signed report that was refused. `reason` is the
+/// controller's own text.
+fn refused_report(
+    host: &HostId,
+    deploy_id: DeployId,
+    deployment: Option<DeploymentId>,
+    reason: &str,
+) -> AuditEvent {
+    AuditEvent {
+        kind: EventKind::ReportRefused,
+        deployment,
+        host: Some(host.clone()),
+        detail: json!({ "deploy_id": deploy_id, "reason": reason }),
+    }
 }
 
 async fn stored_running(
@@ -420,7 +478,8 @@ async fn stored_running(
     state: &RunningState,
 ) -> Result<Option<StoredRunning>, StoreError> {
     let row = sqlx::query(
-        "SELECT host, tag, digest, drift, phase, busy FROM running_states WHERE deployment = ?",
+        "SELECT host, tag, digest, drift, phase, busy, inconsistent
+         FROM running_states WHERE deployment = ?",
     )
     .bind(state.deployment.as_ref())
     .fetch_optional(connection)
@@ -433,5 +492,6 @@ async fn stored_running(
         drift: row.try_get("drift")?,
         phase: row.try_get("phase")?,
         busy: row.try_get("busy")?,
+        inconsistent: row.try_get("inconsistent")?,
     }))
 }

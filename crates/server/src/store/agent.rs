@@ -14,7 +14,8 @@ pub const NONCE_LIFETIME_SECS: i64 = 5 * 60;
 impl Store {
     /// Enrols `key` for `host` with a one-time code, or replaces its key if the
     /// code was issued with `--replace`. The code is used up only if all of it
-    /// succeeds. Recorded in the audit log, without the code.
+    /// succeeds. Recorded in the audit log, without the code, as is a refusal to
+    /// someone holding a valid code.
     ///
     /// # Errors
     /// [`StoreError::InvalidCode`] for a code that is unknown, used, expired or
@@ -34,8 +35,7 @@ impl Store {
 
         let mut tx = self.begin().await?;
         let replace: Option<bool> = sqlx::query_scalar(
-            "DELETE FROM enrol_codes WHERE code_hash = ? AND host = ? AND expires_at > ?
-             RETURNING replace",
+            "SELECT replace FROM enrol_codes WHERE code_hash = ? AND host = ? AND expires_at > ?",
         )
         .bind(code_hash.as_slice())
         .bind(host_id)
@@ -45,23 +45,45 @@ impl Store {
         let Some(replace) = replace else {
             return Err(StoreError::InvalidCode);
         };
+        // A refusal from here on is from someone holding a valid code, so it is
+        // recorded. The code is not used up by it.
+        let refused = |reason, holder| AuditEvent {
+            kind: EventKind::EnrolRefused,
+            deployment: None,
+            host: Some(host.clone()),
+            detail: json!({
+                "reason": reason,
+                "public_key": hex::encode(key.as_bytes()),
+                "holder": holder,
+            }),
+        };
         let previous: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT public_key FROM hosts WHERE id = ?")
                 .bind(host_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         if previous.is_some() && !replace {
+            let event = refused("already_enrolled", None);
+            self.append(&mut tx, &event).await?;
+            tx.commit().await?;
             return Err(StoreError::AlreadyEnrolled(host.clone()));
         }
-        let holder: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM hosts WHERE public_key = ? AND id <> ?")
+        let holder: Option<String> =
+            sqlx::query_scalar("SELECT id FROM hosts WHERE public_key = ? AND id <> ?")
                 .bind(public_key)
                 .bind(host_id)
                 .fetch_optional(&mut *tx)
                 .await?;
         if holder.is_some() {
+            let event = refused("key_in_use", holder);
+            self.append(&mut tx, &event).await?;
+            tx.commit().await?;
             return Err(StoreError::KeyInUse);
         }
+        sqlx::query("DELETE FROM enrol_codes WHERE code_hash = ?")
+            .bind(code_hash.as_slice())
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "INSERT INTO hosts (id, public_key, enrolled_at) VALUES (?, ?, ?)
              ON CONFLICT (id) DO UPDATE SET
@@ -141,14 +163,25 @@ impl Store {
     }
 
     /// Uses up `nonce`. Whether it was outstanding and unexpired; either way it
-    /// cannot be used again.
+    /// cannot be used again. Anyone can send any nonce without limit, so one
+    /// that is not outstanding costs only a read, and never the write lock.
     ///
     /// # Errors
     /// A clock or database failure.
     pub async fn consume_nonce(&self, nonce: &Nonce) -> Result<bool, StoreError> {
+        let now = self.clock.now()?;
+        let outstanding: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM nonces WHERE nonce = ? AND expires_at > ?")
+                .bind(nonce.as_bytes().as_slice())
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?;
+        if outstanding.is_none() {
+            return Ok(false);
+        }
         let result = sqlx::query("DELETE FROM nonces WHERE nonce = ? AND expires_at > ?")
             .bind(nonce.as_bytes().as_slice())
-            .bind(self.clock.now()?)
+            .bind(now)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() == 1)

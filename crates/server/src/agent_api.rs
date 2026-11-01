@@ -10,28 +10,43 @@
 //! are rate-limited per source. The source is the peer of the TCP connection,
 //! never a forwarding header, which anyone could set: behind a proxy all agents
 //! share one allowance, so the defaults leave room for a fleet.
+//!
+//! A refusal that a signer or the holder of a valid code can be held to is in the
+//! audit log. One that could come from anyone goes to a capped stderr log, since
+//! auditing it would let anyone fill the audit log.
+//!
+//! Agent and controller are upgraded together in v0: unknown fields and enum
+//! values in a request are refused, so a newer agent's new outcome or phase gets
+//! `bad_request` from an older controller.
 
 mod handlers;
 mod problem;
 mod rate_limit;
+mod refusal_log;
 mod signed;
 #[cfg(test)]
 mod tests;
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::Extensions;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use landfall_core::config::Config;
-use tokio::sync::watch;
+use landfall_core::ids::HostId;
+use tokio::sync::{oneshot, watch};
 
 use self::problem::ApiProblem;
 pub(crate) use self::problem::log;
 use self::rate_limit::RateLimiter;
+pub(crate) use self::rate_limit::source_key;
+use self::refusal_log::RefusalLog;
 use crate::store::Store;
 
 /// The API's limits.
@@ -78,6 +93,10 @@ pub struct ApiState {
     config: Arc<Config>,
     limits: Limits,
     limiter: Arc<Mutex<RateLimiter>>,
+    refusals: Arc<RefusalLog>,
+    /// What ends each host's current long poll. One entry per host that ever
+    /// signed a `work` request, so bounded by the enrolled hosts.
+    polls: Arc<Mutex<HashMap<HostId, oneshot::Sender<()>>>>,
     shutdown: watch::Sender<bool>,
 }
 
@@ -95,8 +114,41 @@ impl ApiState {
                 limits.source_burst,
                 limits.max_sources,
             ))),
+            refusals: Arc::new(RefusalLog::default()),
+            polls: Arc::new(Mutex::new(HashMap::new())),
             shutdown: watch::channel(false).0,
         }
+    }
+
+    /// Writes a refusal nobody can be held to to the capped log, with the
+    /// connection's source. `what` is the controller's own text.
+    fn note_refusal(&self, extensions: &Extensions, what: &str) {
+        let source = extensions.get::<ConnectInfo<SocketAddr>>().map_or_else(
+            || "an unknown source".to_owned(),
+            |peer| peer.0.ip().to_string(),
+        );
+        // Without a clock the line is not worth failing the refusal for.
+        if let Ok(now) = self.store.now() {
+            self.refusals
+                .note(now, &format!("refused {what} from {source}"));
+        }
+    }
+
+    /// Makes this the host's only long poll: the previous one, if any, ends.
+    /// The receiver resolves when a later one takes over.
+    fn take_over_poll(&self, host: &HostId) -> oneshot::Receiver<()> {
+        let (ours, superseded) = oneshot::channel();
+        let previous = self
+            .polls
+            .lock()
+            // Holds only channel ends, valid at every step.
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.clone(), ours);
+        if let Some(previous) = previous {
+            // It may have finished already, which is fine.
+            let _ = previous.send(());
+        }
+        superseded
     }
 
     /// The store.

@@ -86,16 +86,18 @@ CREATE TABLE deploy_steps (
 
 -- What each host last said about its deployments, only for deployments the
 -- configuration gives it. `tag` and `digest` are both NULL for a deployment that
--- has never been deployed.
+-- has never been deployed. `inconsistent` says the host last said idle and busy
+-- together, which is stored as not busy and audited once until it stops.
 CREATE TABLE running_states (
-    deployment TEXT PRIMARY KEY,
-    host       TEXT NOT NULL,
-    tag        TEXT,
-    digest     TEXT,
-    drift      INTEGER NOT NULL CHECK (drift IN (0, 1)),
-    phase      TEXT NOT NULL,
-    busy       INTEGER NOT NULL CHECK (busy IN (0, 1)),
-    updated_at INTEGER NOT NULL,
+    deployment   TEXT PRIMARY KEY,
+    host         TEXT NOT NULL,
+    tag          TEXT,
+    digest       TEXT,
+    drift        INTEGER NOT NULL CHECK (drift IN (0, 1)),
+    phase        TEXT NOT NULL,
+    busy         INTEGER NOT NULL CHECK (busy IN (0, 1)),
+    inconsistent INTEGER NOT NULL CHECK (inconsistent IN (0, 1)),
+    updated_at   INTEGER NOT NULL,
     CHECK ((tag IS NULL) = (digest IS NULL))
 ) STRICT;
 

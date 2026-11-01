@@ -1,14 +1,20 @@
 //! Bounding a deploy report before anything of it is stored.
 //!
-//! A report is never refused for its size, because a refused report would be
-//! retried forever. Everything an agent sent is kept quoted and truncated with
-//! [`shown`], and the number of steps and checks is capped, with the count of
-//! what was dropped kept in its place.
+//! Within the request body limit, a report is not refused for how much it holds,
+//! because a deploy that cannot report stays claimed and blocks its host. Text is
+//! kept quoted and truncated, and the number of steps and checks stored is
+//! capped, with the count of what was dropped kept in its place. A body over
+//! [`MAX_BODY_BYTES`](landfall_core::protocol::MAX_BODY_BYTES) is still refused:
+//! the agent trims a report to fit before sending it.
+//!
+//! The audit row holds the short form of each text, [`shown`], and the tables the
+//! long one, up to [`MAX_STORED_TEXT_CHARS`], since a failure's cause is often
+//! past its first 64 characters.
 
 use landfall_core::protocol::{
     DeployId, DeployReportBody, ReportedDetail, ReportedOutcome, ReportedStep,
 };
-use landfall_core::text::shown;
+use landfall_core::text::{quoted, shown};
 use serde_json::{Value, json};
 
 /// The most steps stored for one deploy. A real deploy, rollback included, has
@@ -20,6 +26,10 @@ use serde_json::{Value, json};
 /// are then at most 48 KiB.
 pub const MAX_STORED_STEPS: usize = 32;
 
+/// The most characters kept of a reason or a step's failure in `deploys` and
+/// `deploy_steps`.
+pub const MAX_STORED_TEXT_CHARS: usize = 1024;
+
 /// The most post-deploy checks stored for one deploy, across its steps.
 pub const MAX_STORED_CHECKS: usize = 128;
 
@@ -30,8 +40,10 @@ pub struct BoundedStep {
     pub name: String,
     /// How long it took, clamped to what `SQLite` can hold.
     pub millis: i64,
-    /// Why it failed, quoted and truncated.
+    /// Why it failed, quoted, up to [`MAX_STORED_TEXT_CHARS`].
     pub failure: Option<String>,
+    /// The short form of `failure`, for the audit row.
+    pub failure_short: Option<String>,
     /// More about the step, as JSON with its text quoted and truncated.
     pub detail: Option<String>,
 }
@@ -45,10 +57,14 @@ pub struct BoundedReport {
     pub outcome: &'static str,
     /// Whether the host refused the deploy.
     pub refused: bool,
-    /// Why, quoted and truncated.
+    /// Why, quoted, up to [`MAX_STORED_TEXT_CHARS`].
     pub reason: Option<String>,
-    /// Why the rollback failed, quoted and truncated.
+    /// Why the rollback failed, quoted, up to [`MAX_STORED_TEXT_CHARS`].
     pub rollback_reason: Option<String>,
+    /// The short form of `reason`, for the audit row.
+    pub reason_short: Option<String>,
+    /// The short form of `rollback_reason`, for the audit row.
+    pub rollback_reason_short: Option<String>,
     /// The first [`MAX_STORED_STEPS`] steps.
     pub steps: Vec<BoundedStep>,
     /// How many steps were left out.
@@ -61,6 +77,11 @@ pub struct BoundedReport {
 /// hostile or broken agent, but it is no reason to lose the report.
 fn clamped(millis: u64) -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// `text` as the tables keep it.
+fn stored_text(text: &str) -> String {
+    quoted(text, MAX_STORED_TEXT_CHARS)
 }
 
 /// What to store for a step's detail, taking its checks from `checks_left`.
@@ -99,8 +120,8 @@ fn bounded_detail(
             "symlinks": symlinks,
             "bytes": bytes,
         }),
-        // A kind added to the protocol later: nothing is known about how to
-        // bound it, so it is not stored.
+        // Only for `ReportedDetail` being non-exhaustive: a kind this build does
+        // not know gets `bad_request` at parse.
         _ => return None,
     };
     Some(value.to_string())
@@ -114,7 +135,8 @@ fn bounded_step(
     BoundedStep {
         name: shown(&step.name),
         millis: clamped(step.millis),
-        failure: step.failure.as_deref().map(shown),
+        failure: step.failure.as_deref().map(stored_text),
+        failure_short: step.failure.as_deref().map(shown),
         detail: bounded_detail(step.detail.as_ref(), checks_left, checks_dropped),
     }
 }
@@ -135,8 +157,9 @@ impl BoundedReport {
                 rollback_reason,
             } => ("rollback_failed", Some(reason), Some(rollback_reason)),
             ReportedOutcome::Refused { reason } => ("refused", Some(reason), None),
-            // An outcome added to the protocol later: the deploy did end, so
-            // the report is kept without what is not understood.
+            // Only for `ReportedOutcome` being non-exhaustive: an outcome this
+            // build does not know gets `bad_request` at parse. Agent and
+            // controller are upgraded together.
             _ => ("unknown", None, None),
         };
         let mut checks_left = MAX_STORED_CHECKS;
@@ -151,8 +174,10 @@ impl BoundedReport {
             deploy_id: report.deploy_id,
             outcome,
             refused: matches!(report.outcome, ReportedOutcome::Refused { .. }),
-            reason: reason.map(|text| shown(text)),
-            rollback_reason: rollback_reason.map(|text| shown(text)),
+            reason: reason.map(|text| stored_text(text)),
+            rollback_reason: rollback_reason.map(|text| stored_text(text)),
+            reason_short: reason.map(|text| shown(text)),
+            rollback_reason_short: rollback_reason.map(|text| shown(text)),
             steps,
             steps_dropped: report.steps.len().saturating_sub(MAX_STORED_STEPS),
             checks_dropped,
@@ -160,20 +185,21 @@ impl BoundedReport {
     }
 
     /// The audit row's detail: the outcome and every stored step by name, with
-    /// failures. Check details stay in `deploy_steps`, so the row stays bounded.
+    /// the short form of each text. The long forms and check details stay in the
+    /// tables, so the row stays bounded.
     #[must_use]
     pub fn audit_detail(&self, tag: &str) -> Value {
         let steps: Vec<Value> = self
             .steps
             .iter()
-            .map(|s| json!({ "name": s.name, "millis": s.millis, "failure": s.failure }))
+            .map(|s| json!({ "name": s.name, "millis": s.millis, "failure": s.failure_short }))
             .collect();
         json!({
             "deploy_id": self.deploy_id,
             "tag": tag,
             "outcome": self.outcome,
-            "reason": self.reason,
-            "rollback_reason": self.rollback_reason,
+            "reason": self.reason_short,
+            "rollback_reason": self.rollback_reason_short,
             "steps": steps,
             "steps_dropped": self.steps_dropped,
             "checks_dropped": self.checks_dropped,
@@ -247,13 +273,18 @@ mod tests {
     fn agent_text_is_quoted_and_truncated() {
         let bounded = BoundedReport::new(&report(
             ReportedOutcome::Refused {
-                reason: format!("a\nb\u{1b}[31m{}", "x".repeat(100)),
+                reason: format!("a\nb\u{1b}[31m{}", "x".repeat(2000)),
             },
             vec![step("na\nme", Some("fa\u{1b}il"), None)],
         ));
         let reason = bounded.reason.unwrap();
         assert!(reason.starts_with("\"a\\nb\\u{1b}[31m"), "{reason}");
         assert!(reason.ends_with("\"..."), "{reason}");
+        let kept = reason.chars().filter(|c| *c == 'x').count();
+        assert_eq!(kept, MAX_STORED_TEXT_CHARS - 8);
+        let short = bounded.reason_short.unwrap();
+        assert!(short.starts_with("\"a\\nb\\u{1b}[31m"), "{short}");
+        assert_eq!(short.chars().filter(|c| *c == 'x').count(), 64 - 8);
         assert_eq!(bounded.steps[0].name, "\"na\\nme\"");
         assert_eq!(bounded.steps[0].failure.as_deref(), Some("\"fa\\u{1b}il\""));
         assert!(bounded.refused);

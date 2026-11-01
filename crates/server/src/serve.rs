@@ -1,15 +1,27 @@
 //! Serving the routes over TCP, with the limits a hostile client calls for.
 //!
 //! `axum::serve` cannot set a timeout on reading a request's headers, so this is
-//! a small accept loop over `hyper` instead. A client that connects and sends
-//! nothing, or stops halfway through its headers, is dropped after
-//! [`ServeOptions::header_read_timeout`], which also ends idle keep-alive
-//! connections. Once the headers are in, the routes' own deadlines apply. The
-//! number of connections is capped: past that they wait in the kernel's backlog.
+//! a small accept loop over `hyper` instead. Each way a client can hold a
+//! connection has its own limit:
+//!
+//! - sending nothing, stopping halfway through its headers, or idling on a
+//!   keep-alive connection: dropped after [`ServeOptions::header_read_timeout`];
+//! - sending a body slowly, or a handler running long: the routes' own deadlines;
+//! - not reading what it is sent: dropped once a write has made no progress for
+//!   [`ServeOptions::write_timeout`]. Without this a client could keep a slot for
+//!   as long as it liked, with requests that need no key.
+//!
+//! A client reading just fast enough to keep making progress is not caught by
+//! these. What it can hold is bounded by the caps: the connections from one source
+//! are capped, and past that a new one is closed at once; the total is capped, and
+//! past that they wait in the kernel's backlog.
 
+mod write_deadline;
+
+use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
@@ -24,6 +36,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tower::ServiceExt as _;
 
+use self::write_deadline::WriteDeadline;
+use crate::agent_api::{log, source_key};
+
 /// How long to wait before accepting again after `accept` itself failed, as it
 /// does when the process is out of file descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -34,8 +49,13 @@ pub struct ServeOptions {
     /// How long a client has to send a request's headers, and how long an idle
     /// connection stays open.
     pub header_read_timeout: Duration,
+    /// How long a write may make no progress before the client is dropped.
+    pub write_timeout: Duration,
     /// How many connections are served at once.
     pub max_connections: u32,
+    /// How many of those one source may hold. Behind a proxy all agents are one
+    /// source, so this leaves room for a fleet.
+    pub max_connections_per_source: u32,
     /// How long stopping waits for requests in flight.
     pub drain_timeout: Duration,
 }
@@ -44,8 +64,50 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             header_read_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
             max_connections: 1024,
+            max_connections_per_source: 256,
             drain_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Live connections per source. Entries exist only for live connections, so it
+/// is bounded by [`ServeOptions::max_connections`].
+type SourceCounts = Arc<Mutex<HashMap<IpAddr, u32>>>;
+
+/// One source's claim on a connection, given back when dropped.
+#[derive(Debug)]
+struct SourceSlot {
+    counts: SourceCounts,
+    source: IpAddr,
+}
+
+impl SourceSlot {
+    /// A slot for `peer`, or `None` if it holds all it may.
+    fn take(counts: &SourceCounts, peer: IpAddr, max: u32) -> Option<Self> {
+        let source = source_key(peer);
+        let mut locked = counts.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = locked.entry(source).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            counts: Arc::clone(counts),
+            source,
+        })
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut locked = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = locked.get_mut(&self.source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                locked.remove(&self.source);
+            }
         }
     }
 }
@@ -64,7 +126,7 @@ async fn serve_connection(
     app: Router,
     options: ServeOptions,
     closing: watch::Receiver<bool>,
-    permit: OwnedSemaphorePermit,
+    held: (OwnedSemaphorePermit, SourceSlot),
 ) {
     let service = service_fn(move |mut request: Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
@@ -73,7 +135,10 @@ async fn serve_connection(
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(options.header_read_timeout)
-        .serve_connection(TokioIo::new(stream), service);
+        .serve_connection(
+            TokioIo::new(WriteDeadline::new(stream, options.write_timeout)),
+            service,
+        );
     tokio::pin!(connection);
     tokio::select! {
         result = connection.as_mut() => drop(result),
@@ -82,11 +147,12 @@ async fn serve_connection(
             drop(connection.await);
         }
     }
-    drop(permit);
+    drop(held);
 }
 
 /// Serves `app` on `listener` until `shutdown` completes, then lets requests in
 /// flight finish for up to [`ServeOptions::drain_timeout`].
+///
 /// Failing to accept one connection is no reason to stop serving the others, so
 /// it is logged and retried.
 pub async fn run(
@@ -100,6 +166,7 @@ pub async fn run(
         usize::try_from(permits).unwrap_or(usize::MAX),
     ));
     let (closing, closing_rx) = watch::channel(false);
+    let sources = SourceCounts::default();
     tokio::pin!(shutdown);
     loop {
         let permit = tokio::select! {
@@ -114,17 +181,23 @@ pub async fn run(
         };
         match accepted {
             Ok((stream, peer)) => {
-                tokio::spawn(serve_connection(
-                    stream,
-                    peer,
-                    app.clone(),
-                    options,
-                    closing_rx.clone(),
-                    permit,
-                ));
+                // Over its cap the source's connection closes here, unserved,
+                // and the place goes back with the permit.
+                let slot =
+                    SourceSlot::take(&sources, peer.ip(), options.max_connections_per_source);
+                if let Some(slot) = slot {
+                    tokio::spawn(serve_connection(
+                        stream,
+                        peer,
+                        app.clone(),
+                        options,
+                        closing_rx.clone(),
+                        (permit, slot),
+                    ));
+                }
             }
             Err(error) => {
-                crate::agent_api::log(&format!("cannot accept a connection: {error}"));
+                log(&format!("cannot accept a connection: {error}"));
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
             }
         }
@@ -160,6 +233,13 @@ mod tests {
         "done"
     }
 
+    /// More than the socket buffers at both ends can hold.
+    const BIG: usize = 32 * 1024 * 1024;
+
+    async fn big() -> Vec<u8> {
+        vec![b'x'; BIG]
+    }
+
     struct Server {
         addr: SocketAddr,
         stop: oneshot::Sender<()>,
@@ -172,6 +252,7 @@ mod tests {
         let app = Router::new()
             .route("/peer", get(peer))
             .route("/slow", get(slow))
+            .route("/big", get(big))
             .route("/hang", get(std::future::pending::<()>));
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(run(listener, app, options, async {
@@ -285,12 +366,7 @@ mod tests {
         // A request that will never finish.
         let mut stream = TcpStream::connect(server.addr).await.unwrap();
         stream
-            .write_all(
-                b"GET /hang HTTP/1.1
-Host: test
-
-",
-            )
+            .write_all(b"GET /hang HTTP/1.1\r\nHost: test\r\n\r\n")
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -299,5 +375,102 @@ Host: test
             .await
             .expect("stopping should not hang")
             .unwrap();
+    }
+
+    /// The only slot goes to a client that asks for more than the socket buffers
+    /// hold and never reads it. Its write stops making progress, it is dropped,
+    /// and the next client is served. The headers are long since in, so the
+    /// header timeout has nothing to say about this, and it is set far away.
+    #[tokio::test]
+    async fn a_client_that_never_reads_does_not_keep_its_slot() {
+        let server = start(ServeOptions {
+            max_connections: 1,
+            header_read_timeout: Duration::from_secs(60),
+            write_timeout: Duration::from_millis(200),
+            ..ServeOptions::default()
+        })
+        .await;
+        let mut stuck = TcpStream::connect(server.addr).await.unwrap();
+        stuck
+            .write_all(b"GET /big HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut next = TcpStream::connect(server.addr).await.unwrap();
+        next.write_all(REQUEST).await.unwrap();
+        let started = Instant::now();
+        let answer = read_to_close(&mut next).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        drop(stuck);
+    }
+
+    /// A client that keeps reading, however slowly it starts, gets all of it:
+    /// the deadline is on progress, not on the whole answer.
+    #[tokio::test]
+    async fn a_client_that_reads_keeps_its_connection() {
+        let server = start(ServeOptions {
+            write_timeout: Duration::from_millis(200),
+            ..options()
+        })
+        .await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /big HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut got = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.len() >= BIG, "{}", got.len());
+    }
+
+    #[tokio::test]
+    async fn one_source_cannot_take_every_connection() {
+        let server = start(ServeOptions {
+            header_read_timeout: Duration::from_secs(60),
+            max_connections_per_source: 1,
+            ..ServeOptions::default()
+        })
+        .await;
+        let held = TcpStream::connect(server.addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Closed at once, long before any timeout could do it.
+        let mut over = TcpStream::connect(server.addr).await.unwrap();
+        assert_eq!(read_to_close(&mut over).await, "");
+
+        // When the first goes, its place is free again. How soon the server
+        // notices is its business, so this tries for a while.
+        drop(held);
+        let mut answer = String::new();
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut again = TcpStream::connect(server.addr).await.unwrap();
+            if again.write_all(REQUEST).await.is_ok() {
+                let mut got = Vec::new();
+                if again.read_to_end(&mut got).await.is_ok() && !got.is_empty() {
+                    answer = String::from_utf8(got).unwrap();
+                    break;
+                }
+            }
+        }
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+
+    #[test]
+    fn a_source_slot_is_given_back_and_leaves_nothing_behind() {
+        let counts = SourceCounts::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let first = SourceSlot::take(&counts, ip, 2).unwrap();
+        let second = SourceSlot::take(&counts, mapped, 2).unwrap();
+        assert!(SourceSlot::take(&counts, ip, 2).is_none());
+        drop((first, second));
+        assert!(counts.lock().unwrap().is_empty());
     }
 }

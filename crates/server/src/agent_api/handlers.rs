@@ -6,7 +6,7 @@ use std::sync::PoisonError;
 
 use axum::Extension;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use landfall_core::config::Deployment;
@@ -84,17 +84,25 @@ fn check_source(state: &ApiState, peer: &Peer) -> Result<(), ApiProblem> {
 pub(super) async fn enrol(
     State(state): State<ApiState>,
     peer: Peer,
-    body: Body,
+    request: Request,
 ) -> Result<StatusCode, ApiProblem> {
     check_source(&state, &peer)?;
+    let (parts, body) = request.into_parts();
     let bytes = read_body(body, MAX_ENROL_BODY_BYTES, state.limits.body_timeout).await?;
     let request: EnrolRequest =
         serde_json::from_slice(&bytes).map_err(|_| ApiProblem::BadRequest)?;
-    state
+    match state
         .store
         .enrol(&request.host, &request.code, &request.public_key)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(StoreError::InvalidCode) => {
+            state.note_refusal(&parts.extensions, "an invalid enrolment code");
+            Err(ApiProblem::InvalidCode)
+        }
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// `GET /agent/v1/nonce`. Not cacheable: a proxy serving one nonce twice would
@@ -172,11 +180,14 @@ fn work_answer(pick: WorkPick) -> Response {
 /// deploy, waiting up to the long poll for one. The answer with nothing to do
 /// comes only after that wait, also for a host with the wrong configuration, so
 /// a poll loop is paced by the controller. Nothing holds a database connection
-/// during the wait.
+/// during the wait. A host has one long poll at a time: a new one ends the old,
+/// so a host cannot pile up connections by polling, and a deploy handed to a
+/// connection that died is handed out again under the same id.
 pub(super) async fn work(
     State(state): State<ApiState>,
     Signed { host, body }: Signed<WorkRequest>,
 ) -> Result<Response, ApiProblem> {
+    let mut superseded = state.take_over_poll(&host);
     let deadline = Instant::now() + state.limits.long_poll;
     let config_matches = hex::encode(body.config_hash) == state.config.hash();
     let drifted_hash = (!config_matches).then_some(&body.config_hash);
@@ -190,6 +201,7 @@ pub(super) async fn work(
         tokio::select! {
             () = sleep_until(deadline) => {}
             () = until_shutdown(shutdown) => {}
+            _ = &mut superseded => {}
         }
         return Ok(work_answer(WorkPick {
             work: None,
@@ -210,6 +222,7 @@ pub(super) async fn work(
         tokio::select! {
             () = sleep_until(deadline) => return Ok(work_answer(pick)),
             () = &mut stopping => return Ok(work_answer(pick)),
+            _ = &mut superseded => return Ok(work_answer(WorkPick::default())),
             Ok(()) = queued.changed() => {}
         }
     }
@@ -222,17 +235,6 @@ pub(super) async fn report(
     Signed { host, body }: Signed<DeployReportBody>,
 ) -> Result<StatusCode, ApiProblem> {
     let report = BoundedReport::new(&body);
-    match state.store.finish_deploy(&host, &report).await {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
-        Err(StoreError::UnknownDeploy) => {
-            // A host's own bug or a host probing others. It changed nothing, so
-            // it is not an audit event, which it could use to fill the log.
-            log(&format!(
-                "host {host} reported on deploy {}, which is not its own",
-                body.deploy_id
-            ));
-            Err(ApiProblem::UnknownDeploy)
-        }
-        Err(other) => Err(other.into()),
-    }
+    state.store.finish_deploy(&host, &report).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

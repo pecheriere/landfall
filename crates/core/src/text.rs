@@ -5,8 +5,14 @@
 /// a hostile value cannot flood a log line.
 #[must_use]
 pub fn shown(text: &str) -> String {
-    const MAX: usize = 64;
-    let cut: String = text.chars().take(MAX).collect();
+    quoted(text, 64)
+}
+
+/// Quotes `text` as [`shown`] does, shortened to `max_chars` characters: for
+/// keeping untrusted text where more of it is worth the room.
+#[must_use]
+pub fn quoted(text: &str, max_chars: usize) -> String {
+    let cut: String = text.chars().take(max_chars).collect();
     if cut.len() < text.len() {
         format!("{cut:?}...")
     } else {
@@ -16,7 +22,13 @@ pub fn shown(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::shown;
+    use super::{quoted, shown};
+
+    #[test]
+    fn quoted_keeps_what_it_is_asked_to() {
+        assert_eq!(quoted("a\nbcd", 3), "\"a\\nb\"...");
+        assert_eq!(quoted("abc", 3), "\"abc\"");
+    }
 
     #[test]
     fn quotes_escapes_and_truncates() {

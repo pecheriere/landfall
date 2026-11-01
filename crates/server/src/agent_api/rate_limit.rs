@@ -26,7 +26,7 @@ impl Bucket {
 /// What a source is limited as. Someone with one IPv6 address usually has a
 /// whole /64 to send from, so that is what counts as one source. An IPv4 address
 /// on an IPv6 socket counts as the IPv4 address.
-fn source_key(source: IpAddr) -> IpAddr {
+pub(crate) fn source_key(source: IpAddr) -> IpAddr {
     match source.to_canonical() {
         IpAddr::V6(address) => {
             let bits = address.to_bits() & !u128::from(u64::MAX);

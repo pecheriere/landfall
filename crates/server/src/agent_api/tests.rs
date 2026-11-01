@@ -1,6 +1,9 @@
 //! The agent API through its real router, on an in-memory store.
 
+mod concurrent;
+mod contention;
 mod enrol;
+mod over_tcp;
 mod report;
 mod signing;
 mod work;
@@ -121,11 +124,13 @@ impl Harness {
     }
 
     pub(super) async fn with_limits(limits: Limits) -> Self {
+        let store = Store::open_in_memory().await.unwrap();
+        Self::on_store(store, limits)
+    }
+
+    pub(super) fn on_store(store: Store, limits: Limits) -> Self {
         let clock = ManualClock::at(1_800_000_000);
-        let store = Store::open_in_memory()
-            .await
-            .unwrap()
-            .with_clock(clock.clone());
+        let store = store.with_clock(clock.clone());
         let config = config::parse(CONFIG.as_bytes()).unwrap();
         let config_hash: [u8; 32] = hex::decode(config.hash()).unwrap().try_into().unwrap();
         let state = ApiState::new(store.clone(), config, limits);

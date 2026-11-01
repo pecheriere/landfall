@@ -9,6 +9,13 @@ The agent does not yet have a long-running command: it will get one with the
 controller loop. Today it has `status` and `recover`, and the deploy engine runs
 as a library.
 
+## Upgrading
+
+Upgrade the agents and the controller together. Neither accepts a request or an
+answer with fields or values it does not know, so a mismatched pair refuses each
+other: a newer agent's new report outcome gets `bad_request` from an older
+controller, and the deploy stays claimed until the two match.
+
 ## Requirements
 
 - **Linux 5.8 or later.** Copying a symlink into a backup sets its owner and

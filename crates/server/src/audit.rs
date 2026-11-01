@@ -68,6 +68,13 @@ pub enum EventKind {
     RunningDrift,
     /// A host reported a different release deployed for a deployment.
     RunningChanged,
+    /// A host reported a state that cannot be: idle, and busy with a deploy.
+    RunningInconsistent,
+    /// Someone holding a valid enrolment code was refused.
+    EnrolRefused,
+    /// A signed report was refused: for a deploy that is not the signer's, or
+    /// one never handed out.
+    ReportRefused,
 }
 
 impl EventKind {
@@ -86,6 +93,9 @@ impl EventKind {
             Self::ConfigDrift => "config_drift",
             Self::RunningDrift => "running_drift",
             Self::RunningChanged => "running_changed",
+            Self::RunningInconsistent => "running_inconsistent",
+            Self::EnrolRefused => "enrol_refused",
+            Self::ReportRefused => "report_refused",
         }
     }
 }

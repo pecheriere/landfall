@@ -325,6 +325,22 @@ async fn oversized_body_is_refused() {
 }
 
 #[tokio::test]
+async fn an_oversized_body_says_nothing_about_which_hosts_exist() {
+    let h = Harness::new().await;
+    let key = h.enrolled("host-a", 1).await;
+    let body = vec![b' '; MAX_BODY_BYTES + 1];
+    let mut answers = Vec::new();
+    for name in ["host-a", "nobody"] {
+        let nonce = h.nonce().await;
+        let request = signed_request(name, &key, WORK, WORK, &nonce, body.clone());
+        answers.push(h.send(request).await);
+    }
+    assert_eq!(answers[0].status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(answers[1].status, answers[0].status);
+    assert_eq!(answers[1].body, answers[0].body);
+}
+
+#[tokio::test]
 async fn a_stalled_body_is_cut_off() {
     let h = Harness::with_limits(Limits {
         body_timeout: Duration::from_millis(50),

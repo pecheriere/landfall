@@ -1,4 +1,4 @@
-//! Signed requests: nonce, then host key, then signature, then parse.
+//! Signed requests: nonce, then body, then host key and signature, then parse.
 
 use std::error::Error;
 use std::time::Duration;
@@ -78,28 +78,32 @@ impl<T: DeserializeOwned> FromRequest<ApiState> for Signed<T> {
         if !state.store.consume_nonce(&nonce).await? {
             return Err(ApiProblem::BadNonce);
         }
-        let key = state
-            .store
-            .host_key(&host)
-            .await?
-            .ok_or(ApiProblem::BadSignature)?;
+        // Before the key is looked up, so that a body over the limit gets the
+        // same answer for a host that exists and one that does not.
         let bytes = read_body(body, MAX_BODY_BYTES, state.limits.body_timeout).await?;
+        let key = state.store.host_key(&host).await?;
 
         // The path as sent, with its query: the signature covers both.
         let path = parts
             .uri
             .path_and_query()
             .map_or_else(|| parts.uri.path(), PathAndQuery::as_str);
-        protocol::verify(
-            &key,
-            &signature,
-            &host,
-            parts.method.as_str(),
-            path,
-            &nonce,
-            &bytes,
-        )
-        .map_err(|_| ApiProblem::BadSignature)?;
+        let verified = key.is_some_and(|key| {
+            protocol::verify(
+                &key,
+                &signature,
+                &host,
+                parts.method.as_str(),
+                path,
+                &nonce,
+                &bytes,
+            )
+            .is_ok()
+        });
+        if !verified {
+            state.note_refusal(&parts.extensions, "a request with a bad signature");
+            return Err(ApiProblem::BadSignature);
+        }
 
         let body = serde_json::from_slice(&bytes).map_err(|_| ApiProblem::BadRequest)?;
         Ok(Self { host, body })
