@@ -1267,6 +1267,7 @@ dependencies = [
 name = "landfall-core"
 version = "0.0.0"
 dependencies = [
+ "ed25519-dalek",
  "semver",
  "serde",
  "serde_json",
