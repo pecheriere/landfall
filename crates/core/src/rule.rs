@@ -80,7 +80,7 @@ mod tests {
         let text = format!(
             r#"
 [signers]
-maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPllr3rhAPNIZD4W0jBk/LlLJFZIniscS6lZCMZCxzOG"
+maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
 
 [approvers]
 operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}

@@ -13,6 +13,7 @@ constants in `src/tag.rs` must be updated together. Not run in CI.
 | `unknown-signer.tag` | the same tag signed by `other.pub` |
 | `unsigned.tag` | an annotated, unsigned `v1.2.3` |
 | `tree-object.tag` | a signed `v1.2.3` that points at a tree, not a commit |
+| `other-commit.tag` | a signed `1.37.4` (the attestation fixture's tag name) on the same commit |
 | `wrong-namespace.tag` | the valid tag's bytes signed with `ssh-keygen -Y sign -n file` |
 | `signer.pub`, `other.pub` | ed25519 public keys |
 | `ecdsa.pub` | an `ecdsa-sha2-nistp256` public key (rejected as a signer) |
@@ -20,5 +21,5 @@ constants in `src/tag.rs` must be updated together. Not run in CI.
 Values as printed by the script (`ssh-keygen -lf`):
 
 - release commit: `7160f743d0664e041913065355d7bcd291ad2a01`
-- `signer.pub`: `SHA256:gdcqb1DcL2Rv7xn5I2LqM0wcjbk377gXNansYwAXoDQ`
-- `other.pub`: `SHA256:2CMsEhXo18QW2DrGcNms5cgJmcdUlUUyXlMIfWSmKA0`
+- `signer.pub`: `SHA256:aN9xB/PG8u3ubV37qOIeOe3nPDkWfAzfFl+We+g5ASA`
+- `other.pub`: `SHA256:cRL49yC67xm1DyK5ViDqOGgd4BMfcjucVSAUA7c0Aeo`

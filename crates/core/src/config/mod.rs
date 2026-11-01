@@ -749,7 +749,7 @@ mod tests {
 
     const EXAMPLE: &str = r#"
 [signers]
-maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPllr3rhAPNIZD4W0jBk/LlLJFZIniscS6lZCMZCxzOG"
+maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
 
 [approvers]
 operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
@@ -816,7 +816,7 @@ can = ["view", "request", "approve", "rollback"]
         let key = config.signer(&maintainer).unwrap();
         assert_eq!(
             key.fingerprint(),
-            "SHA256:gdcqb1DcL2Rv7xn5I2LqM0wcjbk377gXNansYwAXoDQ"
+            "SHA256:aN9xB/PG8u3ubV37qOIeOe3nPDkWfAzfFl+We+g5ASA"
         );
         assert!(config.signer(&"nobody".parse().unwrap()).is_none());
 

@@ -45,6 +45,11 @@ git -c commit.gpgsign=false -c tag.gpgsign=false tag -a -m 'release v1.2.3' v1.2
 dump v1.2.3 unsigned.tag
 sign signer v1.2.3 'HEAD^{tree}' 'release v1.2.3'
 dump v1.2.3 tree-object.tag
+# The attestation fixture's tag name (crates/origin/tests/fixtures/attestation)
+# on this commit: a signed tag that matches that bundle in everything but the
+# commit.
+sign signer 1.37.4 HEAD 'release 1.37.4'
+dump 1.37.4 other-commit.tag
 
 # The same signed bytes signed in another namespace, appended the way git does.
 sed '/^-----BEGIN SSH SIGNATURE-----$/,$d' "$out/valid.tag" >"$work/payload"

@@ -2,6 +2,8 @@
 
 use ssh_key::{Algorithm, HashAlg, PublicKey};
 
+use crate::text::shown;
+
 /// A trusted tag-signing key: an `ssh-ed25519` public key in OpenSSH format,
 /// as written in a `.pub` file. Only ed25519 is supported, so a key of any
 /// other type is a configuration error rather than a key that silently never
@@ -43,17 +45,5 @@ impl SignerKey {
     /// The parsed key, for signature verification.
     pub(crate) fn public_key(&self) -> &PublicKey {
         &self.key
-    }
-}
-
-/// Quotes `text` for an error message, shortened so a hostile value cannot
-/// flood a log line.
-fn shown(text: &str) -> String {
-    const MAX: usize = 64;
-    let cut: String = text.chars().take(MAX).collect();
-    if cut.len() < text.len() {
-        format!("{cut:?}...")
-    } else {
-        format!("{cut:?}")
     }
 }

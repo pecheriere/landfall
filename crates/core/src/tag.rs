@@ -6,7 +6,8 @@
 //! signature block. [`verify_tag`] checks such an object against the trusted
 //! keys and returns the facts it proves: which tag, which commit, signed by
 //! whom. Nothing outside the signed bytes is trusted, and a failure names
-//! what was expected and what was found.
+//! what was expected and what was found. OpenPGP and X.509 signatures are
+//! recognised and refused as unsupported.
 
 use serde::Serialize;
 use ssh_key::SshSig;
@@ -14,12 +15,20 @@ use thiserror::Error;
 
 use crate::config::SignerKey;
 use crate::ids::{CommitSha, PrincipalId, ReleaseTag};
+use crate::text::shown;
 
 /// The namespace `git` signs tags under.
 const NAMESPACE: &str = "git";
 
 /// Opens the armored signature that `git` appends to a signed tag.
 const SIGNATURE_START: &[u8] = b"-----BEGIN SSH SIGNATURE-----";
+
+/// The armor lines `git` writes for the signature formats landfall does not
+/// verify (`gpg.format = openpgp` and `x509`), with their names.
+const UNSUPPORTED_SIGNATURES: [(&[u8], &str); 2] = [
+    (b"-----BEGIN PGP SIGNATURE-----", "OpenPGP"),
+    (b"-----BEGIN SIGNED MESSAGE-----", "X.509"),
+];
 
 /// What a valid maintainer signature on a release tag proves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -41,6 +50,16 @@ pub enum TagVerifyError {
     /// annotated tag that nobody signed (what `gh release create` makes).
     #[error("tag is not signed")]
     NotSigned,
+    /// The object carries an OpenPGP or X.509 signature and no SSH one.
+    /// Only SSH signatures are verified, so such a tag is refused.
+    #[error(
+        "tag carries an {kind} signature; only SSH signatures are supported \
+         (git tag -s with gpg.format = ssh)"
+    )]
+    UnsupportedSignature {
+        /// `"OpenPGP"` or `"X.509"`.
+        kind: &'static str,
+    },
     /// The object cannot be read as a signed annotated tag.
     #[error("tag object is malformed: {reason}")]
     Malformed {
@@ -48,17 +67,17 @@ pub enum TagVerifyError {
         reason: String,
     },
     /// The tag points at something other than a commit.
-    #[error("tag points at a {found:?} object, expected a commit")]
+    #[error("tag points at a {found} object, expected a commit")]
     WrongType {
-        /// The object type the tag names.
+        /// The object type the tag names, quoted and shortened.
         found: String,
     },
     /// The signed tag has another name than the release being verified.
-    #[error("signed tag is named {found:?}, expected {expected:?}")]
+    #[error("signed tag is named {found}, expected {expected:?}")]
     WrongTag {
         /// The tag name being verified.
         expected: String,
-        /// The tag name inside the signed object.
+        /// The tag name inside the signed object, quoted and shortened.
         found: String,
     },
     /// The signature does not match the bytes it covers.
@@ -73,9 +92,9 @@ pub enum TagVerifyError {
         fingerprint: String,
     },
     /// The signature was made for another purpose than signing git objects.
-    #[error("signature namespace is {found:?}, expected \"git\"")]
+    #[error("signature namespace is {found}, expected \"git\"")]
     WrongNamespace {
-        /// The namespace inside the signature.
+        /// The namespace inside the signature, quoted and shortened.
         found: String,
     },
 }
@@ -85,7 +104,7 @@ pub enum TagVerifyError {
 /// The headers are checked before the signature, so a malformed or
 /// mismatched object is refused for that reason. A tag is accepted only if
 /// it is named `expected_tag`, points at a commit, and carries a `git`
-/// namespace signature that verifies with one of `signers`.
+/// namespace SSH signature that verifies with one of `signers`.
 ///
 /// # Errors
 ///
@@ -95,7 +114,7 @@ pub fn verify_tag(
     expected_tag: &ReleaseTag,
     signers: &[(PrincipalId, &SignerKey)],
 ) -> Result<SignedTag, TagVerifyError> {
-    let start = signature_start(raw).ok_or(TagVerifyError::NotSigned)?;
+    let start = signature_start(raw).ok_or_else(|| unsigned(raw))?;
     let (payload, armored) = raw.split_at(start);
     let headers = Headers::parse(payload)?;
 
@@ -112,7 +131,7 @@ pub fn verify_tag(
     }
     let commit = headers.object.parse::<CommitSha>().map_err(|_| {
         malformed(format!(
-            "object {:?} is not a commit id",
+            "object {} is not a commit id",
             shown(headers.object)
         ))
     })?;
@@ -148,18 +167,34 @@ pub fn verify_tag(
 
 /// Offset of the last line that starts the signature block.
 fn signature_start(raw: &[u8]) -> Option<usize> {
-    let mut found = None;
-    let mut line_start = 0;
-    while line_start < raw.len() {
-        if raw[line_start..].starts_with(SIGNATURE_START) {
-            found = Some(line_start);
-        }
-        match raw[line_start..].iter().position(|&b| b == b'\n') {
-            Some(newline) => line_start += newline + 1,
-            None => break,
-        }
-    }
-    found
+    lines(raw)
+        .filter(|&(_, line)| line.starts_with(SIGNATURE_START))
+        .map(|(offset, _)| offset)
+        .last()
+}
+
+/// Why an object without an SSH signature block is refused: it carries a
+/// signature of an unsupported format, or none.
+fn unsigned(raw: &[u8]) -> TagVerifyError {
+    lines(raw)
+        .find_map(|(_, line)| {
+            UNSUPPORTED_SIGNATURES
+                .iter()
+                .find(|(armor, _)| line.starts_with(armor))
+        })
+        .map_or(TagVerifyError::NotSigned, |&(_, kind)| {
+            TagVerifyError::UnsupportedSignature { kind }
+        })
+}
+
+/// Each line of `raw` with its offset.
+fn lines(raw: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+    raw.split_inclusive(|&b| b == b'\n')
+        .scan(0, |offset, line| {
+            let start = *offset;
+            *offset += line.len();
+            Some((start, line))
+        })
 }
 
 /// The headers of a tag object that matter here.
@@ -206,12 +241,6 @@ fn malformed(reason: String) -> TagVerifyError {
     TagVerifyError::Malformed { reason }
 }
 
-/// Shortens attacker-controlled text before it goes into an error.
-fn shown(text: &str) -> String {
-    const MAX: usize = 128;
-    text.chars().take(MAX).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,8 +254,8 @@ mod tests {
 
     // Recorded from `make-fixtures.sh`; see the fixtures README.
     const COMMIT: &str = "7160f743d0664e041913065355d7bcd291ad2a01";
-    const SIGNER_FINGERPRINT: &str = "SHA256:gdcqb1DcL2Rv7xn5I2LqM0wcjbk377gXNansYwAXoDQ";
-    const OTHER_FINGERPRINT: &str = "SHA256:2CMsEhXo18QW2DrGcNms5cgJmcdUlUUyXlMIfWSmKA0";
+    const SIGNER_FINGERPRINT: &str = "SHA256:aN9xB/PG8u3ubV37qOIeOe3nPDkWfAzfFl+We+g5ASA";
+    const OTHER_FINGERPRINT: &str = "SHA256:cRL49yC67xm1DyK5ViDqOGgd4BMfcjucVSAUA7c0Aeo";
 
     fn key(file: &str) -> SignerKey {
         let text = std::fs::read_to_string(format!(
@@ -303,13 +332,63 @@ mod tests {
         assert_eq!(verify(b"", "v1.2.3"), Err(TagVerifyError::NotSigned));
     }
 
+    /// A tag signed with `gpg.format = openpgp` or `x509`: the payload of
+    /// the valid tag with that format's armor block appended.
+    #[test]
+    fn unsupported_signature_formats_are_named() {
+        let split = signature_offset(VALID);
+        for (armor, kind) in [
+            (
+                "-----BEGIN PGP SIGNATURE-----\n\niQEzBAABCAAdFiEE\n=abcd\n-----END PGP SIGNATURE-----\n",
+                "OpenPGP",
+            ),
+            (
+                "-----BEGIN SIGNED MESSAGE-----\nMIIC\n-----END SIGNED MESSAGE-----\n",
+                "X.509",
+            ),
+        ] {
+            let mut raw = VALID[..split].to_vec();
+            raw.extend_from_slice(armor.as_bytes());
+            let result = verify(&raw, "v1.2.3");
+            assert_eq!(
+                result,
+                Err(TagVerifyError::UnsupportedSignature { kind }),
+                "{kind}"
+            );
+            let message = result.unwrap_err().to_string();
+            assert!(
+                message.contains("only SSH signatures are supported"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostile_header_values_are_quoted_and_shortened() {
+        let split = signature_offset(VALID);
+        let payload = std::str::from_utf8(&VALID[..split]).unwrap();
+        let hostile = format!("x\u{1b}[2J{}", "y".repeat(200));
+        let mut raw = payload
+            .replacen("tag v1.2.3", &format!("tag {hostile}"), 1)
+            .into_bytes();
+        raw.extend_from_slice(&VALID[split..]);
+        match verify(&raw, "v1.2.3") {
+            Err(TagVerifyError::WrongTag { found, .. }) => {
+                assert!(found.starts_with("\"x\\u{1b}[2J"), "{found}");
+                assert!(found.ends_with("\"..."), "{found}");
+                assert!(found.len() < 80, "{found}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn wrong_tag_name_is_refused() {
         assert_eq!(
             verify(VALID, "v1.2.4"),
             Err(TagVerifyError::WrongTag {
                 expected: "v1.2.4".to_owned(),
-                found: "v1.2.3".to_owned()
+                found: "\"v1.2.3\"".to_owned()
             })
         );
     }
@@ -319,7 +398,7 @@ mod tests {
         assert_eq!(
             verify(TREE, "v1.2.3"),
             Err(TagVerifyError::WrongType {
-                found: "tree".to_owned()
+                found: "\"tree\"".to_owned()
             })
         );
     }
@@ -368,7 +447,7 @@ mod tests {
         assert_eq!(
             verify(WRONG_NAMESPACE, "v1.2.3"),
             Err(TagVerifyError::WrongNamespace {
-                found: "file".to_owned()
+                found: "\"file\"".to_owned()
             })
         );
     }
