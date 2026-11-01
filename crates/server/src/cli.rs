@@ -53,8 +53,11 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AuditCommand {
-    /// Walk the hash chain and print the row count and the first bad row as
-    /// JSON.
+    /// Walk the hash chain without writing to the database, and print as JSON
+    /// the row count, the first bad row and the head: the last row's `seq` and
+    /// `hash`. The chain alone cannot show rows cut from the end or an old
+    /// backup restored: keep the printed head elsewhere, and check later that
+    /// the log still holds that row with that hash.
     Verify(AuditVerifyArgs),
 }
 
@@ -81,7 +84,7 @@ struct EnrolCodeArgs {
     /// the audit log.
     #[arg(long)]
     replace: bool,
-    /// The database file, created if it is missing.
+    /// The database file `serve` uses, which must exist.
     #[arg(long, value_name = "FILE")]
     db: PathBuf,
 }
@@ -116,6 +119,14 @@ pub enum CliError {
     /// The store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// `enrol-code` needs the database `serve` uses, and could not open it.
+    #[error("cannot open database {}: {source}; run `serve` once first to create it, or check the path", .path.display())]
+    NoDatabase {
+        /// The file.
+        path: PathBuf,
+        /// The failure.
+        source: StoreError,
+    },
     /// The listen address could not be bound or served.
     #[error("cannot serve on {addr}: {source}")]
     Serve {
@@ -169,16 +180,27 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
 }
 
 async fn enrol_code(args: EnrolCodeArgs, out: &mut impl Write) -> Result<u8, CliError> {
-    let store = Store::open(&args.db).await?;
+    let store = Store::open_existing(&args.db)
+        .await
+        .map_err(|source| CliError::NoDatabase {
+            path: args.db.clone(),
+            source,
+        })?;
     let code = store.issue_enrol_code(&args.host, args.replace).await?;
     writeln!(out, "{}", code.reveal()).map_err(CliError::Output)?;
     Ok(EXIT_OK)
 }
 
 async fn audit_verify(args: AuditVerifyArgs, out: &mut impl Write) -> Result<u8, CliError> {
-    let store = Store::open_existing(&args.db).await?;
+    let store = Store::open_read_only(&args.db).await?;
     let report = store.verify_audit().await?;
-    let line = json!({ "rows": report.rows, "first_bad": report.first_bad });
+    let line = json!({
+        "rows": report.rows,
+        "empty": report.rows == 0,
+        "first_bad": report.first_bad,
+        "head_seq": report.head_seq,
+        "head_hash": report.head_hash,
+    });
     writeln!(out, "{line}").map_err(CliError::Output)?;
     Ok(if report.first_bad.is_some() {
         EXIT_TAMPERED
@@ -204,7 +226,7 @@ pub fn run(cli: Cli) -> u8 {
         .enable_all()
         .build()
         .map_err(CliError::Runtime)
-        .and_then(|runtime| runtime.block_on(execute(cli, &mut io::stdout().lock())));
+        .and_then(|runtime| runtime.block_on(execute(cli, &mut io::stdout())));
     match result {
         Ok(code) => code,
         Err(error) => {
@@ -253,6 +275,7 @@ mod tests {
     async fn enrol_code_prints_only_the_code_and_audit_verify_sees_it() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("controller.db");
+        Store::open(&db).await.unwrap().close().await;
         let db = db.to_str().unwrap();
 
         let mut out = Vec::new();
@@ -275,10 +298,52 @@ mod tests {
         let mut out = Vec::new();
         let verify = parse(&["landfall-server", "audit", "verify", "--db", db]);
         assert_eq!(execute(verify, &mut out).await.unwrap(), EXIT_OK);
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed["rows"], 1);
+        assert_eq!(printed["empty"], false);
+        assert_eq!(printed["first_bad"], serde_json::Value::Null);
+        assert_eq!(printed["head_seq"], 1);
+        assert_eq!(printed["head_hash"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn audit_verify_says_when_the_log_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        Store::open(&path).await.unwrap().close().await;
+
+        let mut out = Vec::new();
+        let verify = parse(&[
+            "landfall-server",
+            "audit",
+            "verify",
+            "--db",
+            path.to_str().unwrap(),
+        ]);
+        assert_eq!(execute(verify, &mut out).await.unwrap(), EXIT_OK);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"first_bad\":null,\"rows\":1}\n"
+            "{\"empty\":true,\"first_bad\":null,\"head_hash\":null,\"head_seq\":null,\"rows\":0}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn enrol_code_refuses_a_missing_database_and_says_to_start_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typo.db");
+        let mut out = Vec::new();
+        let enrol = parse(&[
+            "landfall-server",
+            "enrol-code",
+            "--host",
+            "host-a",
+            "--db",
+            path.to_str().unwrap(),
+        ]);
+        let error = execute(enrol, &mut out).await.unwrap_err();
+        assert!(error.to_string().contains("run `serve` once"), "{error}");
+        assert_eq!(out, b"");
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -294,10 +359,9 @@ mod tests {
         let mut out = Vec::new();
         let verify = parse(&["landfall-server", "audit", "verify", "--db", db]);
         assert_eq!(execute(verify, &mut out).await.unwrap(), EXIT_TAMPERED);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "{\"first_bad\":1,\"rows\":1}\n"
-        );
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed["rows"], 1);
+        assert_eq!(printed["first_bad"], 1);
     }
 
     #[tokio::test]

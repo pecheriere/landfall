@@ -10,10 +10,18 @@
 //! a storage contract: a change makes every existing log fail verification, so
 //! it never changes without bumping the prefix.
 //!
-//! The chain finds a row edited, deleted or reordered by anyone who did not also
-//! rewrite every later row. It holds no secret, so someone who can write the
-//! whole database can forge a complete new history; only a copy of a hash kept
-//! elsewhere would show that.
+//! The chain finds a row edited, reordered or deleted from the middle by anyone
+//! who did not also rewrite every later row. It holds no secret and nothing
+//! outside the database vouches for it, so it cannot show:
+//!
+//! - rows removed from the end, if the sequence record is lowered to match (one
+//!   more statement) or the table is dropped and made again;
+//! - a rollback: an older backup of the database restored over the current one
+//!   verifies clean;
+//! - a complete new history forged by someone who can write the whole database.
+//!
+//! Only a head kept elsewhere shows these: `audit verify` prints the last row's
+//! `seq` and `hash`, and a later run must still hold that row with that hash.
 
 use landfall_core::ids::{DeploymentId, HostId};
 use sha2::{Digest, Sha256};
@@ -86,14 +94,21 @@ pub struct AuditEvent {
 }
 
 /// The result of walking the chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuditReport {
     /// How many rows the log holds.
     pub rows: u64,
     /// The `seq` of the first row that does not follow from the ones before
-    /// it, or of the first row missing from the end of the log; `None` when
-    /// the whole chain is intact.
+    /// it, or, when the rows all follow but the database's record of them
+    /// disagrees, the `seq` after the last good row; `None` when the whole
+    /// chain is intact.
     pub first_bad: Option<u64>,
+    /// The `seq` of the last row as stored, whether or not it is good; `None`
+    /// for an empty log.
+    pub head_seq: Option<i64>,
+    /// The `hash` of the last row as stored, in lowercase hex; `None` for an
+    /// empty log.
+    pub head_hash: Option<String>,
 }
 
 /// The hashed fields of a row, as stored. Bytes rather than text, so verifying

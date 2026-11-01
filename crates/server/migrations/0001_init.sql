@@ -101,3 +101,10 @@ CREATE TRIGGER audit_events_no_delete BEFORE DELETE ON audit_events
 BEGIN
     SELECT RAISE(ABORT, 'audit_events is append-only');
 END;
+
+-- INSERT OR REPLACE deletes the row it replaces without firing the trigger above.
+CREATE TRIGGER audit_events_no_replace BEFORE INSERT ON audit_events
+WHEN EXISTS (SELECT 1 FROM audit_events WHERE seq = NEW.seq)
+BEGIN
+    SELECT RAISE(ABORT, 'audit_events is append-only');
+END;

@@ -36,6 +36,26 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// memory in proportion to its length.
 const VERIFY_PAGE: i64 = 1000;
 
+/// `SQLite`'s result code when a read needs a file created in a directory that
+/// cannot take one.
+const SQLITE_READONLY_DIRECTORY: &str = "1544";
+
+/// One page of the audit log after `$condition`. Fields come back as bytes so
+/// that invalid text in a tampered row is a hash mismatch, not a decoding error.
+/// Two statements and not one with an optional bound, which would scan the
+/// table from its start for every page.
+macro_rules! audit_page {
+    ($condition:literal) => {
+        concat!(
+            "SELECT seq, ts, CAST(kind AS BLOB), CAST(deployment AS BLOB),
+                    CAST(host AS BLOB), CAST(detail AS BLOB), prev_hash, hash
+             FROM audit_events ",
+            $condition,
+            " ORDER BY seq LIMIT ?"
+        )
+    };
+}
+
 /// Why the store could not do what was asked.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -138,6 +158,17 @@ fn prepare_private_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Whether a `-wal` file with content sits beside the database. One that cannot
+/// be read counts: only a file known to be absent or empty rules a WAL out.
+fn has_pending_wal(path: &Path) -> bool {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    match std::fs::metadata(&wal) {
+        Ok(meta) => meta.len() > 0,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
+}
+
 /// The controller's database. Cloning shares the connections.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -159,14 +190,58 @@ impl Store {
         Ok(store)
     }
 
-    /// Opens a database that must already exist, leaving its schema alone: for
-    /// inspecting a log, where a mistyped path must not become an empty and
-    /// apparently intact one.
+    /// Opens a database that must already exist, leaving its schema alone: a
+    /// mistyped path must not become a new and apparently working one.
     ///
     /// # Errors
     /// [`StoreError`] if the file is missing or cannot be opened.
     pub async fn open_existing(path: &Path) -> Result<Self, StoreError> {
         Self::connect(path).await
+    }
+
+    /// Opens a database for reading only, for inspecting a log: the main file
+    /// is not written, nor its schema or journal mode changed, and a running
+    /// controller's latest rows are seen.
+    ///
+    /// # Errors
+    /// [`StoreError`] if the file is missing or cannot be read.
+    pub async fn open_read_only(path: &Path) -> Result<Self, StoreError> {
+        match Self::connect_read_only(path, false).await {
+            // A database in WAL mode needs a shared-memory file beside it, which
+            // a read-only directory cannot take. If the log has no unfinished
+            // WAL, the main file is all there is, and `immutable` reads it
+            // without one. With a WAL it would miss rows, so that stays an error.
+            Err(StoreError::Database(error))
+                if error
+                    .as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .is_some_and(|code| code == SQLITE_READONLY_DIRECTORY)
+                    && !has_pending_wal(path) =>
+            {
+                Self::connect_read_only(path, true).await
+            }
+            other => other,
+        }
+    }
+
+    async fn connect_read_only(path: &Path, immutable: bool) -> Result<Self, StoreError> {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .immutable(immutable)
+            .busy_timeout(BUSY_TIMEOUT);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        // Opening touches nothing: this first read is what can fail.
+        sqlx::query("SELECT count(*) FROM sqlite_master")
+            .execute(&pool)
+            .await?;
+        Ok(Self {
+            pool,
+            clock: system_clock,
+        })
     }
 
     async fn connect(path: &Path) -> Result<Self, StoreError> {
@@ -306,26 +381,29 @@ impl Store {
         // A read transaction: every page sees the same state of the log.
         let mut snapshot = self.pool.begin().await?;
         let mut walk = ChainWalk::new();
-        let mut after = i64::MIN;
+        let mut after: Option<i64> = None;
         loop {
-            // Fields come back as bytes so that invalid text in a tampered row
-            // is a hash mismatch, not a decoding error.
-            let page = sqlx::query(
-                "SELECT seq, ts, CAST(kind AS BLOB), CAST(deployment AS BLOB),
-                        CAST(host AS BLOB), CAST(detail AS BLOB), prev_hash, hash
-                 FROM audit_events WHERE seq > ? ORDER BY seq LIMIT ?",
-            )
-            .bind(after)
-            .bind(VERIFY_PAGE)
-            .fetch_all(&mut *snapshot)
+            let page = match after {
+                // No lower bound: any `seq` a forged row could have is walked.
+                None => sqlx::query(audit_page!(""))
+                    .bind(VERIFY_PAGE)
+                    .fetch_all(&mut *snapshot),
+                Some(seq) => sqlx::query(audit_page!("WHERE seq > ?"))
+                    .bind(seq)
+                    .bind(VERIFY_PAGE)
+                    .fetch_all(&mut *snapshot),
+            }
             .await?;
             let Some(last) = page.last() else { break };
-            after = last.try_get(0)?;
+            after = Some(last.try_get(0)?);
             for row in &page {
                 walk.visit(row)?;
             }
         }
-        Ok(walk.finish(highest_seq(&mut *snapshot).await?))
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events")
+            .fetch_one(&mut *snapshot)
+            .await?;
+        Ok(walk.finish(highest_seq(&mut *snapshot).await?, count))
     }
 
     /// Issues a one-time enrolment code bound to `host`, valid for an hour. It
@@ -397,6 +475,8 @@ struct ChainWalk {
     first_bad: Option<u64>,
     last_seq: i64,
     prev_hash: [u8; 32],
+    /// The last row seen, good or not.
+    head: Option<(i64, Vec<u8>)>,
 }
 
 /// A `seq` as `first_bad` reports it. Only a tampered row can have one below
@@ -412,6 +492,7 @@ impl ChainWalk {
             first_bad: None,
             last_seq: 0,
             prev_hash: GENESIS,
+            head: None,
         }
     }
 
@@ -420,16 +501,18 @@ impl ChainWalk {
     /// can be said to follow from a good chain.
     fn visit(&mut self, row: &SqliteRow) -> Result<(), sqlx::Error> {
         self.rows += 1;
+        let seq: i64 = row.try_get(0)?;
+        let stored_hash: Vec<u8> = row.try_get(7)?;
+        let head = self.head.insert((seq, stored_hash));
         if self.first_bad.is_some() {
             return Ok(());
         }
-        let seq: i64 = row.try_get(0)?;
+        let stored_hash = &head.1;
         let kind: Vec<u8> = row.try_get(2)?;
         let deployment: Option<Vec<u8>> = row.try_get(3)?;
         let host: Option<Vec<u8>> = row.try_get(4)?;
         let detail: Vec<u8> = row.try_get(5)?;
         let stored_prev: Vec<u8> = row.try_get(6)?;
-        let stored_hash: Vec<u8> = row.try_get(7)?;
         let hash = RowFields {
             seq,
             ts: row.try_get(1)?,
@@ -441,7 +524,7 @@ impl ChainWalk {
         .hash(&self.prev_hash);
         let follows = self.last_seq.checked_add(1) == Some(seq)
             && stored_prev == self.prev_hash
-            && stored_hash == hash;
+            && *stored_hash == hash;
         if follows {
             self.last_seq = seq;
             self.prev_hash = hash;
@@ -451,15 +534,24 @@ impl ChainWalk {
         Ok(())
     }
 
-    /// The report, given the highest `seq` the database remembers writing: if
-    /// that is past the last row, rows are missing from the end of the log.
-    fn finish(self, highest: i64) -> AuditReport {
+    /// The report, given the highest `seq` the database remembers writing and
+    /// its count of rows. The record past the last row means rows are missing
+    /// from the end; below it, or gone, means the record was changed; a count
+    /// other than the rows walked means some row was not walked.
+    fn finish(self, highest: i64, count: i64) -> AuditReport {
+        let disagrees = highest != self.last_seq || u64::try_from(count).ok() != Some(self.rows);
         let first_bad = self
             .first_bad
-            .or_else(|| (highest > self.last_seq).then(|| report_seq(self.last_seq) + 1));
+            .or_else(|| disagrees.then(|| report_seq(self.last_seq) + 1));
+        let (head_seq, head_hash) = self
+            .head
+            .map(|(seq, hash)| (seq, hex::encode(hash)))
+            .unzip();
         AuditReport {
             rows: self.rows,
             first_bad,
+            head_seq,
+            head_hash,
         }
     }
 }
@@ -496,6 +588,32 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    /// The rows and the first bad row of a walk of the chain.
+    async fn chain(store: &Store) -> (u64, Option<u64>) {
+        let report = store.verify_audit().await.unwrap();
+        (report.rows, report.first_bad)
+    }
+
+    /// A database with `rows` audit rows, closed so its WAL is checkpointed.
+    async fn closed_database(path: &Path, rows: u32) {
+        let store = Store::open(path).await.unwrap();
+        append_events(&store, rows).await;
+        store.close().await;
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     async fn insert_release(store: &Store, deployment: &str, tag: &str) {
@@ -548,13 +666,52 @@ mod tests {
             assert_eq!(row.get::<Vec<u8>, _>("prev_hash"), prev);
             prev = row.get("hash");
         }
+        assert_eq!(chain(&store).await, (3, None));
+        let report = store.verify_audit().await.unwrap();
+        assert_eq!(report.head_seq, Some(3));
+        assert_eq!(report.head_hash, Some(hex::encode(prev)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_log_has_no_head() {
+        let store = Store::open_in_memory().await.unwrap();
         assert_eq!(
             store.verify_audit().await.unwrap(),
             AuditReport {
-                rows: 3,
-                first_bad: None
+                rows: 0,
+                first_bad: None,
+                head_seq: None,
+                head_hash: None
             }
         );
+    }
+
+    /// The limit of the chain, which is why the head is printed: these verify
+    /// clean, and only a head kept from before shows they happened.
+    #[tokio::test]
+    async fn the_head_shows_what_the_chain_cannot() {
+        for statements in [
+            vec![
+                "DELETE FROM audit_events WHERE seq > 2",
+                "UPDATE sqlite_sequence SET seq = 2 WHERE name = 'audit_events'",
+            ],
+            vec![
+                "DELETE FROM audit_events",
+                "DELETE FROM sqlite_sequence WHERE name = 'audit_events'",
+            ],
+        ] {
+            let store = Store::open_in_memory().await.unwrap();
+            append_events(&store, 4).await;
+            let kept = store.verify_audit().await.unwrap();
+            drop_append_only_triggers(&store).await;
+            for statement in statements {
+                sqlx::query(statement).execute(&store.pool).await.unwrap();
+            }
+            let later = store.verify_audit().await.unwrap();
+            assert_eq!(later.first_bad, None);
+            assert_ne!(later.head_seq, kept.head_seq);
+            assert_ne!(later.head_hash, kept.head_hash);
+        }
     }
 
     #[tokio::test]
@@ -648,6 +805,27 @@ mod tests {
                 4,
                 5,
             ),
+            (
+                "forge a row at the lowest seq",
+                vec![
+                    "INSERT INTO audit_events (seq, ts, kind, detail, prev_hash, hash)
+                     VALUES (-9223372036854775808, 0, 'forged', '{}', X'00', X'00')",
+                ],
+                5,
+                1,
+            ),
+            (
+                "lower the sequence record",
+                vec!["UPDATE sqlite_sequence SET seq = 2 WHERE name = 'audit_events'"],
+                4,
+                5,
+            ),
+            (
+                "delete the sequence record",
+                vec!["DELETE FROM sqlite_sequence WHERE name = 'audit_events'"],
+                4,
+                5,
+            ),
         ] {
             let store = Store::open_in_memory().await.unwrap();
             append_events(&store, 4).await;
@@ -655,14 +833,7 @@ mod tests {
             for statement in statements {
                 sqlx::query(statement).execute(&store.pool).await.unwrap();
             }
-            assert_eq!(
-                store.verify_audit().await.unwrap(),
-                AuditReport {
-                    rows,
-                    first_bad: Some(first_bad)
-                },
-                "{name}"
-            );
+            assert_eq!(chain(&store).await, (rows, Some(first_bad)), "{name}");
         }
     }
 
@@ -676,13 +847,7 @@ mod tests {
             .await
             .unwrap();
         append_events(&store, 1).await;
-        assert_eq!(
-            store.verify_audit().await.unwrap(),
-            AuditReport {
-                rows: 3,
-                first_bad: Some(4)
-            }
-        );
+        assert_eq!(chain(&store).await, (3, Some(4)));
     }
 
     #[tokio::test]
@@ -699,6 +864,23 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("append-only"), "{error}");
         }
+        assert_eq!(store.verify_audit().await.unwrap().first_bad, None);
+    }
+
+    /// `INSERT OR REPLACE` deletes the row it replaces without firing a delete
+    /// trigger.
+    #[tokio::test]
+    async fn insert_or_replace_cannot_overwrite_a_row() {
+        let store = Store::open_in_memory().await.unwrap();
+        append_events(&store, 2).await;
+        let error = sqlx::query(
+            "INSERT OR REPLACE INTO audit_events (seq, ts, kind, detail, prev_hash, hash)
+             VALUES (1, 0, 'forged', '{}', X'00', X'00')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("append-only"), "{error}");
         assert_eq!(store.verify_audit().await.unwrap().first_bad, None);
     }
 
@@ -726,13 +908,7 @@ mod tests {
             .unwrap();
         store.append(&mut tx, &event(2)).await.unwrap();
         tx.commit().await.unwrap();
-        assert_eq!(
-            store.verify_audit().await.unwrap(),
-            AuditReport {
-                rows: 1,
-                first_bad: None
-            }
-        );
+        assert_eq!(chain(&store).await, (1, None));
     }
 
     #[tokio::test]
@@ -876,13 +1052,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied, 1);
-        assert_eq!(
-            store.verify_audit().await.unwrap(),
-            AuditReport {
-                rows: 2,
-                first_bad: None
-            }
-        );
+        assert_eq!(chain(&store).await, (2, None));
     }
 
     #[tokio::test]
@@ -903,13 +1073,7 @@ mod tests {
         for writer in writers {
             writer.await.unwrap();
         }
-        assert_eq!(
-            store.verify_audit().await.unwrap(),
-            AuditReport {
-                rows: 16,
-                first_bad: None
-            }
-        );
+        assert_eq!(chain(&store).await, (16, None));
     }
 
     #[tokio::test]
@@ -921,13 +1085,7 @@ mod tests {
             store.append(&mut tx, &event(n)).await.unwrap();
         }
         tx.commit().await.unwrap();
-        assert_eq!(
-            store.verify_audit().await.unwrap(),
-            AuditReport {
-                rows: u64::from(rows),
-                first_bad: None
-            }
-        );
+        assert_eq!(chain(&store).await, (u64::from(rows), None));
     }
 
     #[tokio::test]
@@ -945,11 +1103,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_a_missing_log_read_only_does_not_create_it() {
+    async fn opening_a_missing_database_does_not_create_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("typo.db");
         assert!(Store::open_existing(&path).await.is_err());
+        assert!(Store::open_read_only(&path).await.is_err());
         assert!(!path.exists());
+    }
+
+    /// A copy in a directory nothing can be created in: the file stays as it was
+    /// and no file appears beside it.
+    #[tokio::test]
+    async fn a_read_only_copy_verifies_without_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("controller.db");
+        closed_database(&source, 3).await;
+        let copies = dir.path().join("copies");
+        fs::create_dir(&copies).unwrap();
+        let copy = copies.join("controller.db");
+        fs::copy(&source, &copy).unwrap();
+        let before = fs::read(&copy).unwrap();
+        set_mode(&copy, 0o400);
+        set_mode(&copies, 0o500);
+        // Root ignores the mode, and `SQLite` then does create its files.
+        let probe = copies.join("probe");
+        let mode_binds = fs::File::create(&probe).is_err();
+
+        let store = Store::open_read_only(&copy).await.unwrap();
+        let report = store.verify_audit().await;
+        store.close().await;
+
+        set_mode(&copies, 0o700);
+        assert_eq!(report.unwrap().rows, 3);
+        assert_eq!(fs::read(&copy).unwrap(), before);
+        if mode_binds {
+            assert_eq!(names_in(&copies), ["controller.db"]);
+        }
+    }
+
+    /// A read-only file in a directory that can be written: `SQLite` may put its
+    /// shared-memory files there, but the file itself is untouched.
+    #[tokio::test]
+    async fn a_read_only_file_verifies_without_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        closed_database(&path, 3).await;
+        let before = fs::read(&path).unwrap();
+        set_mode(&path, 0o400);
+
+        let store = Store::open_read_only(&path).await.unwrap();
+        let report = store.verify_audit().await.unwrap();
+        store.close().await;
+
+        assert_eq!(report.rows, 3);
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// `immutable` would read past rows still in the WAL, so with a WAL it is
+    /// not tried: a copy taken while the controller ran cannot verify in place
+    /// from a read-only directory, and says so rather than verify old rows.
+    #[tokio::test]
+    async fn a_read_only_copy_with_a_wal_is_not_read_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("controller.db");
+        let running = Store::open(&source).await.unwrap();
+        append_events(&running, 3).await;
+        let copies = dir.path().join("copies");
+        fs::create_dir(&copies).unwrap();
+        let copy = copies.join("controller.db");
+        fs::copy(&source, &copy).unwrap();
+        fs::copy(
+            dir.path().join("controller.db-wal"),
+            copies.join("controller.db-wal"),
+        )
+        .unwrap();
+        set_mode(&copy, 0o400);
+        set_mode(&copies, 0o500);
+
+        let opened = Store::open_read_only(&copy).await;
+        set_mode(&copies, 0o700);
+        // Running as root, the directory's mode binds nothing and the WAL is read.
+        match opened {
+            Ok(store) => assert_eq!(store.verify_audit().await.unwrap().rows, 3),
+            Err(error) => assert!(matches!(error, StoreError::Database(_)), "{error}"),
+        }
+        running.close().await;
+    }
+
+    #[tokio::test]
+    async fn read_only_sees_a_running_controllers_latest_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        let running = Store::open(&path).await.unwrap();
+        append_events(&running, 2).await;
+
+        let reader = Store::open_read_only(&path).await.unwrap();
+        assert_eq!(chain(&reader).await, (2, None));
+        append_events(&running, 1).await;
+        assert_eq!(chain(&reader).await, (3, None));
+        assert!(
+            sqlx::query("DELETE FROM enrol_codes")
+                .execute(&reader.pool)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

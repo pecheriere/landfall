@@ -170,8 +170,9 @@ impl Stack {
     ) -> Result<DeployReport, DeployError> {
         let deployment = self.deployment(rest);
         let plan = plan(&deployment, tag, digest);
-        // Boxed: the engine's future is large, and clippy's limit is on what
-        // every caller here would otherwise hold on its stack.
+        // Boxed: in a workspace build, feature unification (tokio's
+        // `rt-multi-thread` through the server crate) takes the engine's future
+        // over clippy's size limit in every caller here.
         Box::pin(deploy::run(
             &self.docker,
             &self.state,
