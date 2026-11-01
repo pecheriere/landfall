@@ -36,10 +36,17 @@ const VERIFICATION_WAIT: &str = "verification-wait.json";
 // its name, so these can't be taken for one.
 const OUTBOX: &str = "outbox";
 const FINISHED: &str = "finished";
+const FINISHED_ORDER: &str = "order.json";
 const DAEMON_LOCK: &str = "daemon.lock";
+const FAILED_RELEASES: &str = "failed-releases.json";
 
 /// How many finished deploys are remembered by number.
 pub const FINISHED_KEPT: usize = 1024;
+/// How many failed releases a deployment remembers. Only a deploy that really
+/// ran and failed adds one, so a controller can't push them out cheaply.
+pub const FAILED_KEPT: usize = 1024;
+/// How many files of one name are kept set aside as corrupt.
+pub const CORRUPT_KEPT: usize = 8;
 
 /// A failure reading or writing the agent's state.
 #[derive(Debug, thiserror::Error)]
@@ -207,6 +214,31 @@ pub struct ControllerClaim {
     pub reports_before: Vec<String>,
 }
 
+/// How a controller's deploy ended, and what it was of, so that the same number
+/// naming another release can be told apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishedDeploy {
+    /// The deployment it was for.
+    pub deployment: DeploymentId,
+    /// The release it was of.
+    pub tag: ReleaseTag,
+    /// Its image digest, as it was asked for.
+    pub digest: ImageDigest,
+    /// How it ended.
+    pub report: DeployReportBody,
+}
+
+/// A release that failed on this host and isn't retried automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedRelease {
+    /// The release tag.
+    pub tag: ReleaseTag,
+    /// Its image digest.
+    pub digest: ImageDigest,
+}
+
 /// How long verification of one work item has been unable to run. The time is
 /// summed from the monotonic clock, one poll to the next, so a wall clock that
 /// jumps doesn't move it, and time the agent was stopped doesn't count.
@@ -354,41 +386,54 @@ impl StateDir {
     }
 
     /// Records for good how the controller's deploy ended, so that it is answered
-    /// with this report if it is ever delivered again, and never runs again. Only
-    /// the newest [`FINISHED_KEPT`] are kept: a controller can ask for as many
-    /// numbers as it likes, and an older one that comes back is judged afresh, by
-    /// a rule that refuses what ran or failed.
+    /// with this report if it is ever delivered again, and never runs again. The
+    /// [`FINISHED_KEPT`] most recently added are kept, by the order they were
+    /// added in and whatever their numbers: a controller can ask for as many
+    /// numbers as it likes, and one that comes back after that is judged afresh,
+    /// by a rule that refuses what ran or failed. An id already on record keeps
+    /// its report and its place.
     ///
     /// # Errors
     ///
     /// [`StateError`] if the write fails.
-    pub fn finished_put(&self, report: &DeployReportBody) -> Result<(), StateError> {
+    pub fn finished_put(&self, entry: &FinishedDeploy) -> Result<(), StateError> {
         let dir = self.path.join(FINISHED);
         create_private(&self.path, &dir)?;
-        let name = format!("{}.json", report.deploy_id);
-        let bytes = serde_json::to_vec_pretty(report).map_err(|source| StateError::Serialise {
-            path: dir.join(&name),
-            source,
-        })?;
-        write_atomic(&dir, &name, &bytes)?;
-        let mut kept = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(io_err("list", &dir))? {
-            let path = entry.map_err(io_err("list", &dir))?.path();
-            if let Some(id) = path
+        let id = entry.report.deploy_id.0;
+        let mut order: Vec<u64> = read_or_set_aside(&dir.join(FINISHED_ORDER))?.unwrap_or_default();
+        // Records the order doesn't name, after a crash or with the order lost,
+        // count as older than what it does, lowest number first.
+        let mut unlisted = Vec::new();
+        for file in fs::read_dir(&dir).map_err(io_err("list", &dir))? {
+            let path = file.map_err(io_err("list", &dir))?.path();
+            if let Some(found) = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .and_then(|stem| stem.parse::<u64>().ok())
+                && !order.contains(&found)
             {
-                kept.push(id);
+                unlisted.push(found);
             }
         }
-        if kept.len() > FINISHED_KEPT {
-            kept.sort_unstable();
-            for id in &kept[..kept.len() - FINISHED_KEPT] {
-                remove_in(&dir, &format!("{id}.json"))?;
-            }
+        unlisted.sort_unstable();
+        unlisted.append(&mut order);
+        let mut order = unlisted;
+        if order.contains(&id) {
+            return write_order(&dir, &order);
         }
-        Ok(())
+        order.push(id);
+        let evicted = order.len().saturating_sub(FINISHED_KEPT);
+        let gone: Vec<u64> = order.drain(..evicted).collect();
+        write_order(&dir, &order)?;
+        for old in gone {
+            remove_in(&dir, &format!("{old}.json"))?;
+        }
+        let name = format!("{id}.json");
+        let bytes = serde_json::to_vec_pretty(entry).map_err(|source| StateError::Serialise {
+            path: dir.join(&name),
+            source,
+        })?;
+        write_atomic(&dir, &name, &bytes)
     }
 
     /// How the controller's deploy ended, if it is on record. A record that
@@ -397,7 +442,7 @@ impl StateDir {
     /// # Errors
     ///
     /// [`StateError`] if the file cannot be read.
-    pub fn finished(&self, deploy_id: DeployId) -> Result<Option<DeployReportBody>, StateError> {
+    pub fn finished(&self, deploy_id: DeployId) -> Result<Option<FinishedDeploy>, StateError> {
         read_or_set_aside(&self.path.join(FINISHED).join(format!("{deploy_id}.json")))
     }
 
@@ -429,8 +474,47 @@ fn lock_file(path: &Path, busy: impl FnOnce() -> StateError) -> Result<DeployLoc
     }
 }
 
-/// Reads a JSON file the daemon can do without. One that doesn't parse is renamed
-/// to `<name>.corrupt` and journalled, rather than stop everything else.
+fn write_order(dir: &Path, order: &[u64]) -> Result<(), StateError> {
+    let bytes = serde_json::to_vec(order).map_err(|source| StateError::Serialise {
+        path: dir.join(FINISHED_ORDER),
+        source,
+    })?;
+    write_atomic(dir, FINISHED_ORDER, &bytes)
+}
+
+/// Moves a file aside as `<name>.corrupt.<n>`, with a number no earlier one had,
+/// keeping the newest [`CORRUPT_KEPT`] of that name: evidence isn't overwritten,
+/// and a file that keeps going bad can't fill the disk.
+fn set_aside(path: &Path) -> Result<(), StateError> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return Err(StateError::NotADirectory(path.to_owned()));
+    };
+    let prefix = format!("{name}.corrupt.");
+    let mut numbers = Vec::new();
+    for entry in fs::read_dir(dir).map_err(io_err("list", dir))? {
+        let file = entry.map_err(io_err("list", dir))?.file_name();
+        if let Some(number) = file
+            .to_str()
+            .and_then(|file| file.strip_prefix(&prefix))
+            .and_then(|number| number.parse::<u64>().ok())
+        {
+            numbers.push(number);
+        }
+    }
+    numbers.sort_unstable();
+    let next = numbers.last().map_or(1, |last| last.saturating_add(1));
+    let aside = dir.join(format!("{prefix}{next}"));
+    fs::rename(path, &aside).map_err(io_err("set aside", path))?;
+    numbers.push(next);
+    let excess = numbers.len().saturating_sub(CORRUPT_KEPT);
+    for old in &numbers[..excess] {
+        remove_in(dir, &format!("{prefix}{old}"))?;
+    }
+    Ok(())
+}
+
+/// Reads a JSON file the daemon can do without. One that doesn't parse is set
+/// aside (see [`set_aside`]) and journalled, rather than stop everything else.
 fn read_or_set_aside<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StateError> {
     #[derive(Serialize)]
     struct SetAside<'a> {
@@ -446,9 +530,7 @@ fn read_or_set_aside<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Stat
     match serde_json::from_slice(&bytes) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
-            let mut aside = path.as_os_str().to_owned();
-            aside.push(".corrupt");
-            fs::rename(path, &aside).map_err(io_err("set aside", path))?;
+            set_aside(path)?;
             journal::emit(
                 Priority::Error,
                 &SetAside {
@@ -514,6 +596,40 @@ impl DeploymentState {
     /// [`StateError`] if the file cannot be read.
     pub fn claim(&self) -> Result<Option<ControllerClaim>, StateError> {
         read_or_set_aside(&self.dir.join(CLAIM))
+    }
+
+    /// The releases that failed on this host. Written only by the daemon, from
+    /// the outcome it holds. Never read as empty when it can't be read: that
+    /// would let a failed release run again.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if it exists and cannot be read.
+    pub fn failed_releases(&self) -> Result<Vec<FailedRelease>, StateError> {
+        Ok(self.read_json(FAILED_RELEASES)?.unwrap_or_default())
+    }
+
+    /// Where [`Self::failed_releases`] are kept.
+    #[must_use]
+    pub fn failed_releases_path(&self) -> PathBuf {
+        self.dir.join(FAILED_RELEASES)
+    }
+
+    /// Remembers that a release failed. The newest [`FAILED_KEPT`] are kept, by
+    /// the order they failed in.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the record can't be read or written.
+    pub fn add_failed_release(&self, release: &FailedRelease) -> Result<(), StateError> {
+        let mut failed = self.failed_releases()?;
+        if failed.contains(release) {
+            return Ok(());
+        }
+        failed.push(release.clone());
+        let excess = failed.len().saturating_sub(FAILED_KEPT);
+        failed.drain(..excess);
+        self.write_json(FAILED_RELEASES, &failed)
     }
 
     /// How long verification has been unable to run, if it has. One that cannot
@@ -585,6 +701,12 @@ impl DeploymentState {
             }
         }
         Ok(names)
+    }
+
+    /// Where the engine's report of this name is.
+    #[must_use]
+    pub fn report_path(&self, name: &str) -> PathBuf {
+        self.dir.join(REPORTS).join(name)
     }
 
     /// One of the engine's reports, by the name [`Self::report_names`] gave.
@@ -1049,7 +1171,7 @@ mod tests {
         dir.outbox_put(&body(2)).unwrap();
         fs::write(tmp.path().join("outbox/1.json"), "{").unwrap();
         assert_eq!(dir.outbox().unwrap(), vec![body(2)]);
-        assert!(tmp.path().join("outbox/1.json.corrupt").exists());
+        assert!(tmp.path().join("outbox/1.json.corrupt.1").exists());
         assert_eq!(
             dir.outbox().unwrap(),
             vec![body(2)],
@@ -1099,7 +1221,7 @@ mod tests {
         assert_eq!(s.claim().unwrap(), None);
         assert!(!file.exists());
         assert_eq!(
-            fs::read_to_string(file.with_file_name(format!("{CLAIM}.corrupt"))).unwrap(),
+            fs::read_to_string(file.with_file_name(format!("{CLAIM}.corrupt.1"))).unwrap(),
             "{"
         );
         let events = journal::capture::events("state_file_set_aside");
@@ -1107,17 +1229,107 @@ mod tests {
         assert_eq!(events[0].0, Priority::Error);
     }
 
+    fn finished_entry(id: u64) -> FinishedDeploy {
+        FinishedDeploy {
+            deployment: self::id("example/prod"),
+            tag: "v1.2.3".parse().unwrap(),
+            digest: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+            report: body(id),
+        }
+    }
+
     #[test]
-    fn a_finished_deploy_is_remembered_and_the_oldest_numbers_go_first() {
+    fn the_ledger_evicts_the_longest_on_record_whatever_the_numbers() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StateDir::open(tmp.path()).unwrap();
         assert_eq!(dir.finished(DeployId(1)).unwrap(), None);
-        for id in 1..=u64::try_from(FINISHED_KEPT).unwrap() + 2 {
-            dir.finished_put(&body(id)).unwrap();
+        // A full ledger, written directly as a thousand synced writes are slow. A
+        // very high number came first: by number it would be the last to go.
+        dir.finished_put(&finished_entry(u64::MAX)).unwrap();
+        dir.finished_put(&finished_entry(u64::MAX - 1)).unwrap();
+        let ledger = tmp.path().join(FINISHED);
+        let mut order = vec![u64::MAX, u64::MAX - 1];
+        for id in 1..=u64::try_from(FINISHED_KEPT - 2).unwrap() {
+            let entry = serde_json::to_vec(&finished_entry(id)).unwrap();
+            fs::write(ledger.join(format!("{id}.json")), entry).unwrap();
+            order.push(id);
         }
-        assert_eq!(dir.finished(DeployId(1)).unwrap(), None);
-        assert_eq!(dir.finished(DeployId(2)).unwrap(), None);
-        assert_eq!(dir.finished(DeployId(3)).unwrap(), Some(body(3)));
+        write_order(&ledger, &order).unwrap();
+
+        dir.finished_put(&finished_entry(5000)).unwrap();
+
+        assert_eq!(dir.finished(DeployId(u64::MAX)).unwrap(), None);
+        assert!(dir.finished(DeployId(u64::MAX - 1)).unwrap().is_some());
+        assert!(dir.finished(DeployId(1)).unwrap().is_some());
+        assert!(dir.finished(DeployId(5000)).unwrap().is_some());
+        let kept = fs::read_dir(&ledger).unwrap().count();
+        assert_eq!(kept, FINISHED_KEPT + 1, "with the order file");
+    }
+
+    #[test]
+    fn a_ledger_entry_keeps_its_report_and_its_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StateDir::open(tmp.path()).unwrap();
+        let first = finished_entry(1);
+        dir.finished_put(&first).unwrap();
+        let mut again = finished_entry(1);
+        again.tag = "v9.9.9".parse().unwrap();
+        dir.finished_put(&again).unwrap();
+        assert_eq!(dir.finished(DeployId(1)).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn a_lost_order_is_rebuilt_from_what_is_on_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StateDir::open(tmp.path()).unwrap();
+        dir.finished_put(&finished_entry(5)).unwrap();
+        fs::write(tmp.path().join(FINISHED).join(FINISHED_ORDER), "{").unwrap();
+        dir.finished_put(&finished_entry(6)).unwrap();
+        let order: Vec<u64> = serde_json::from_slice(
+            &fs::read(tmp.path().join(FINISHED).join(FINISHED_ORDER)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(order, [5, 6]);
+        assert!(dir.finished(DeployId(5)).unwrap().is_some());
+    }
+
+    #[test]
+    fn set_aside_files_keep_earlier_evidence_up_to_a_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = state(&tmp);
+        let dir = tmp.path().join("example__prod");
+        for round in 1..=CORRUPT_KEPT + 3 {
+            fs::write(dir.join(CLAIM), format!("{{{round}")).unwrap();
+            assert_eq!(s.claim().unwrap(), None);
+        }
+        let name = |n: usize| dir.join(format!("{CLAIM}.corrupt.{n}"));
+        let last = CORRUPT_KEPT + 3;
+        assert_eq!(fs::read_to_string(name(last)).unwrap(), format!("{{{last}"));
+        assert_eq!(fs::read_to_string(name(4)).unwrap(), "{4");
+        assert!(!name(3).exists(), "the oldest went");
+    }
+
+    #[test]
+    fn failed_releases_keep_the_newest_and_never_read_as_empty_when_corrupt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = state(&tmp);
+        assert_eq!(s.failed_releases().unwrap(), []);
+        let release = |n: usize| FailedRelease {
+            tag: format!("v1.0.{n}").parse().unwrap(),
+            digest: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+        };
+        let full: Vec<FailedRelease> = (0..FAILED_KEPT).map(release).collect();
+        s.write_json(FAILED_RELEASES, &full).unwrap();
+        s.add_failed_release(&release(FAILED_KEPT)).unwrap();
+        s.add_failed_release(&release(5)).unwrap();
+        let kept = s.failed_releases().unwrap();
+        assert_eq!(kept.len(), FAILED_KEPT);
+        assert_eq!(kept[0], release(1), "the oldest went");
+        assert_eq!(kept[FAILED_KEPT - 1], release(FAILED_KEPT));
+
+        fs::write(s.failed_releases_path(), "{").unwrap();
+        assert!(s.failed_releases().is_err());
+        assert!(s.add_failed_release(&release(0)).is_err());
     }
 
     #[test]

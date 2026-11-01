@@ -78,10 +78,11 @@ impl Shutdown {
 }
 
 /// How long to wait after each step. A poll that found nothing goes again soon,
-/// and only a release that deployed, or a long enough quiet, resets the backoff.
-/// Everything else makes it grow: a refusal or a rollback that is reported well
-/// must not be able to repeat every second, however the controller mixes them
-/// with answers of no work.
+/// and only a release that deployed in that very step and whose report was
+/// acknowledged, or a long enough quiet, resets the backoff. Everything else makes
+/// it grow: a refusal, a rollback, a replay of a finished deploy or a report
+/// refused for good must not be able to repeat every second, however the
+/// controller mixes them with each other and with answers of no work.
 #[derive(Debug, Clone)]
 pub struct Pacing {
     floor: Duration,

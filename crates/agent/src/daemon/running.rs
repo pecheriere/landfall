@@ -163,7 +163,11 @@ async fn running_state<D: Docker>(
             digest: deployed.digest,
         }),
         drift,
-        phase: marker.map_or(Phase::Idle, |marker| wire_phase(marker.phase)),
+        // A deploy that is running and hasn't written its marker yet is not idle.
+        phase: marker.map_or(
+            if busy { Phase::Deploying } else { Phase::Idle },
+            |marker| wire_phase(marker.phase),
+        ),
         busy,
     }
 }

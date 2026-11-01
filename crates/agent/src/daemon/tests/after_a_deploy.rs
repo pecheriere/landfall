@@ -25,7 +25,7 @@ fn ups(f: &super::Fixture) -> usize {
 
 fn finished(outcome: &StepOutcome) -> &ReportedOutcome {
     match outcome {
-        StepOutcome::Finished { outcome, .. } => outcome,
+        StepOutcome::Finished { outcome, .. } | StepOutcome::Replayed { outcome, .. } => outcome,
         other => panic!("not finished: {other:?}"),
     }
 }
@@ -54,6 +54,7 @@ async fn a_controller_cannot_drive_a_release_round_deploy_and_rollback() {
 
     // The same number again: its original report, and nothing runs.
     let again = poll(&f, &controller, &verifier).await;
+    assert!(matches!(again, StepOutcome::Replayed { .. }), "{again:?}");
     assert_eq!(finished(&again), finished(&first));
     assert_eq!(ups(&f), 2);
     assert_eq!(capture::events("finished_work_delivered_again").len(), 1);
@@ -502,8 +503,8 @@ async fn a_corrupt_report_or_claim_is_set_aside_and_the_host_goes_on_reporting()
     assert_eq!(outcome, StepOutcome::NoWork);
     assert_eq!(controller.reports(), [good], "the good report went out");
     assert_eq!(controller.requests().len(), 1, "and the host was heard");
-    assert!(f.state_dir.join("outbox/1.json.corrupt").exists());
-    assert!(claim_file.with_extension("json.corrupt").exists());
+    assert!(f.state_dir.join("outbox/1.json.corrupt.1").exists());
+    assert!(claim_file.with_extension("json.corrupt.1").exists());
 }
 
 #[tokio::test]

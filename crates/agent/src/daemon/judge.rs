@@ -11,7 +11,7 @@ use landfall_core::rule::{Decision, Refusal, decide};
 use landfall_origin::release::ReleaseOrigin;
 use serde::Serialize;
 
-use super::outbox::failed_before;
+use super::outbox::{FailureEvidence, failure_evidence};
 use super::running::{fresh_drift, locked};
 use super::{DaemonOptions, Verifier, VerifyFailure, deployment_state, on_thread};
 use crate::deploy::DeployPlan;
@@ -226,6 +226,49 @@ async fn waiting_verdict<'a>(
     }
 }
 
+/// What this host knows of the release having failed here says no. What runs is
+/// the digest asked for or nothing, as verification sees to later, so a name of
+/// the controller's choosing can't get around this.
+fn refused_by_evidence<'a>(evidence: FailureEvidence, work: &DeployWork) -> Option<Verdict<'a>> {
+    #[derive(Serialize)]
+    struct Unreadable<'a> {
+        event: &'static str,
+        file: &'a Path,
+        error: &'a str,
+        clear: &'static str,
+    }
+    const CLEAR: &str = "read or restore the file if you can; removing it clears this, and forgets any failure it recorded, so a release that failed can then deploy again";
+    match evidence {
+        FailureEvidence::None => None,
+        FailureEvidence::Failed => Some(refuse(
+            Priority::Error,
+            format!(
+                "{} with digest {} failed on this host and was rolled back; it isn't retried automatically, a newer release is",
+                work.tag, work.digest
+            ),
+        )),
+        FailureEvidence::Unreadable { file, error } => {
+            journal::emit(
+                Priority::Error,
+                &Unreadable {
+                    event: "failure_evidence_unreadable",
+                    file: &file,
+                    error: &error,
+                    clear: CLEAR,
+                },
+            );
+            Some(refuse(
+                Priority::Error,
+                format!(
+                    "can't tell whether {} failed on this host: {} can't be read: {error}; {CLEAR}",
+                    work.tag,
+                    file.display()
+                ),
+            ))
+        }
+    }
+}
+
 /// Goes through everything this host requires of a work item, cheapest first:
 /// the rule comes before verification, so a request the rule refuses costs no
 /// outbound request.
@@ -256,11 +299,11 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
             state.deployed()?,
             state.in_progress()?,
             state.claim()?,
-            failed_before(&state, &tag, &digest)?,
+            failure_evidence(&state, &tag, &digest),
         ))
     })
     .await;
-    let (deployed, marker, claim, failed) = match read {
+    let (deployed, marker, claim, evidence) = match read {
         Ok(read) => read,
         Err(error) => return refuse(Priority::Error, error),
     };
@@ -276,16 +319,8 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
     if let Some(reason) = not_auto(decision, running, &version) {
         return refuse(Priority::Critical, reason);
     }
-    // What runs is the digest asked for or nothing: verification sees to that
-    // below, so a name of the controller's choosing can't get around this.
-    if failed {
-        return refuse(
-            Priority::Error,
-            format!(
-                "{} with digest {} failed on this host and was rolled back; it isn't retried automatically, a newer release is",
-                work.tag, work.digest
-            ),
-        );
+    if let Some(verdict) = refused_by_evidence(evidence, work) {
+        return verdict;
     }
     match fresh_drift(docker, deployment, dir, deployed.is_some(), options).await {
         Ok(false) => {}

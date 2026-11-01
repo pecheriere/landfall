@@ -38,7 +38,10 @@ use crate::deploy::{self, DeployError, DeployPlan, EngineOptions, Unfinished};
 use crate::docker::{Docker, DockerCli};
 use crate::enrol::{self, EnrolError};
 use crate::journal::{self, Priority};
-use crate::state::{ControllerClaim, DeployLock, DeploymentState, StateDir, StateError};
+use crate::state::{
+    ControllerClaim, DeployLock, DeploymentState, FailedRelease, FinishedDeploy, StateDir,
+    StateError,
+};
 
 mod control;
 mod judge;
@@ -50,6 +53,7 @@ pub use control::{Backoff, Pacing, Shutdown, ShutdownTrigger};
 pub use verifier::{OriginVerifier, Verifier, VerifyFailure};
 
 use judge::{Verdict, judge};
+use outbox::Keep;
 use running::{Memory, work_request};
 
 /// Between polls that went well. The controller holds a poll with no work, so
@@ -122,7 +126,18 @@ pub enum StepOutcome {
         deploy_id: DeployId,
         /// How it ended, as reported.
         outcome: ReportedOutcome,
-        /// Whether the report has left the outbox. If not, it is sent again.
+        /// Whether the controller acknowledged the report. If not, it is sent
+        /// again, unless the controller refused it for good.
+        delivered: bool,
+    },
+    /// A work item that had finished was delivered again, and was answered with
+    /// its original report. Nothing ran.
+    Replayed {
+        /// The controller's deploy.
+        deploy_id: DeployId,
+        /// How it ended, the first time.
+        outcome: ReportedOutcome,
+        /// Whether the controller acknowledged the report this time.
         delivered: bool,
     },
     /// A work item can't be dealt with now, and nothing was reported: the
@@ -255,7 +270,16 @@ async fn deploy_approved<D: Docker, C: Controller>(
     };
     options.memory.forget_drift(id);
     let body = match result {
-        Ok(report) => outbox::reported(work.deploy_id, &report),
+        Ok(report) => {
+            if outbox::is_failure(&report.outcome) {
+                let release = FailedRelease {
+                    tag: report.tag.clone(),
+                    digest: report.digest.clone(),
+                };
+                outbox::remember_failure(state_dir, id, release).await;
+            }
+            outbox::reported(work.deploy_id, &report)
+        }
         Err(error @ DeployError::LeftBlocked { .. }) => {
             // The marker stays, and with it the claim: `recover` ends this one.
             let reason = error.to_string();
@@ -291,7 +315,11 @@ async fn deploy_approved<D: Docker, C: Controller>(
             steps: Vec::new(),
         },
     };
-    outbox::finish(controller, state_dir, body, Some(id)).await
+    let keep = Keep::Finished {
+        record: finished_record(work, &body),
+        claimed: Some(id),
+    };
+    outbox::finish(controller, state_dir, body, keep).await
 }
 
 fn journal_held_back(held_back: &[HeldBack], options: &DaemonOptions) {
@@ -318,13 +346,25 @@ fn journal_held_back(held_back: &[HeldBack], options: &DaemonOptions) {
     }
 }
 
-/// Journals and reports a refusal. Nothing has run.
+/// What the ledger keeps of a work item that has ended with `body`.
+fn finished_record(work: &DeployWork, body: &DeployReportBody) -> FinishedDeploy {
+    FinishedDeploy {
+        deployment: work.deployment.clone(),
+        tag: work.tag.clone(),
+        digest: work.digest.clone(),
+        report: body.clone(),
+    }
+}
+
+/// Journals and reports a refusal. Nothing has run. `ends_it` says the work item
+/// has its answer for good; otherwise it is another release's number.
 async fn refuse_work<C: Controller>(
     controller: &C,
     state_dir: &Path,
     work: &DeployWork,
     priority: Priority,
     reason: &str,
+    ends_it: bool,
 ) -> StepOutcome {
     #[derive(Serialize)]
     struct Refused<'a> {
@@ -353,7 +393,15 @@ async fn refuse_work<C: Controller>(
         },
         steps: Vec::new(),
     };
-    outbox::finish(controller, state_dir, body, None).await
+    let keep = if ends_it {
+        Keep::Finished {
+            record: finished_record(work, &body),
+            claimed: None,
+        }
+    } else {
+        Keep::SendOnly
+    };
+    outbox::finish(controller, state_dir, body, keep).await
 }
 
 /// Settles what earlier runs left. One deployment's trouble is journalled, and
@@ -383,7 +431,9 @@ async fn settle_claims(state_dir: &Path, options: &DaemonOptions) {
 }
 
 /// A deploy that has finished never runs again: if the controller delivers it
-/// again, it gets its original report.
+/// again, it gets its original report. The same number naming another release,
+/// as from a controller whose database was rebuilt, is refused, with the record
+/// left as it is.
 async fn answer_finished<C: Controller>(
     controller: &C,
     state_dir: &Path,
@@ -401,7 +451,18 @@ async fn answer_finished<C: Controller>(
     .await;
     match found {
         Ok(None) => None,
-        Ok(Some(body)) => {
+        Ok(Some(entry))
+            if entry.deployment != work.deployment
+                || entry.tag != work.tag
+                || entry.digest != work.digest =>
+        {
+            let reason = format!(
+                "deploy {deploy_id} already finished on this host as {} {} {}, and this asks for another release under its number",
+                entry.deployment, entry.tag, entry.digest
+            );
+            Some(refuse_work(controller, state_dir, work, Priority::Error, &reason, false).await)
+        }
+        Ok(Some(entry)) => {
             journal::emit(
                 Priority::Warning,
                 &AskedAgain {
@@ -409,7 +470,19 @@ async fn answer_finished<C: Controller>(
                     deploy_id,
                 },
             );
-            Some(outbox::finish(controller, state_dir, body, None).await)
+            let finished = outbox::finish(controller, state_dir, entry.report, Keep::SendOnly);
+            Some(match finished.await {
+                StepOutcome::Finished {
+                    deploy_id,
+                    outcome,
+                    delivered,
+                } => StepOutcome::Replayed {
+                    deploy_id,
+                    outcome,
+                    delivered,
+                },
+                other => other,
+            })
         }
         Err(error) => Some(StepOutcome::Failed { error }),
     }
@@ -484,7 +557,7 @@ pub async fn step<D: Docker, C: Controller, V: Verifier>(
             reason,
         },
         Verdict::Refuse { priority, reason } => {
-            refuse_work(controller, state_dir, &work, priority, &reason).await
+            refuse_work(controller, state_dir, &work, priority, &reason, true).await
         }
     }
 }
@@ -518,7 +591,7 @@ pub async fn run_loop<D: Docker, C: Controller, V: Verifier>(
         };
         match &outcome {
             StepOutcome::ShuttingDown => return,
-            StepOutcome::NoWork | StepOutcome::Finished { .. } => {}
+            StepOutcome::NoWork | StepOutcome::Finished { .. } | StepOutcome::Replayed { .. } => {}
             StepOutcome::Waiting { reason, .. } => {
                 trouble(Priority::Warning, "work_waiting", reason);
             }

@@ -28,6 +28,7 @@ use crate::state::{ControllerClaim, Deployed, DeploymentState, InProgress, State
 use crate::testing::{Call, FakeDocker, running};
 
 mod after_a_deploy;
+mod failure_evidence;
 mod lifecycle;
 mod refusals;
 mod reports;

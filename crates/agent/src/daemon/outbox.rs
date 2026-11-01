@@ -2,9 +2,9 @@
 //! terms, what a crash or a `recover` left of a deploy, the outbox, and the
 //! ledger of what has finished.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use landfall_core::ids::DeploymentId;
+use landfall_core::ids::{DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, MAX_BODY_BYTES, ReportedCheck, ReportedDetail, ReportedOutcome,
     ReportedStep,
@@ -15,7 +15,9 @@ use super::{StepOutcome, on_thread};
 use crate::client::Controller;
 use crate::deploy::{DeployReport, Outcome, StepDetail, StepResult};
 use crate::journal::{self, Priority};
-use crate::state::{ControllerClaim, DeploymentState, StateDir, StateError};
+use crate::state::{
+    ControllerClaim, DeploymentState, FailedRelease, FinishedDeploy, StateDir, StateError,
+};
 
 /// The longest text of a report, in characters. What fits in a body is up to
 /// [`fit_to_the_wire`]: a character can take many bytes once serialised.
@@ -87,10 +89,30 @@ fn trimmed_step() -> ReportedStep {
     }
 }
 
+/// Cuts the outcome's reasons to [`MAX_REPORT_TEXT`] characters. A report made
+/// here has them that short already; one read back from the outbox need not.
+fn bound_the_outcome(outcome: &mut ReportedOutcome) {
+    match outcome {
+        ReportedOutcome::RolledBack { reason }
+        | ReportedOutcome::NothingChanged { reason }
+        | ReportedOutcome::FailedNoPrevious { reason }
+        | ReportedOutcome::Refused { reason } => *reason = bounded(reason),
+        ReportedOutcome::RollbackFailed {
+            reason,
+            rollback_reason,
+        } => {
+            *reason = bounded(reason);
+            *rollback_reason = bounded(rollback_reason);
+        }
+        _ => {}
+    }
+}
+
 /// A body over the API's limit would be refused every time, so it is cut down
 /// until it fits: first the steps' details, then what the steps say beyond their
-/// names, then the steps. A last step says it was done. The outcome stays, and it
-/// fits: two bounded reasons are far under the limit however they serialise.
+/// names, then the steps and the length of the outcome's reasons. A last step says
+/// it was done. What is left always fits: one step and two reasons of
+/// [`MAX_REPORT_TEXT`] characters are far under the limit however they serialise.
 fn fit_to_the_wire(mut body: DeployReportBody) -> DeployReportBody {
     if fits(&body) {
         return body;
@@ -111,6 +133,7 @@ fn fit_to_the_wire(mut body: DeployReportBody) -> DeployReportBody {
         return body;
     }
     body.steps = vec![trimmed_step()];
+    bound_the_outcome(&mut body.outcome);
     body
 }
 
@@ -184,24 +207,81 @@ fn latest_report(
         }))
 }
 
-/// Whether this release has already failed on this host, by the engine's own
-/// reports, which a controller has no say in. It stays failed: a newer release is
-/// another matter.
-pub(super) fn failed_before(
+/// Whether this outcome means the release failed on this host.
+pub(super) fn is_failure(outcome: &Outcome) -> bool {
+    matches!(
+        outcome,
+        Outcome::RolledBack { .. }
+            | Outcome::FailedNoPrevious { .. }
+            | Outcome::RollbackFailed { .. }
+    )
+}
+
+/// What this host knows of a release having failed here.
+pub(super) enum FailureEvidence {
+    /// Nothing says it failed, and everything could be read.
+    None,
+    /// It failed. It stays failed: a newer release is another matter.
+    Failed,
+    /// Something that could say so can't be read, so nothing can be ruled out.
+    Unreadable {
+        /// The file.
+        file: PathBuf,
+        /// Why.
+        error: String,
+    },
+}
+
+/// Goes by the daemon's own record first, which holds what the outcome said
+/// whatever became of the report, and by the engine's reports second, which also
+/// know of a `recover` the daemon didn't see. A controller has no say in either. A
+/// report that can't be read could be of this very release.
+pub(super) fn failure_evidence(
     state: &DeploymentState,
-    tag: &landfall_core::ids::ReleaseTag,
-    digest: &landfall_core::ids::ImageDigest,
-) -> Result<bool, StateError> {
-    Ok(engine_reports(state)?.iter().any(|(_, report)| {
-        report.tag == *tag
-            && report.digest == *digest
-            && matches!(
-                report.outcome,
-                Outcome::RolledBack { .. }
-                    | Outcome::FailedNoPrevious { .. }
-                    | Outcome::RollbackFailed { .. }
-            )
-    }))
+    tag: &ReleaseTag,
+    digest: &ImageDigest,
+) -> FailureEvidence {
+    let failed = match state.failed_releases() {
+        Ok(failed) => failed,
+        Err(error) => {
+            return FailureEvidence::Unreadable {
+                file: state.failed_releases_path(),
+                error: error.to_string(),
+            };
+        }
+    };
+    if failed
+        .iter()
+        .any(|release| release.tag == *tag && release.digest == *digest)
+    {
+        return FailureEvidence::Failed;
+    }
+    let names = match state.report_names() {
+        Ok(names) => names,
+        Err(error) => {
+            return FailureEvidence::Unreadable {
+                file: state.backups_dir().with_file_name("reports"),
+                error: error.to_string(),
+            };
+        }
+    };
+    let mut unreadable = FailureEvidence::None;
+    for name in names {
+        match state.report::<DeployReport>(&name) {
+            Ok(report) => {
+                if report.tag == *tag && report.digest == *digest && is_failure(&report.outcome) {
+                    return FailureEvidence::Failed;
+                }
+            }
+            Err(error) => {
+                unreadable = FailureEvidence::Unreadable {
+                    file: state.report_path(&name),
+                    error: error.to_string(),
+                };
+            }
+        }
+    }
+    unreadable
 }
 
 /// Deals with what a crash or a `recover` left of a deploy. With its marker
@@ -229,6 +309,12 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), St
         return Ok(());
     }
     let body = if let Some(report) = latest_report(&state, &claim)? {
+        if is_failure(&report.outcome) {
+            state.add_failed_release(&FailedRelease {
+                tag: claim.tag.clone(),
+                digest: claim.digest.clone(),
+            })?;
+        }
         Some(reported(claim.deploy_id, &report))
     } else {
         // No report, yet the record names the release: the engine got that far
@@ -248,7 +334,12 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), St
         "never started; the controller delivers it again"
     };
     if let Some(body) = &body {
-        root.finished_put(body)?;
+        root.finished_put(&FinishedDeploy {
+            deployment: id.clone(),
+            tag: claim.tag.clone(),
+            digest: claim.digest.clone(),
+            report: body.clone(),
+        })?;
         root.outbox_put(body)?;
     }
     journal::emit(
@@ -265,8 +356,10 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), St
 
 /// How sending one report ended.
 enum Delivery {
-    /// Acknowledged, or refused for good; it has left the outbox.
-    Gone,
+    /// Acknowledged; it has left the outbox.
+    Acknowledged,
+    /// Refused for good; it has left the outbox.
+    Rejected,
     /// Not delivered; it stays in the outbox.
     Kept(String),
 }
@@ -294,12 +387,18 @@ async fn send_report<C: Controller>(
     // answer to that can arrive as a connection reset, which looks retryable and
     // would never end.
     let result = controller.report(&fit_to_the_wire(report.clone())).await;
-    match &result {
-        Ok(()) => journal::emit(Priority::Info, &event("report_delivered", None)),
-        Err(error) if error.is_rejection() => journal::emit(
-            Priority::Error,
-            &event("report_rejected", Some(error.to_string())),
-        ),
+    let delivery = match &result {
+        Ok(()) => {
+            journal::emit(Priority::Info, &event("report_delivered", None));
+            Delivery::Acknowledged
+        }
+        Err(error) if error.is_rejection() => {
+            journal::emit(
+                Priority::Error,
+                &event("report_rejected", Some(error.to_string())),
+            );
+            Delivery::Rejected
+        }
         Err(error) => {
             journal::emit(
                 Priority::Warning,
@@ -307,7 +406,7 @@ async fn send_report<C: Controller>(
             );
             return Delivery::Kept(error.to_string());
         }
-    }
+    };
     let (dir, id) = (state_dir.to_owned(), report.deploy_id);
     let removed = on_thread("remove report", move || {
         StateDir::open(&dir)?.outbox_remove(id)
@@ -317,7 +416,7 @@ async fn send_report<C: Controller>(
         // It is sent again, and reports are idempotent by deploy id.
         journal::emit(Priority::Error, &event("report_not_removed", Some(error)));
     }
-    Delivery::Gone
+    delivery
 }
 
 /// Sends what is in the outbox, oldest first, stopping at one that can't be
@@ -338,13 +437,52 @@ pub(super) async fn flush<C: Controller>(
     Ok(())
 }
 
-/// Records a finished report in the ledger and the outbox, releases the claim and
-/// sends it.
+/// Remembers that a release failed, from the outcome the daemon holds, before
+/// anything is sent. If that can't be written, the release is still on record in
+/// the engine's report, if that was written.
+pub(super) async fn remember_failure(state_dir: &Path, id: &DeploymentId, release: FailedRelease) {
+    #[derive(Serialize)]
+    struct NotRemembered<'a> {
+        event: &'static str,
+        deployment: &'a DeploymentId,
+        error: String,
+    }
+    let (dir, owned) = (state_dir.to_owned(), id.clone());
+    let added = on_thread("remember failure", move || {
+        StateDir::open(&dir)?
+            .deployment(&owned)?
+            .add_failed_release(&release)
+    })
+    .await;
+    if let Err(error) = added {
+        journal::emit(
+            Priority::Critical,
+            &NotRemembered {
+                event: "failed_release_not_remembered",
+                deployment: id,
+                error,
+            },
+        );
+    }
+}
+
+/// What happens to a report besides being sent.
+pub(super) enum Keep<'a> {
+    /// It is how this deploy ended: on record for good, and the claim released.
+    Finished {
+        record: FinishedDeploy,
+        claimed: Option<&'a DeploymentId>,
+    },
+    /// It answers a request and ends nothing on this host: only sent.
+    SendOnly,
+}
+
+/// Puts a report in the outbox, in the ledger if it ends a deploy, and sends it.
 pub(super) async fn finish<C: Controller>(
     controller: &C,
     state_dir: &Path,
     body: DeployReportBody,
-    claimed: Option<&DeploymentId>,
+    keep: Keep<'_>,
 ) -> StepOutcome {
     #[derive(Serialize)]
     struct NotKept {
@@ -352,12 +490,18 @@ pub(super) async fn finish<C: Controller>(
         deploy_id: DeployId,
         error: String,
     }
-    let (dir, copy, id) = (state_dir.to_owned(), body.clone(), claimed.cloned());
+    let (record, claimed) = match keep {
+        Keep::Finished { record, claimed } => (Some(record), claimed.cloned()),
+        Keep::SendOnly => (None, None),
+    };
+    let (dir, copy) = (state_dir.to_owned(), body.clone());
     let kept = on_thread("keep report", move || {
         let root = StateDir::open(&dir)?;
-        root.finished_put(&copy)?;
+        if let Some(record) = &record {
+            root.finished_put(record)?;
+        }
         root.outbox_put(&copy)?;
-        if let Some(id) = id {
+        if let Some(id) = claimed {
             root.deployment(&id)?.clear_claim()?;
         }
         Ok(())
@@ -377,7 +521,7 @@ pub(super) async fn finish<C: Controller>(
     }
     let delivered = matches!(
         send_report(controller, state_dir, &body).await,
-        Delivery::Gone
+        Delivery::Acknowledged
     );
     StepOutcome::Finished {
         deploy_id: body.deploy_id,

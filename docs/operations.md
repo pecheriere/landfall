@@ -302,13 +302,27 @@ promotion rules on the controller would, which are controller-enforced only.
 
 **A release that rolled back on this host isn't retried automatically; a newer release
 is.** Retrying the same one is a manual action, which plan 05 adds. The host goes by
-the engine's reports under `<deployment>/reports/`, so removing the report of a failed
-deploy by hand also forgets that it failed. The controller can't run a release in
-circles either way: a deploy that has finished never runs again. Delivered again
-under its number, it gets its original report (`finished_work_delivered_again`), from
-a ledger of the newest 1024 under `<state dir>/finished/`. And after a refusal or a
-rollback the agent's polls back off, up to five minutes apart, until a release deploys
-or five minutes pass without trouble.
+its own record, `<deployment>/failed-releases.json`, the tag and digest of the newest
+1,024 releases that failed here, written before the report is sent; and after that by
+the engine's reports under `<deployment>/reports/`. The record is what counts, so
+removing old reports doesn't forget a failure.
+
+**Evidence that can't be read refuses the deploy.** If the record or any of the engine's
+reports can't be read, it could be about the release at hand, or the next one, so no
+automatic deploy of that deployment goes ahead. The journal says
+`failure_evidence_unreadable` at priority 3, naming the file. Read or restore the file if
+you can; removing it clears this, and forgets any failure it recorded, so a release that
+failed can then deploy again.
+
+The controller can't run a release in circles either. A deploy that has finished never
+runs again: delivered again under its number, it gets its original report
+(`finished_work_delivered_again`), from a ledger under `<state dir>/finished/` of the
+1,024 finished most recently, whatever their numbers. The same number naming another
+deployment, tag or digest is refused and the ledger left as it is, so a controller whose
+database was rebuilt and reuses numbers gets refusals until those numbers leave the
+ledger. And polls back off, up to five minutes apart, after a refusal, a rollback, a
+replay or a report refused for good. Only a release that deploys in that very step, with
+its report acknowledged, or five minutes without trouble, starts the backoff over.
 
 Verification that can't run, because the registry or GitHub can't be reached or a
 rate limit is in the way, reports nothing: the work comes back and is tried again, for
@@ -329,11 +343,18 @@ classified final. It is journalled as `report_rejected`, and the engine's copy s
 under `<deployment>/reports/`. Any other answer keeps it, a proxy's 404, a failed nonce
 and a connection reset among them.
 
-A report or a claim that can't be read is renamed to `<name>.corrupt` and journalled
-as `state_file_set_aside` at priority 3, and the agent carries on. A report over the
-API's size limit loses the details of its steps, then what its steps say, then the
-steps, and a last step named `report_trimmed` says so. The agent reaches the controller
-directly: proxy variables in its environment are ignored.
+A report in the outbox, a claim or a ledger entry that can't be read is renamed to
+`<name>.corrupt.<n>`, the newest 8 of a name being kept, and journalled as
+`state_file_set_aside` at priority 3, and the agent carries on. **A corrupt claim with its
+marker still there** means the controller's number for that deploy is gone: when the
+controller delivers the work again it ends in `refused`, because of the marker, and the
+real outcome of `recover` later has no number to be reported under. That fails closed;
+`recover`'s report is under `<deployment>/reports/`.
+
+A report over the API's size limit loses the details of its steps, then what its steps
+say, then the steps, with its reasons cut short, and a last step named `report_trimmed`
+says so. The agent reaches the controller directly: proxy variables in its environment
+are ignored.
 
 The controller's number for a deploy is written to
 `<deployment>/controller-claim.json` before the deploy starts, and the file is removed
@@ -424,7 +445,9 @@ The sequence is in the design, section 7.2. What an operator will notice:
   yet** ([#14](https://github.com/pecheriere/landfall/issues/14)): they are small
   JSON files under `<state dir>/<deployment>/reports/`, where the deployment's
   `/` becomes `__` (`/var/lib/landfall-agent/app__prod/reports/`), one per deploy,
-  and removing old ones by hand is safe.
+  and removing old ones by hand is safe: `failed-releases.json` beside them, which
+  isn't pruned beyond its newest 1,024, is what remembers a failed release. A `recover`
+  with no daemon's claim to go with it is known only by its report.
 
 ## `status`
 

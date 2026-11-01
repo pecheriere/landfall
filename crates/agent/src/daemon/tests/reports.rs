@@ -280,7 +280,7 @@ async fn a_report_the_controller_refuses_for_good_is_dropped_loudly() {
         matches!(
             outcome,
             StepOutcome::Finished {
-                delivered: true,
+                delivered: false,
                 ..
             }
         ),
