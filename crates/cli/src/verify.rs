@@ -85,14 +85,20 @@ pub enum VerifyError {
         #[source]
         source: std::io::Error,
     },
+    /// `GITHUB_TOKEN` is set but cannot be used. The value is never shown.
+    #[error("GITHUB_TOKEN is set but is not valid UTF-8 text or not a valid HTTP header value")]
+    Token,
     /// The Sigstore trust root could not be built.
     #[error("Sigstore trust root")]
     Trust(#[source] TrustError),
     /// The HTTP client could not be built.
     #[error("HTTP client")]
     Fetcher(#[source] FetchError),
-    /// The release was refused.
-    #[error("release {tag} of {deployment} is refused")]
+    /// The release was refused, or its material could not be fetched.
+    #[error(
+        "release {tag} of {deployment} {}",
+        if source.is_refusal() { "is refused" } else { "could not be verified" }
+    )]
     Release {
         /// The deployment.
         deployment: DeploymentId,
@@ -104,11 +110,31 @@ pub enum VerifyError {
     },
 }
 
-/// Runs `landfall verify`.
+impl VerifyError {
+    /// The process exit status: 1 when the release was refused (a
+    /// verification check failed), 2 when it could not be verified
+    /// (configuration, usage, network, rate limit, trust root).
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Release { source, .. } if source.is_refusal() => EXIT_REFUSED,
+            _ => EXIT_UNVERIFIED,
+        }
+    }
+}
+
+/// Exit status of a refused release.
+pub const EXIT_REFUSED: u8 = 1;
+/// Exit status when the release could not be verified.
+pub const EXIT_UNVERIFIED: u8 = 2;
+
+/// Runs `landfall verify`. A non-empty `GITHUB_TOKEN` in the environment is
+/// sent to the GitHub API (never to the registry) for its higher rate limit.
 ///
 /// # Errors
 ///
-/// A [`VerifyError`]; [`VerifyError::Release`] when the release is refused.
+/// A [`VerifyError`]; [`VerifyError::Release`] when the release is refused
+/// or its material could not be fetched.
 pub async fn run(args: VerifyArgs) -> Result<ReleaseOrigin, VerifyError> {
     let platform = match args.platform {
         Some(platform) => platform,
@@ -140,8 +166,13 @@ pub async fn run(args: VerifyArgs) -> Result<ReleaseOrigin, VerifyError> {
         .await
         .map_err(VerifyError::Trust)?;
 
-    let fetcher = Fetcher::new(Endpoints::public().map_err(VerifyError::Fetcher)?)
+    let mut fetcher = Fetcher::new(Endpoints::public().map_err(VerifyError::Fetcher)?)
         .map_err(VerifyError::Fetcher)?;
+    if let Some(token) = github_token(std::env::var_os("GITHUB_TOKEN"))? {
+        fetcher = fetcher
+            .with_github_token(&token)
+            .map_err(|_| VerifyError::Token)?;
+    }
     verify_release(
         &fetcher,
         &root,
@@ -156,6 +187,19 @@ pub async fn run(args: VerifyArgs) -> Result<ReleaseOrigin, VerifyError> {
         tag: args.tag,
         source: Box::new(source),
     })
+}
+
+/// The GitHub token from the value of `GITHUB_TOKEN`: `None` when unset or
+/// empty.
+fn github_token(value: Option<OsString>) -> Result<Option<String>, VerifyError> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => value
+            .into_string()
+            .map(Some)
+            .map_err(|_| VerifyError::Token),
+    }
 }
 
 /// The OCI platform of a Linux host with this `std::env::consts::ARCH`.
@@ -194,7 +238,70 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{VerifyError, default_cache_dir, host_platform};
+    use landfall_core::tag::TagVerifyError;
+    use landfall_origin::fetch::FetchError;
+    use landfall_origin::release::ReleaseError;
+    use landfall_origin::trust::TrustError;
+
+    use super::{
+        EXIT_REFUSED, EXIT_UNVERIFIED, VerifyError, default_cache_dir, github_token, host_platform,
+    };
+
+    fn release(source: ReleaseError) -> VerifyError {
+        VerifyError::Release {
+            deployment: "app/prod".parse().unwrap(),
+            tag: "v1.2.3".parse().unwrap(),
+            source: Box::new(source),
+        }
+    }
+
+    #[test]
+    fn refused_releases_exit_1_and_unverifiable_ones_exit_2() {
+        let refused = release(ReleaseError::TagSignature(TagVerifyError::NotSigned));
+        assert_eq!(refused.exit_code(), EXIT_REFUSED);
+        assert_eq!(EXIT_REFUSED, 1);
+
+        assert!(refused.to_string().ends_with("is refused"), "{refused}");
+
+        let unavailable = release(ReleaseError::Index(FetchError::NotFound {
+            url: "https://registry.example/v2/example/app/manifests/1.2.3".to_owned(),
+        }));
+        assert_eq!(unavailable.exit_code(), EXIT_UNVERIFIED);
+        assert!(
+            unavailable.to_string().ends_with("could not be verified"),
+            "{unavailable}"
+        );
+        assert_eq!(EXIT_UNVERIFIED, 2);
+        for error in [
+            release(ReleaseError::UnknownDeployment("app/prod".parse().unwrap())),
+            VerifyError::Trust(TrustError::Expired("timestamp".to_owned())),
+            VerifyError::NoCacheDir,
+            VerifyError::Token,
+        ] {
+            assert_eq!(error.exit_code(), EXIT_UNVERIFIED, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn github_token_is_used_only_when_set_and_non_empty() {
+        assert!(github_token(None).unwrap().is_none());
+        assert!(github_token(Some(OsString::new())).unwrap().is_none());
+        assert_eq!(
+            github_token(Some(OsString::from("t0ken")))
+                .unwrap()
+                .as_deref(),
+            Some("t0ken")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_github_token_is_an_error_that_does_not_show_it() {
+        use std::os::unix::ffi::OsStringExt;
+        let error = github_token(Some(OsString::from_vec(b"secret\xff".to_vec()))).unwrap_err();
+        assert!(matches!(error, VerifyError::Token), "{error:?}");
+        assert!(!error.to_string().contains("secret"), "{error}");
+    }
 
     #[test]
     fn host_platform_uses_oci_architecture_names() {
