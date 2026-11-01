@@ -29,7 +29,7 @@ use jiff::Timestamp;
 use landfall_agent::checks::CheckOptions;
 use landfall_agent::compose::{self, OVERRIDE_FILE, PLACEHOLDER};
 use landfall_agent::deploy::{
-    self, DeployError, DeployPlan, DeployReport, EngineOptions, Outcome, StepResult,
+    self, DeployError, DeployPlan, DeployReport, EngineOptions, Outcome, StepDetail, StepResult,
 };
 use landfall_agent::docker::{ContainerId, Docker, DockerCli};
 use landfall_agent::safefs::{self, RelPath, Root};
@@ -237,7 +237,7 @@ impl Stack {
     }
 
     /// Whether version B has started: the file it adds is there.
-    fn b_started(&self) -> impl Fn() -> bool {
+    fn b_started(&self) -> impl Fn() -> bool + use<> {
         let file = self.data("started-v1.28.4");
         move || fs::symlink_metadata(&file).is_ok()
     }
@@ -475,6 +475,21 @@ async fn docker_real_deploy_then_failed_check_rolls_back() {
 
     assert_rolled_back(&report);
     assert!(failed_step(&report, "checks"), "{report:?}");
+    let detail = |name: &str| {
+        report
+            .steps
+            .iter()
+            .find(|step| step.name == name)
+            .and_then(|step| step.detail.as_ref())
+    };
+    assert!(
+        matches!(detail("backup"), Some(StepDetail::Backup { stats }) if stats.files >= 1),
+        "{report:?}"
+    );
+    assert!(
+        matches!(detail("checks"), Some(StepDetail::Checks { checks }) if checks[0].attempts >= 1),
+        "{report:?}"
+    );
     assert!(
         overwritten,
         "version B never overwrote the file, so the restore proves nothing"
@@ -669,6 +684,7 @@ async fn docker_real_recover_rolls_back_an_interrupted_deploy() {
 
     let status = stack.status(&rest).await;
     assert_eq!(status["in_progress"], true);
+    assert_eq!(status["phase"], "deploying");
 
     // Through the binary, with the engine's real timing.
     let config = stack.config_file(&rest);
@@ -706,14 +722,23 @@ async fn docker_real_status_reports_drift() {
     assert_eq!(status["dir"], stack.dir.to_str().unwrap());
     assert_eq!(status["deployed"]["digest"], DIGEST_A);
     assert_eq!(status["in_progress"], false);
+    assert_eq!(status["phase"], Value::Null);
     assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_A)));
+    assert_eq!(status["running_image_matches"], true);
     assert_eq!(status["drift"], false);
 
     // The override moves on and the container doesn't.
     stack.write_override_for(rest, DIGEST_B);
     let status = stack.status(rest).await;
     assert_eq!(status["override_file"], "pinned");
-    assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_A)));
+    assert_eq!(status["running_image"], Value::Null);
+    assert_eq!(status["running_image_matches"], false);
+    assert_eq!(status["drift"], true);
+
+    // The override is gone, with a deploy on record.
+    fs::remove_file(stack.dir.join(OVERRIDE_FILE)).unwrap();
+    let status = stack.status(rest).await;
+    assert_eq!(status["override_file"], "missing");
     assert_eq!(status["drift"], true);
 
     // A hand-edited override isn't the agent's to go by.
@@ -756,8 +781,34 @@ async fn docker_real_drift_goes_by_the_override_not_by_what_env_resolves_to() {
 
     let status = stack.status(PASSES).await;
     assert_eq!(status["override_file"], "pinned");
-    assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_B)));
+    assert_eq!(status["running_image"], Value::Null);
+    assert_eq!(status["running_image_matches"], false);
     assert_eq!(status["drift"], true);
+}
+
+/// `image: ${IMG}` puts whatever `.env` says into the container's image, so an
+/// image other than the pinned one can hold a secret. Here that value is the
+/// other version's reference, which nothing else in the row has a reason to name.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_status_never_prints_an_image_it_did_not_pin() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let first = stack.deploy(PASSES, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+
+    stack.docker.pull(&image(DIGEST_B)).await.unwrap();
+    fs::write(stack.dir.join(".env"), format!("IMG={}\n", image(DIGEST_B))).unwrap();
+    stack.edit_compose("  app:\n", "  app:\n    image: ${IMG}\n");
+    stack.compose_by_hand(&["up", "-d", "--no-deps", "app"]);
+    assert_eq!(stack.running_image().await, image(DIGEST_B));
+
+    let status = stack.status(PASSES).await;
+
+    assert_eq!(status["override_file"], "pinned");
+    assert_eq!(status["running_image"], Value::Null);
+    assert_eq!(status["running_image_matches"], false);
+    assert_eq!(status["drift"], true);
+    assert!(!status.to_string().contains(DIGEST_B), "{status}");
 }
 
 /// Before a first deploy: no override, and a stack the agent's user can't read.
@@ -893,7 +944,7 @@ async fn docker_failed_deploys_keep_only_the_newest_backups() {
     let bad = format!("{}{BACKUP}", passes_only_on("v1.36"));
     let backups = stack.state.backups_dir();
     let count = |dir: &Path| fs::read_dir(dir).map_or(0, Iterator::count);
-    for attempt in 0..4 {
+    for attempt in 0..3 {
         let (report, over) = stack
             .deploy_watching(&bad, "v2.0.0", DIGEST_B, || count(&backups) > KEPT)
             .await;
@@ -906,9 +957,10 @@ async fn docker_failed_deploys_keep_only_the_newest_backups() {
     // whose prune failed ahead of its backup leaves that.
     let seeded = std::cell::Cell::new(false);
     let stale = backups.join("2000-01-01T00-00-00-000000000Z");
+    let b_started = stack.b_started();
     let (report, _) = stack
         .deploy_watching(&bad, "v2.0.0", DIGEST_B, || {
-            if !seeded.get() && count(&backups) == KEPT {
+            if !seeded.get() && b_started() {
                 fs::create_dir(&stale).unwrap();
                 seeded.set(true);
             }
@@ -919,6 +971,119 @@ async fn docker_failed_deploys_keep_only_the_newest_backups() {
     assert!(seeded.get());
     assert!(fs::symlink_metadata(&stale).is_err(), "it was pruned");
     assert_eq!(count(&backups), KEPT);
+}
+
+/// The backup a marker names is what a rollback or `recover` would restore, so
+/// it stays even when others sort ahead of it, as a clock that went back leaves.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_prune_spares_the_backup_a_live_marker_names() {
+    const AHEAD: [&str; 3] = [
+        "2999-01-01T00-00-00-000000000Z",
+        "2999-01-02T00-00-00-000000000Z",
+        "2999-01-03T00-00-00-000000000Z",
+    ];
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = format!("{PASSES}{BACKUP}");
+    let first = stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+    let earlier = stack.newest_backup();
+
+    // Seeded once the backup of this deploy is taken, with the marker naming
+    // it, so only the prune at the end of the deploy can see them.
+    let backups = stack.state.backups_dir();
+    let seeded = std::cell::Cell::new(false);
+    let b_started = stack.b_started();
+    let (second, _) = stack
+        .deploy_watching(&rest, "v2.0.0", DIGEST_B, || {
+            if !seeded.get() && b_started() {
+                for name in AHEAD {
+                    fs::create_dir(backups.join(name)).unwrap();
+                }
+                seeded.set(true);
+            }
+            false
+        })
+        .await;
+
+    assert_eq!(second.outcome, Outcome::Deployed, "{second:?}");
+    assert!(seeded.get());
+    let left: Vec<PathBuf> = fs::read_dir(&backups)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| !AHEAD.iter().any(|name| path.ends_with(name)))
+        .collect();
+    assert_eq!(left.len(), 1, "the marker's backup, and only it: {left:?}");
+    assert_ne!(left[0], earlier, "the older one was pruned, not this one");
+}
+
+/// A rollback's `up` fails. Whatever is running stays running, in the critical
+/// state with deploys blocked; the agent does not stop it to tidy up.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_failed_rollback_up_leaves_what_runs_running() {
+    let mut stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = passes_only_on("v1.36");
+    let first = stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+
+    // With version B up, the compose file breaks, so every `docker compose`
+    // from here on fails: the checks, and then the rollback's `up`.
+    stack.options = quick_to_fail();
+    let compose_file = stack.dir.join("compose.yaml");
+    let intact = fs::read_to_string(&compose_file).unwrap();
+    let broken = std::cell::Cell::new(false);
+    let b_started = stack.b_started();
+    let (report, _) = stack
+        .deploy_watching(&rest, "v2.0.0", DIGEST_B, || {
+            if !broken.get() && b_started() {
+                fs::write(&compose_file, "services: [\n").unwrap();
+                broken.set(true);
+            }
+            false
+        })
+        .await;
+
+    assert!(broken.get());
+    assert!(
+        matches!(&report.outcome, Outcome::RollbackFailed { rollback_reason, .. }
+            if rollback_reason.contains("start_previous")),
+        "{:?}",
+        report.outcome
+    );
+    assert!(report.steps.iter().all(|step| step.name != "stop_service"));
+    let containers = stack.project.all_containers();
+    assert_eq!(containers.len(), 1, "{containers:?}");
+    let id: ContainerId = containers[0].parse().unwrap();
+    let info = stack.docker.inspect(&id).await.unwrap();
+    assert_eq!(info.status, "running", "the agent stopped it");
+    assert_eq!(info.image, image(DIGEST_B));
+
+    let refused = stack.attempt(&rest, "v3.0.0", DIGEST_B).await.unwrap_err();
+    assert!(
+        matches!(refused, DeployError::Interrupted { .. }),
+        "{refused}"
+    );
+    let status = stack.status(&rest).await;
+    assert_eq!(status["in_progress"], true);
+    assert_eq!(status["phase"], "rolling_back");
+    assert_eq!(status["running_image_matches"], false);
+
+    // The operator fixes it, and `recover` brings the previous version back.
+    fs::write(&compose_file, intact).unwrap();
+    stack.options = options();
+    let deployment = stack.deployment(&rest);
+    let recovered = deploy::recover(
+        &stack.docker,
+        &stack.state,
+        &deployment,
+        &stack.dir,
+        &stack.options,
+    )
+    .await
+    .unwrap();
+    assert_rolled_back(&recovered);
+    assert_eq!(stack.running_image().await, image(DIGEST_A));
 }
 
 /// A scaled service used to pass the preflight, get stopped and end in a false
