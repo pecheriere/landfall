@@ -12,6 +12,9 @@ passkey approvals. Agents drive it through a typed API. Design:
 
 - `landfall-core` (`crates/core`): shared library with no I/O: validated
   identifiers, configuration types and the pure verification and rule logic.
+- `landfall-origin` (`crates/origin`): release origin verification that needs
+  the Sigstore stack or the network: build-provenance bundles and their
+  Fulcio certificate identity.
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI.
