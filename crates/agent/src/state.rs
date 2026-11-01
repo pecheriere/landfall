@@ -4,7 +4,9 @@
 //! The directory belongs to the agent's user and is not writable by anyone
 //! else, so nothing in it is hostile and plain file operations are enough.
 //! Every write is a temporary file, `fsync`, rename and a directory `fsync`,
-//! so a crash leaves the old content or the new, never a mix.
+//! so a crash leaves the old content or the new, never a mix. The temporary
+//! file's name is fixed, so a writer must hold the deployment's lock
+//! ([`DeploymentState::lock`]): two at once could mix their bytes in it.
 
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -173,7 +175,7 @@ fn check_private_dir(path: &Path) -> Result<(), StateError> {
     if !meta.is_dir() {
         return Err(StateError::NotADirectory(path.to_owned()));
     }
-    let agent = rustix::process::getuid().as_raw();
+    let agent = rustix::process::geteuid().as_raw();
     if meta.uid() != agent {
         return Err(StateError::WrongOwner {
             path: path.to_owned(),
@@ -227,7 +229,8 @@ impl StateDir {
     }
 }
 
-/// The state files of one deployment.
+/// The state files of one deployment. Reading needs no lock; whoever writes
+/// holds [`Self::lock`].
 #[derive(Debug, Clone)]
 pub struct DeploymentState {
     id: DeploymentId,
@@ -613,6 +616,50 @@ mod tests {
             );
             assert!(err.to_string().contains(name), "{err}");
         }
+    }
+
+    #[test]
+    fn deployment_directory_that_is_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join("example__prod")).unwrap();
+        let err = StateDir::open(tmp.path())
+            .unwrap()
+            .deployment(&id("example/prod"))
+            .unwrap_err();
+        assert!(matches!(err, StateError::NotADirectory(_)), "{err}");
+    }
+
+    #[test]
+    fn deployment_directory_with_a_loose_mode_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("example__prod");
+        fs::create_dir(&dir).unwrap();
+        for loose in [0o770, 0o702] {
+            fs::set_permissions(&dir, Permissions::from_mode(loose)).unwrap();
+            let err = StateDir::open(tmp.path())
+                .unwrap()
+                .deployment(&id("example/prod"))
+                .unwrap_err();
+            assert!(matches!(err, StateError::Writable { .. }), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_old_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = state(&tmp);
+        s.set_deployed(&deployed()).unwrap();
+        // A directory where the temporary file goes fails the write whoever
+        // runs this; permissions would not stop root.
+        fs::create_dir(tmp.path().join("example__prod").join(".deployed.json.tmp")).unwrap();
+
+        let mut newer = deployed();
+        newer.version = semver::Version::new(9, 9, 9);
+        let err = s.set_deployed(&newer).unwrap_err();
+
+        assert!(matches!(err, StateError::Io { .. }), "{err}");
+        assert_eq!(s.deployed().unwrap(), Some(deployed()));
     }
 
     #[test]
