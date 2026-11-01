@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 const DEPLOYED: &str = "deployed.json";
 const IN_PROGRESS: &str = "in-progress.json";
 const PREVIOUS_OVERRIDE: &str = "previous-override.yaml";
+const PREVIOUS_DEPLOYED: &str = "previous-deployed.json";
 const LOCK: &str = "lock";
 const BACKUPS: &str = "backups";
 const REPORTS: &str = "reports";
@@ -91,6 +92,8 @@ fn io_err(op: &'static str, path: &Path) -> impl FnOnce(io::Error) -> StateError
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployed {
+    /// The deploy that recorded this, as in [`InProgress::deploy_id`].
+    pub deploy_id: String,
     /// The release tag.
     pub tag: ReleaseTag,
     /// The version the tag parses to.
@@ -103,11 +106,43 @@ pub struct Deployed {
     pub deployed_at: Timestamp,
 }
 
+/// How far an unfinished deploy got, which is what `recover` goes by. Each
+/// value is on disk before the work it announces starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Going forward. The deploy has finished only if [`Deployed`] names its
+    /// id: that is written once the checks have passed.
+    Deploying,
+    /// Going back. A [`Deployed`] that names this deploy means nothing here:
+    /// the record can have been left by a write reported as failed, and the
+    /// release is on its way out.
+    RollingBack,
+    /// Back, and checked. Only the marker is left to remove; restoring again
+    /// would discard what the previous version wrote since.
+    RolledBack,
+}
+
+/// A backup that is complete, and what it holds. The paths are the ones it was
+/// taken of, whatever the configuration says by the time it is restored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedBackup {
+    /// The backup's directory name.
+    pub id: String,
+    /// The paths it holds, relative to the compose directory.
+    pub paths: Vec<String>,
+}
+
 /// A deploy that has started and not finished. While it exists, further
 /// deploys of the deployment are refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InProgress {
+    /// Tells this deploy from every other one, also of the same release.
+    pub deploy_id: String,
+    /// How far it got.
+    pub phase: Phase,
     /// The release being deployed.
     pub tag: ReleaseTag,
     /// Its image digest.
@@ -117,7 +152,7 @@ pub struct InProgress {
     /// file without one, rollback stops the service instead.
     pub previous_can_start: bool,
     /// The backup taken for this deploy, if any.
-    pub backup: Option<String>,
+    pub backup: Option<RecordedBackup>,
     /// When the deploy began.
     pub started_at: Timestamp,
 }
@@ -266,13 +301,36 @@ impl DeploymentState {
     ///
     /// [`StateError`] if the removal fails.
     pub fn clear_in_progress(&self) -> Result<(), StateError> {
-        let path = self.dir.join(IN_PROGRESS);
-        match fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(io_err("remove", &path)(e)),
-        }
-        sync_dir(&self.dir)
+        self.remove(IN_PROGRESS)
+    }
+
+    /// Removes the record of what is deployed; absent is fine.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the removal fails.
+    pub fn clear_deployed(&self) -> Result<(), StateError> {
+        self.remove(DEPLOYED)
+    }
+
+    /// What [`Self::deployed`] returned when the current deploy started, or
+    /// `None` if that was not saved.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::Corrupt`] if the file exists and is not valid.
+    pub fn previous_deployed(&self) -> Result<Option<Option<Deployed>>, StateError> {
+        self.read_json(PREVIOUS_DEPLOYED)
+    }
+
+    /// Saves what a rollback puts back with [`Self::set_deployed`] or
+    /// [`Self::clear_deployed`].
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the write fails.
+    pub fn set_previous_deployed(&self, deployed: Option<&Deployed>) -> Result<(), StateError> {
+        self.write_json(PREVIOUS_DEPLOYED, &deployed)
     }
 
     /// The previous override file's bytes, if one was saved.
@@ -330,6 +388,16 @@ impl DeploymentState {
     #[must_use]
     pub fn backups_dir(&self) -> PathBuf {
         self.dir.join(BACKUPS)
+    }
+
+    fn remove(&self, name: &str) -> Result<(), StateError> {
+        let path = self.dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(io_err("remove", &path)(e)),
+        }
+        sync_dir(&self.dir)
     }
 
     fn read_json<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>, StateError> {
@@ -390,6 +458,7 @@ mod tests {
 
     fn deployed() -> Deployed {
         Deployed {
+            deploy_id: "2026-11-01T09-00-00-000000000Z".to_owned(),
             tag: "v1.2.3".parse().unwrap(),
             version: semver::Version::new(1, 2, 3),
             digest: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
@@ -480,10 +549,15 @@ mod tests {
         let s = state(&tmp);
         assert_eq!(s.in_progress().unwrap(), None);
         let marker = InProgress {
+            deploy_id: "2026-11-01T10-00-00-000000000Z".to_owned(),
+            phase: Phase::RollingBack,
             tag: "v1.2.3".parse().unwrap(),
             digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             previous_can_start: true,
-            backup: Some("2026-11-01T10-00-00Z".to_owned()),
+            backup: Some(RecordedBackup {
+                id: "2026-11-01T10-00-00Z".to_owned(),
+                paths: vec!["data".to_owned()],
+            }),
             started_at: "2026-11-01T10:00:00Z".parse().unwrap(),
         };
         s.set_in_progress(&marker).unwrap();
@@ -491,6 +565,27 @@ mod tests {
         s.clear_in_progress().unwrap();
         assert_eq!(s.in_progress().unwrap(), None);
         s.clear_in_progress().unwrap();
+    }
+
+    #[test]
+    fn previous_deployed_tells_nothing_saved_from_nothing_deployed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = state(&tmp);
+        assert_eq!(s.previous_deployed().unwrap(), None);
+        s.set_previous_deployed(None).unwrap();
+        assert_eq!(s.previous_deployed().unwrap(), Some(None));
+        s.set_previous_deployed(Some(&deployed())).unwrap();
+        assert_eq!(s.previous_deployed().unwrap(), Some(Some(deployed())));
+    }
+
+    #[test]
+    fn deployed_record_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = state(&tmp);
+        s.set_deployed(&deployed()).unwrap();
+        s.clear_deployed().unwrap();
+        assert_eq!(s.deployed().unwrap(), None);
+        s.clear_deployed().unwrap();
     }
 
     #[test]

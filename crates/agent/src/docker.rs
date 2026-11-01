@@ -228,6 +228,20 @@ pub trait Docker: Send + Sync {
         service: &str,
     ) -> impl Future<Output = Result<ServiceConfig, DockerError>> + Send;
 
+    /// [`compose_service`](Self::compose_service) with the whole project held
+    /// to what `up` requires: a network, volume, secret or `depends_on` target
+    /// that is not defined is an error here, and so is a service without an
+    /// image, so this is for a project that should be ready to start.
+    ///
+    /// # Errors
+    ///
+    /// [`DockerError::NoSuchService`] when the project has no such service.
+    fn compose_service_checked(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> impl Future<Output = Result<ServiceConfig, DockerError>> + Send;
+
     /// `docker compose up -d --no-deps <service>`.
     fn compose_up(
         &self,
@@ -730,6 +744,17 @@ impl Docker for DockerCli {
         // Without `--no-consistency`, compose refuses a service that has no
         // image yet, which is what a first deploy starts from (design 7.1).
         let cmd = self.compose(dir, &["config", "--no-consistency", "--format", "json"]);
+        let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
+        parse_config(&captured.stdout, service)
+    }
+
+    async fn compose_service_checked(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> Result<ServiceConfig, DockerError> {
+        const LABEL: &str = "docker compose config";
+        let cmd = self.compose(dir, &["config", "--format", "json"]);
         let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
         parse_config(&captured.stdout, service)
     }

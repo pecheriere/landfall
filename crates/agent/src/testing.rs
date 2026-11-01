@@ -95,15 +95,11 @@ impl ComposeProject {
 impl Drop for ComposeProject {
     fn drop(&mut self) {
         let _ = Command::new("docker")
-            .args([
-                "compose",
-                "down",
-                "--volumes",
-                "--remove-orphans",
-                "--timeout",
-                "1",
-            ])
-            .current_dir(self.dir.path())
+            .args(["compose", "-p", &self.name, "down"])
+            .args(["--volumes", "--remove-orphans", "--timeout", "1"])
+            // By name and from elsewhere: a test may leave a project behind
+            // that compose refuses to load.
+            .current_dir(self.dir.path().parent().unwrap_or(Path::new("/")))
             .output();
     }
 }
@@ -118,6 +114,13 @@ pub enum Call {
     Pull(String),
     /// `compose_service(dir, service)`.
     ComposeService {
+        /// Compose directory.
+        dir: PathBuf,
+        /// Service name.
+        service: String,
+    },
+    /// `compose_service_checked(dir, service)`.
+    ComposeServiceChecked {
         /// Compose directory.
         dir: PathBuf,
         /// Service name.
@@ -398,6 +401,26 @@ impl Docker for FakeDocker {
         )
     }
 
+    /// Answers from the same script as `compose_service`.
+    async fn compose_service_checked(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> Result<ServiceConfig, DockerError> {
+        self.record(Call::ComposeServiceChecked {
+            dir: dir.to_owned(),
+            service: service.to_owned(),
+        })
+        .await;
+        lift(
+            "compose config",
+            self.lock()
+                .compose_service
+                .next()
+                .unwrap_or(Err("unscripted compose_service")),
+        )
+    }
+
     async fn compose_up(&self, dir: &Path, service: &str) -> Result<(), DockerError> {
         self.record(Call::ComposeUp {
             dir: dir.to_owned(),
@@ -534,7 +557,7 @@ mod tests {
             .unwrap();
         assert!(
             docker.inspect(&id).await.is_err(),
-            "nothing scripted for two ups, and no fallback"
+            "nothing scripted for two ups, and no plain inspect script to fall back on"
         );
     }
 }
