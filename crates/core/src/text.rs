@@ -3,7 +3,8 @@
 /// Quotes `text` for an error message (Rust debug quoting, so control
 /// characters are escaped), shortened to 64 characters followed by `...` so
 /// a hostile value cannot flood a log line.
-pub(crate) fn shown(text: &str) -> String {
+#[must_use]
+pub fn shown(text: &str) -> String {
     const MAX: usize = 64;
     let cut: String = text.chars().take(MAX).collect();
     if cut.len() < text.len() {

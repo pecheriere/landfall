@@ -10,4 +10,4 @@ pub mod protocol;
 pub mod release;
 pub mod rule;
 pub mod tag;
-mod text;
+pub mod text;

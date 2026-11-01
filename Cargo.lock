@@ -385,6 +385,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -565,6 +566,7 @@ dependencies = [
  "ed25519",
  "sha2 0.10.9",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]

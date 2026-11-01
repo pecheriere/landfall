@@ -36,7 +36,7 @@ semver = { version = "1.0.28", features = ["serde"] }
 sha2 = "0.11.1"
 # Agent request signatures: sign and verify only. Keys are supplied by the
 # caller, so no randomness feature is enabled here.
-ed25519-dalek = { version = "2.2.0", default-features = false }
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 toml = "0.9.8"
