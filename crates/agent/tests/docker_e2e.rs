@@ -1306,6 +1306,85 @@ async fn docker_project_name_shared_with_another_directory_is_refused_before_sto
     assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_A)));
 }
 
+/// The other directory's service is stopped. `up` under the shared name would
+/// recreate its container all the same, so it is no less in the way.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_stopped_service_of_another_directory_is_refused_before_stop() {
+    let first_stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = format!("{PASSES}{BACKUP}");
+    let first = first_stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+    first_stack.compose_by_hand(&["stop", "app"]);
+    let before = first_stack.project.all_containers();
+    assert_eq!(before.len(), 1);
+
+    let second_stack = Stack::new(RunAs::Agent, &script_with(":"));
+    second_stack.edit_compose(
+        &format!("name: {}\n", second_stack.project.name),
+        &format!("name: {}\n", first_stack.project.name),
+    );
+    let err = second_stack
+        .attempt(&rest, "v2.0.0", DIGEST_B)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
+    assert_eq!(
+        first_stack.project.all_containers(),
+        before,
+        "the stopped container was not replaced"
+    );
+    assert_eq!(second_stack.state.in_progress().unwrap(), None);
+}
+
+/// A second project started through a symlink is labelled with the link, which
+/// the lookup by the directory's path doesn't match.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_second_project_started_through_a_symlink_is_refused_before_stop() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = format!("{PASSES}{BACKUP}");
+    let first = stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+    let before = stack.running_since().await;
+
+    let other = OtherProject(format!("{}-other", stack.project.name));
+    let link = stack.symlink_to_dir();
+    let out = StdCommand::new("docker")
+        .args(["compose", "-p", &other.0, "up", "-d", "--no-deps", "app"])
+        .current_dir(&link)
+        .env("PWD", &link)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        stack.docker.container_at(&stack.dir, "app").await.unwrap(),
+        Some(before.0.clone()),
+        "only the deployment's own is found by the real path, or this proves nothing"
+    );
+
+    let err = stack.attempt(&rest, "v2.0.0", DIGEST_B).await.unwrap_err();
+    assert!(
+        matches!(err, DeployError::SeveralContainers { .. }),
+        "{err}"
+    );
+    assert_eq!(stack.running_since().await, before);
+
+    // With its own stopped, it is the only one running from the directory.
+    stack.compose_by_hand(&["stop", "app"]);
+    let err = stack.attempt(&rest, "v2.0.0", DIGEST_B).await.unwrap_err();
+    assert!(
+        matches!(err, DeployError::OutsideTheProject { .. }),
+        "{err}"
+    );
+    assert_eq!(stack.state.in_progress().unwrap(), None);
+
+    drop(other);
+    let second = stack.deploy(&rest, "v2.0.0", DIGEST_B).await;
+    assert_eq!(second.outcome, Outcome::Deployed, "{second:?}");
+}
+
 /// A service started by hand through a symlink is labelled with the symlink's
 /// path. That used to turn a healthy service into a permanent critical.
 #[tokio::test]

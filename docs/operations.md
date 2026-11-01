@@ -52,22 +52,28 @@ one deployment. The service's image belongs to the agent:
   ```
 
 - **The compose file must live in `compose.dir`, and the project's name must be this
-  directory's alone.** A deploy finds the service's container by its project's name,
-  and looks at the working directory compose labelled it with. A running container
-  started from another directory is refused before anything stops, as a deploy would
-  stop and replace it. A project's name defaults to the directory's base name, so two
-  directories with the same base name share one: give each a unique `name:` or
-  `COMPOSE_PROJECT_NAME`. A compose file kept elsewhere is refused the same way, once
-  its container is running. Only running containers are looked at, so a stopped one of
-  another stack under the same name is not noticed.
+  directory's alone.** A deploy looks at every container with the service's name, and
+  at the working directory compose labelled each with. One in this project that was
+  started from another directory, running or stopped, is refused before anything stops,
+  as a deploy would stop and replace it. A project's name defaults to the directory's
+  base name, so two directories with the same base name share one: give each a unique
+  `name:` or `COMPOSE_PROJECT_NAME`. A compose file kept elsewhere is refused the same
+  way, once it has a container. A stack elsewhere under another project's name that only
+  shares the service's name is left alone. Rollback and `recover` don't repeat these
+  checks, so another stack started under the same name after the preflight isn't
+  noticed.
 - Run `docker compose` from the directory's real path. A deploy accepts a start through
   a symlink to the directory. `status` must not load the project, so it goes by the
   label as it is spelled, and reports such a container as not running. `docker compose
-  up -d --force-recreate <service>` from the real path puts the label right.
+  up -d --force-recreate <service>` from the real path puts the label right, and is the
+  fix when the agent's user can't resolve the symlink: under `ProtectHome` or
+  `PrivateTmp`, or behind a directory it can't search, a start through it is refused as
+  started from elsewhere.
 - One container per service. A service with `scale` or `deploy.replicas` other than 1,
   one scaled by hand, or a container running from this directory under another
-  project's name (`docker compose -p other up`, or one left behind by editing `name:`)
-  is refused before anything stops, and the error names the fix.
+  project's name (`docker compose -p other up`, also through a symlink, or one left
+  behind by editing `name:`) is refused before anything stops, and the error names the
+  fix.
 - A service behind a profile that isn't active is not in the project, so a deploy
   is refused as having no such service. Set `COMPOSE_PROFILES` in `.env`, or remove
   the profile. The agent ignores that variable in its own environment.
@@ -183,9 +189,10 @@ The sequence is in the design, section 7.2. What an operator will notice:
 - **If a rollback's `up` of the previous version fails, whatever is running stays
   running.** The state is critical and deploys are blocked, and the agent doesn't
   force a stop. What that leaves depends on how far things got:
-  - If nothing stopped the service (no backup declared, or a failed one with
-    `stop = false`), it can be the failed release, still serving: `status` shows
-    `running_image_matches: false`.
+  - With no backup declared, nothing stopped the service, so it can be the failed
+    release, still serving: `status` shows `running_image_matches: false`.
+  - A failed backup with `stop = false` happens before the override and `up`, so what
+    is left running is the previous version, not the release.
   - If the service stopped for a backup that then failed (`stop = true`), or for the
     restore of one that completed, it is down unless the failed `up` started it.
   - In a later `recover` from phase `restored`, nothing is stopped, so the previous

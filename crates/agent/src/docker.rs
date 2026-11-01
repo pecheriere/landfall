@@ -74,10 +74,14 @@ const INSPECT_FORMAT: &str = concat!(
     "[{{json $name}},{{json $net.IPAddress}},{{json $net.GlobalIPv6Address}}],{{end}}null]}"
 );
 
-/// The Go template that reads a container's compose working directory, and
-/// nothing else, as a JSON string: empty when it has no such label.
-const WORKING_DIR_FORMAT: &str =
-    "{{json (index .Config.Labels \"com.docker.compose.project.working_dir\")}}";
+/// The Go template of `docker ps` that reads a container's id, state, compose
+/// project and working directory, and nothing else, as a JSON array on one
+/// line: a label it doesn't have is empty.
+const SERVICE_CONTAINER_FORMAT: &str = concat!(
+    "[{{json .ID}},{{json .State}},",
+    "{{json (.Label \"com.docker.compose.project\")}},",
+    "{{json (.Label \"com.docker.compose.project.working_dir\")}}]"
+);
 
 /// A failure running Docker.
 #[derive(Debug, thiserror::Error)]
@@ -239,6 +243,23 @@ pub struct ContainerInfo {
     pub networks: BTreeMap<String, Option<IpAddr>>,
 }
 
+/// What the agent reads of a container that has the service's name, in whichever
+/// project. The names of other projects stay out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceContainer {
+    /// The container.
+    pub id: ContainerId,
+    /// Whether it is up, as `docker ps` without `--all` counts it: a paused or
+    /// restarting one is. A state not known to mean down counts as up.
+    pub running: bool,
+    /// Whether it has the project's name.
+    pub in_project: bool,
+    /// The working directory compose labelled it with, as the label spells it;
+    /// `None` without that label. Whoever started the container chose it: it
+    /// is quoted wherever it is shown.
+    pub working_dir: Option<String>,
+}
+
 /// The Docker operations the agent needs. Implemented by [`DockerCli`]; a
 /// fake stands in for it in tests of the deploy sequence.
 pub trait Docker: Send + Sync {
@@ -319,13 +340,16 @@ pub trait Docker: Send + Sync {
         id: &ContainerId,
     ) -> impl Future<Output = Result<ContainerInfo, DockerError>> + Send;
 
-    /// The working directory compose labelled the container `id` with, as the
-    /// label spells it; `None` without that label. Whoever started the
-    /// container chose it: it is quoted wherever it is shown.
-    fn compose_working_dir(
+    /// Every container of a service called `service` on this host, in any state
+    /// and any project, one-offs left out, each said to be in the compose
+    /// project of `dir` or not. It loads the project for its name, so it needs
+    /// the stack's files. For telling what stands in the way of a deploy;
+    /// [`container`](Self::container) is the service's running one.
+    fn service_containers(
         &self,
-        id: &ContainerId,
-    ) -> impl Future<Output = Result<Option<String>, DockerError>> + Send;
+        dir: &Path,
+        service: &str,
+    ) -> impl Future<Output = Result<Vec<ServiceContainer>, DockerError>> + Send;
 
     /// Runs `argv` in the container; whether it exited with status 0. Its
     /// output is discarded. On a timeout only the `docker exec` client is
@@ -794,10 +818,32 @@ fn parse_inspect(raw: &[u8]) -> Result<ContainerInfo, DockerError> {
     })
 }
 
-fn parse_working_dir(raw: &[u8]) -> Result<Option<String>, DockerError> {
-    let label: String =
-        serde_json::from_slice(raw).map_err(|_| bad_inspect("not the expected JSON"))?;
-    Ok(Some(label).filter(|label| !label.is_empty()))
+/// Reads `docker ps --format SERVICE_CONTAINER_FORMAT`, one container per line.
+/// Errors quote nothing: labels are anyone's who can start a container.
+fn parse_service_containers(
+    raw: &[u8],
+    project: &str,
+) -> Result<Vec<ServiceContainer>, DockerError> {
+    let bad = |reason| DockerError::BadOutput {
+        command: "docker ps",
+        reason,
+    };
+    let text = std::str::from_utf8(raw).map_err(|_| bad("not UTF-8"))?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let (id, state, in_project, working_dir): (String, String, String, String) =
+                serde_json::from_str(line).map_err(|_| bad("not the expected JSON"))?;
+            Ok(ServiceContainer {
+                id: id
+                    .parse()
+                    .map_err(|_: ContainerIdError| bad("not a container id"))?,
+                running: !matches!(state.as_str(), "exited" | "created" | "dead" | "removing"),
+                in_project: in_project == project,
+                working_dir: Some(working_dir).filter(|dir| !dir.is_empty()),
+            })
+        })
+        .collect()
 }
 
 fn parse_container(raw: &[u8]) -> Result<Option<ContainerId>, DockerError> {
@@ -994,20 +1040,21 @@ impl Docker for DockerCli {
         parse_inspect(&captured.stdout)
     }
 
-    async fn compose_working_dir(&self, id: &ContainerId) -> Result<Option<String>, DockerError> {
-        const LABEL: &str = "docker inspect";
+    async fn service_containers(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> Result<Vec<ServiceContainer>, DockerError> {
+        const LABEL: &str = "docker ps";
+        not_a_flag(LABEL, service)?;
+        let project = self.project_name(LABEL, dir).await?;
         let mut cmd = self.command(None);
-        cmd.args([
-            "inspect",
-            "--type",
-            "container",
-            "--format",
-            WORKING_DIR_FORMAT,
-        ])
-        .arg("--")
-        .arg(id.as_ref());
+        cmd.args(["ps", "--all", "--no-trunc", "--filter"])
+            .arg(format!("label=com.docker.compose.service={service}"))
+            .args(["--filter", "label=com.docker.compose.oneoff=False"])
+            .args(["--format", SERVICE_CONTAINER_FORMAT]);
         let captured = Self::run(LABEL, cmd, self.timeout).await?;
-        parse_working_dir(&captured.stdout)
+        parse_service_containers(&captured.stdout, &project)
     }
 
     async fn exec(&self, id: &ContainerId, argv: &[String]) -> Result<bool, DockerError> {
@@ -1650,30 +1697,96 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn working_dir_label_is_read_and_absent_is_none() {
+    async fn service_containers_are_listed_in_any_state_and_project() {
         let stub = Stub::new(
-            "{ for a in \"$@\"; do echo \"arg:$a\"; done; } > \"$(dirname \"$0\")/seen\"\ncat \"$(dirname \"$0\")/reply\"",
+            "case \"$1\" in compose) echo '{\"name\":\"stack\",\"services\":{}}'; exit 0;; esac\n{ for a in \"$@\"; do echo \"arg:$a\"; done; } > \"$(dirname \"$0\")/seen\"\ncat \"$(dirname \"$0\")/reply\"",
         );
         let cli = stub.cli();
-        fs::write(stub.path("reply"), "\"/srv/compose/app\"\n").unwrap();
+        fs::write(
+            stub.path("reply"),
+            "[\"0123456789ab\",\"running\",\"stack\",\"/srv/compose/app\"]\n\
+             [\"0123456789ac\",\"exited\",\"other\",\"\"]\n\
+             [\"0123456789ad\",\"paused\",\"stack\",\"/srv/a,b\"]\n",
+        )
+        .unwrap();
+
+        let found = cli
+            .service_containers(stub.dir.path(), "app")
+            .await
+            .unwrap();
+
+        let ids = |text: &str| text.parse::<ContainerId>().unwrap();
         assert_eq!(
-            cli.compose_working_dir(&id()).await.unwrap().as_deref(),
-            Some("/srv/compose/app")
+            found,
+            [
+                ServiceContainer {
+                    id: ids("0123456789ab"),
+                    running: true,
+                    in_project: true,
+                    working_dir: Some("/srv/compose/app".to_owned()),
+                },
+                ServiceContainer {
+                    id: ids("0123456789ac"),
+                    running: false,
+                    in_project: false,
+                    working_dir: None,
+                },
+                ServiceContainer {
+                    id: ids("0123456789ad"),
+                    running: true,
+                    in_project: true,
+                    working_dir: Some("/srv/a,b".to_owned()),
+                },
+            ]
         );
         let seen = fs::read_to_string(stub.path("seen")).unwrap();
-        assert!(
-            seen.contains("com.docker.compose.project.working_dir"),
-            "{seen}"
+        let seen: Vec<&str> = seen.lines().collect();
+        assert_eq!(
+            seen,
+            [
+                "arg:ps",
+                "arg:--all",
+                "arg:--no-trunc",
+                "arg:--filter",
+                "arg:label=com.docker.compose.service=app",
+                "arg:--filter",
+                "arg:label=com.docker.compose.oneoff=False",
+                "arg:--format",
+                format!("arg:{SERVICE_CONTAINER_FORMAT}").as_str(),
+            ]
         );
-        assert!(!seen.contains("Env"), "{seen}");
 
-        fs::write(stub.path("reply"), "\"\"\n").unwrap();
-        assert_eq!(cli.compose_working_dir(&id()).await.unwrap(), None);
+        fs::write(stub.path("reply"), "").unwrap();
+        assert_eq!(
+            cli.service_containers(stub.dir.path(), "app")
+                .await
+                .unwrap(),
+            []
+        );
 
-        fs::write(stub.path("reply"), "s3cret, not JSON\n").unwrap();
-        let err = cli.compose_working_dir(&id()).await.unwrap_err();
-        assert!(matches!(err, DockerError::BadOutput { .. }), "{err}");
-        assert!(!format!("{err} {err:?}").contains("s3cret"), "{err}");
+        for reply in [
+            "s3cret, not JSON\n",
+            "[\"s3cret\",\"running\",\"stack\",\"\"]\n",
+        ] {
+            fs::write(stub.path("reply"), reply).unwrap();
+            let err = cli
+                .service_containers(stub.dir.path(), "app")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DockerError::BadOutput { .. }), "{err}");
+            assert!(!format!("{err} {err:?}").contains("s3cret"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_name_that_looks_like_a_flag_is_refused_before_listing() {
+        let stub = Stub::new("exit 0");
+        let err = stub
+            .cli()
+            .service_containers(stub.dir.path(), "--all")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DockerError::BadArgument { .. }), "{err}");
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::checks::{CheckOptions, CheckReport, quote, run_checks};
 use crate::compose::{self, Pin};
-use crate::docker::{ContainerId, Docker, DockerError};
+use crate::docker::{Docker, DockerError};
 use crate::journal::{self, Priority};
 use crate::safefs::{self, RelPath, Root, SafeFsError, SnapshotStats};
 use crate::state::{
@@ -851,19 +851,26 @@ fn rel_paths(paths: &[String]) -> Result<Vec<RelPath>, SafeFsError> {
     paths.iter().map(|p| RelPath::new(p)).collect()
 }
 
-/// Whether a compose working directory label names `dir`, through symlinks or
-/// not. A label that is missing, relative or doesn't resolve names no directory
-/// of this deployment. Nothing is opened: the two paths are only compared.
-fn labelled_with(dir: &Path, label: Option<&str>) -> Result<bool, SafeFsError> {
+/// For each compose working directory label, whether it names `dir`, through
+/// symlinks or not. A label that is missing, relative or doesn't resolve names
+/// no directory of this deployment. Nothing is opened: the paths are only
+/// compared.
+fn labelled_with(dir: &Path, labels: &[Option<String>]) -> Result<Vec<bool>, SafeFsError> {
     let own = fs::canonicalize(dir).map_err(|source| SafeFsError::Io {
         op: "canonicalize",
         path: dir.to_owned(),
         source,
     })?;
-    let Some(label) = label.map(Path::new).filter(|label| label.is_absolute()) else {
-        return Ok(false);
-    };
-    Ok(fs::canonicalize(label).is_ok_and(|theirs| theirs == own))
+    Ok(labels
+        .iter()
+        .map(|label| {
+            label
+                .as_deref()
+                .map(Path::new)
+                .filter(|label| label.is_absolute())
+                .is_some_and(|label| fs::canonicalize(label).is_ok_and(|theirs| theirs == own))
+        })
+        .collect())
 }
 
 /// The steps of one deploy or recovery, each also sent to the journal.
@@ -1104,60 +1111,68 @@ impl<D: Docker> Engine<'_, D> {
                 replicas: base.replicas,
             });
         }
-        // Every step after this one needs to tell the service's one container,
-        // which the project's name does. A container started from this directory
-        // under another project's name would be left out of that, while it shares
-        // the directory's data with a backup and a restore.
-        let in_project = self
-            .docker
-            .container(self.dir, self.service())
-            .await
-            .map_err(|e| self.compose_error(e))?;
-        let in_directory = self
-            .docker
-            .container_at(self.dir, self.service())
-            .await
-            .map_err(|e| self.compose_error(e))?;
-        if in_directory.is_some() && in_directory != in_project {
-            return Err(DeployError::OutsideTheProject {
-                deployment: self.deployment.id().clone(),
-                service: self.service().to_owned(),
-            });
-        }
-        if let Some(id) = in_project {
-            self.refuse_started_elsewhere(&id).await?;
-        }
+        self.refuse_what_stands_in_the_way().await?;
         Ok(Preflight {
             previous,
             previous_can_start: base.image.is_some(),
         })
     }
 
-    /// The project's name can be shared with another directory, whose service
-    /// this deploy would then stop and replace. The container says where it was
-    /// started from.
-    async fn refuse_started_elsewhere(&self, id: &ContainerId) -> Result<(), DeployError> {
-        let label = self
+    /// Every step after the preflight goes by the project's name and the service,
+    /// so this looks at every container with the service's name:
+    ///
+    /// - One of the project, running or stopped, started from another directory:
+    ///   the project's name is shared, and this deploy would replace it.
+    /// - One running from this directory under another project's name: the steps
+    ///   after this would leave it out, while it shares the directory's data with
+    ///   a backup and a restore.
+    /// - More than one running in all of those.
+    ///
+    /// A stack elsewhere with another project that only shares the service's
+    /// name is none of this deployment's business, whatever its label says.
+    async fn refuse_what_stands_in_the_way(&self) -> Result<(), DeployError> {
+        let found = self
             .docker
-            .compose_working_dir(id)
+            .service_containers(self.dir, self.service())
             .await
             .map_err(|e| self.compose_error(e))?;
         let dir = self.dir.to_owned();
-        let asked = label.clone();
+        let labels: Vec<Option<String>> = found.iter().map(|c| c.working_dir.clone()).collect();
         let here = self
-            .file("compare working directory", move || {
-                labelled_with(&dir, asked.as_deref())
+            .file("compare working directories", move || {
+                labelled_with(&dir, &labels)
             })
             .await
             .map_err(|e| self.file_error(e))?;
-        if here {
-            return Ok(());
+        let mut running_in_project = 0_usize;
+        let mut running_outside = false;
+        for (container, here) in found.iter().zip(here) {
+            if container.in_project && !here {
+                return Err(DeployError::StartedElsewhere {
+                    deployment: self.deployment.id().clone(),
+                    service: self.service().to_owned(),
+                    found: container
+                        .working_dir
+                        .as_deref()
+                        .map_or_else(|| "no directory it labels".to_owned(), quote),
+                });
+            }
+            running_in_project += usize::from(container.in_project && container.running);
+            running_outside |= here && container.running && !container.in_project;
         }
-        Err(DeployError::StartedElsewhere {
-            deployment: self.deployment.id().clone(),
-            service: self.service().to_owned(),
-            found: label.map_or_else(|| "no directory it labels".to_owned(), |l| quote(&l)),
-        })
+        if running_in_project > 1 || (running_outside && running_in_project > 0) {
+            return Err(DeployError::SeveralContainers {
+                deployment: self.deployment.id().clone(),
+                service: self.service().to_owned(),
+            });
+        }
+        if running_outside {
+            return Err(DeployError::OutsideTheProject {
+                deployment: self.deployment.id().clone(),
+                service: self.service().to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// What a rollback goes back to, then the marker, which promises it. No
@@ -2029,7 +2044,7 @@ mod tests {
     };
     use crate::checks::CheckOptions;
     use crate::compose::{self, OVERRIDE_FILE, PLACEHOLDER};
-    use crate::docker::{ContainerId, ContainerInfo, ServiceConfig};
+    use crate::docker::{ContainerInfo, ServiceConfig, ServiceContainer};
     use crate::journal::Priority;
     use crate::safefs::{self, RelPath, Root};
     use crate::state::{Deployed, DeploymentState, InProgress, Phase, RecordedBackup, StateDir};
@@ -2280,7 +2295,7 @@ mod tests {
                 Call::Container { .. }
                     | Call::ContainerAt { .. }
                     | Call::Inspect(_)
-                    | Call::WorkingDir(_)
+                    | Call::ServiceContainers { .. }
             ) {
                 log.lock().unwrap().push(override_text(&dir));
             }
@@ -4527,72 +4542,129 @@ mod tests {
         refused_before_anything_changed(&f, &err);
     }
 
+    /// A container of the service, with how the lookup describes it.
+    fn found(running: bool, in_project: bool, working_dir: Option<&str>) -> ServiceContainer {
+        ServiceContainer {
+            id: crate::testing::container_id(),
+            running,
+            in_project,
+            working_dir: working_dir.map(str::to_owned),
+        }
+    }
+
+    fn found_dir(f: &Fixture) -> &str {
+        f.dir.to_str().unwrap()
+    }
+
+    /// The preflight finds these, and refuses.
+    async fn refused_finding(f: &Fixture, containers: Vec<ServiceContainer>) -> DeployError {
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        f.docker.script_service_containers([Ok(containers)]);
+        let err = deploy(f).await.unwrap_err();
+        refused_before_anything_changed(f, &err);
+        err
+    }
+
     #[tokio::test]
-    async fn a_lone_container_outside_the_project_is_refused() {
-        let id = crate::testing::container_id();
-        let other: ContainerId = "0123456789ac".parse().unwrap();
-        for (in_project, in_directory) in [
-            // The project's name changed, or its own is stopped.
-            (None, id.clone()),
-            (Some(other), id),
-        ] {
+    async fn a_lone_running_container_outside_the_project_is_refused() {
+        let f = fixture(STOP_TRUE);
+        let dir = found_dir(&f).to_owned();
+        // Its own project is stopped, or was renamed away from it.
+        let err = refused_finding(
+            &f,
+            vec![
+                found(false, true, Some(&dir)),
+                found(true, false, Some(&dir)),
+            ],
+        )
+        .await;
+        assert!(
+            matches!(err, DeployError::OutsideTheProject { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("docker compose -p <other> down"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_project_through_a_symlink_to_this_directory_is_outside_too() {
+        let f = fixture(STOP_TRUE);
+        let link = f.dir.with_file_name("link");
+        std::os::unix::fs::symlink(&f.dir, &link).unwrap();
+        let err = refused_finding(&f, vec![found(true, false, link.to_str())]).await;
+        assert!(
+            matches!(err, DeployError::OutsideTheProject { .. }),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_container_of_the_project_started_elsewhere_is_refused_running_or_not() {
+        for running in [true, false] {
             let f = fixture(STOP_TRUE);
-            f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-            f.docker
-                .script_container([Ok(in_project), Ok(Some(in_directory))]);
-            let err = deploy(&f).await.unwrap_err();
+            let elsewhere = f.dir.with_file_name("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            let err = refused_finding(&f, vec![found(running, true, elsewhere.to_str())]).await;
+            assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
+            let text = err.to_string();
             assert!(
-                matches!(err, DeployError::OutsideTheProject { .. }),
-                "{err}"
+                text.contains("`name:`") && text.contains("`COMPOSE_PROJECT_NAME`"),
+                "{text}"
             );
-            assert!(err.to_string().contains("docker compose -p <other> down"));
-            refused_before_anything_changed(&f, &err);
+            assert!(text.contains(elsewhere.to_str().unwrap()), "{text}");
         }
     }
 
     #[tokio::test]
-    async fn a_container_of_the_project_started_elsewhere_is_refused_naming_the_fix() {
-        let f = fixture(STOP_TRUE);
-        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-        let elsewhere = f.dir.with_file_name("elsewhere");
-        fs::create_dir(&elsewhere).unwrap();
-        f.docker
-            .script_working_dir([Ok(Some(elsewhere.to_str().unwrap().to_owned()))]);
-        // By its project it is found, and by this directory it isn't.
-        f.docker
-            .script_container([Ok(Some(crate::testing::container_id())), Ok(None)]);
-
-        let err = deploy(&f).await.unwrap_err();
-
-        assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
-        let text = err.to_string();
-        assert!(
-            text.contains("`name:`") && text.contains("`COMPOSE_PROJECT_NAME`"),
-            "{text}"
-        );
-        assert!(text.contains(elsewhere.to_str().unwrap()), "{text}");
-        refused_before_anything_changed(&f, &err);
-    }
-
-    #[tokio::test]
-    async fn a_working_dir_label_that_names_nothing_here_is_refused_and_quoted() {
+    async fn a_working_dir_label_of_the_project_that_names_nothing_here_is_refused_and_quoted() {
         for label in [
             None,
             Some("relative/path"),
             Some("/does/not/exist\"\n\u{1b}[31mforged"),
         ] {
             let f = fixture(STOP_TRUE);
-            f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-            f.docker.script_working_dir([Ok(label.map(str::to_owned))]);
-            let err = deploy(&f).await.unwrap_err();
+            let err = refused_finding(&f, vec![found(true, true, label)]).await;
             assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
             let text = err.to_string();
             assert!(
                 !text.contains('\n') && !text.contains('\u{1b}'),
                 "the label is quoted: {text}"
             );
-            refused_before_anything_changed(&f, &err);
         }
+    }
+
+    #[tokio::test]
+    async fn another_project_elsewhere_with_the_same_service_name_passes() {
+        let f = fixture(STOP_TRUE);
+        healthy_deploy(&f);
+        let elsewhere = f.dir.with_file_name("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        f.docker.script_service_containers([Ok(vec![
+            found(true, false, elsewhere.to_str()),
+            found(false, false, elsewhere.to_str()),
+            // Its label can't be resolved, which only matters in this project.
+            found(true, false, Some("/does/not/exist")),
+            found(true, false, None),
+        ])]);
+
+        let report = deploy(&f).await.unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_container_of_another_project_in_this_directory_passes() {
+        let f = fixture(STOP_TRUE);
+        healthy_deploy(&f);
+        let dir = found_dir(&f).to_owned();
+        f.docker
+            .script_service_containers([Ok(vec![found(false, false, Some(&dir))])]);
+
+        let report = deploy(&f).await.unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
     }
 
     #[tokio::test]
@@ -4602,11 +4674,7 @@ mod tests {
         let link = f.dir.with_file_name("link");
         std::os::unix::fs::symlink(&f.dir, &link).unwrap();
         f.docker
-            .script_working_dir([Ok(Some(link.to_str().unwrap().to_owned()))]);
-        // By its project it is found, and by the real path it isn't.
-        let id = crate::testing::container_id();
-        f.docker
-            .script_container([Ok(Some(id.clone())), Ok(None), Ok(Some(id))]);
+            .script_service_containers([Ok(vec![found(true, true, link.to_str())])]);
 
         let report = deploy(&f).await.unwrap();
 
@@ -4616,39 +4684,42 @@ mod tests {
     #[tokio::test]
     async fn several_running_containers_are_refused_naming_the_fix() {
         let f = fixture(STOP_TRUE);
-        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-        let id = crate::testing::container_id();
-        f.docker.script_containers([Ok(vec![id.clone(), id])]);
-        let err = deploy(&f).await.unwrap_err();
+        let dir = found_dir(&f).to_owned();
+        let err = refused_finding(
+            &f,
+            vec![found(true, true, Some(&dir)), found(true, true, Some(&dir))],
+        )
+        .await;
         assert!(
             matches!(err, DeployError::SeveralContainers { .. }),
             "{err}"
         );
         assert!(err.to_string().contains("--scale app=1"), "{err}");
-        refused_before_anything_changed(&f, &err);
     }
 
     #[tokio::test]
     async fn a_second_project_in_the_directory_is_refused() {
         let f = fixture(STOP_TRUE);
-        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-        let id = crate::testing::container_id();
-        // One of its own by the project's name, two by the directory.
-        f.docker
-            .script_containers([Ok(vec![id.clone()]), Ok(vec![id.clone(), id])]);
-        let err = deploy(&f).await.unwrap_err();
+        let dir = found_dir(&f).to_owned();
+        let err = refused_finding(
+            &f,
+            vec![
+                found(true, true, Some(&dir)),
+                found(true, false, Some(&dir)),
+            ],
+        )
+        .await;
         assert!(
             matches!(err, DeployError::SeveralContainers { .. }),
             "{err}"
         );
-        refused_before_anything_changed(&f, &err);
     }
 
     #[tokio::test]
     async fn a_failing_container_lookup_is_refused_before_the_marker() {
         let f = fixture(STOP_TRUE);
         f.docker.script_compose_service([Ok(image(Some(OLD)))]);
-        f.docker.script_container([Err("daemon gone")]);
+        f.docker.script_service_containers([Err("daemon gone")]);
         let err = deploy(&f).await.unwrap_err();
         assert!(matches!(err, DeployError::Compose { .. }), "{err}");
         refused_before_anything_changed(&f, &err);

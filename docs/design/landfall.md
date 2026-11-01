@@ -249,9 +249,11 @@ Host-side enforcement is later.
   Back it up with the host, but keep it out of the host's config repo.
 - Services with `build:` are refused, and so is any number of containers of the service but one: `scale` or
   `deploy.replicas` other than 1, a service scaled by hand, or a container running from the directory
-  under another project's name.
+  under another project's name, through a symlink or not.
 - The compose file lives in the compose directory, and the project's name is that directory's alone: a
-  running container of the project started from another directory is refused, as a deploy would replace it.
+  container of the project started from another directory, running or stopped, is refused, as a deploy would
+  replace it. Rollback and `recover` don't repeat these checks, so a stack started under the same name
+  afterwards isn't noticed.
 - Other image updaters must not manage a service landfall manages.
 - The agent compares the running container's image with its override every minute and reports drift
   as an error.
@@ -272,9 +274,9 @@ Rollback target is always the previously healthy digest. A rollback runs the dep
 too, and starts the service even if an operator had stopped it before the deploy.
 
 **A rollback whose `up` fails.** Whatever is running stays running, with the critical state and deploys
-blocked: the agent does not force a stop. If nothing stopped the service (no backup declared, or a failed
-one without `stop`), that can be the failed release, still serving. If it stopped for a backup that then
-failed, or for the restore of a completed one, nothing of it is running unless the failed `up` started
+blocked: the agent does not force a stop. With no backup declared, nothing stopped the service, so that can
+be the failed release, still serving. A failed backup without `stop` happens before the override and `up`, so
+what is left running is the previous version. If it stopped for a backup that then failed, or for the restore of a completed one, nothing of it is running unless the failed `up` started
 something. A later `recover` of a completed restore stops nothing, so the previous version can still be up.
 What `docker compose up` did itself before failing is compose's.
 

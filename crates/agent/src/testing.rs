@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use jiff::Timestamp;
 
-use crate::docker::{ContainerId, ContainerInfo, Docker, DockerCli, DockerError, ServiceConfig};
+use crate::docker::{
+    ContainerId, ContainerInfo, Docker, DockerCli, DockerError, ServiceConfig, ServiceContainer,
+};
 
 /// The image of tests against a real Docker daemon: busybox 1.37, by the
 /// digest of its multi-platform index.
@@ -93,8 +95,13 @@ pub enum Call {
     },
     /// `inspect(id)`.
     Inspect(ContainerId),
-    /// `compose_working_dir(id)`.
-    WorkingDir(ContainerId),
+    /// `service_containers(dir, service)`.
+    ServiceContainers {
+        /// Compose directory.
+        dir: PathBuf,
+        /// Service name.
+        service: String,
+    },
     /// `exec(id, argv)`.
     Exec {
         /// Container.
@@ -151,9 +158,7 @@ struct Inner {
     stopped: bool,
     inspect: Script<ContainerInfo>,
     inspect_after_up: BTreeMap<usize, Script<ContainerInfo>>,
-    working_dir: Script<Option<String>>,
-    /// The directory of the last `container` call.
-    looked_up_in: Option<PathBuf>,
+    service_containers: Script<Vec<ServiceContainer>>,
     exec: Script<bool>,
     logs_contain: Script<bool>,
 }
@@ -226,8 +231,7 @@ impl FakeDocker {
                 stopped: false,
                 inspect: Script::empty(),
                 inspect_after_up: BTreeMap::new(),
-                working_dir: Script::empty(),
-                looked_up_in: None,
+                service_containers: Script::empty(),
                 exec: Script::empty(),
                 logs_contain: Script::empty(),
             }),
@@ -348,9 +352,10 @@ impl FakeDocker {
         script_inspect, inspect, ContainerInfo
     );
     script_setter!(
-        /// Replies of `compose_working_dir`. Default: the directory of the last
-        /// `container` call, as for a service started there.
-        script_working_dir, working_dir, Option<String>
+        /// Replies of `service_containers`. Default: the id from [`container_id`],
+        /// in the project and started from the directory asked about, running
+        /// unless a `compose_stop` has stopped it.
+        script_service_containers, service_containers, Vec<ServiceContainer>
     );
     script_setter!(
         /// Replies of `exec`. Default: an error.
@@ -449,7 +454,6 @@ impl Docker for FakeDocker {
             service: service.to_owned(),
         })
         .await;
-        self.lock().looked_up_in = Some(dir.to_owned());
         self.found_container()
     }
 
@@ -481,16 +485,27 @@ impl Docker for FakeDocker {
         lift("inspect", reply.unwrap_or(Err("unscripted inspect")))
     }
 
-    async fn compose_working_dir(&self, id: &ContainerId) -> Result<Option<String>, DockerError> {
-        self.record(Call::WorkingDir(id.clone())).await;
+    async fn service_containers(
+        &self,
+        dir: &Path,
+        service: &str,
+    ) -> Result<Vec<ServiceContainer>, DockerError> {
+        self.record(Call::ServiceContainers {
+            dir: dir.to_owned(),
+            service: service.to_owned(),
+        })
+        .await;
         let mut inner = self.lock();
-        let reply = inner.working_dir.next().unwrap_or_else(|| {
-            Ok(inner
-                .looked_up_in
-                .as_ref()
-                .map(|dir| dir.to_string_lossy().into_owned()))
+        let running = !inner.stopped;
+        let reply = inner.service_containers.next().unwrap_or_else(|| {
+            Ok(vec![ServiceContainer {
+                id: container_id(),
+                running,
+                in_project: true,
+                working_dir: Some(dir.to_string_lossy().into_owned()),
+            }])
         });
-        lift("docker inspect", reply)
+        lift("docker ps", reply)
     }
 
     async fn exec(&self, id: &ContainerId, argv: &[String]) -> Result<bool, DockerError> {
