@@ -14,7 +14,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   identifiers, configuration types and the pure verification and rule logic.
 - `landfall-origin` (`crates/origin`): release origin verification that needs
   the Sigstore stack or the network: build-provenance bundles and their
-  Fulcio certificate identity.
+  Fulcio certificate identity, the TUF trust root, and the fetchers for
+  signed tag objects (GitHub API), image indexes and bundles (GHCR).
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI.
