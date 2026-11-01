@@ -111,10 +111,10 @@ pub struct Deployed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Checking the project. No service has been touched; only the override
-    /// can be out of place.
+    /// Checking the project and pulling the image. No service has been
+    /// touched; only the override can be out of place.
     Preflight,
-    /// Going forward. The deploy has finished only if [`Deployed`] names its
+    /// Going forward: the service may have been touched. The deploy has finished only if [`Deployed`] names its
     /// id: that is written once the checks have passed.
     Deploying,
     /// Going back. A [`Deployed`] that names this deploy means nothing here:

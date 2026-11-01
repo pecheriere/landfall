@@ -382,15 +382,16 @@ pub enum DeployError {
 }
 
 /// Deploys `plan`: preflight, `in-progress.json`, a check of the project with
-/// the new override, the marker's move to [`Phase::Deploying`], pull, backup, override, `up`, image check and post-deploy
-/// checks. A failure from the backup on rolls back. The report is written
-/// before this returns, on every outcome, and the outcome goes to the journal.
+/// the new override, pull, the marker's move to [`Phase::Deploying`], stop if
+/// the backup asks for it, backup, override, `up`, image check and post-deploy
+/// checks. A failure from that stop on rolls back. The report is written before
+/// this returns, on every outcome, and the outcome goes to the journal.
 ///
 /// # Errors
 ///
 /// [`DeployError`] when the deploy never started: the deployment is locked or
-/// has an interrupted deploy, the preflight refused, or the pull failed. No
-/// service was touched. The override and the marker are as they were, other
+/// has an interrupted deploy, the preflight refused, the pull failed, or a state
+/// file could not be written. No service was touched. The override and the marker are as they were, other
 /// than a placeholder override where there was none, unless the error is
 /// [`DeployError::LeftBlocked`], which keeps the marker and names `recover`.
 pub async fn run<D: Docker>(
@@ -753,9 +754,10 @@ impl<D: Docker> Engine<'_, D> {
         }
     }
 
-    /// What can be refused without changing anything: the backup's paths, and
-    /// the project as it is. This reads the project leniently, since a first
-    /// deploy may start from a service without an image.
+    /// What can be refused before the marker goes in: the backup's paths, and
+    /// the project as it is. The only change is a placeholder override where
+    /// there was none. This reads the project leniently, since a first deploy
+    /// may start from a service without an image.
     async fn preflight(&self) -> Result<Preflight, DeployError> {
         if let Some(backup) = self.deployment.backup() {
             rel_paths(backup.paths()).map_err(|source| DeployError::BackupPath {
@@ -793,6 +795,7 @@ impl<D: Docker> Engine<'_, D> {
     /// What a rollback goes back to, then the marker, which promises it. No
     /// marker was there when this runs and the new override has not been
     /// written, so `previous` cannot be the override of an unfinished deploy.
+    /// The marker can be on disk even if the write reports a failure.
     async fn record_in_progress(
         &self,
         marker: &InProgress,
@@ -800,13 +803,15 @@ impl<D: Docker> Engine<'_, D> {
     ) -> Result<(), DeployError> {
         let state = self.state.clone();
         let marker = marker.clone();
-        self.file("record in-progress", move || {
-            state.set_previous_deployed(state.deployed()?.as_ref())?;
-            state.set_previous_override(&previous)?;
-            state.set_in_progress(&marker)
-        })
-        .await
-        .map_err(|e| self.file_error(e))
+        let written = self
+            .file("record in-progress", move || {
+                state.set_previous_deployed(state.deployed()?.as_ref())?;
+                state.set_previous_override(&previous)?;
+                state.set_in_progress(&marker)
+            })
+            .await;
+        self.settle_marker_write(written, "recording the deploy's start")
+            .await
     }
 
     /// With the marker written: reads the project with the new override in
@@ -869,9 +874,9 @@ impl<D: Docker> Engine<'_, D> {
         }
     }
 
-    /// The checks are over and the deploy goes ahead: from here on `recover`
-    /// has to assume the service was touched. A write that fails leaves nothing
-    /// but the marker; one past its deadline may yet land after a clear.
+    /// The checks and the pull are over and nothing was touched yet. The next
+    /// step may touch the service, so from here on `recover` has to assume it
+    /// did.
     async fn start_deploying(&self, marker: &InProgress) -> Result<(), DeployError> {
         let state = self.state.clone();
         let next = InProgress {
@@ -881,10 +886,22 @@ impl<D: Docker> Engine<'_, D> {
         let written = self
             .file("mark deploying", move || state.set_in_progress(&next))
             .await;
+        self.settle_marker_write(written, "recording that the deploy goes ahead")
+            .await
+    }
+
+    /// A marker write before anything was touched: one that failed leaves at
+    /// most the marker, which is cleared, and one past its deadline may yet
+    /// land after a clear, so that keeps deploys blocked.
+    async fn settle_marker_write(
+        &self,
+        written: Result<(), FileFailure>,
+        failed: &'static str,
+    ) -> Result<(), DeployError> {
         match written {
             Ok(()) => Ok(()),
             Err(source @ FileFailure::Deadline { .. }) => {
-                Err(self.left_blocked(None, "recording that the deploy goes ahead", source))
+                Err(self.left_blocked(None, failed, source))
             }
             Err(source) => Err(self.abandon(self.file_error(source)).await),
         }
@@ -938,9 +955,6 @@ impl<D: Docker> Engine<'_, D> {
             self.verify_override(plan, preflight.previous),
         )
         .await?;
-        rec.step("mark_deploying", self.start_deploying(&marker))
-            .await?;
-        marker.phase = Phase::Deploying;
         let pulled = rec
             .step("pull", async {
                 self.docker
@@ -956,6 +970,9 @@ impl<D: Docker> Engine<'_, D> {
         if let Err(refused) = pulled {
             return Err(self.abandon(refused).await);
         }
+        rec.step("mark_deploying", self.start_deploying(&marker))
+            .await?;
+        marker.phase = Phase::Deploying;
 
         // From here on, the report tells how it went.
         let outcome = match self.forward(plan, &mut rec, &mut marker).await {
@@ -1832,8 +1849,8 @@ mod tests {
                 "preflight",
                 "record_in_progress",
                 "verify_override",
-                "mark_deploying",
                 "pull",
+                "mark_deploying",
                 "stop",
                 "backup",
                 "record_backup",
@@ -2707,7 +2724,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_during_the_pull_counts_as_deploying() {
+    async fn crash_during_the_pull_changes_nothing() {
         let f = fixture(STOP_TRUE);
         resolves(&f, Some(OLD));
 
@@ -2715,13 +2732,110 @@ mod tests {
 
         assert_eq!(
             f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Preflight,
+            "nothing is touched by a pull"
+        );
+        let calls = f.docker.calls().len();
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::NothingChanged { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(f.docker.calls().len(), calls, "no stop, up or check");
+        assert_eq!(override_text(&f.dir), PREVIOUS);
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn crash_right_after_the_pull_may_have_touched_the_service() {
+        // The stop for the backup is the first thing that touches it.
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+
+        crash_at(&f, 0, |c| matches!(c, Call::ComposeStop { .. })).await;
+
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
             Phase::Deploying,
-            "on disk before the pull"
+            "on disk before the stop"
         );
     }
 
     #[tokio::test]
-    async fn failed_move_to_deploying_is_a_refusal_before_the_pull() {
+    async fn failed_record_in_progress_leaves_no_marker_behind() {
+        // The rename landed and the directory `fsync` after it failed.
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+
+        let err = with_faults([("record in-progress", vec![Fault::FailAfter])], deploy(&f))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DeployError::File { .. }), "{err}");
+        assert_eq!(changes(&f), ["config"], "no new override read, no pull");
+        assert_eq!(override_text(&f.dir), PREVIOUS);
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_record_in_progress_whose_clear_fails_names_recover() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+
+        let err = with_faults(
+            [
+                ("record in-progress", vec![Fault::FailAfter]),
+                ("clear in-progress", vec![Fault::Fail]),
+            ],
+            deploy(&f),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, DeployError::LeftBlocked { .. }), "{err}");
+        assert!(
+            err.to_string().contains("recover --deployment app/prod"),
+            "{err}"
+        );
+        assert_ne!(f.state.in_progress().unwrap(), None);
+
+        let report = recovered(&f).await.unwrap();
+        assert!(matches!(report.outcome, Outcome::NothingChanged { .. }));
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn record_in_progress_past_its_deadline_blocks_and_recovers() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        let (release, late) = std::sync::mpsc::channel();
+
+        let err = with_faults(
+            [("record in-progress", vec![Fault::Late(late)])],
+            deploy(&f),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, DeployError::LeftBlocked { .. }), "{err}");
+        assert!(
+            err.to_string().contains("recover --deployment app/prod"),
+            "{err}"
+        );
+        assert_eq!(changes(&f), ["config"], "no new override read, no pull");
+        release.send(()).unwrap();
+        late_work_has_ended(&f).await;
+        assert_ne!(f.state.in_progress().unwrap(), None, "it did land");
+
+        let report = recovered(&f).await.unwrap();
+        assert!(matches!(report.outcome, Outcome::NothingChanged { .. }));
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_move_to_deploying_is_a_refusal_before_anything_stops() {
         let f = fixture(STOP_TRUE);
         resolves(&f, Some(OLD));
 
@@ -2730,7 +2844,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, DeployError::File { .. }), "{err}");
-        assert_eq!(changes(&f), ["config", "config"], "no pull, stop or up");
+        assert_eq!(changes(&f), ["config", "config", "pull"], "no stop or up");
         assert_eq!(override_text(&f.dir), PREVIOUS);
         assert_eq!(f.state.in_progress().unwrap(), None);
     }
@@ -2747,7 +2861,7 @@ mod tests {
 
         assert!(matches!(err, DeployError::LeftBlocked { .. }), "{err}");
         assert!(err.to_string().contains("recover"), "{err}");
-        assert_eq!(changes(&f), ["config", "config"], "no pull, stop or up");
+        assert_eq!(changes(&f), ["config", "config", "pull"], "no stop or up");
         assert_ne!(f.state.in_progress().unwrap(), None);
         release.send(()).unwrap();
         late_work_has_ended(&f).await;
@@ -2889,6 +3003,16 @@ mod tests {
         assert!(text.contains("recover --deployment app/prod"), "{text}");
         assert_ne!(f.state.in_progress().unwrap(), None);
         assert_eq!(count_stops(&f), 0);
+
+        let report = recovered(&f).await.unwrap();
+        assert!(
+            matches!(report.outcome, Outcome::NothingChanged { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(count_stops(&f), 0);
+        assert_eq!(count_ups(&f), 0);
+        assert_eq!(f.state.in_progress().unwrap(), None);
     }
 
     #[tokio::test]

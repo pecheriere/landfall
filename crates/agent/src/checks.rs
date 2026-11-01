@@ -979,7 +979,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn log_window_of_an_old_start_elapsed_before_since_does_not_wait() {
+    async fn log_window_that_closed_after_since_does_not_wait() {
         let docker = FakeDocker::new();
         let mut info = running(Some("healthy"), &[]);
         info.started_at = Timestamp::now()
