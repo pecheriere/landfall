@@ -582,7 +582,7 @@ fn clip(text: &str) -> String {
 
 /// `text` truncated and double-quoted with escapes, so nothing a container
 /// or a server said can pass for the agent's own words or break a line.
-fn quote(text: &str) -> String {
+pub(crate) fn quote(text: &str) -> String {
     format!("{:?}", clip(text))
 }
 

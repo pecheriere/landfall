@@ -112,7 +112,9 @@ pub struct InProgress {
     pub tag: ReleaseTag,
     /// Its image digest.
     pub digest: ImageDigest,
-    /// Whether the previous version was running when the deploy began.
+    /// Whether there is a previous version to start: the compose project gave
+    /// the service an image before the deploy. On a first deploy from a base
+    /// file without one, rollback stops the service instead.
     pub previous_can_start: bool,
     /// The backup taken for this deploy, if any.
     pub backup: Option<String>,

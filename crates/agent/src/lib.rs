@@ -3,7 +3,9 @@
 
 pub mod checks;
 pub mod compose;
+pub mod deploy;
 pub mod docker;
+pub mod journal;
 pub mod safefs;
 pub mod state;
 #[cfg(test)]

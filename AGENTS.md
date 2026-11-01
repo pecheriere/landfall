@@ -29,7 +29,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   by directory descriptor, atomic write, snapshot, restore, prune),
   `docker` (the only code that runs the Docker CLI, behind a trait), `compose`
   (the override file the agent owns, compose directory resolution), `checks`
-  (post-deploy checks: health, HTTP probe, command, log window).
+  (post-deploy checks: health, HTTP probe, command, log window), `deploy` (the
+  sequence, rollback and recovery, recording every step in a report), `journal`
+  (the only code that writes to stderr: syslog-prefixed JSON lines).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 

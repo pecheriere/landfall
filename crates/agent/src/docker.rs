@@ -539,6 +539,26 @@ fn parse_config(raw: &[u8], service: &str) -> Result<ServiceConfig, DockerError>
     })
 }
 
+/// The project's name out of `docker compose config --format json`. As in
+/// [`parse_config`], errors say nothing about the input.
+fn parse_project_name(raw: &[u8]) -> Result<String, DockerError> {
+    #[derive(Deserialize)]
+    struct NameDoc {
+        name: Option<String>,
+    }
+    const LABEL: &str = "docker compose config";
+    let doc: NameDoc = serde_json::from_slice(raw).map_err(|_| DockerError::BadOutput {
+        command: LABEL,
+        reason: "not the expected JSON",
+    })?;
+    doc.name
+        .filter(|name| !name.is_empty())
+        .ok_or(DockerError::BadOutput {
+            command: LABEL,
+            reason: "the project has no name",
+        })
+}
+
 /// `docker inspect --format INSPECT_FORMAT`, as emitted.
 #[derive(Deserialize)]
 struct InspectDoc {
@@ -707,7 +727,9 @@ impl Docker for DockerCli {
         service: &str,
     ) -> Result<ServiceConfig, DockerError> {
         const LABEL: &str = "docker compose config";
-        let cmd = self.compose(dir, &["config", "--format", "json"]);
+        // Without `--no-consistency`, compose refuses a service that has no
+        // image yet, which is what a first deploy starts from (design 7.1).
+        let cmd = self.compose(dir, &["config", "--no-consistency", "--format", "json"]);
         let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
         parse_config(&captured.stdout, service)
     }
@@ -724,7 +746,14 @@ impl Docker for DockerCli {
     async fn compose_stop(&self, dir: &Path, service: &str) -> Result<(), DockerError> {
         const LABEL: &str = "docker compose stop";
         not_a_flag(LABEL, service)?;
-        let cmd = self.compose(dir, &["stop", "--", service]);
+        // By project name, which doesn't load the project: compose refuses
+        // one where the service has no image, and that is the state a failed
+        // first deploy goes back to with its container still running.
+        let config = self.compose(dir, &["config", "--no-consistency", "--format", "json"]);
+        let captured = Self::run_compose(LABEL, config, self.timeout).await?;
+        let project = parse_project_name(&captured.stdout)?;
+        not_a_flag(LABEL, &project)?;
+        let cmd = self.compose(dir, &["-p", &project, "stop", "--", service]);
         Self::run_compose(LABEL, cmd, self.long_timeout)
             .await
             .map(drop)
@@ -1463,6 +1492,35 @@ mod tests {
 
             cli.compose_stop(project.path(), "plain").await.unwrap();
             assert_eq!(cli.container(project.path(), "plain").await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        #[ignore = "docker: runs in ci.yml"]
+        async fn docker_config_and_stop_work_on_a_service_without_an_image() {
+            let cli = DockerCli::new();
+            let project = project(&cli).await;
+            cli.compose_up(project.path(), "plain").await.unwrap();
+            let id = cli
+                .container(project.path(), "plain")
+                .await
+                .unwrap()
+                .unwrap();
+            // The override of a failed first deploy has been taken back out.
+            fs::write(
+                project.path().join("compose.yaml"),
+                format!(
+                    "name: {}\nservices:\n  plain:\n    command: [sleep, '300']\n    stop_grace_period: 1s\n",
+                    project.name
+                ),
+            )
+            .unwrap();
+
+            let svc = cli.compose_service(project.path(), "plain").await.unwrap();
+            assert_eq!(svc.image, None);
+            assert!(!svc.has_build);
+
+            cli.compose_stop(project.path(), "plain").await.unwrap();
+            assert_eq!(cli.inspect(&id).await.unwrap().status, "exited");
         }
 
         #[tokio::test]
