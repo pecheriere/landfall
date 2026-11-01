@@ -52,9 +52,18 @@ one deployment. The service's image belongs to the agent:
   ```
 
 - Run `docker compose` from the directory's real path, with `compose.yaml` in it.
-  The agent finds a service's container by the working directory compose labels it
-  with, and through a symlink that label is the symlink's path, so `status` would
-  report such a container as not running.
+  Deploys find a service's container by its project's name, wherever it was started
+  from. `status` must not load the project, so it goes by the working directory
+  compose labels the container with. Through a symlink, or with the compose file in
+  another directory, that label is another path, so `status` reports such a container
+  as not running. After a start through a symlink, `docker compose up -d
+  --force-recreate <service>` from the real path puts the label right.
+- One container per service. A service with `scale` or `deploy.replicas` above 1, one
+  scaled by hand, or a second project running from this directory (`docker compose
+  -p other up`) is refused before anything stops, and the error names the fix.
+- A service behind a profile that isn't active is not in the project, so a deploy
+  is refused as having no such service. Set `COMPOSE_PROFILES` in `.env`, or remove
+  the profile. The agent ignores that variable in its own environment.
 
 Keep `compose.landfall.yaml` out of the host's configuration repository (add it
 to `.gitignore`), and back it up with the host. It changes with every deploy
@@ -146,6 +155,11 @@ forbids it, which is worth trying once with `curl` from the host: the check has
 no way to tell a firewall from a service that is down. Docker on a Mac has no such
 route, so these checks only work on Linux.
 
+`network` is the name Docker knows, as `docker network ls` shows it: usually
+`<project>_<key>`, such as `app_app` for a network `app` in a project `app`, unless
+the network sets its own `name:`. The key alone fails the check, as the container is
+not attached to a network of that name.
+
 ## What a deploy does
 
 The sequence is in the design, section 7.2. What an operator will notice:
@@ -159,6 +173,20 @@ The sequence is in the design, section 7.2. What an operator will notice:
 - **A rollback starts the service, even one an operator had stopped.** The agent
   doesn't record whether it was running before the deploy; a deploy also starts
   it.
+- **If a rollback's `up` of the previous version fails, whatever is running stays
+  running.** The state is critical and deploys are blocked, and the agent doesn't
+  force a stop. Without a backup to restore, that can be the failed release, still
+  serving: `status` shows `running_image_matches: false`. With one, the service was
+  stopped for the restore before that `up`, so it is down unless the failed `up`
+  started it. What `docker compose up` itself did before it failed is compose's.
+- **A rollback whose `up` leaves the container untouched waits the whole log
+  window.** With a `no_log_match` check, a container that was not recreated is
+  observed for all of `within_secs` from just before that `up`, however long ago it
+  started.
+- **A missing external network passes `docker compose config`.** The preflight can't
+  see it, so with `stop = true` the service can be stopped before an `up` that fails,
+  and the rollback then fails the same way if the previous version needs that
+  network too. Create the network first.
 - **Details of a `docker compose` failure are withheld.** It loads the stack's
   `.env` and compose files and quotes their values in its errors, so a report or
   the journal only has the exit status and the command, for example:
@@ -174,7 +202,13 @@ The sequence is in the design, section 7.2. What an operator will notice:
 - **A first deploy has nothing to roll back to,** if the base file gives the
   service no image. A failed one stops the service, puts the placeholder back and
   ends as `failed_no_previous`: not the critical `rollback_failed`.
-- **The newest 3 backups are kept** per deployment. **Reports are not pruned
+- **The newest 3 backups are kept** per deployment, whether deploys succeed or fail.
+  Before a backup they are pruned to 2, to leave room for it, and after a deploy or
+  a completed rollback to 3. The backup an unfinished deploy names is never pruned,
+  and after a failed rollback nothing is pruned until `recover` has finished.
+- **A report records every step,** with what each check took (`attempts`, `millis`)
+  and what a backup copied (`files`, `directories`, `symlinks`, `bytes`), under
+  `detail`, also for checks that failed. **Reports are not pruned
   yet** ([#14](https://github.com/pecheriere/landfall/issues/14)): they are small
   JSON files under `<state dir>/<deployment>/reports/`, where the deployment's
   `/` becomes `__` (`/var/lib/landfall-agent/app__prod/reports/`), one per deploy,
@@ -193,20 +227,25 @@ read those, or accept an error row for that deployment. It prints one JSON objec
 per line, one per deployment of the host:
 
 ```json
-{"deployment":"app/prod","dir":"/srv/compose/app","deployed":{"deploy_id":"...","tag":"v1.2.3","version":"1.2.3","digest":"sha256:...","commit":"...","deployed_at":"2026-11-01T10:00:00Z"},"in_progress":false,"override_file":"pinned","running_image":"\"ghcr.io/example/app@sha256:...\"","drift":false,"error":null}
+{"deployment":"app/prod","dir":"/srv/compose/app","deployed":{"deploy_id":"...","tag":"v1.2.3","version":"1.2.3","digest":"sha256:...","commit":"...","deployed_at":"2026-11-01T10:00:00Z"},"in_progress":false,"phase":null,"override_file":"pinned","running_image":"\"ghcr.io/example/app@sha256:...\"","running_image_matches":true,"drift":false,"error":null}
 ```
 
 - `deployed` is what the agent last recorded, or `null`.
-- `in_progress` means a deploy started and did not finish; see below.
+- `in_progress` means a deploy started and did not finish, and `phase` says how far
+  it got, or is `null`; see below.
 - `override_file` is `missing`, `placeholder`, `pinned`, or `unrecognised` when the
   file isn't one the agent wrote for this service. A missing one is a state to
   report, not a failure: it is what a host looks like before its first deploy.
-- `running_image` is the running container's word, so it is quoted and truncated
-  as any text from a container is, and `null` if none is running.
+- `running_image` is the running container's image, quoted and truncated, only if it
+  is the one the override pins. Any other can come from interpolated configuration
+  (`image: ${IMG}`) and hold a secret, so it is not printed.
+- `running_image_matches` says whether the running container runs the pinned image.
+  Both are `null` if none is running.
 - `drift` is true when a running container's image is not the one the override
-  file pins, or the file is `unrecognised`, whatever `.env` makes of the project.
-  With nothing pinned, or nothing running, it is false. During a deploy a
-  difference is expected, and `in_progress` says so.
+  file pins, the file is `unrecognised`, or it is `missing` while a deploy is on
+  record, whatever `.env` makes of the project. With nothing running it is false, as
+  it is with nothing pinned and nothing on record. During a deploy a difference is
+  expected, and `in_progress` says so.
 - `error` says why a deployment could not be read, and what could not be found out
   is `null`. One bad deployment does not keep the others from being reported.
 
@@ -228,14 +267,44 @@ journalctl -u "landfall-agent-recover@$(systemd-escape app/prod).service"
 `systemctl start` itself returns 1 for any failure of the unit: `ExecMainStatus` is
 the agent's own exit status, from the table below.
 
-It takes the same rollback path as a failed deploy: the previous override, the
-backup if one was completed, start, verify, checks. If the deploy had in fact
-finished and only the clean-up was left, it finishes that instead. A deployment
-with `rollback_failed` in its report also stays blocked until `recover` succeeds.
+It goes by the `phase` of the unfinished deploy, which `status` shows:
+
+| `phase` | What `recover` does | Outcome when it works |
+|---|---|---|
+| `preflight` | The service was never touched: puts the previous override back and leaves the service alone | `nothing_changed` |
+| `deploying` | If the deploy had in fact finished and only the clean-up was left, finishes that. Otherwise the rollback path: the previous override, the backup if one was completed, start, verify, checks | `deployed`, or `rolled_back` |
+| `rolling_back` | The rollback path again, from the start | `rolled_back` |
+| `restored` | The backup is back in full, and the previous version may have been running on it since. Only start, verify and checks: it does not stop the service or restore again, so what that version wrote since is kept | `rolled_back` |
+| `rolled_back` | The previous version is back and checked: removes the marker | `rolled_back` |
+
+The outcome is `failed_no_previous` in place of `rolled_back` when there is no
+previous version to start. A deployment with `rollback_failed` in its report stays
+blocked until `recover` succeeds. So does one whose marker could not be removed,
+whatever the outcome says: that step fails in the report and the exit status is 1.
 It prints the report as JSON on stdout.
 
 | Exit | Meaning |
 |---|---|
-| 0 | the previous version is back, or there is none and the service is stopped, or the deploy had finished |
-| 1 | the rollback failed; deploys stay blocked. Fix the cause and run it again |
+| 0 | the previous version is back, or there is none and the service is stopped, or the deploy had finished, or it had never touched the service; and the marker is gone |
+| 1 | deploys stay blocked: the rollback failed, or the marker could not be removed. Fix the cause and run it again |
 | 2 | it could not run: usage, configuration, state, another process holding the lock, or nothing to recover |
+
+### A marker that stays
+
+`recover` is the way out, and running it again is always safe: it goes by the phase.
+If it keeps exiting 1:
+
+1. Read the failing step in the report it printed, or in `journalctl`. A failed
+   `docker compose` step names the command to run by hand in the compose directory.
+2. Fix that: a dependency that is down, a compose file that doesn't load, a network
+   that is missing. A check that can never pass on the previous version needs the
+   configuration changed.
+3. Run `recover` again. Another deployment's missing directory doesn't stop it.
+
+Removing the marker by hand is the last resort, and only once the service is as you
+want it: nothing checks it afterwards. Hold off while any agent process for the
+deployment is running, then delete `in-progress.json` from
+`<state dir>/<deployment>/`, where the deployment's `/` becomes `__`. The override
+and `deployed.json` stay as they are, so see that they agree with what runs: `status`
+shows the override against the running image as `drift`. A backup the marker named is
+then pruned like any other.

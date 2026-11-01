@@ -25,7 +25,7 @@ host = "home-1"
 compose = { dir = "/srv/compose/app", service = "app" }
 origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
 rule = { auto = "patch", approve = "minor", approvers = ["operator"] }
-checks = [{ http = "/health", network = "app", port = 8080, expect = 200 }]
+checks = [{ http = "/health", network = "app_app", port = 8080, expect = 200 }]
 backup = { paths = ["state"], stop = true }
 
 [[deployment]]
@@ -148,11 +148,14 @@ Each entry is the string `"container-healthy"` or a table with exactly one of
 - `"container-healthy"`: the container's Docker healthcheck reports healthy.
   The image must define a healthcheck; if it defines none, the check fails at
   deploy time.
-- `{ http = "/health", network = "app", port = 8080, expect = 200 }`: an HTTP
+- `{ http = "/health", network = "app_app", port = 8080, expect = 200 }`: an HTTP
   probe. The agent connects from the host to the container's address on the
   named Docker network and the given port, with no proxy and no redirects, so
   the host must be able to reach that network (true for Docker bridge
-  networks on Linux, unless a firewall forbids it). The path starts with `/`
+  networks on Linux, unless a firewall forbids it). `network` is the name Docker
+  knows, as `docker network ls` shows it, not the key in the compose file:
+  usually `<project>_<key>`, so `app_app` for a network `app` in a project `app`,
+  unless the network sets its own `name:`. The path starts with `/`
   and contains only visible ASCII (no spaces or control characters); the
   network matches Docker's network name grammar `[A-Za-z0-9][A-Za-z0-9_.-]*`,
   at most 128 bytes; `port` is a TCP port from 1 to 65535 and is required;

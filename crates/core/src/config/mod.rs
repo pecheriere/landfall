@@ -764,7 +764,7 @@ host = "home-1"
 compose = { dir = "/srv/compose/app", service = "app" }
 origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
 rule = { auto = "patch", approve = "minor", approvers = ["operator"] }
-checks = [{ http = "/health", network = "app", port = 8080, expect = 200 }]
+checks = [{ http = "/health", network = "app_app", port = 8080, expect = 200 }]
 backup = { paths = ["state"], stop = true }
 
 [[deployment]]
@@ -994,7 +994,7 @@ can = ["view", "request", "approve", "rollback"]
 
         // 5: checks non-empty.
         let err = parse_str(&edited(
-            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]",
+            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]",
             "checks = []",
         ))
         .unwrap_err();
@@ -1017,7 +1017,7 @@ can = ["view", "request", "approve", "rollback"]
         assert!(matches!(err, ConfigError::SelfPromotion(_)), "{err}");
         assert!(err.to_string().contains("app/staging"));
         let cyclic = edited(
-            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]",
+            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]",
             "checks = [\"container-healthy\"]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
         );
         let err = parse_str(&cyclic).unwrap_err();
@@ -1472,8 +1472,8 @@ promote_to = { deployment = "app/staging", healthy_for = "1h" }
 id = "app/prod""#;
         let text = edited("\n[[deployment]]\nid = \"app/prod\"", canary);
         let text = text.replacen(
-            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]",
-            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
+            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]",
+            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
             1,
         );
         let err = parse_str(&text).unwrap_err();
