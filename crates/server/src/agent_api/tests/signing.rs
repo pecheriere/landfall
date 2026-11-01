@@ -1,16 +1,18 @@
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::http::header::CACHE_CONTROL;
 use axum::http::{Method, Request, StatusCode};
 use landfall_core::protocol::{
-    self, HOST_HEADER, MAX_BODY_BYTES, NONCE_HEADER, Nonce, SIGNATURE_HEADER, WorkRequest,
+    self, HOST_HEADER, MAX_BODY_BYTES, NONCE_HEADER, Nonce, SIGNATURE_HEADER, SigningKey,
+    WorkRequest,
 };
 use serde_json::json;
 
 use super::{Harness, REPORT, WORK, host, signed_request, signing_key, test_limits};
 use crate::agent_api::Limits;
+use crate::agent_api::signed::UNKNOWN_HOST_SEED;
 use crate::store::NONCE_LIFETIME_SECS;
 
 fn work_body(h: &Harness) -> Vec<u8> {
@@ -338,6 +340,47 @@ async fn an_oversized_body_says_nothing_about_which_hosts_exist() {
     assert_eq!(answers[0].status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(answers[1].status, answers[0].status);
     assert_eq!(answers[1].body, answers[0].body);
+}
+
+/// The key for an unknown host is public, so a good signature by it must count
+/// for nothing.
+#[tokio::test]
+async fn a_signature_by_the_unknown_host_key_is_refused() {
+    let h = Harness::new().await;
+    let key = SigningKey::from_bytes(&UNKNOWN_HOST_SEED);
+    let nonce = h.nonce().await;
+    let request = signed_request("nobody", &key, WORK, WORK, &nonce, work_body(&h));
+    let answer = h.send(request).await;
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(answer.code(), "bad_signature");
+}
+
+/// The quickest of a few refusals for a body at the limit.
+async fn quickest_refusal(h: &Harness, name: &str, key: &SigningKey) -> Duration {
+    let mut quickest = Duration::MAX;
+    for _ in 0..5 {
+        let nonce = h.nonce().await;
+        let mut request = signed_request(name, key, WORK, WORK, &nonce, Vec::new());
+        *request.body_mut() = Body::from(vec![b' '; MAX_BODY_BYTES]);
+        let started = Instant::now();
+        let answer = h.send(request).await;
+        quickest = quickest.min(started.elapsed());
+        assert_eq!(answer.code(), "bad_signature");
+    }
+    quickest
+}
+
+/// Most of this refusal's time is hashing a large body, so an unknown host skipping
+/// the work takes a small fraction of a known host's time. The margin is wide, and
+/// the quickest of several ignores a busy machine: the two take about the same.
+#[tokio::test]
+async fn an_unknown_host_takes_as_long_to_refuse_as_a_known_one() {
+    let h = Harness::new().await;
+    h.enrolled("host-a", 1).await;
+    let wrong = signing_key(9);
+    let known = quickest_refusal(&h, "host-a", &wrong).await;
+    let unknown = quickest_refusal(&h, "nobody", &wrong).await;
+    assert!(unknown * 2 >= known, "{unknown:?} against {known:?}");
 }
 
 #[tokio::test]

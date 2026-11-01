@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use landfall_core::protocol::{DeployedRelease, Phase, RunningState, WorkRequest};
 use sqlx::Row as _;
 
-use super::{Harness, WORK, deployed_report, test_limits};
+use super::{Harness, WORK, deployed_report, host, test_limits};
 use crate::agent_api::Limits;
 
 const A: &str = "host-a";
@@ -207,6 +207,7 @@ async fn a_new_long_poll_ends_the_old_one_empty() {
     .await;
     let a = h.enrolled(A, 1).await;
     let b = h.enrolled(B, 2).await;
+    let a_host = host(A);
 
     // The first ends because of the second, and for no other reason: shutdown
     // comes only after it has answered. Host B's poll is not touched by either.
@@ -216,7 +217,10 @@ async fn a_new_long_poll_ends_the_old_one_empty() {
         answer
     };
     let second = async {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Only once the first is waiting, however long that takes it.
+        while !h.state.polls.lock().unwrap().contains_key(&a_host) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         h.work(A, &a, Vec::new()).await
     };
     let other = h.work(B, &b, Vec::new());

@@ -3,7 +3,8 @@
 //! A bad signature or an invalid enrolment code could come from anyone, so
 //! auditing them would let anyone fill the audit log. They go to stderr instead,
 //! and even that is capped, so that they cannot fill the disk through it.
-//! Refusals a signer or a valid code can be held to are in the audit log.
+//! Refusals a signer or a valid code can be held to are in the audit log. A
+//! connection refused for its source's cap goes here too, from `serve`.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -50,12 +51,12 @@ impl Window {
 
 /// The capped log, shared by the requests.
 #[derive(Debug, Default)]
-pub(super) struct RefusalLog(Mutex<Window>);
+pub(crate) struct RefusalLog(Mutex<Window>);
 
 impl RefusalLog {
     /// Writes `line`, unless too many have gone already. `line` must hold only
     /// validated values.
-    pub(super) fn note(&self, now: i64, line: &str) {
+    pub(crate) fn note(&self, now: i64, line: &str) {
         let admit = self
             .0
             .lock()

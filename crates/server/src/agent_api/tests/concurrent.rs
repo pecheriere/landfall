@@ -37,6 +37,12 @@ fn count(kinds: &[String], kind: &str) -> usize {
     kinds.iter().filter(|k| *k == kind).count()
 }
 
+/// This pins the outcome, not how it is reached, and it cannot pin the lock mode.
+/// The window is between two statements inside `enrol`, with nothing to hold it
+/// open from here, so most runs never overlap there. And an overlap would change
+/// little: under `BEGIN DEFERRED` the loser's write fails on its stale snapshot,
+/// so one code still enrols one key, and the loser gets `busy`, not a second
+/// enrolment. `a_transaction_takes_the_write_lock_at_once` pins the mode directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_code_enrols_one_key_however_many_race_for_it() {
     let (_dir, h) = harness().await;

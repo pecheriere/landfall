@@ -6,8 +6,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use landfall_core::protocol::{
-    self, EnrolRequest, HOST_HEADER, NONCE_HEADER, Nonce, NonceResponse, SIGNATURE_HEADER,
-    SigningKey, WorkRequest, WorkResponse,
+    self, EnrolRequest, HOST_HEADER, MAX_BODY_BYTES, NONCE_HEADER, Nonce, NonceResponse, Problem,
+    SIGNATURE_HEADER, SigningKey, WorkRequest, WorkResponse,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -98,6 +98,54 @@ async fn queue(store: &Store) {
     store.queue_deploy(&mut tx, &deploy).await.unwrap();
     tx.commit().await.unwrap();
     store.wake_agents();
+}
+
+/// A body over the limit is read far enough that its sender hears why, rather
+/// than having the connection reset under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_body_a_little_over_the_limit_gets_its_answer_over_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("controller.db"))
+        .await
+        .unwrap();
+    let config = landfall_core::config::parse(super::CONFIG.as_bytes()).unwrap();
+    let state = ApiState::new(store, config, test_limits());
+    let app = crate::router(state.clone());
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn(serve::run(
+        listener,
+        app,
+        ServeOptions::default(),
+        async move {
+            drop(stopped.await);
+            state.begin_shutdown();
+        },
+    ));
+
+    let (status, body) = signed_post(
+        addr,
+        &signing_key(1),
+        WORK,
+        &vec![b' '; MAX_BODY_BYTES + 32 * 1024],
+    )
+    .await;
+    assert_eq!(status, 413);
+    let problem: Problem = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem.code, "body_too_large");
+
+    let (status, _) = exchange(
+        addr,
+        &format!("POST {ENROL}"),
+        &[],
+        &vec![b' '; 4 * 1024 + 32 * 1024],
+    )
+    .await;
+    assert_eq!(status, 413);
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -18,6 +18,19 @@ async fn impatient() -> (TempDir, Harness, Store) {
     (dir, Harness::on_store(store, test_limits()), writer)
 }
 
+/// A write transaction holds the lock from its first moment, so it never finds,
+/// after reading, that another writer has moved on: which would fail it with
+/// `busy` where it could have waited. See the note on the enrolment race.
+#[tokio::test]
+async fn a_transaction_takes_the_write_lock_at_once() {
+    let (_dir, h, writer) = impatient().await;
+    let lock = writer.begin().await.unwrap();
+    let error = h.store.begin().await.err().unwrap();
+    assert!(error.is_busy(), "{error}");
+    drop(lock);
+    h.store.begin().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_busy_database_is_a_retryable_answer_and_not_a_failure() {
     let (_dir, h, writer) = impatient().await;

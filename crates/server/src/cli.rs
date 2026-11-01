@@ -75,6 +75,34 @@ struct ServeArgs {
     /// TLS-terminating proxy.
     #[arg(long, value_name = "ADDR")]
     listen: SocketAddr,
+    /// How many connections are served at once. More wait to be accepted.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = ServeOptions::default().max_connections,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    max_connections: u32,
+    /// How many of those one source address may hold; more are closed at once and
+    /// logged. Behind a proxy all clients are one source, so raise this to fit the
+    /// fleet there, and know that any client of that proxy can then use it up.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = ServeOptions::default().max_connections_per_source,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    max_connections_per_source: u32,
+}
+
+impl ServeArgs {
+    fn serve_options(&self) -> ServeOptions {
+        ServeOptions {
+            max_connections: self.max_connections,
+            max_connections_per_source: self.max_connections_per_source,
+            ..ServeOptions::default()
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -182,7 +210,7 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
         }
         state.begin_shutdown();
     };
-    crate::serve::run(listener, app, ServeOptions::default(), shutdown).await;
+    crate::serve::run(listener, app, args.serve_options(), shutdown).await;
     Ok(EXIT_OK)
 }
 
@@ -260,6 +288,45 @@ mod tests {
     #[test]
     fn command_line_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    fn parsed_serve_options(extra: &[&str]) -> Result<ServeOptions, clap::Error> {
+        let base = [
+            "landfall-server",
+            "serve",
+            "--config",
+            "c.toml",
+            "--db",
+            "x.db",
+            "--listen",
+            "127.0.0.1:0",
+        ];
+        let cli = Cli::try_parse_from(base.iter().chain(extra))?;
+        let Command::Serve(args) = cli.command else {
+            panic!("not serve");
+        };
+        Ok(args.serve_options())
+    }
+
+    #[test]
+    fn connection_caps_can_be_set_and_default_to_the_servers_own() {
+        assert_eq!(parsed_serve_options(&[]).unwrap(), ServeOptions::default());
+        let options = parsed_serve_options(&[
+            "--max-connections",
+            "2048",
+            "--max-connections-per-source",
+            "512",
+        ])
+        .unwrap();
+        assert_eq!(options.max_connections, 2048);
+        assert_eq!(options.max_connections_per_source, 512);
+    }
+
+    #[test]
+    fn a_connection_cap_of_zero_is_refused() {
+        for flag in ["--max-connections", "--max-connections-per-source"] {
+            assert!(parsed_serve_options(&[flag, "0"]).is_err(), "{flag}");
+        }
     }
 
     #[test]

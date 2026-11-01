@@ -8,13 +8,17 @@
 //!   keep-alive connection: dropped after [`ServeOptions::header_read_timeout`];
 //! - sending a body slowly, or a handler running long: the routes' own deadlines;
 //! - not reading what it is sent: dropped once a write has made no progress for
-//!   [`ServeOptions::write_timeout`]. Without this a client could keep a slot for
-//!   as long as it liked, with requests that need no key.
+//!   [`ServeOptions::write_timeout`];
+//! - reading just fast enough to make progress, or sending one small request after
+//!   another: none of the above applies, and these need no key. So every
+//!   connection has [`ServeOptions::max_connection_lifetime`]: at that age it ends
+//!   between requests, and a request in flight then has
+//!   [`ServeOptions::finish_timeout`] before the connection is dropped anyway. A
+//!   slot always turns over.
 //!
-//! A client reading just fast enough to keep making progress is not caught by
-//! these. What it can hold is bounded by the caps: the connections from one source
-//! are capped, and past that a new one is closed at once; the total is capped, and
-//! past that they wait in the kernel's backlog.
+//! What one client can hold until then is bounded by the caps: the connections
+//! from one source are capped, and past that a new one is closed at once and
+//! logged; the total is capped, and past that they wait in the kernel's backlog.
 
 mod write_deadline;
 
@@ -22,7 +26,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -37,7 +41,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tower::ServiceExt as _;
 
 use self::write_deadline::WriteDeadline;
-use crate::agent_api::{log, source_key};
+use crate::agent_api::{RefusalLog, log, source_key};
 
 /// How long to wait before accepting again after `accept` itself failed, as it
 /// does when the process is out of file descriptors.
@@ -51,10 +55,18 @@ pub struct ServeOptions {
     pub header_read_timeout: Duration,
     /// How long a write may make no progress before the client is dropped.
     pub write_timeout: Duration,
+    /// How long a connection is kept. Longer than a long poll, so that an agent
+    /// is not interrupted by it; a client just reconnects.
+    pub max_connection_lifetime: Duration,
+    /// How long a request in flight has to finish once its connection is past
+    /// its lifetime or the server is stopping. Longer than any request may take,
+    /// so that only a client holding on to its answer is cut off.
+    pub finish_timeout: Duration,
     /// How many connections are served at once.
     pub max_connections: u32,
-    /// How many of those one source may hold. Behind a proxy all agents are one
-    /// source, so this leaves room for a fleet.
+    /// How many of those one source may hold: a small share, so that one source
+    /// cannot take the rest. Behind a proxy all agents are one source, and this
+    /// needs raising: see `docs/operations.md`.
     pub max_connections_per_source: u32,
     /// How long stopping waits for requests in flight.
     pub drain_timeout: Duration,
@@ -65,8 +77,11 @@ impl Default for ServeOptions {
         Self {
             header_read_timeout: Duration::from_secs(10),
             write_timeout: Duration::from_secs(10),
+            max_connection_lifetime: Duration::from_secs(120),
+            // The agent API's request deadline is 45 seconds.
+            finish_timeout: Duration::from_secs(50),
             max_connections: 1024,
-            max_connections_per_source: 256,
+            max_connections_per_source: 32,
             drain_timeout: Duration::from_secs(5),
         }
     }
@@ -117,8 +132,9 @@ async fn until_closing(mut closing: watch::Receiver<bool>) {
     drop(closing.wait_for(|closing| *closing).await);
 }
 
-/// Serves one connection until it ends, or until `closing` says to finish what
-/// it is doing and stop. The peer's address reaches the routes as
+/// Serves one connection until it ends, or until it reaches its lifetime or
+/// `closing` says to stop: then it finishes what it is doing, for up to
+/// [`ServeOptions::finish_timeout`]. The peer's address reaches the routes as
 /// [`ConnectInfo`]. A failed connection is the client's affair: nothing to log.
 async fn serve_connection(
     stream: TcpStream,
@@ -140,12 +156,17 @@ async fn serve_connection(
             service,
         );
     tokio::pin!(connection);
-    tokio::select! {
-        result = connection.as_mut() => drop(result),
-        () = until_closing(closing) => {
-            connection.as_mut().graceful_shutdown();
-            drop(connection.await);
+    let ended = tokio::select! {
+        result = connection.as_mut() => {
+            drop(result);
+            true
         }
+        () = tokio::time::sleep(options.max_connection_lifetime) => false,
+        () = until_closing(closing) => false,
+    };
+    if !ended {
+        connection.as_mut().graceful_shutdown();
+        drop(tokio::time::timeout(options.finish_timeout, connection).await);
     }
     drop(held);
 }
@@ -167,6 +188,8 @@ pub async fn run(
     ));
     let (closing, closing_rx) = watch::channel(false);
     let sources = SourceCounts::default();
+    let refusals = RefusalLog::default();
+    let started = Instant::now();
     tokio::pin!(shutdown);
     loop {
         let permit = tokio::select! {
@@ -194,6 +217,15 @@ pub async fn run(
                         closing_rx.clone(),
                         (permit, slot),
                     ));
+                } else {
+                    let now = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
+                    let line = format!(
+                        "refused a connection from {}: it holds the {} that one source may \
+                         (--max-connections-per-source; behind a proxy all clients are one source)",
+                        source_key(peer.ip()),
+                        options.max_connections_per_source,
+                    );
+                    refusals.note(now, &line);
                 }
             }
             Err(error) => {
@@ -211,7 +243,6 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
-    use std::time::Instant;
 
     use axum::extract::ConnectInfo;
     use axum::routing::get;
@@ -323,7 +354,7 @@ mod tests {
     async fn connections_past_the_cap_wait_their_turn() {
         let server = start(ServeOptions {
             max_connections: 1,
-            header_read_timeout: Duration::from_millis(300),
+            header_read_timeout: Duration::from_secs(1),
             ..ServeOptions::default()
         })
         .await;
@@ -332,11 +363,11 @@ mod tests {
         // The kernel accepts this one, but nothing serves it until the first
         // is dropped for its silence.
         let mut second = TcpStream::connect(server.addr).await.unwrap();
-        second.write_all(REQUEST).await.unwrap();
         let started = Instant::now();
+        second.write_all(REQUEST).await.unwrap();
         let answer = read_to_close(&mut second).await;
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() >= Duration::from_millis(500));
         read_to_close(&mut first).await;
     }
 
@@ -395,15 +426,136 @@ mod tests {
             .write_all(b"GET /big HTTP/1.1\r\nHost: test\r\n\r\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The start of its answer has arrived, so it is being served and holds
+        // the slot. It reads no more of it than this.
+        stuck.read_exact(&mut [0; 12]).await.unwrap();
 
         let mut next = TcpStream::connect(server.addr).await.unwrap();
         next.write_all(REQUEST).await.unwrap();
-        let started = Instant::now();
         let answer = read_to_close(&mut next).await;
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        drop(stuck);
+        // The slot came free because this one was cut off: it does not get it all.
+        assert!(read_what_is_left(&mut stuck).await < BIG);
+    }
+
+    /// The only slot goes to a client that never stops reading, but so slowly that
+    /// its answer would take most of a minute. The next client still gets the slot,
+    /// once the connection's lifetime and the time to finish have passed.
+    #[tokio::test]
+    async fn a_client_that_trickles_does_not_keep_its_slot() {
+        let server = start(ServeOptions {
+            max_connections: 1,
+            header_read_timeout: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(60),
+            max_connection_lifetime: Duration::from_millis(200),
+            finish_timeout: Duration::from_millis(200),
+            ..ServeOptions::default()
+        })
+        .await;
+        let mut trickling = TcpStream::connect(server.addr).await.unwrap();
+        trickling
+            .write_all(b"GET /big HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        trickling.read_exact(&mut [0; 12]).await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut buffer = vec![0; 64 * 1024];
+            loop {
+                match trickling.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        });
+
+        let mut next = TcpStream::connect(server.addr).await.unwrap();
+        next.write_all(REQUEST).await.unwrap();
+        let answer = read_to_close(&mut next).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        reader.abort();
+    }
+
+    /// The only slot goes to a client sending one small request after another,
+    /// each answered, so it is never idle. The next client still gets the slot, and
+    /// the first sees its connection end between requests: every answer whole.
+    #[tokio::test]
+    async fn a_stream_of_small_requests_does_not_keep_its_slot() {
+        let server = start(ServeOptions {
+            max_connections: 1,
+            header_read_timeout: Duration::from_secs(60),
+            max_connection_lifetime: Duration::from_millis(500),
+            ..ServeOptions::default()
+        })
+        .await;
+        let mut busy = TcpStream::connect(server.addr).await.unwrap();
+        // The first answer proves it holds the slot.
+        assert!(keep_alive_exchange(&mut busy).await);
+        let client = tokio::spawn(async move {
+            let mut answered = 1;
+            while keep_alive_exchange(&mut busy).await {
+                answered += 1;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            answered
+        });
+
+        let mut next = TcpStream::connect(server.addr).await.unwrap();
+        next.write_all(REQUEST).await.unwrap();
+        let answer = read_to_close(&mut next).await;
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(client.await.unwrap() >= 1);
+    }
+
+    /// One request and its whole answer on a kept-alive connection, or `false` if
+    /// the connection has ended. An answer cut short panics.
+    async fn keep_alive_exchange(stream: &mut TcpStream) -> bool {
+        let request = b"GET /peer HTTP/1.1\r\nHost: test\r\n\r\n";
+        if stream.write_all(request).await.is_err() {
+            return false;
+        }
+        let mut answer = Vec::new();
+        let mut buffer = [0; 1024];
+        while !answer.ends_with(b"127.0.0.1") {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => {
+                    let text = String::from_utf8_lossy(&answer);
+                    assert!(answer.is_empty(), "an answer was cut short: {text}");
+                    return false;
+                }
+                Ok(count) => answer.extend_from_slice(&buffer[..count]),
+            }
+        }
+        true
+    }
+
+    /// A request running when the connection reaches its lifetime is not cut off.
+    #[tokio::test]
+    async fn a_request_in_flight_finishes_past_the_lifetime() {
+        let server = start(ServeOptions {
+            max_connection_lifetime: Duration::from_millis(50),
+            ..options()
+        })
+        .await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        let answer = read_to_close(&mut stream).await;
+        assert!(answer.ends_with("done"), "{answer}");
+    }
+
+    /// How much more arrives before the connection ends, by close or reset.
+    async fn read_what_is_left(stream: &mut TcpStream) -> usize {
+        let mut total = 0;
+        let mut buffer = vec![0; 64 * 1024];
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer));
+            match read.await.expect("the server should end the connection") {
+                Ok(0) | Err(_) => return total,
+                Ok(count) => total += count,
+            }
+        }
     }
 
     /// A client that keeps reading, however slowly it starts, gets all of it:
@@ -411,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn a_client_that_reads_keeps_its_connection() {
         let server = start(ServeOptions {
-            write_timeout: Duration::from_millis(200),
+            write_timeout: Duration::from_secs(2),
             ..options()
         })
         .await;
@@ -437,8 +589,8 @@ mod tests {
             ..ServeOptions::default()
         })
         .await;
+        // Accepted in order, so this one has the place.
         let held = TcpStream::connect(server.addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Closed at once, long before any timeout could do it.
         let mut over = TcpStream::connect(server.addr).await.unwrap();

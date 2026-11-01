@@ -46,7 +46,7 @@ use self::problem::ApiProblem;
 pub(crate) use self::problem::log;
 use self::rate_limit::RateLimiter;
 pub(crate) use self::rate_limit::source_key;
-use self::refusal_log::RefusalLog;
+pub(crate) use self::refusal_log::RefusalLog;
 use crate::store::Store;
 
 /// The API's limits.

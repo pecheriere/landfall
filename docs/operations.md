@@ -15,6 +15,25 @@ answer with fields or values it does not know, so a mismatched pair refuses each
 other: a newer agent's new report outcome gets `bad_request` from an older
 controller, and the deploy stays claimed until the two match.
 
+## Connections to the controller
+
+Prefer direct connections to the controller, over a tailnet for example. The
+controller limits clients by the address they connect from: by default 32
+connections from one address, out of 1,024 in all, and a rate limit on requests
+that need no key. Past the per-address cap a connection is closed with no answer
+and the controller logs the refusal to stderr, at most 60 such lines a minute. A
+connection lasts at most about two minutes, after which the client reconnects.
+
+Behind a TLS-terminating proxy, the proxy is the one address all agents share. So:
+
+- Raise the cap to fit the fleet, with
+  `landfall-server serve --max-connections-per-source <count>`, and
+  `--max-connections` above it. Each agent holds one connection most of the time,
+  and briefly another.
+- Know what that gives up: any client that can reach the proxy can use up that
+  whole allowance, and so keep the agents out, without having a key. The limits
+  cannot tell them apart, since a forwarding header is something anyone can send.
+
 ## Requirements
 
 - **Linux 5.8 or later.** Copying a symlink into a backup sets its owner and

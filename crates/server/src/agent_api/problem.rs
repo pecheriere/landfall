@@ -30,8 +30,9 @@ pub(crate) enum ApiProblem {
     /// The nonce is unknown, used or expired: fetch another.
     BadNonce,
     /// The host is unknown or the signature does not verify. One code for both,
-    /// reached in the same order with the body read first, so that the answer
-    /// does not say which hosts exist.
+    /// reached in the same order with the body read first and a signature checked
+    /// either way, against a fixed key for an unknown host, so that neither the
+    /// answer nor the time it takes says which hosts exist.
     BadSignature,
     /// The enrolment code is unknown, used, expired or for another host.
     InvalidCode,
