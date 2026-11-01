@@ -5,9 +5,8 @@ what a host needs and what to do when a deploy goes wrong. The design is in
 [`design/landfall.md`](design/landfall.md), section 7, and the configuration
 file in [`configuration.md`](configuration.md).
 
-The agent does not yet have a long-running command: it will get one with the
-controller loop. Today it has `status` and `recover`, and the deploy engine runs
-as a library.
+It has four commands: `enrol` and `run` connect it to a controller, `status` and
+`recover` work on the host alone.
 
 ## Upgrading
 
@@ -165,7 +164,149 @@ the agent's user and not be writable by group or others.
 
 The agent writes one JSON line per event to stderr with a `<N>` syslog priority
 prefix, which journald understands (`SyslogLevelPrefix`, on by default). A
-failed rollback is priority 2, critical.
+failed rollback is priority 2, critical, and so is a controller asking for what
+the host doesn't allow (below).
+
+## Enrolling a host
+
+The agent connects out to the controller, and signs every request with a key only
+it has. On the controller, make a one-time code for the host, valid for an hour:
+
+```sh
+landfall-server enrol-code --host home-1
+```
+
+Put the code in a file on the host that only the agent's user can read: it is not
+taken on the command line, where any user could see it. Then, as the agent's user:
+
+```sh
+landfall-agent enrol --controller https://controller.example --host home-1 --code-file /path/to/code
+```
+
+This generates `agent.key` in the state directory if there isn't one (mode 0600,
+never overwritten, never printed), sends the public key with the code, and prints
+the host and the public key as JSON. Delete the code file afterwards. If it fails,
+run it again with a new code: the key stays. `run` refuses a key file that anyone
+else can read.
+
+The rule for `--controller` is the same on `enrol` and `run`:
+
+- `https://` is what to use. Only a scheme, a host and a port: no path, query or
+  credentials.
+- `http://` needs `--allow-insecure-controller`, and only goes to a loopback
+  address, `localhost` or a tailnet name (`*.ts.net`). Requests are signed, so a
+  listener can't forge or replay one, but work contents are visible. A tailnet's
+  `100.x` addresses are refused, as nothing in the address says it is a tailnet's:
+  use the name.
+
+Redirects are not followed.
+
+## Running the agent
+
+`landfall-agent run` polls the controller, and on each work item decides for itself.
+It deploys one release at a time. Run it as a unit,
+`/etc/systemd/system/landfall-agent.service`, with the capabilities that deploys
+need:
+
+```ini
+[Unit]
+Description=landfall-agent
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+User=landfall-agent
+SupplementaryGroups=docker
+ExecStart=/usr/local/bin/landfall-agent run --config /etc/landfall/fleet.toml --controller https://controller.example --host home-1
+Restart=always
+RestartSec=5
+# A deploy in flight finishes before the agent exits: its deadlines add up to
+# about two hours for a backup and a restore, plus the checks. Only the agent gets
+# SIGTERM: with the default KillMode its `docker compose` would get it too, and
+# the deploy it is waiting on would fail.
+KillMode=mixed
+TimeoutStopSec=3h
+AmbientCapabilities=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_FSETID
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_FSETID
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=landfall-agent
+StateDirectoryMode=0700
+# Every managed compose directory on this host.
+ReadWritePaths=/srv/compose/app
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**It refuses to start** (exit status 2) if the configuration doesn't parse, the host
+has no deployment in it, a compose directory is missing or isn't a directory, two
+deployments resolve to the same directory (a symlink or a bind mount counts), the
+host isn't enrolled, or another `run` holds the state directory. Once it has started
+it doesn't stop for trouble: it waits and tries again, up to five minutes apart.
+
+The configuration is read once. Its SHA-256 goes with every request, and the
+controller holds back a host whose file differs from its own, which is logged as
+`controller_holds_back`. Restart the agent after changing the file.
+
+**A stop finishes the deploy first.** SIGTERM ends a wait for the controller at once.
+A deploy in flight runs to its end and is reported before the process exits, and no
+new one starts.
+
+### What a compromised controller can and can't do
+
+The controller orchestrates, and the host decides. It can only ask. For every work
+item, the host checks by its own configuration and its own records, and runs
+nothing unless all of this holds:
+
+- The deployment is one of this host's.
+- It has no unfinished deploy, and no drift: what runs is what the agent deployed.
+- The deployment's rule makes the move from what the host has on record to this tag
+  `Auto`. A first deploy, a downgrade, the version already running, a pre-release the
+  rule doesn't opt in to, or a step that needs an approval: all are refused.
+- The release verifies, with this host's own trust root, and to the digest and the
+  commit the controller named.
+
+A refusal is reported as `refused` with the reason, and journalled as
+`controller_work_refused`. For a request the rule or the verification refuses that
+is priority 2, critical: **treat it as an alert**, since an honest controller decides
+by the same rule and doesn't ask. A refusal because of a marker or drift is priority
+3, error: the controller can have asked before it heard.
+
+What it can do: withhold work, ask again, and see what the host reports. It can
+also make the host deploy a release that is allowed by all of the above sooner than
+promotion rules on the controller would, which are controller-enforced only.
+
+Verification that can't run, because the registry or GitHub can't be reached, reports
+nothing: the work comes back and is tried again.
+
+### Reports
+
+A report goes to the outbox, `<state dir>/outbox/<deploy id>.json`, before it is sent,
+and is removed when the controller acknowledges it. While the controller is down a
+deploy finishes as usual, the agent asks for no more work, and the report is sent
+when the controller is back. It can arrive twice after a crash at the wrong moment:
+reports are idempotent by deploy id. A report the controller refuses for good (a 4xx
+other than 401, 408 or 429) is dropped and journalled as `report_rejected`; the
+engine's own copy stays under `<deployment>/reports/`.
+
+The controller's number for a deploy is written to
+`<deployment>/controller-claim.json` before the deploy starts, and the file is removed
+when the report is safe. After a crash, it stays with the marker: the agent tells the
+controller the phase and waits for `recover`, and its next poll after that reports
+the outcome under that number, whether or not it was running when `recover` ran. A
+claim with no marker, no report and nothing recorded means that the deploy never
+started: it is dropped, and the controller delivers the work again.
+
+### Drift
+
+Each deployment's drift goes to the controller with every poll, read at most once a
+minute, and a change is journalled as `drift_changed`. A deploy always looks again
+first. A deployment that has drifted gets no automatic deploys until it clears, and
+one whose state or container can't be read is treated the same.
 
 ## HTTP checks
 

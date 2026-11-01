@@ -13,7 +13,8 @@ use serde::Serialize;
 /// How serious an event is, by syslog priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
-    /// A person has to act: a rollback failed.
+    /// A person has to act: a rollback failed, or the controller asked for
+    /// what this host doesn't allow.
     Critical,
     /// Something failed, and the agent dealt with it.
     Error,
@@ -40,7 +41,42 @@ impl Priority {
 /// told so, and must not stop a deploy or a rollback, so that failure is
 /// dropped.
 pub fn emit(priority: Priority, event: &impl Serialize) {
+    #[cfg(test)]
+    capture::record(priority, event);
     let _ = write_line(&mut io::stderr().lock(), priority, event);
+}
+
+/// Test support: what this thread sends to the journal, which a test's fake
+/// and a `current_thread` runtime keep on one thread.
+#[cfg(test)]
+pub(crate) mod capture {
+    use std::cell::RefCell;
+
+    use serde::Serialize;
+
+    use super::Priority;
+
+    thread_local! {
+        static LINES: RefCell<Vec<(Priority, serde_json::Value)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(priority: Priority, event: &impl Serialize) {
+        if let Ok(value) = serde_json::to_value(event) {
+            LINES.with(|lines| lines.borrow_mut().push((priority, value)));
+        }
+    }
+
+    /// The events with this `event` name, so far, on this thread.
+    pub(crate) fn events(name: &str) -> Vec<(Priority, serde_json::Value)> {
+        LINES.with(|lines| {
+            lines
+                .borrow()
+                .iter()
+                .filter(|(_, value)| value["event"] == name)
+                .cloned()
+                .collect()
+        })
+    }
 }
 
 fn write_line(out: &mut impl Write, priority: Priority, event: &impl Serialize) -> io::Result<()> {

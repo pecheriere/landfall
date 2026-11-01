@@ -69,7 +69,7 @@ use rustix::fs::{
     symlinkat, unlinkat, utimensat,
 };
 use rustix::io::Errno;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// How deep a walk goes below where it started, so that a deep tree can neither
 /// overflow the stack nor use up file descriptors. Past this a copy stops with
@@ -449,7 +449,7 @@ fn require_absolute(path: &Path) -> Result<(), SafeFsError> {
 }
 
 /// What a snapshot copied.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotStats {
     /// Regular files copied.
     pub files: u64,

@@ -1,7 +1,7 @@
-//! The command line behind the `landfall-agent` binary: `status` and
-//! `recover`. Results go to stdout as JSON and failures to the journal, with
-//! the exit status saying which: 0 success, 1 rollback failed, 2 could not run
-//! (usage included, which is clap's own status).
+//! The command line behind the `landfall-agent` binary: `status`, `recover`,
+//! `enrol` and `run`. Results go to stdout as JSON and failures to the journal,
+//! with the exit status saying which: 0 success, 1 rollback failed, 2 could not
+//! run (usage included, which is clap's own status).
 
 use std::future::Future;
 use std::io::{self, Write};
@@ -13,9 +13,12 @@ use landfall_core::config::{self, Config, ConfigError, Deployment};
 use landfall_core::ids::{DeploymentId, HostId};
 use serde::Serialize;
 
+use crate::client::{ControllerUrl, UrlError};
 use crate::compose::{self, ComposeError};
+use crate::daemon::{self, DaemonError};
 use crate::deploy::{self, DeployError, DeployReport, DriftError, EngineOptions, OverrideFile};
 use crate::docker::{Docker, DockerCli};
+use crate::enrol::{self, EnrolError, Enrolled};
 use crate::journal::{self, Priority};
 use crate::state::{Deployed, DeploymentState, Phase, StateDir, StateError};
 
@@ -46,7 +49,8 @@ Exit status:
   1  recover ran and deploys stay blocked: the rollback failed, or its marker
      could not be removed; run it again
   2  could not run: usage, configuration, state or Docker; for status, some
-     deployment could not be read (its line has the error)";
+     deployment could not be read (its line has the error); for enrol, the
+     controller refused it; for run, it could not start";
 
 /// Runs on each host: verifies and deploys releases, checks health, rolls back.
 #[derive(Debug, Parser)]
@@ -66,6 +70,52 @@ enum Command {
     Status(StatusArgs),
     /// Finish an interrupted deploy by rolling it back, and print its report.
     Recover(RecoverArgs),
+    /// Generate this host's key if it has none, and enrol it with the
+    /// controller. Prints the host and its public key.
+    Enrol(EnrolArgs),
+    /// Poll the controller for work, verify it, deploy it, report. Runs until
+    /// SIGTERM, and a deploy in flight finishes first.
+    Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+struct EnrolArgs {
+    /// The controller's URL.
+    #[arg(long, value_name = "URL")]
+    controller: String,
+    /// The host the code was issued for.
+    #[arg(long, value_name = "ID")]
+    host: HostId,
+    /// The file holding the code from `landfall-server enrol-code`.
+    #[arg(long, value_name = "FILE")]
+    code_file: PathBuf,
+    /// The agent's state directory.
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+    /// Allow `http://` to a loopback address or a tailnet name: requests are
+    /// signed, but work contents are visible.
+    #[arg(long)]
+    allow_insecure_controller: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    /// The fleet configuration file.
+    #[arg(long, value_name = "FILE")]
+    config: PathBuf,
+    /// The controller's URL.
+    #[arg(long, value_name = "URL")]
+    controller: String,
+    /// This host.
+    #[arg(long, value_name = "ID")]
+    host: HostId,
+    /// The agent's state directory.
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_STATE_DIR)]
+    state_dir: PathBuf,
+    /// Allow `http://` to a loopback address or a tailnet name: requests are
+    /// signed, but work contents are visible.
+    #[arg(long)]
+    allow_insecure_controller: bool,
 }
 
 #[derive(Debug, Args)]
@@ -145,6 +195,15 @@ pub enum CliError {
     /// The result could not be written to stdout.
     #[error("cannot write the result: {0}")]
     Output(#[source] io::Error),
+    /// The controller's URL breaks the transport rule.
+    #[error(transparent)]
+    ControllerUrl(#[from] UrlError),
+    /// Enrolment did not go through.
+    #[error(transparent)]
+    Enrol(#[from] EnrolError),
+    /// The daemon could not start.
+    #[error(transparent)]
+    Daemon(#[from] DaemonError),
 }
 
 /// What `status` prints for one deployment. What could not be found out is
@@ -347,6 +406,12 @@ fn write_report(out: &mut impl Write, report: &DeployReport) -> io::Result<()> {
     out.flush()
 }
 
+fn write_enrolled(out: &mut impl Write, enrolled: &Enrolled) -> io::Result<()> {
+    serde_json::to_writer(&mut *out, enrolled)?;
+    writeln!(out)?;
+    out.flush()
+}
+
 /// Runs the command on real Docker, writing its result to `out`.
 fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
     let docker = DockerCli::new();
@@ -372,6 +437,23 @@ fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
             )??;
             write_report(out, &report).map_err(CliError::Output)?;
             Ok(recover_exit_code(&report))
+        }
+        Command::Enrol(args) => {
+            let url = ControllerUrl::parse(&args.controller, args.allow_insecure_controller)?;
+            let enrolled = block_on_bounded(
+                enrol::enrol(&url, &args.host, &args.state_dir, &args.code_file),
+                SHUTDOWN_WAIT,
+            )??;
+            write_enrolled(out, &enrolled).map_err(CliError::Output)?;
+            Ok(EXIT_OK)
+        }
+        Command::Run(args) => {
+            let url = ControllerUrl::parse(&args.controller, args.allow_insecure_controller)?;
+            block_on_bounded(
+                daemon::run(&args.config, url, &args.host, &args.state_dir),
+                SHUTDOWN_WAIT,
+            )??;
+            Ok(EXIT_OK)
         }
     }
 }
@@ -556,6 +638,79 @@ mod tests {
             assert_ne!(err.kind(), ErrorKind::DisplayHelp);
             assert_eq!(err.exit_code(), i32::from(EXIT_COULD_NOT_RUN), "{args:?}");
         }
+    }
+
+    #[test]
+    fn run_and_enrol_take_what_the_operations_guide_says() {
+        let cli = Cli::try_parse_from([
+            "landfall-agent",
+            "run",
+            "--config",
+            "fleet.toml",
+            "--controller",
+            "https://controller.example",
+            "--host",
+            "home-1",
+        ])
+        .unwrap();
+        let Command::Run(args) = cli.command else {
+            panic!("not run");
+        };
+        assert!(!args.allow_insecure_controller);
+        assert_eq!(args.state_dir.to_str(), Some(DEFAULT_STATE_DIR));
+
+        let cli = Cli::try_parse_from([
+            "landfall-agent",
+            "enrol",
+            "--controller",
+            "http://localhost:8080",
+            "--host",
+            "home-1",
+            "--code-file",
+            "code",
+            "--allow-insecure-controller",
+        ])
+        .unwrap();
+        let Command::Enrol(args) = cli.command else {
+            panic!("not enrol");
+        };
+        assert!(args.allow_insecure_controller);
+    }
+
+    #[test]
+    fn enrol_takes_no_code_on_the_command_line() {
+        let err = Cli::try_parse_from([
+            "landfall-agent",
+            "enrol",
+            "--controller",
+            "https://controller.example",
+            "--host",
+            "home-1",
+            "--code",
+            "5e5e",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn an_http_controller_without_the_flag_could_not_run() {
+        let f = fixture();
+        let cli = Cli::try_parse_from([
+            "landfall-agent",
+            "run",
+            "--config",
+            f.config_file.to_str().unwrap(),
+            "--controller",
+            "http://localhost:8080",
+            "--host",
+            "home-1",
+            "--state-dir",
+            f.state_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        let err = execute(cli, &mut Vec::new()).unwrap_err();
+        assert!(matches!(err, CliError::ControllerUrl(_)), "{err}");
     }
 
     #[test]

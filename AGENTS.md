@@ -38,8 +38,12 @@ passkey approvals. Agents drive it through a typed API. Design:
   (the override file the agent owns, compose directory resolution), `checks`
   (post-deploy checks: health, HTTP probe, command, log window), `deploy` (the
   sequence, rollback and recovery, recording every step in a report), `journal`
-  (the only code that writes to stderr: syslog-prefixed JSON lines), `cli`
-  (`status` and `recover`, behind the thin `main.rs`).
+  (the only code that writes to stderr: syslog-prefixed JSON lines), `client`
+  (the `Controller` trait and the signing HTTP client), `enrol` (the host's key
+  and the enrolment request), `daemon` (`run`: one poll is `daemon::step`, which
+  judges each work item by the host's own rule and records, deploys, and keeps
+  reports in an outbox until acknowledged), `cli` (`status`, `recover`, `enrol`
+  and `run`, behind the thin `main.rs`).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 

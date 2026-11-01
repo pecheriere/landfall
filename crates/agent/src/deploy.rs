@@ -16,7 +16,7 @@ use jiff::tz::TimeZone;
 use landfall_core::config::{Backup, Deployment};
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_origin::release::ReleaseOrigin;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::checks::{CheckOptions, CheckReport, quote, run_checks};
 use crate::compose::{self, Pin};
@@ -143,7 +143,7 @@ impl DeployPlan {
 }
 
 /// How a deploy that started ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
     /// The release is running and passed its checks.
@@ -190,7 +190,7 @@ impl Outcome {
 }
 
 /// How a step ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum StepResult {
     /// It did what it should.
@@ -203,7 +203,7 @@ pub enum StepResult {
 }
 
 /// What one post-deploy check took.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckTiming {
     /// The check's description.
     pub check: String,
@@ -224,7 +224,7 @@ impl From<&CheckReport> for CheckTiming {
 }
 
 /// More about what a step did.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepDetail {
     /// A run of the post-deploy checks, whether it passed or not.
@@ -243,7 +243,7 @@ pub enum StepDetail {
 const CLEAR_STEP: &str = "clear_in_progress";
 
 /// One recorded step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     /// What was done.
     pub name: String,
@@ -259,7 +259,7 @@ pub struct Step {
 }
 
 /// The record of a deploy, or a recovery, that started.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployReport {
     /// The deployment.
     pub deployment: DeploymentId,
