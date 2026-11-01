@@ -45,6 +45,8 @@ sigstore-verify = { version = "0.15.1", default-features = false, features = ["a
 jiff = { version = "0.2.38", default-features = false, features = ["std", "serde"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", default-features = false }
+# Linear-time substring search for the agent's log scan.
+memchr = "2.8.3"
 base64 = "0.23.1"
 # HTTP for the GitHub and registry fetchers: the version and TLS stack the
 # Sigstore TUF client already uses (rustls with aws-lc-rs).

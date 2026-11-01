@@ -26,7 +26,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   `state` (the agent's own directory: deployed and in-progress records,
   the previous override, reports, a per-deployment lock), `safefs` (the only
   code that may touch a directory a container can write to: no-follow walking
-  by directory descriptor, atomic write, snapshot, restore, prune).
+  by directory descriptor, atomic write, snapshot, restore, prune),
+  `docker` (the only code that runs the Docker CLI, behind a trait), `compose`
+  (the override file the agent owns, compose directory resolution).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 
