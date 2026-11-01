@@ -9,7 +9,7 @@ use sigstore_verify::types::{
 use sigstore_verify::{SubjectAltName, VerificationPolicy, Verifier};
 use thiserror::Error;
 
-pub use sigstore_verify::trust_root::TrustedRoot;
+use crate::trust::TrustRoot;
 
 /// What the bundle must say, taken from the deployment's configuration and
 /// the verified release tag.
@@ -129,9 +129,9 @@ pub enum AttestationError {
 /// The OIDC issuer of GitHub Actions workflow identities.
 pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
-/// The largest bundle accepted, in bytes. A GitHub build-provenance bundle is
-/// around 10 KiB.
-pub const MAX_BUNDLE_BYTES: usize = 4 << 20;
+/// The largest bundle accepted, in bytes, by [`verify_bundle`] and by the
+/// fetcher. A GitHub build-provenance bundle is around 10 KiB.
+pub const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The in-toto predicate type of a SLSA build provenance attestation.
 pub const SLSA_PROVENANCE: &str = "https://slsa.dev/provenance/v1";
@@ -172,7 +172,7 @@ const ABSENT: &str = "<absent>";
 pub fn verify_bundle(
     bundle_json: &[u8],
     digest: &ImageDigest,
-    root: &TrustedRoot,
+    root: &TrustRoot,
     expected: &Expected<'_>,
 ) -> Result<VerifiedAttestation, AttestationError> {
     let bundle = parse_bundle(bundle_json)?;
@@ -195,7 +195,7 @@ pub fn verify_bundle(
 
     // The identity is matched below, claim by claim, so a refusal can name
     // the claim; the policy here only requires the cryptographic checks.
-    let verifier = Verifier::new(root).map_err(|e| signature(&e))?;
+    let verifier = Verifier::new(root.inner()).map_err(|e| signature(&e))?;
     let result = verifier
         .verify(artifact, &bundle, &VerificationPolicy::any_identity())
         .map_err(|e| signature(&e))?;
@@ -472,8 +472,10 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AttestationError, CertificateIdentity, Expected, TrustedRoot, match_identity, verify_bundle,
+        AttestationError, CertificateIdentity, Expected, MAX_BUNDLE_BYTES, match_identity,
+        verify_bundle,
     };
+    use crate::trust::TrustRoot;
 
     const BUNDLE: &[u8] = include_bytes!("../tests/fixtures/attestation/bundle.json");
     const TRUSTED_ROOT: &str = include_str!("../tests/fixtures/attestation/trusted_root.json");
@@ -526,8 +528,8 @@ mod tests {
         }
     }
 
-    fn root() -> TrustedRoot {
-        TrustedRoot::from_json(TRUSTED_ROOT).unwrap()
+    fn root() -> TrustRoot {
+        TrustRoot::from_json(TRUSTED_ROOT)
     }
 
     fn digest() -> ImageDigest {
@@ -892,7 +894,7 @@ mod tests {
     #[test]
     fn garbage_is_refused() {
         let config = Config::fixture();
-        for input in [&b""[..], b"{}", &vec![b'['; 4 << 20]] {
+        for input in [&b""[..], b"{}", &vec![b'['; MAX_BUNDLE_BYTES]] {
             assert!(
                 matches!(verify(input, &config), Err(AttestationError::Bundle(_))),
                 "{} bytes",

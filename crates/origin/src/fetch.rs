@@ -12,10 +12,15 @@
 //! enabled in the HTTP client), so a cap applies to the bytes on the wire.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
+use jiff::Timestamp;
 use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use landfall_core::release::Platform;
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
+};
 use reqwest::{Client, StatusCode, Url, redirect};
 use serde::Deserialize;
 use sha1_checked::Digest as _;
@@ -23,16 +28,12 @@ use sha1_checked::Sha1;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub use landfall_core::release::Platform;
-
-use crate::attestation::SLSA_PROVENANCE;
+use crate::attestation::{MAX_BUNDLE_BYTES, SLSA_PROVENANCE};
 
 /// Cap on a GitHub API response for a tag ref or tag object.
 pub const TAG_OBJECT_LIMIT: usize = 64 * 1024;
 /// Cap on an image index or manifest, and on a registry token response.
 pub const MANIFEST_LIMIT: usize = 1024 * 1024;
-/// Cap on a Sigstore bundle.
-pub const BUNDLE_LIMIT: usize = 4 * 1024 * 1024;
 
 /// The public GitHub REST API.
 const GITHUB_API: &str = "https://api.github.com";
@@ -61,6 +62,62 @@ const PREDICATE_TYPE_ANNOTATION: &str = "dev.sigstore.bundle.predicateType";
 /// index; they declare the platform `unknown/unknown` and run nowhere.
 const REFERENCE_TYPE_ANNOTATION: &str = "vnd.docker.reference.type";
 const ATTESTATION_MANIFEST: &str = "attestation-manifest";
+/// GitHub's count of requests left in the current rate-limit window.
+const RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+/// GitHub's end of the current rate-limit window, in Unix epoch seconds.
+const RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
+
+/// The service a request went to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    /// The GitHub REST API.
+    GitHubApi,
+    /// The OCI registry.
+    Registry,
+}
+
+impl fmt::Display for Service {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::GitHubApi => "the GitHub API",
+            Self::Registry => "the registry",
+        })
+    }
+}
+
+impl Service {
+    /// What to do about a rate limit, beyond waiting.
+    fn rate_limit_hint(self) -> &'static str {
+        match self {
+            Self::GitHubApi => {
+                "; requests with a GitHub token have a much higher limit \
+                 (landfall verify reads it from GITHUB_TOKEN)"
+            }
+            Self::Registry => "",
+        }
+    }
+}
+
+/// When a rate limit lifts, as the server said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitReset {
+    /// At this time (`x-ratelimit-reset`).
+    At(Timestamp),
+    /// After this many seconds (`Retry-After`).
+    After(u64),
+    /// The server did not say, or said it in a form not read here.
+    Unknown,
+}
+
+impl fmt::Display for RateLimitReset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::At(at) => write!(f, "it resets at {at}"),
+            Self::After(seconds) => write!(f, "retry after {seconds} s"),
+            Self::Unknown => f.write_str("the server did not say when it resets"),
+        }
+    }
+}
 
 /// Why release material could not be fetched, or was refused.
 #[derive(Debug, Error)]
@@ -99,6 +156,19 @@ pub enum FetchError {
     NotFound {
         /// The URL requested.
         url: String,
+    },
+    /// The server refused the request for its rate limit: HTTP 403 or 429
+    /// with `x-ratelimit-remaining: 0` or a `Retry-After` header.
+    #[error("{service} rate limit reached ({url} returned HTTP {status}); {reset}{hint}", hint = .service.rate_limit_hint())]
+    RateLimited {
+        /// The service that refused.
+        service: Service,
+        /// The URL requested.
+        url: String,
+        /// The HTTP status code, 403 or 429.
+        status: u16,
+        /// When the limit lifts.
+        reset: RateLimitReset,
     },
     /// The server answered with a status other than 200 and 404.
     #[error("{url} returned HTTP {status}")]
@@ -159,7 +229,7 @@ pub enum FetchError {
         tag: ReleaseTag,
     },
     /// The reconstructed tag object does not hash to the id it was fetched by.
-    #[error("tag object id mismatch: fetched {expected}, the served bytes hash to {computed}")]
+    #[error("tag object id mismatch: fetched {expected:?}, the served bytes hash to {computed}")]
     ObjectId {
         /// The object id the tag ref named.
         expected: String,
@@ -167,7 +237,7 @@ pub enum FetchError {
         computed: String,
     },
     /// The tag points at a tree or a blob, not a commit or tag object.
-    #[error("tag {tag} points at a {found} object, not a commit")]
+    #[error("tag {tag} points at a {found:?} object, not a commit")]
     ObjectType {
         /// The tag.
         tag: ReleaseTag,
@@ -192,7 +262,8 @@ pub enum FetchError {
     },
     /// The bytes served do not hash to the digest they were named by.
     #[error(
-        "{url}: content digest mismatch: expected {expected}, the served bytes hash to {computed}"
+        "{url}: content digest mismatch: expected {expected:?}, the served bytes hash to \
+         {computed}"
     )]
     Digest {
         /// The URL requested.
@@ -210,6 +281,26 @@ pub enum FetchError {
         /// How many bundles refer to it.
         count: usize,
     },
+}
+
+impl FetchError {
+    /// Whether the material could not be obtained at all: a bad endpoint or
+    /// token, a transport failure, a 404, a rate limit or another HTTP
+    /// status. `false` when it was served and refused by a check here
+    /// (size, media type, digest, object id, shape).
+    #[must_use]
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Endpoint { .. }
+                | Self::Token
+                | Self::Client(_)
+                | Self::Request { .. }
+                | Self::NotFound { .. }
+                | Self::RateLimited { .. }
+                | Self::Status { .. }
+        )
+    }
 }
 
 /// The base URLs requests go to.
@@ -579,10 +670,10 @@ impl Fetcher {
         };
 
         let layer = manifest.bundle_layer(&manifest_url, digest)?;
-        if usize::try_from(layer.size).map_or(true, |size| size > BUNDLE_LIMIT) {
+        if usize::try_from(layer.size).map_or(true, |size| size > MAX_BUNDLE_BYTES) {
             return Err(FetchError::TooLarge {
                 url: manifest_url.to_string(),
-                limit: BUNDLE_LIMIT,
+                limit: MAX_BUNDLE_BYTES,
             });
         }
         let mut segments = vec!["v2"];
@@ -590,7 +681,7 @@ impl Fetcher {
         segments.extend(["blobs", layer.digest.as_ref()]);
         let blob_url = join(&self.endpoints.registry, &segments)?;
         let response = self
-            .registry_get(&blob_url, BUNDLE_TYPE, Some(&token), BUNDLE_LIMIT)
+            .registry_get(&blob_url, BUNDLE_TYPE, Some(&token), MAX_BUNDLE_BYTES)
             .await?;
         layer.check_content(&blob_url, &response.body)?;
         Ok(response.body)
@@ -670,7 +761,9 @@ impl Fetcher {
         if let Some(token) = &self.github_token {
             request = request.header(AUTHORIZATION, token.clone());
         }
-        Ok(send(request, url, TAG_OBJECT_LIMIT).await?.body)
+        Ok(send(request, Service::GitHubApi, url, TAG_OBJECT_LIMIT)
+            .await?
+            .body)
     }
 
     /// A GET to the registry, with its pull token when there is one; never
@@ -686,7 +779,7 @@ impl Fetcher {
         if let Some(token) = token {
             request = request.header(AUTHORIZATION, token.clone());
         }
-        send(request, url, limit).await
+        send(request, Service::Registry, url, limit).await
     }
 }
 
@@ -696,10 +789,11 @@ struct Fetched {
     body: Vec<u8>,
 }
 
-/// Sends `request`, refuses any status but 200, and reads at most `limit`
-/// bytes of body.
+/// Sends `request` to `service`, refuses any status but 200 (naming a rate
+/// limit as such), and reads at most `limit` bytes of body.
 async fn send(
     request: reqwest::RequestBuilder,
+    service: Service,
     url: &Url,
     limit: usize,
 ) -> Result<Fetched, FetchError> {
@@ -716,9 +810,19 @@ async fn send(
             });
         }
         status => {
-            return Err(FetchError::Status {
-                url: url.to_string(),
-                status: status.as_u16(),
+            let url = url.to_string();
+            let status_code = status.as_u16();
+            return Err(match rate_limit_reset(status, response.headers()) {
+                Some(reset) => FetchError::RateLimited {
+                    service,
+                    url,
+                    status: status_code,
+                    reset,
+                },
+                None => FetchError::Status {
+                    url,
+                    status: status_code,
+                },
             });
         }
     }
@@ -745,6 +849,33 @@ async fn send(
         headers: response.headers().clone(),
         body,
     })
+}
+
+/// When the rate limit lifts, for a response that is a rate-limit refusal:
+/// HTTP 403 or 429 with `x-ratelimit-remaining: 0` or a `Retry-After`
+/// header (GitHub's primary and secondary limits). `None` for any other
+/// response.
+fn rate_limit_reset(status: StatusCode, headers: &HeaderMap) -> Option<RateLimitReset> {
+    if status != StatusCode::FORBIDDEN && status != StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
+    let text = |name: &HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    let number = |name: &HeaderName| text(name).and_then(|v| v.trim().parse::<u64>().ok());
+    let exhausted = text(&RATELIMIT_REMAINING).is_some_and(|v| v.trim() == "0");
+    if !exhausted && !headers.contains_key(RETRY_AFTER) {
+        return None;
+    }
+    let reset = if let Some(seconds) = number(&RETRY_AFTER) {
+        RateLimitReset::After(seconds)
+    } else if let Some(at) = number(&RATELIMIT_RESET)
+        .and_then(|epoch| i64::try_from(epoch).ok())
+        .and_then(|epoch| Timestamp::from_second(epoch).ok())
+    {
+        RateLimitReset::At(at)
+    } else {
+        RateLimitReset::Unknown
+    };
+    Some(reset)
 }
 
 /// `base` with `segments` appended to its path, each percent-encoded.
@@ -1079,11 +1210,13 @@ mod tests {
     use reqwest::Url;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use wiremock::MockServer;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
         DOCKER_LIST, Endpoints, FetchError, Fetcher, MANIFEST_LIMIT, MAX_TAG_DEPTH, OCI_INDEX,
-        OCI_MANIFEST, Platform, SLSA_PROVENANCE, TAG_OBJECT_LIMIT, checked_sha1,
+        OCI_MANIFEST, Platform, RateLimitReset, SLSA_PROVENANCE, Service, TAG_OBJECT_LIMIT,
+        checked_sha1,
     };
     use crate::test_support::{
         bundle_manifest, fetcher, fetcher_for, mount_token, payload_and_signature, referrers_index,
@@ -1795,6 +1928,111 @@ mod tests {
             matches!(result, Err(FetchError::Malformed { .. })),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn github_rate_limit_names_the_reset_and_suggests_a_token() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header("x-ratelimit-reset", "1767225600"),
+            )
+            .mount(&github)
+            .await;
+
+        let error = fetcher(&github, &registry)
+            .tag_object(&repo(), &tag())
+            .await
+            .unwrap_err();
+        match &error {
+            FetchError::RateLimited {
+                service,
+                status,
+                reset,
+                ..
+            } => {
+                assert_eq!(*service, Service::GitHubApi);
+                assert_eq!(*status, 403);
+                assert_eq!(
+                    *reset,
+                    RateLimitReset::At("2026-01-01T00:00:00Z".parse().unwrap())
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(error.is_unavailable());
+        let message = error.to_string();
+        assert!(
+            message.contains("it resets at 2026-01-01T00:00:00Z"),
+            "{message}"
+        );
+        assert!(message.contains("GITHUB_TOKEN"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn registry_retry_after_is_a_rate_limit() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
+            .mount(&registry)
+            .await;
+
+        let error = fetcher(&github, &registry)
+            .resolve_index(IMAGE, &tag())
+            .await
+            .unwrap_err();
+        match &error {
+            FetchError::RateLimited {
+                service,
+                status,
+                reset,
+                ..
+            } => {
+                assert_eq!(*service, Service::Registry);
+                assert_eq!(*status, 429);
+                assert_eq!(*reset, RateLimitReset::After(30));
+            }
+            other => panic!("{other:?}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains("retry after 30 s"), "{message}");
+        assert!(!message.contains("GITHUB_TOKEN"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn forbidden_without_rate_limit_headers_is_a_status() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).insert_header("x-ratelimit-remaining", "59"))
+            .mount(&github)
+            .await;
+
+        let result = fetcher(&github, &registry)
+            .tag_object(&repo(), &tag())
+            .await;
+        assert!(
+            matches!(result, Err(FetchError::Status { status: 403, .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn server_text_in_errors_is_quoted() {
+        let error = FetchError::ObjectType {
+            tag: tag(),
+            found: "tree\u{1b}[2J".to_owned(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "tag v1.2.3 points at a \"tree\\u{1b}[2J\" object, not a commit"
+        );
+        let error = FetchError::ObjectId {
+            expected: "a\nb".to_owned(),
+            computed: "c".repeat(40),
+        };
+        assert!(error.to_string().contains("fetched \"a\\nb\""), "{error}");
     }
 
     #[test]

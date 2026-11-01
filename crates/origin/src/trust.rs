@@ -6,6 +6,9 @@
 //! cache from the repository; [`Refresh::Offline`] makes no request and
 //! re-verifies the cache, so a missing, tampered or expired cache is an
 //! error and never a fallback to older or embedded material.
+//!
+//! The result is a [`TrustRoot`], which only [`load_trusted_root`] makes:
+//! every bundle is verified against a root that came through TUF.
 
 use std::path::Path;
 use std::time::Duration;
@@ -34,6 +37,27 @@ pub enum Refresh {
     Online,
     /// Make no request: re-verify the cache and build the root from it.
     Offline,
+}
+
+/// The Sigstore trust root bundles are verified against: the Fulcio
+/// certificate authorities, Rekor logs and certificate transparency logs of
+/// the public-good instance. Only [`load_trusted_root`] makes one in
+/// production code.
+#[derive(Debug, Clone)]
+pub struct TrustRoot(TrustedRoot);
+
+impl TrustRoot {
+    /// The root for the Sigstore verifier.
+    pub(crate) fn inner(&self) -> &TrustedRoot {
+        &self.0
+    }
+
+    /// A root parsed from a `trusted_root.json` snapshot, without TUF. Test
+    /// builds only, for fixtures verified offline.
+    #[cfg(test)]
+    pub(crate) fn from_json(json: &str) -> Self {
+        Self(TrustedRoot::from_json(json).unwrap())
+    }
 }
 
 /// Why the trust root could not be built.
@@ -67,7 +91,7 @@ pub enum TrustError {
 pub async fn load_trusted_root(
     cache_dir: &Path,
     refresh: Refresh,
-) -> Result<TrustedRoot, TrustError> {
+) -> Result<TrustRoot, TrustError> {
     load_trusted_root_at(cache_dir, refresh, Timestamp::now()).await
 }
 
@@ -77,7 +101,7 @@ async fn load_trusted_root_at(
     cache_dir: &Path,
     refresh: Refresh,
     now: Timestamp,
-) -> Result<TrustedRoot, TrustError> {
+) -> Result<TrustRoot, TrustError> {
     let meta = std::fs::metadata(cache_dir)
         .map_err(|e| TrustError::Cache(format!("{}: {e}", cache_dir.display())))?;
     if !meta.is_dir() {
@@ -100,18 +124,21 @@ async fn load_trusted_root_at(
         config = config.offline();
     }
 
-    TrustedRoot::from_tuf_at(config, now).await.map_err(|e| {
-        let message = e.to_string();
-        // The TUF client reports failures as text only; this is its message
-        // for metadata past its expiry (sigstore-tuf `Error::Expired`).
-        if message.contains(" metadata expired at ") {
-            TrustError::Expired(message)
-        } else if refresh == Refresh::Offline {
-            TrustError::Cache(message)
-        } else {
-            TrustError::Fetch(message)
-        }
-    })
+    TrustedRoot::from_tuf_at(config, now)
+        .await
+        .map(TrustRoot)
+        .map_err(|e| {
+            let message = e.to_string();
+            // The TUF client reports failures as text only; this is its message
+            // for metadata past its expiry (sigstore-tuf `Error::Expired`).
+            if message.contains(" metadata expired at ") {
+                TrustError::Expired(message)
+            } else if refresh == Refresh::Offline {
+                TrustError::Cache(message)
+            } else {
+                TrustError::Fetch(message)
+            }
+        })
 }
 
 #[cfg(test)]
