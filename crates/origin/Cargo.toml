@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+jiff.workspace = true
 landfall-core.workspace = true
 reqwest.workspace = true
 serde.workspace = true

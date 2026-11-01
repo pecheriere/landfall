@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use jiff::Timestamp;
 use sigstore_verify::trust_root::reqwest::Client;
 use sigstore_verify::trust_root::{TrustedRoot, TufBootstrap, TufConfig};
 use thiserror::Error;
@@ -53,7 +54,9 @@ pub enum TrustError {
 ///
 /// `cache_dir` must already exist and be a directory; it is never created.
 /// The cache is untrusted input: everything read from it is re-verified
-/// against the embedded root.
+/// against the embedded root. Even [`Refresh::Offline`] may write to
+/// `cache_dir`: newer root versions it verified on the way from the embedded
+/// root are stored there. It makes no network request.
 ///
 /// # Errors
 ///
@@ -64,6 +67,16 @@ pub enum TrustError {
 pub async fn load_trusted_root(
     cache_dir: &Path,
     refresh: Refresh,
+) -> Result<TrustedRoot, TrustError> {
+    load_trusted_root_at(cache_dir, refresh, Timestamp::now()).await
+}
+
+/// [`load_trusted_root`] with TUF metadata expiry evaluated at `now`, so
+/// tests do not depend on the calendar.
+async fn load_trusted_root_at(
+    cache_dir: &Path,
+    refresh: Refresh,
+    now: Timestamp,
 ) -> Result<TrustedRoot, TrustError> {
     let meta = std::fs::metadata(cache_dir)
         .map_err(|e| TrustError::Cache(format!("{}: {e}", cache_dir.display())))?;
@@ -87,10 +100,11 @@ pub async fn load_trusted_root(
         config = config.offline();
     }
 
-    TrustedRoot::from_tuf(config).await.map_err(|e| {
+    TrustedRoot::from_tuf_at(config, now).await.map_err(|e| {
         let message = e.to_string();
-        // The TUF client reports failures as text only.
-        if message.contains("expired") {
+        // The TUF client reports failures as text only; this is its message
+        // for metadata past its expiry (sigstore-tuf `Error::Expired`).
+        if message.contains(" metadata expired at ") {
             TrustError::Expired(message)
         } else if refresh == Refresh::Offline {
             TrustError::Cache(message)
@@ -104,16 +118,24 @@ pub async fn load_trusted_root(
 mod tests {
     use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
 
-    use super::{Refresh, TrustError, load_trusted_root};
+    use jiff::{SignedDuration, Timestamp};
+
+    use super::{Refresh, TrustError, load_trusted_root, load_trusted_root_at};
     use crate::attestation::{Expected, verify_bundle};
 
     const BUNDLE: &[u8] = include_bytes!("../tests/fixtures/attestation/bundle.json");
     const INDEX_DIGEST: &str = include_str!("../tests/fixtures/attestation/index-digest.txt");
 
+    /// Well before the embedded root expires, so the tests never depend on
+    /// the calendar.
+    fn fixed_now() -> Timestamp {
+        "2026-11-01T00:00:00Z".parse().unwrap()
+    }
+
     #[tokio::test]
     async fn offline_with_empty_cache_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let result = load_trusted_root(dir.path(), Refresh::Offline).await;
+        let result = load_trusted_root_at(dir.path(), Refresh::Offline, fixed_now()).await;
         assert!(matches!(result, Err(TrustError::Cache(_))), "{result:?}");
     }
 
@@ -133,7 +155,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("file");
         std::fs::write(&file, b"x").unwrap();
-        let result = load_trusted_root(&file, Refresh::Offline).await;
+        let result = load_trusted_root_at(&file, Refresh::Offline, fixed_now()).await;
         assert!(matches!(result, Err(TrustError::Cache(_))), "{result:?}");
     }
 
@@ -147,6 +169,12 @@ mod tests {
         let offline = load_trusted_root(dir.path(), Refresh::Offline)
             .await
             .unwrap();
+        // The timestamp metadata lives 7 days: a month on, the cache is stale.
+        let later = Timestamp::now()
+            .checked_add(SignedDuration::from_hours(30 * 24))
+            .unwrap();
+        let stale = load_trusted_root_at(dir.path(), Refresh::Offline, later).await;
+        assert!(matches!(stale, Err(TrustError::Expired(_))), "{stale:?}");
 
         let repo: RepoName = "dani-garcia/vaultwarden".parse().unwrap();
         let tag: ReleaseTag = "1.37.4".parse().unwrap();

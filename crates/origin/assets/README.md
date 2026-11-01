@@ -11,6 +11,8 @@ the trust root is bootstrapped from; everything else is verified against it.
 - SHA-256: `27aea7e372aa7864065174f0661784fcf8b0e28b1dbfebeada31a0f1fb19167f`.
 
 The TUF client walks forward from this root through newer root versions the
-repository publishes, each signed by the previous one, so the embedded file
-stays valid until its own expiry. Before then, replace it with the current
-`metadata/root.json` from the source above and update this file.
+repository publishes, each signed by the previous one, so an old embedded
+root still bootstraps after its own expiry. Refresh it from the source above
+periodically anyway: a shorter chain means fewer downloads, and an offline
+load with an empty cache has only the embedded root to start from, which must
+not have expired by then.
