@@ -3,7 +3,7 @@
 //! recording every step.
 
 use std::fmt::Display;
-use std::fs::DirBuilder;
+use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::Path;
@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::checks::{CheckOptions, CheckReport, quote, run_checks};
 use crate::compose::{self, Pin};
-use crate::docker::{Docker, DockerError};
+use crate::docker::{ContainerId, Docker, DockerError};
 use crate::journal::{self, Priority};
 use crate::safefs::{self, RelPath, Root, SafeFsError, SnapshotStats};
 use crate::state::{
@@ -320,6 +320,10 @@ pub enum FileFailure {
     /// The state has no earlier deployed record, which a deploy saves first.
     #[error("what was deployed before this deploy was not saved")]
     NoPreviousDeployed,
+    /// Work that ran past its deadline may still be running on the backups,
+    /// and a prune would take its unfinished copy for a leftover.
+    #[error("skipped: work that ran past its deadline may still be running on the backups")]
+    PruneSkipped,
 }
 
 /// A deploy that never started: no service was touched and no backup taken.
@@ -386,9 +390,9 @@ pub enum DeployError {
         /// The service.
         service: String,
     },
-    /// The project asks for more than one container of the service.
+    /// The project asks for another number of containers of the service than one.
     #[error(
-        "deployment {deployment}: service {service:?} asks for {replicas} containers; landfall deploys a service with one, so remove `scale` and `deploy.replicas` from the compose file"
+        "deployment {deployment}: service {service:?} asks for {replicas} containers; landfall deploys a service with exactly one, so remove `scale` and `deploy.replicas` from the compose file"
     )]
     Scaled {
         /// The deployment.
@@ -397,6 +401,30 @@ pub enum DeployError {
         service: String,
         /// How many it asks for.
         replicas: u64,
+    },
+    /// A container started from this directory is not the project's: a backup
+    /// or a restore would run under it while it writes.
+    #[error(
+        "deployment {deployment}: service {service:?} has a running container started from this directory that is not in the project the directory's files name now, and it would keep writing during a backup or a restore; remove it with `docker compose -p <other> down`, or put the project's name back"
+    )]
+    OutsideTheProject {
+        /// The deployment.
+        deployment: DeploymentId,
+        /// The service.
+        service: String,
+    },
+    /// The project's container of the service was started from elsewhere: a
+    /// deploy would stop and replace what may be another stack's service.
+    #[error(
+        "deployment {deployment}: the running container of service {service:?} in this directory's project was started from {found}, not from this directory, so a deploy would stop and replace it; if that is another stack, give each its own project with a unique `name:` or `COMPOSE_PROJECT_NAME`, and if it is this one, keep its compose file in the compose directory and recreate the container from there"
+    )]
+    StartedElsewhere {
+        /// The deployment.
+        deployment: DeploymentId,
+        /// The service.
+        service: String,
+        /// The directory its label names, quoted and truncated.
+        found: String,
     },
     /// The service runs in more than one container right now.
     #[error(
@@ -495,6 +523,7 @@ pub async fn run<D: Docker>(
             options,
             lock: take_lock(state, deployment.id()).await?,
             file_outran_deadline: AtomicBool::new(false),
+            backups_outran_deadline: AtomicBool::new(false),
         };
         engine.deploy(plan).await
     }
@@ -515,7 +544,9 @@ pub async fn run<D: Docker>(
 /// - [`Phase::Restored`]: the backup is back in full, and the previous version
 ///   may have been running on it since, as after a rollback whose checks failed.
 ///   Only the start, the image check and the checks run again: stopping the
-///   service and restoring would discard what it wrote.
+///   service and restoring would discard what it wrote. With no previous version
+///   to start, the service is stopped instead. This assumes that only the
+///   previous version touched the data since the restore.
 /// - [`Phase::RolledBack`]: the previous version is back and has been checked,
 ///   so only the marker is removed. The backup is not restored again: that
 ///   would discard what the previous version wrote since.
@@ -544,6 +575,7 @@ pub async fn recover<D: Docker>(
             options,
             lock: take_lock(state, deployment.id()).await?,
             file_outran_deadline: AtomicBool::new(false),
+            backups_outran_deadline: AtomicBool::new(false),
         };
         engine.recover().await
     }
@@ -819,6 +851,21 @@ fn rel_paths(paths: &[String]) -> Result<Vec<RelPath>, SafeFsError> {
     paths.iter().map(|p| RelPath::new(p)).collect()
 }
 
+/// Whether a compose working directory label names `dir`, through symlinks or
+/// not. A label that is missing, relative or doesn't resolve names no directory
+/// of this deployment. Nothing is opened: the two paths are only compared.
+fn labelled_with(dir: &Path, label: Option<&str>) -> Result<bool, SafeFsError> {
+    let own = fs::canonicalize(dir).map_err(|source| SafeFsError::Io {
+        op: "canonicalize",
+        path: dir.to_owned(),
+        source,
+    })?;
+    let Some(label) = label.map(Path::new).filter(|label| label.is_absolute()) else {
+        return Ok(false);
+    };
+    Ok(fs::canonicalize(label).is_ok_and(|theirs| theirs == own))
+}
+
 /// The steps of one deploy or recovery, each also sent to the journal.
 struct Recorder {
     deployment: DeploymentId,
@@ -934,6 +981,9 @@ struct Engine<'a, D> {
     /// Small file work ran past its deadline and may yet land. See
     /// [`Self::rollback`].
     file_outran_deadline: AtomicBool,
+    /// A backup or a prune ran past its deadline and may still be at work in
+    /// the backups directory. See [`Self::prune`].
+    backups_outran_deadline: AtomicBool,
 }
 
 impl<D: Docker> Engine<'_, D> {
@@ -961,6 +1011,23 @@ impl<D: Docker> Engine<'_, D> {
         let result = off_thread(&self.lock, op, self.options.file_deadline, work).await;
         if matches!(result, Err(FileFailure::Deadline { .. })) {
             self.file_outran_deadline.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    /// Work in the backups directory, under the backup's deadline.
+    async fn on_backups<T, E>(
+        &self,
+        op: &'static str,
+        work: impl FnOnce() -> Result<T, E> + Send + 'static,
+    ) -> Result<T, FileFailure>
+    where
+        T: Send + 'static,
+        E: Into<FileFailure> + Send + 'static,
+    {
+        let result = off_thread(&self.lock, op, self.options.backup_deadline, work).await;
+        if matches!(result, Err(FileFailure::Deadline { .. })) {
+            self.backups_outran_deadline.store(true, Ordering::SeqCst);
         }
         result
     }
@@ -1030,7 +1097,7 @@ impl<D: Docker> Engine<'_, D> {
                 service: self.service().to_owned(),
             });
         }
-        if base.replicas > 1 {
+        if base.replicas != 1 {
             return Err(DeployError::Scaled {
                 deployment: self.deployment.id().clone(),
                 service: self.service().to_owned(),
@@ -1038,20 +1105,58 @@ impl<D: Docker> Engine<'_, D> {
             });
         }
         // Every step after this one needs to tell the service's one container,
-        // which the project's name does. A second project running from this
-        // directory has a container of its own and would be left out of that,
-        // while it shares the directory's data with a backup and a restore.
-        self.docker
+        // which the project's name does. A container started from this directory
+        // under another project's name would be left out of that, while it shares
+        // the directory's data with a backup and a restore.
+        let in_project = self
+            .docker
             .container(self.dir, self.service())
             .await
             .map_err(|e| self.compose_error(e))?;
-        self.docker
+        let in_directory = self
+            .docker
             .container_at(self.dir, self.service())
             .await
             .map_err(|e| self.compose_error(e))?;
+        if in_directory.is_some() && in_directory != in_project {
+            return Err(DeployError::OutsideTheProject {
+                deployment: self.deployment.id().clone(),
+                service: self.service().to_owned(),
+            });
+        }
+        if let Some(id) = in_project {
+            self.refuse_started_elsewhere(&id).await?;
+        }
         Ok(Preflight {
             previous,
             previous_can_start: base.image.is_some(),
+        })
+    }
+
+    /// The project's name can be shared with another directory, whose service
+    /// this deploy would then stop and replace. The container says where it was
+    /// started from.
+    async fn refuse_started_elsewhere(&self, id: &ContainerId) -> Result<(), DeployError> {
+        let label = self
+            .docker
+            .compose_working_dir(id)
+            .await
+            .map_err(|e| self.compose_error(e))?;
+        let dir = self.dir.to_owned();
+        let asked = label.clone();
+        let here = self
+            .file("compare working directory", move || {
+                labelled_with(&dir, asked.as_deref())
+            })
+            .await
+            .map_err(|e| self.file_error(e))?;
+        if here {
+            return Ok(());
+        }
+        Err(DeployError::StartedElsewhere {
+            deployment: self.deployment.id().clone(),
+            service: self.service().to_owned(),
+            found: label.map_or_else(|| "no directory it labels".to_owned(), |l| quote(&l)),
         })
     }
 
@@ -1310,7 +1415,8 @@ impl<D: Docker> Engine<'_, D> {
             // Room for the copy about to be made, so a full disk is less
             // likely to fail it, while the service still runs. Failing here
             // stops nothing: the backup then finds out if there is room.
-            let room = self.options.backups_kept.saturating_sub(1);
+            // At least one stays: the new copy doesn't exist yet.
+            let room = self.options.backups_kept.saturating_sub(1).max(1);
             let _ = rec
                 .step(
                     "prune_before_backup",
@@ -1449,35 +1555,38 @@ impl<D: Docker> Engine<'_, D> {
         let dir = self.dir.to_owned();
         let backups = self.state.backups_dir();
         let dest = backups.join(id);
-        off_thread(
-            &self.lock,
-            "backup",
-            self.options.backup_deadline,
-            move || {
-                match DirBuilder::new().mode(0o700).create(&backups) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(source) => {
-                        return Err(FileFailure::State(StateError::Io {
-                            op: "create",
-                            path: backups,
-                            source,
-                        }));
-                    }
+        self.on_backups("backup", move || {
+            match DirBuilder::new().mode(0o700).create(&backups) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(source) => {
+                    return Err(FileFailure::State(StateError::Io {
+                        op: "create",
+                        path: backups,
+                        source,
+                    }));
                 }
-                let source = Root::open(&dir)?;
-                Ok(safefs::snapshot(&source, &paths, &dest)?)
-            },
-        )
+            }
+            let source = Root::open(&dir)?;
+            Ok(safefs::snapshot(&source, &paths, &dest)?)
+        })
         .await
     }
 
     /// Removes all but the newest `keep` backups, and never the one a marker
-    /// on disk names: that is what a rollback or `recover` would restore.
+    /// on disk names: that is what a rollback or `recover` would restore. Skipped
+    /// once a deadline has fired in this run: the work may still be running, and
+    /// the `.partial` of a snapshot would look like a leftover. The next run
+    /// has to take the lock, so it starts when that work has ended.
     async fn prune(&self, op: &'static str, keep: usize) -> Result<(), FileFailure> {
+        if self.file_outran_deadline.load(Ordering::SeqCst)
+            || self.backups_outran_deadline.load(Ordering::SeqCst)
+        {
+            return Err(FileFailure::PruneSkipped);
+        }
         let backups = self.state.backups_dir();
         let state = self.state.clone();
-        off_thread(&self.lock, op, self.options.backup_deadline, move || {
+        self.on_backups(op, move || {
             let marker = state.in_progress()?;
             let named = marker.as_ref().and_then(|m| m.backup.as_ref());
             safefs::prune(&backups, keep, named.map(|backup| backup.id.as_str()))?;
@@ -1628,6 +1737,8 @@ impl<D: Docker> Engine<'_, D> {
     /// rest runs. The marker takes that phase as soon as the restore has
     /// returned: from then on the previous version's data is what counts, and
     /// a failure further on can leave it running and writing for a long time.
+    /// With no previous version there are no writes of it to lose, so the service
+    /// is stopped from that phase too: a container may have come back since.
     async fn rollback(&self, rec: &mut Recorder, marker: &InProgress) -> Result<(), String> {
         let restored = marker.phase == Phase::Restored;
         if !restored && marker.phase != Phase::RollingBack {
@@ -1645,7 +1756,7 @@ impl<D: Docker> Engine<'_, D> {
                     .to_owned(),
             );
         }
-        let mut stopped = restored;
+        let mut stopped = false;
         if !restored {
             self.restore_previous_override(rec).await?;
             rec.must("restore_deployed", self.restore_deployed())
@@ -1918,7 +2029,7 @@ mod tests {
     };
     use crate::checks::CheckOptions;
     use crate::compose::{self, OVERRIDE_FILE, PLACEHOLDER};
-    use crate::docker::{ContainerInfo, ServiceConfig};
+    use crate::docker::{ContainerId, ContainerInfo, ServiceConfig};
     use crate::journal::Priority;
     use crate::safefs::{self, RelPath, Root};
     use crate::state::{Deployed, DeploymentState, InProgress, Phase, RecordedBackup, StateDir};
@@ -2166,7 +2277,10 @@ mod tests {
         f.docker.on_call(move |call| {
             if !matches!(
                 call,
-                Call::Container { .. } | Call::ContainerAt { .. } | Call::Inspect(_)
+                Call::Container { .. }
+                    | Call::ContainerAt { .. }
+                    | Call::Inspect(_)
+                    | Call::WorkingDir(_)
             ) {
                 log.lock().unwrap().push(override_text(&dir));
             }
@@ -4008,7 +4122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restored_phase_of_a_first_deploy_starts_nothing() {
+    async fn restored_phase_of_a_first_deploy_stops_the_service_and_starts_nothing() {
         let f = fixture(STOP_TRUE);
         fs::remove_file(f.dir.join(OVERRIDE_FILE)).unwrap();
         resolves(&f, None);
@@ -4031,8 +4145,165 @@ mod tests {
             "{:?}",
             report.outcome
         );
-        assert_eq!((count_ups(&f), count_stops(&f)), (ups, stops));
+        assert!(step_names(&report).contains(&"stop_service"));
+        assert_eq!(
+            (count_ups(&f), count_stops(&f)),
+            (ups, stops + 1),
+            "what it reports as stopped is stopped, with no previous version to lose writes from"
+        );
         assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    /// The new version fails its check, and the previous one passes after an `up`.
+    fn fails_then_previous_passes(f: &Fixture) {
+        resolves(f, Some(OLD));
+        failing_check(f, OLD);
+        new_version_migrates(f);
+    }
+
+    #[tokio::test]
+    async fn marker_that_cannot_say_restored_starts_nothing_and_recover_restores_again() {
+        let f = fixture(STOP_TRUE);
+        fails_then_previous_passes(&f);
+
+        let report = with_faults([("mark restored", vec![Fault::Fail])], deploy(&f))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&report.outcome, Outcome::RollbackFailed { rollback_reason, .. }
+                if rollback_reason.contains("mark_restored")),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(count_ups(&f), 1, "the rollback's `up` did not run");
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::RollingBack
+        );
+        assert_eq!(data(&f), "before");
+
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::RolledBack { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(step_names(&report).contains(&"restore_backup"));
+        assert_eq!(count_ups(&f), 2);
+        assert_eq!(data(&f), "before");
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn marker_that_says_restored_though_its_write_failed_is_not_restored_again() {
+        let f = fixture(STOP_TRUE);
+        fails_then_previous_passes(&f);
+
+        let report = with_faults([("mark restored", vec![Fault::FailAfter])], deploy(&f))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&report.outcome, Outcome::RollbackFailed { rollback_reason, .. }
+                if rollback_reason.contains("mark_restored")),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(count_ups(&f), 1, "the rollback's `up` did not run");
+        assert_eq!(
+            f.state.in_progress().unwrap().unwrap().phase,
+            Phase::Restored
+        );
+
+        // What the marker promises holds: the restore is not repeated.
+        fs::write(f.dir.join("data/db"), "written since").unwrap();
+        let report = recovered(&f).await.unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::RolledBack { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(!step_names(&report).contains(&"restore_backup"));
+        assert_eq!(count_ups(&f), 2);
+        assert_eq!(data(&f), "written since");
+        assert_eq!(f.state.in_progress().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_backup_past_its_deadline_keeps_the_prune_off_its_partial_copy() {
+        let f = fixture(STOP_TRUE);
+        resolves(&f, Some(OLD));
+        f.docker
+            .script_inspect_after_up(1, [Ok(container(OLD, true))]);
+        // The copy a snapshot is still writing, from when the service stopped.
+        let partial = f
+            .state
+            .backups_dir()
+            .join("2000-01-01T00-00-00-000000000Z.partial");
+        let (backups_dir, unfinished) = (f.state.backups_dir(), partial.clone());
+        f.docker.on_call(move |call| {
+            if matches!(call, Call::ComposeStop { .. }) {
+                fs::create_dir_all(&backups_dir).unwrap();
+                fs::create_dir(&unfinished).unwrap();
+            }
+        });
+        let (release, released) = std::sync::mpsc::channel();
+
+        let report = with_faults([("backup", vec![Fault::Late(released)])], deploy(&f))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(report.outcome, Outcome::RolledBack { .. }),
+            "{:?}",
+            report.outcome
+        );
+        assert!(step_failed(&report, "backup"));
+        assert!(step_failed(&report, "prune_backups"), "the report says so");
+        assert_eq!(
+            f.state.in_progress().unwrap(),
+            None,
+            "the skipped prune changes no outcome"
+        );
+        assert!(partial.exists(), "a snapshot may still be writing it");
+        release.send(()).unwrap();
+        late_work_has_ended(&f).await;
+    }
+
+    #[tokio::test]
+    async fn keeping_one_backup_keeps_it_until_the_new_one_exists() {
+        let f = fixture(STOP_TRUE);
+        let old = old_backups(&f, 3);
+        healthy_deploy(&f);
+        let at_stop = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&at_stop);
+        let backups_dir = f.state.backups_dir();
+        f.docker.on_call(move |call| {
+            if matches!(call, Call::ComposeStop { .. }) {
+                log.lock()
+                    .unwrap()
+                    .push(fs::read_dir(&backups_dir).unwrap().count());
+            }
+        });
+
+        let report = deploy_with(
+            &f,
+            &EngineOptions {
+                backups_kept: 1,
+                ..options()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
+        assert_eq!(*at_stop.lock().unwrap(), [1], "the newest stays for now");
+        let kept = backups(&f);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(!old.contains(&kept[0]), "{kept:?}");
     }
 
     /// `how_many` old backups, which sort before anything the deploy takes.
@@ -4238,6 +4509,108 @@ mod tests {
         );
         assert!(err.to_string().contains("deploy.replicas"), "{err}");
         refused_before_anything_changed(&f, &err);
+    }
+
+    #[tokio::test]
+    async fn a_service_asking_for_no_container_is_refused() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(ServiceConfig {
+            replicas: 0,
+            ..image(Some(OLD))
+        })]);
+        let err = deploy(&f).await.unwrap_err();
+        assert!(
+            matches!(err, DeployError::Scaled { replicas: 0, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("exactly one"), "{err}");
+        refused_before_anything_changed(&f, &err);
+    }
+
+    #[tokio::test]
+    async fn a_lone_container_outside_the_project_is_refused() {
+        let id = crate::testing::container_id();
+        let other: ContainerId = "0123456789ac".parse().unwrap();
+        for (in_project, in_directory) in [
+            // The project's name changed, or its own is stopped.
+            (None, id.clone()),
+            (Some(other), id),
+        ] {
+            let f = fixture(STOP_TRUE);
+            f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+            f.docker
+                .script_container([Ok(in_project), Ok(Some(in_directory))]);
+            let err = deploy(&f).await.unwrap_err();
+            assert!(
+                matches!(err, DeployError::OutsideTheProject { .. }),
+                "{err}"
+            );
+            assert!(err.to_string().contains("docker compose -p <other> down"));
+            refused_before_anything_changed(&f, &err);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_container_of_the_project_started_elsewhere_is_refused_naming_the_fix() {
+        let f = fixture(STOP_TRUE);
+        f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+        let elsewhere = f.dir.with_file_name("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        f.docker
+            .script_working_dir([Ok(Some(elsewhere.to_str().unwrap().to_owned()))]);
+        // By its project it is found, and by this directory it isn't.
+        f.docker
+            .script_container([Ok(Some(crate::testing::container_id())), Ok(None)]);
+
+        let err = deploy(&f).await.unwrap_err();
+
+        assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("`name:`") && text.contains("`COMPOSE_PROJECT_NAME`"),
+            "{text}"
+        );
+        assert!(text.contains(elsewhere.to_str().unwrap()), "{text}");
+        refused_before_anything_changed(&f, &err);
+    }
+
+    #[tokio::test]
+    async fn a_working_dir_label_that_names_nothing_here_is_refused_and_quoted() {
+        for label in [
+            None,
+            Some("relative/path"),
+            Some("/does/not/exist\"\n\u{1b}[31mforged"),
+        ] {
+            let f = fixture(STOP_TRUE);
+            f.docker.script_compose_service([Ok(image(Some(OLD)))]);
+            f.docker.script_working_dir([Ok(label.map(str::to_owned))]);
+            let err = deploy(&f).await.unwrap_err();
+            assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
+            let text = err.to_string();
+            assert!(
+                !text.contains('\n') && !text.contains('\u{1b}'),
+                "the label is quoted: {text}"
+            );
+            refused_before_anything_changed(&f, &err);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_through_a_symlink_to_this_directory_is_not_elsewhere() {
+        let f = fixture(STOP_TRUE);
+        healthy_deploy(&f);
+        let link = f.dir.with_file_name("link");
+        std::os::unix::fs::symlink(&f.dir, &link).unwrap();
+        f.docker
+            .script_working_dir([Ok(Some(link.to_str().unwrap().to_owned()))]);
+        // By its project it is found, and by the real path it isn't.
+        let id = crate::testing::container_id();
+        f.docker
+            .script_container([Ok(Some(id.clone())), Ok(None), Ok(Some(id))]);
+
+        let report = deploy(&f).await.unwrap();
+
+        assert_eq!(report.outcome, Outcome::Deployed);
     }
 
     #[tokio::test]

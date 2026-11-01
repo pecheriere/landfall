@@ -247,8 +247,11 @@ Host-side enforcement is later.
   override.
 - `compose.landfall.yaml` is written only by the agent: `image: <repo>@sha256:<index digest>` plus labels.
   Back it up with the host, but keep it out of the host's config repo.
-- Services with `build:` are refused, and so is more than one container of the service: `scale` or
-  `deploy.replicas` above 1, a service scaled by hand, or a second project running from the directory.
+- Services with `build:` are refused, and so is any number of containers of the service but one: `scale` or
+  `deploy.replicas` other than 1, a service scaled by hand, or a container running from the directory
+  under another project's name.
+- The compose file lives in the compose directory, and the project's name is that directory's alone: a
+  running container of the project started from another directory is refused, as a deploy would replace it.
 - Other image updaters must not manage a service landfall manages.
 - The agent compares the running container's image with its override every minute and reports drift
   as an error.
@@ -269,9 +272,11 @@ Rollback target is always the previously healthy digest. A rollback runs the dep
 too, and starts the service even if an operator had stopped it before the deploy.
 
 **A rollback whose `up` fails.** Whatever is running stays running, with the critical state and deploys
-blocked: the agent does not force a stop. Without a backup to restore that can be the failed release, still
-serving. With one, the service was stopped for the restore before that `up`, so nothing of it is running
-unless the failed `up` started something. What `docker compose up` did itself before failing is compose's.
+blocked: the agent does not force a stop. If nothing stopped the service (no backup declared, or a failed
+one without `stop`), that can be the failed release, still serving. If it stopped for a backup that then
+failed, or for the restore of a completed one, nothing of it is running unless the failed `up` started
+something. A later `recover` of a completed restore stops nothing, so the previous version can still be up.
+What `docker compose up` did itself before failing is compose's.
 
 **First deploy.** With no override yet, the agent writes a placeholder that names no service, so a
 `COMPOSE_FILE` naming it works, and treats it as the previous state. If the base compose file gives the
@@ -285,6 +290,7 @@ path, or finishes the deploy if it had already been recorded as done. So power l
 half-deployed service looking healthy. A failed rollback leaves the record in place, for the same reason.
 The record says how far things got. Once a backup has been restored in full, `recover` only starts and
 checks the previous version: it may have been running since, and restoring again would discard what it wrote.
+With no previous version it stops the service instead.
 
 **One deployment per compose directory on a host** (validation rule 8 of the configuration): overrides and
 backups are per directory. The agent resolves each directory once at start-up and refuses to run if two

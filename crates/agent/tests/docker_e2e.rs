@@ -1115,6 +1115,18 @@ async fn docker_scaled_service_is_refused_before_stop() {
         assert_eq!(stack.state.in_progress().unwrap(), None, "{asked}");
         fs::write(stack.dir.join("compose.yaml"), &plain).unwrap();
     }
+    // None at all used to pass too, and end in a false critical.
+    for asked in ["    scale: 0\n", "    deploy:\n      replicas: 0\n"] {
+        stack.edit_compose("  app:\n", &format!("  app:\n{asked}"));
+        let err = stack.attempt(&rest, "v2.0.0", DIGEST_B).await.unwrap_err();
+        assert!(
+            matches!(err, DeployError::Scaled { replicas: 0, .. }),
+            "{asked}: {err}"
+        );
+        assert_eq!(stack.running_since().await, before, "{asked}");
+        assert_eq!(stack.state.in_progress().unwrap(), None, "{asked}");
+        fs::write(stack.dir.join("compose.yaml"), &plain).unwrap();
+    }
     assert_eq!(
         fs::read(stack.dir.join(OVERRIDE_FILE)).unwrap(),
         override_before
@@ -1178,6 +1190,122 @@ async fn docker_second_project_in_the_directory_is_refused_before_stop() {
     assert_eq!(second.outcome, Outcome::Deployed, "{second:?}");
 }
 
+/// `name:` edited while the container runs: the project no longer has it, and a
+/// restore would have run under it while it wrote.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_container_left_behind_by_a_renamed_project_is_refused_before_stop() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = format!("{PASSES}{BACKUP}");
+    let first = stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+    let (id, started_at) = stack.running_since().await;
+    let name = stack.project.name.clone();
+    // Nothing should run under the new name; if a deploy starts it, it goes too.
+    let _renamed = OtherProject(format!("{name}-renamed"));
+
+    stack.edit_compose(
+        &format!("name: {name}\n"),
+        &format!("name: {name}-renamed\n"),
+    );
+    let err = stack.attempt(&rest, "v2.0.0", DIGEST_B).await.unwrap_err();
+
+    assert!(
+        matches!(err, DeployError::OutsideTheProject { .. }),
+        "{err}"
+    );
+    let info = stack.docker.inspect(&id).await.unwrap();
+    assert_eq!(
+        (info.status.as_str(), info.started_at),
+        ("running", started_at)
+    );
+    assert_eq!(stack.state.in_progress().unwrap(), None);
+
+    stack.edit_compose(
+        &format!("name: {name}-renamed\n"),
+        &format!("name: {name}\n"),
+    );
+    let second = stack.deploy(&rest, "v2.0.0", DIGEST_B).await;
+    assert_eq!(second.outcome, Outcome::Deployed, "{second:?}");
+}
+
+/// Another project runs alone from the directory, with the deployment's own
+/// stopped: the lookup by the project's name finds nothing.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_lone_container_of_another_project_is_refused_before_stop() {
+    let stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = format!("{PASSES}{BACKUP}");
+    let first = stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+
+    stack.compose_by_hand(&["stop", "app"]);
+    let other = OtherProject(format!("{}-other", stack.project.name));
+    stack.compose_by_hand(&["-p", &other.0, "up", "-d", "--no-deps", "app"]);
+    let lone = stack
+        .docker
+        .container_at(&stack.dir, "app")
+        .await
+        .unwrap()
+        .expect("the other project's container runs from this directory");
+    let started_at = stack.docker.inspect(&lone).await.unwrap().started_at;
+
+    let err = stack.attempt(&rest, "v2.0.0", DIGEST_B).await.unwrap_err();
+
+    assert!(
+        matches!(err, DeployError::OutsideTheProject { .. }),
+        "{err}"
+    );
+    let info = stack.docker.inspect(&lone).await.unwrap();
+    assert_eq!(
+        (info.status.as_str(), info.started_at),
+        ("running", started_at)
+    );
+    assert_eq!(stack.state.in_progress().unwrap(), None);
+
+    drop(other);
+    let second = stack.deploy(&rest, "v2.0.0", DIGEST_B).await;
+    assert_eq!(second.outcome, Outcome::Deployed, "{second:?}");
+}
+
+/// Two directories with one project's name. Deploying the second used to stop
+/// and replace the first's service, end `Deployed`, and leave the first's
+/// `status` clean.
+#[tokio::test]
+#[ignore = "docker: runs in ci.yml"]
+async fn docker_project_name_shared_with_another_directory_is_refused_before_stop() {
+    let first_stack = Stack::new(RunAs::Agent, &script_with(":"));
+    let rest = format!("{PASSES}{BACKUP}");
+    let first = first_stack.deploy(&rest, "v1.0.0", DIGEST_A).await;
+    assert_eq!(first.outcome, Outcome::Deployed, "{first:?}");
+    let before = first_stack.running_since().await;
+
+    let second_stack = Stack::new(RunAs::Agent, &script_with(":"));
+    second_stack.edit_compose(
+        &format!("name: {}\n", second_stack.project.name),
+        &format!("name: {}\n", first_stack.project.name),
+    );
+    let err = second_stack
+        .attempt(&rest, "v2.0.0", DIGEST_B)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("`name:`") && text.contains("`COMPOSE_PROJECT_NAME`"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("\"{}\"", first_stack.dir.display())),
+        "the other directory is named, quoted: {text}"
+    );
+    assert_eq!(first_stack.running_since().await, before);
+    assert_eq!(second_stack.state.in_progress().unwrap(), None);
+    let status = first_stack.status(&rest).await;
+    assert_eq!(status["running_image"], format!("{:?}", image(DIGEST_A)));
+}
+
 /// A service started by hand through a symlink is labelled with the symlink's
 /// path. That used to turn a healthy service into a permanent critical.
 #[tokio::test]
@@ -1225,10 +1353,11 @@ async fn docker_service_started_through_a_symlink_is_found() {
 }
 
 /// The base file lives elsewhere, so that is the working directory compose
-/// labels the container with.
+/// labels the container with. The container can't be told from another stack's,
+/// so the compose file has to live in the compose directory.
 #[tokio::test]
 #[ignore = "docker: runs in ci.yml"]
-async fn docker_compose_file_in_another_directory_is_found() {
+async fn docker_compose_file_in_another_directory_is_refused_before_stop() {
     let stack = Stack::new(RunAs::Agent, &script_with(":"));
     let elsewhere = stack.dir.join("elsewhere");
     fs::create_dir_all(elsewhere.join("data")).unwrap();
@@ -1251,12 +1380,14 @@ async fn docker_compose_file_in_another_directory_is_found() {
         elsewhere,
         "the working directory is the agent's, so this proves nothing"
     );
+    let before = stack.running_since().await;
 
-    let second = stack
-        .deploy(&passes_only_on("v1.36"), "v2.0.0", DIGEST_B)
-        .await;
-    assert_rolled_back(&second);
-    assert_eq!(stack.running_image().await, image(DIGEST_A));
+    let err = stack.attempt(PASSES, "v2.0.0", DIGEST_B).await.unwrap_err();
+
+    assert!(matches!(err, DeployError::StartedElsewhere { .. }), "{err}");
+    assert!(err.to_string().contains("compose directory"), "{err}");
+    assert_eq!(stack.running_since().await, before);
+    assert_eq!(stack.state.in_progress().unwrap(), None);
 }
 
 /// An agent started with `PWD` on a symlink to the directory must not hand it to

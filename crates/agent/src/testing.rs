@@ -93,6 +93,8 @@ pub enum Call {
     },
     /// `inspect(id)`.
     Inspect(ContainerId),
+    /// `compose_working_dir(id)`.
+    WorkingDir(ContainerId),
     /// `exec(id, argv)`.
     Exec {
         /// Container.
@@ -149,6 +151,9 @@ struct Inner {
     stopped: bool,
     inspect: Script<ContainerInfo>,
     inspect_after_up: BTreeMap<usize, Script<ContainerInfo>>,
+    working_dir: Script<Option<String>>,
+    /// The directory of the last `container` call.
+    looked_up_in: Option<PathBuf>,
     exec: Script<bool>,
     logs_contain: Script<bool>,
 }
@@ -221,6 +226,8 @@ impl FakeDocker {
                 stopped: false,
                 inspect: Script::empty(),
                 inspect_after_up: BTreeMap::new(),
+                working_dir: Script::empty(),
+                looked_up_in: None,
                 exec: Script::empty(),
                 logs_contain: Script::empty(),
             }),
@@ -341,6 +348,11 @@ impl FakeDocker {
         script_inspect, inspect, ContainerInfo
     );
     script_setter!(
+        /// Replies of `compose_working_dir`. Default: the directory of the last
+        /// `container` call, as for a service started there.
+        script_working_dir, working_dir, Option<String>
+    );
+    script_setter!(
         /// Replies of `exec`. Default: an error.
         script_exec, exec, bool
     );
@@ -437,6 +449,7 @@ impl Docker for FakeDocker {
             service: service.to_owned(),
         })
         .await;
+        self.lock().looked_up_in = Some(dir.to_owned());
         self.found_container()
     }
 
@@ -466,6 +479,18 @@ impl Docker for FakeDocker {
             None => inner.inspect.next(),
         };
         lift("inspect", reply.unwrap_or(Err("unscripted inspect")))
+    }
+
+    async fn compose_working_dir(&self, id: &ContainerId) -> Result<Option<String>, DockerError> {
+        self.record(Call::WorkingDir(id.clone())).await;
+        let mut inner = self.lock();
+        let reply = inner.working_dir.next().unwrap_or_else(|| {
+            Ok(inner
+                .looked_up_in
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().into_owned()))
+        });
+        lift("docker inspect", reply)
     }
 
     async fn exec(&self, id: &ContainerId, argv: &[String]) -> Result<bool, DockerError> {

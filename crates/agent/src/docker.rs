@@ -74,6 +74,11 @@ const INSPECT_FORMAT: &str = concat!(
     "[{{json $name}},{{json $net.IPAddress}},{{json $net.GlobalIPv6Address}}],{{end}}null]}"
 );
 
+/// The Go template that reads a container's compose working directory, and
+/// nothing else, as a JSON string: empty when it has no such label.
+const WORKING_DIR_FORMAT: &str =
+    "{{json (index .Config.Labels \"com.docker.compose.project.working_dir\")}}";
+
 /// A failure running Docker.
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
@@ -214,8 +219,8 @@ pub struct ServiceConfig {
     pub image: Option<String>,
     /// Whether the service has a `build` section (refused by the agent).
     pub has_build: bool,
-    /// How many containers the project asks for: the larger of `scale` and
-    /// `deploy.replicas`, 1 with neither.
+    /// How many containers the project asks for: `scale` or `deploy.replicas`,
+    /// whichever is not 1 if one isn't, and 1 with neither.
     pub replicas: u64,
 }
 
@@ -313,6 +318,14 @@ pub trait Docker: Send + Sync {
         &self,
         id: &ContainerId,
     ) -> impl Future<Output = Result<ContainerInfo, DockerError>> + Send;
+
+    /// The working directory compose labelled the container `id` with, as the
+    /// label spells it; `None` without that label. Whoever started the
+    /// container chose it: it is quoted wherever it is shown.
+    fn compose_working_dir(
+        &self,
+        id: &ContainerId,
+    ) -> impl Future<Output = Result<Option<String>, DockerError>> + Send;
 
     /// Runs `argv` in the container; whether it exited with status 0. Its
     /// output is discarded. On a timeout only the `docker exec` client is
@@ -707,7 +720,7 @@ fn parse_config(raw: &[u8], service: &str) -> Result<ServiceConfig, DockerError>
             .scale
             .into_iter()
             .chain(svc.deploy.as_ref().and_then(|deploy| deploy.replicas))
-            .max()
+            .find(|asked| *asked != 1)
             .unwrap_or(1),
     })
 }
@@ -779,6 +792,12 @@ fn parse_inspect(raw: &[u8]) -> Result<ContainerInfo, DockerError> {
         started_at,
         networks,
     })
+}
+
+fn parse_working_dir(raw: &[u8]) -> Result<Option<String>, DockerError> {
+    let label: String =
+        serde_json::from_slice(raw).map_err(|_| bad_inspect("not the expected JSON"))?;
+    Ok(Some(label).filter(|label| !label.is_empty()))
 }
 
 fn parse_container(raw: &[u8]) -> Result<Option<ContainerId>, DockerError> {
@@ -973,6 +992,22 @@ impl Docker for DockerCli {
             .arg(id.as_ref());
         let captured = Self::run(LABEL, cmd, self.timeout).await?;
         parse_inspect(&captured.stdout)
+    }
+
+    async fn compose_working_dir(&self, id: &ContainerId) -> Result<Option<String>, DockerError> {
+        const LABEL: &str = "docker inspect";
+        let mut cmd = self.command(None);
+        cmd.args([
+            "inspect",
+            "--type",
+            "container",
+            "--format",
+            WORKING_DIR_FORMAT,
+        ])
+        .arg("--")
+        .arg(id.as_ref());
+        let captured = Self::run(LABEL, cmd, self.timeout).await?;
+        parse_working_dir(&captured.stdout)
     }
 
     async fn exec(&self, id: &ContainerId, argv: &[String]) -> Result<bool, DockerError> {
@@ -1190,14 +1225,18 @@ mod tests {
             "scaled":{"image":"i","scale":2},
             "replicated":{"image":"i","deploy":{"replicas":3,"resources":{"limits":{"memory":"1"}}}},
             "other":{"image":"i","deploy":{"resources":{}}},
-            "both":{"image":"i","scale":2,"deploy":{"replicas":4}}}}"#;
+            "no_scale":{"image":"i","scale":0},
+            "no_replicas":{"image":"i","deploy":{"replicas":0}},
+            "one_and_none":{"image":"i","scale":1,"deploy":{"replicas":0}}}}"#;
         for (service, replicas) in [
             ("plain", 1),
             ("one", 1),
             ("scaled", 2),
             ("replicated", 3),
             ("other", 1),
-            ("both", 4),
+            ("no_scale", 0),
+            ("no_replicas", 0),
+            ("one_and_none", 0),
         ] {
             assert_eq!(
                 parse_config(raw, service).unwrap().replicas,
@@ -1599,6 +1638,33 @@ mod tests {
                 "arg:label=com.docker.compose.oneoff=False",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn working_dir_label_is_read_and_absent_is_none() {
+        let stub = Stub::new(
+            "{ for a in \"$@\"; do echo \"arg:$a\"; done; } > \"$(dirname \"$0\")/seen\"\ncat \"$(dirname \"$0\")/reply\"",
+        );
+        let cli = stub.cli();
+        fs::write(stub.path("reply"), "\"/srv/compose/app\"\n").unwrap();
+        assert_eq!(
+            cli.compose_working_dir(&id()).await.unwrap().as_deref(),
+            Some("/srv/compose/app")
+        );
+        let seen = fs::read_to_string(stub.path("seen")).unwrap();
+        assert!(
+            seen.contains("com.docker.compose.project.working_dir"),
+            "{seen}"
+        );
+        assert!(!seen.contains("Env"), "{seen}");
+
+        fs::write(stub.path("reply"), "\"\"\n").unwrap();
+        assert_eq!(cli.compose_working_dir(&id()).await.unwrap(), None);
+
+        fs::write(stub.path("reply"), "s3cret, not JSON\n").unwrap();
+        let err = cli.compose_working_dir(&id()).await.unwrap_err();
+        assert!(matches!(err, DockerError::BadOutput { .. }), "{err}");
+        assert!(!format!("{err} {err:?}").contains("s3cret"), "{err}");
     }
 
     #[tokio::test]

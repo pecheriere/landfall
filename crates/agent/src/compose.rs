@@ -5,15 +5,13 @@
 //! the labels that say what is running. The stack's `.env` names it in
 //! `COMPOSE_FILE` (design 7.1).
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 
-use landfall_core::config::{Config, Deployment};
-use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag, RepoName};
+use landfall_core::config::Deployment;
+use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag, RepoName};
 use landfall_origin::release::{REGISTRY_HOST, image_name};
 
 /// The override's file name, in the compose directory.
@@ -70,7 +68,7 @@ pub fn pinned_image<'a>(file: &'a [u8], service: &str) -> Pin<'a> {
     image.map_or(Pin::Unrecognised, Pin::Image)
 }
 
-/// A failure resolving the compose directories of a host.
+/// A failure resolving a compose directory.
 #[derive(Debug, thiserror::Error)]
 pub enum ComposeError {
     /// The directory cannot be resolved (missing, not searchable).
@@ -90,18 +88,6 @@ pub enum ComposeError {
         deployment: DeploymentId,
         /// The configured directory.
         dir: String,
-    },
-    /// Two deployments resolve to the same directory (a symlink, a bind
-    /// mount path or a different spelling): overrides and backups are per
-    /// directory, so this is refused.
-    #[error("deployments {first} and {second} resolve to the same compose directory {resolved:?}")]
-    Aliased {
-        /// One deployment.
-        first: DeploymentId,
-        /// The other.
-        second: DeploymentId,
-        /// The directory both resolve to.
-        resolved: PathBuf,
     },
 }
 
@@ -161,13 +147,9 @@ fn yaml_string(text: &str) -> String {
 ///
 /// [`ComposeError`] when it is missing or not a directory.
 pub fn resolve_dir(deployment: &Deployment) -> Result<PathBuf, ComposeError> {
-    resolve_one(deployment).map(|(canonical, _)| canonical)
-}
-
-fn resolve_one(d: &Deployment) -> Result<(PathBuf, fs::Metadata), ComposeError> {
-    let dir = d.compose().dir();
+    let dir = deployment.compose().dir();
     let unusable = |source| ComposeError::Unusable {
-        deployment: d.id().clone(),
+        deployment: deployment.id().clone(),
         dir: dir.to_owned(),
         source,
     };
@@ -175,49 +157,17 @@ fn resolve_one(d: &Deployment) -> Result<(PathBuf, fs::Metadata), ComposeError> 
     let meta = fs::metadata(&canonical).map_err(unusable)?;
     if !meta.is_dir() {
         return Err(ComposeError::NotADirectory {
-            deployment: d.id().clone(),
+            deployment: deployment.id().clone(),
             dir: dir.to_owned(),
         });
     }
-    Ok((canonical, meta))
-}
-
-/// Resolves the compose directory of each deployment on `host` to its
-/// canonical path, once, at start-up. A directory that is missing or not a
-/// directory, or two deployments that resolve to the same one, is an error,
-/// so the agent does not run with an ambiguous layout.
-///
-/// # Errors
-///
-/// [`ComposeError`] for the first deployment that fails.
-pub fn resolve_dirs(
-    config: &Config,
-    host: &HostId,
-) -> Result<BTreeMap<DeploymentId, PathBuf>, ComposeError> {
-    let mut resolved: BTreeMap<DeploymentId, PathBuf> = BTreeMap::new();
-    // Keyed on the directory's identity, which unlike its canonical path is
-    // the same through a bind mount.
-    let mut owners: BTreeMap<(u64, u64), DeploymentId> = BTreeMap::new();
-    for d in config.deployments_for_host(host) {
-        let (canonical, meta) = resolve_one(d)?;
-        if let Some(first) = owners.insert((meta.dev(), meta.ino()), d.id().clone()) {
-            return Err(ComposeError::Aliased {
-                first,
-                second: d.id().clone(),
-                resolved: canonical,
-            });
-        }
-        resolved.insert(d.id().clone(), canonical);
-    }
-    Ok(resolved)
+    Ok(canonical)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
-
     use landfall_core::config::parse;
-    use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag, RepoName};
+    use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag, RepoName};
 
     use super::*;
 
@@ -314,81 +264,37 @@ mod tests {
         assert_eq!(OVERRIDE_FILE, "compose.landfall.yaml");
     }
 
-    fn config(dirs: &[(&str, &str)]) -> landfall_core::config::Config {
-        let mut text = String::from(
+    fn deployment_in(dir: &std::path::Path) -> Deployment {
+        let dir = dir.to_str().unwrap();
+        let text = format!(
             "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-             [approvers]\noperator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }\n",
+             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+             [[deployment]]\nid = \"app/prod\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
+             host = \"home-1\"\ncompose = {{ dir = \"{dir}\", service = \"app\" }}\n\
+             origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
+             rule = {{ auto = \"any\", approvers = [\"operator\"] }}\nchecks = [\"container-healthy\"]\n\
+             [[grant]]\nprincipal = \"operator\"\ndeployments = [\"app/prod\"]\ncan = [\"approve\"]\n"
         );
-        for (id, dir) in dirs {
-            write!(
-                text,
-                "[[deployment]]\nid = \"{id}\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
-                 host = \"home-1\"\ncompose = {{ dir = \"{dir}\", service = \"app\" }}\n\
-                 origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
-                 rule = {{ auto = \"any\", approvers = [\"operator\"] }}\nchecks = [\"container-healthy\"]\n"
-            )
-            .unwrap();
-        }
-        write!(
-            text,
-            "[[grant]]\nprincipal = \"operator\"\ndeployments = [{}]\ncan = [\"approve\"]\n",
-            dirs.iter()
-                .map(|(id, _)| format!("\"{id}\""))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .unwrap();
-        parse(text.as_bytes()).unwrap()
+        parse(text.as_bytes()).unwrap().deployments()[0].clone()
     }
 
     #[test]
-    fn directories_resolve_to_their_canonical_paths() {
+    fn a_directory_resolves_to_its_canonical_path() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real");
         std::fs::create_dir(&real).unwrap();
-        let other = tmp.path().join("other");
-        std::fs::create_dir(&other).unwrap();
-        let cfg = config(&[
-            ("app/prod", real.to_str().unwrap()),
-            ("app/staging", other.to_str().unwrap()),
-        ]);
-        let host: HostId = "home-1".parse().unwrap();
-        let dirs = resolve_dirs(&cfg, &host).unwrap();
-        assert_eq!(dirs.len(), 2);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(
-            dirs[&"app/prod".parse::<DeploymentId>().unwrap()],
+            resolve_dir(&deployment_in(&link)).unwrap(),
             real.canonicalize().unwrap()
-        );
-        let elsewhere: HostId = "home-2".parse().unwrap();
-        assert!(resolve_dirs(&cfg, &elsewhere).unwrap().is_empty());
-    }
-
-    #[test]
-    fn aliased_directories_are_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let alias = tmp.path().join("alias");
-        symlink(&real, &alias).unwrap();
-        let cfg = config(&[
-            ("app/prod", real.to_str().unwrap()),
-            ("app/staging", alias.to_str().unwrap()),
-        ]);
-        let err = resolve_dirs(&cfg, &"home-1".parse().unwrap()).unwrap_err();
-        assert!(matches!(err, ComposeError::Aliased { .. }), "{err}");
-        let text = err.to_string();
-        assert!(
-            text.contains("app/prod") && text.contains("app/staging"),
-            "{text}"
         );
     }
 
     #[test]
     fn missing_directory_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let gone = tmp.path().join("gone");
-        let cfg = config(&[("app/prod", gone.to_str().unwrap())]);
-        let err = resolve_dirs(&cfg, &"home-1".parse().unwrap()).unwrap_err();
+        let err = resolve_dir(&deployment_in(&tmp.path().join("gone"))).unwrap_err();
         assert!(matches!(err, ComposeError::Unusable { .. }), "{err}");
         assert!(err.to_string().contains("app/prod"));
     }
@@ -398,8 +304,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
-        let cfg = config(&[("app/prod", file.to_str().unwrap())]);
-        let err = resolve_dirs(&cfg, &"home-1".parse().unwrap()).unwrap_err();
+        let err = resolve_dir(&deployment_in(&file)).unwrap_err();
         assert!(matches!(err, ComposeError::NotADirectory { .. }), "{err}");
     }
 }

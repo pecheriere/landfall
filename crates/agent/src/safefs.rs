@@ -740,8 +740,10 @@ pub fn restore(snapshot: &Path, target: &Root, paths: &[RelPath]) -> Result<(), 
 /// not directories are not backups and stay. An absent `backups` directory is
 /// nothing to do.
 ///
-/// Call it under the deployment's lock: a `.partial` is assumed to be a
-/// leftover, not a snapshot in progress.
+/// A `.partial` is taken for a leftover, not a snapshot in progress. So call it
+/// under the deployment's lock, and not at all while a snapshot that outran its
+/// deadline may still be running under that same lock: the thread cannot be
+/// cancelled.
 ///
 /// # Errors
 ///

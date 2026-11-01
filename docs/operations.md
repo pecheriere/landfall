@@ -51,16 +51,23 @@ one deployment. The service's image belongs to the agent:
   printf '# Managed by landfall. Do not edit: the agent rewrites this file on every deploy.\nservices: {}\n' > compose.landfall.yaml
   ```
 
-- Run `docker compose` from the directory's real path, with `compose.yaml` in it.
-  Deploys find a service's container by its project's name, wherever it was started
-  from. `status` must not load the project, so it goes by the working directory
-  compose labels the container with. Through a symlink, or with the compose file in
-  another directory, that label is another path, so `status` reports such a container
-  as not running. After a start through a symlink, `docker compose up -d
-  --force-recreate <service>` from the real path puts the label right.
-- One container per service. A service with `scale` or `deploy.replicas` above 1, one
-  scaled by hand, or a second project running from this directory (`docker compose
-  -p other up`) is refused before anything stops, and the error names the fix.
+- **The compose file must live in `compose.dir`, and the project's name must be this
+  directory's alone.** A deploy finds the service's container by its project's name,
+  and looks at the working directory compose labelled it with. A running container
+  started from another directory is refused before anything stops, as a deploy would
+  stop and replace it. A project's name defaults to the directory's base name, so two
+  directories with the same base name share one: give each a unique `name:` or
+  `COMPOSE_PROJECT_NAME`. A compose file kept elsewhere is refused the same way, once
+  its container is running. Only running containers are looked at, so a stopped one of
+  another stack under the same name is not noticed.
+- Run `docker compose` from the directory's real path. A deploy accepts a start through
+  a symlink to the directory. `status` must not load the project, so it goes by the
+  label as it is spelled, and reports such a container as not running. `docker compose
+  up -d --force-recreate <service>` from the real path puts the label right.
+- One container per service. A service with `scale` or `deploy.replicas` other than 1,
+  one scaled by hand, or a container running from this directory under another
+  project's name (`docker compose -p other up`, or one left behind by editing `name:`)
+  is refused before anything stops, and the error names the fix.
 - A service behind a profile that isn't active is not in the project, so a deploy
   is refused as having no such service. Set `COMPOSE_PROFILES` in `.env`, or remove
   the profile. The agent ignores that variable in its own environment.
@@ -175,10 +182,16 @@ The sequence is in the design, section 7.2. What an operator will notice:
   it.
 - **If a rollback's `up` of the previous version fails, whatever is running stays
   running.** The state is critical and deploys are blocked, and the agent doesn't
-  force a stop. Without a backup to restore, that can be the failed release, still
-  serving: `status` shows `running_image_matches: false`. With one, the service was
-  stopped for the restore before that `up`, so it is down unless the failed `up`
-  started it. What `docker compose up` itself did before it failed is compose's.
+  force a stop. What that leaves depends on how far things got:
+  - If nothing stopped the service (no backup declared, or a failed one with
+    `stop = false`), it can be the failed release, still serving: `status` shows
+    `running_image_matches: false`.
+  - If the service stopped for a backup that then failed (`stop = true`), or for the
+    restore of one that completed, it is down unless the failed `up` started it.
+  - In a later `recover` from phase `restored`, nothing is stopped, so the previous
+    version can still be up from the attempt before.
+
+  What `docker compose up` itself did before it failed is compose's.
 - **A rollback whose `up` leaves the container untouched waits the whole log
   window.** With a `no_log_match` check, a container that was not recreated is
   observed for all of `within_secs` from just before that `up`, however long ago it
@@ -205,7 +218,9 @@ The sequence is in the design, section 7.2. What an operator will notice:
 - **The newest 3 backups are kept** per deployment, whether deploys succeed or fail.
   Before a backup they are pruned to 2, to leave room for it, and after a deploy or
   a completed rollback to 3. The backup an unfinished deploy names is never pruned,
-  and after a failed rollback nothing is pruned until `recover` has finished.
+  and after a failed rollback nothing is pruned until `recover` has finished. A run in
+  which file work outlasted its deadline skips the pruning and says so in the report,
+  as that work may still be running; the next run does it.
 - **A report records every step,** with what each check took (`attempts`, `millis`)
   and what a backup copied (`files`, `directories`, `symlinks`, `bytes`), under
   `detail`, also for checks that failed. **Reports are not pruned
@@ -274,8 +289,12 @@ It goes by the `phase` of the unfinished deploy, which `status` shows:
 | `preflight` | The service was never touched: puts the previous override back and leaves the service alone | `nothing_changed` |
 | `deploying` | If the deploy had in fact finished and only the clean-up was left, finishes that. Otherwise the rollback path: the previous override, the backup if one was completed, start, verify, checks | `deployed`, or `rolled_back` |
 | `rolling_back` | The rollback path again, from the start | `rolled_back` |
-| `restored` | The backup is back in full, and the previous version may have been running on it since. Only start, verify and checks: it does not stop the service or restore again, so what that version wrote since is kept | `rolled_back` |
+| `restored` | The backup is back in full, and the previous version may have been running on it since. Only start, verify and checks: it does not stop the service or restore again, so what that version wrote since is kept. With no previous version it stops the service instead, as there are no writes of one to lose | `rolled_back` |
 | `rolled_back` | The previous version is back and checked: removes the marker | `rolled_back` |
+
+A `restored` marker assumes that only the previous version touched the data since
+the restore. A release container with `restart: always` can come back on a daemon
+restart and write to it, and `recover` keeps that too.
 
 The outcome is `failed_no_previous` in place of `rolled_back` when there is no
 previous version to start. A deployment with `rollback_failed` in its report stays
@@ -291,7 +310,14 @@ It prints the report as JSON on stdout.
 
 ### A marker that stays
 
-`recover` is the way out, and running it again is always safe: it goes by the phase.
+`recover` is the way out, and it goes by the phase, so running it again after it failed
+repeats nothing that would undo its own work.
+
+It can discard writes in one case. With `stop = false`, a crash between recording the
+backup and `up` leaves the previous version running on an unfinished marker in phase
+`deploying`, and `recover` restores the backup, discarding what the service wrote since.
+`status` shows the phase, so an operator can decide what to save first.
+
 If it keeps exiting 1:
 
 1. Read the failing step in the report it printed, or in `journalctl`. A failed
