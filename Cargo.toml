@@ -32,7 +32,7 @@ print_stderr = "deny"
 landfall-core = { path = "crates/core", version = "0.0.0" }
 landfall-origin = { path = "crates/origin", version = "0.0.0" }
 clap = { version = "4.6.7", features = ["derive"] }
-semver = "1.0.28"
+semver = { version = "1.0.28", features = ["serde"] }
 sha2 = "0.11.1"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
@@ -42,7 +42,7 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed2
 # Sigstore bundle verification. Only the aws-lc-rs crypto backend: no TUF
 # client with rustls (no openssl, no native-tls) for the trust root.
 sigstore-verify = { version = "0.15.1", default-features = false, features = ["aws-lc-rs", "rustls", "tuf"] }
-jiff = { version = "0.2.38", default-features = false, features = ["std"] }
+jiff = { version = "0.2.38", default-features = false, features = ["std", "serde"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", default-features = false }
 base64 = "0.23.1"
@@ -53,3 +53,5 @@ reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] 
 # 0.11 is a release candidate.
 sha1-checked = { version = "0.10.0", default-features = false }
 wiremock = "0.6.5"
+# Process identity (uid) without unsafe code.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process"] }

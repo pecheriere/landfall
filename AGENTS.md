@@ -22,7 +22,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   the audit log, serves the API and the web UI.
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
-  deploys, checks, rolls back.
+  deploys, checks, rolls back. A library plus a thin binary; modules:
+  `state` (the agent's own directory: deployed and in-progress records,
+  the previous override, reports, a per-deployment lock).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 

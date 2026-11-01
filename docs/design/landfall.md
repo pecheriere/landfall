@@ -180,7 +180,7 @@ host = "home-1"
 compose = { dir = "/srv/compose/app", service = "app" }
 origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
 rule = { auto = "patch", approve = "minor", approvers = ["operator"] }   # major: manual + approval
-checks = [{ http = "/health", network = "app", expect = 200 }]
+checks = [{ http = "/health", network = "app", port = 8080, expect = 200 }]
 backup = { paths = ["state"], stop = true }
 
 [[deployment]]
@@ -270,7 +270,7 @@ crate) and preserve ownership and modes. Special files are refused.
 
 ### 7.4 Checks
 Checks are Rust types with typed parameters; configuration chooses and parameterises them, never adds
-code. v0: Docker healthcheck (fails if the image defines none), HTTP probe from inside a Docker network,
+code. v0: Docker healthcheck (fails if the image defines none), HTTP probe of the container on a Docker network and port,
 command exit status inside the container, "no log line matching X in the first N seconds". Each check
 reports a short reason string used verbatim in the "why" view.
 

@@ -193,11 +193,11 @@ pub enum ConfigError {
         /// The grant's principal.
         principal: PrincipalId,
     },
-    /// Rule 8: two deployments own the same compose service on one host.
+    /// Rule 8: two deployments use the same compose directory on one host.
     #[error(
-        "deployment {deployment}: compose service {service:?} in {dir:?} on host {host} is already owned by {other}"
+        "deployment {deployment}: compose directory {dir:?} on host {host} is already used by {other}"
     )]
-    DuplicateService {
+    DuplicateComposeDir {
         /// The later deployment.
         deployment: DeploymentId,
         /// The earlier deployment.
@@ -206,8 +206,6 @@ pub enum ConfigError {
         host: HostId,
         /// The compose directory.
         dir: String,
-        /// The compose service.
-        service: String,
     },
 }
 
@@ -378,6 +376,8 @@ pub enum Check {
         /// Docker network to probe from, `[A-Za-z0-9][A-Za-z0-9_.-]*`, at
         /// most 128 bytes.
         network: String,
+        /// TCP port of the container, 1 to 65535.
+        port: u16,
         /// Expected status code, 100 to 599.
         expect: u16,
     },
@@ -655,7 +655,7 @@ fn validate_deployment(config: &Config, d: &Deployment) -> Result<(), ConfigErro
 
 fn validate(config: &Config) -> Result<(), ConfigError> {
     let mut seen = HashSet::new();
-    let mut services: HashMap<(&HostId, &str, &str), &DeploymentId> = HashMap::new();
+    let mut dirs: HashMap<(&HostId, &str), &DeploymentId> = HashMap::new();
     for d in &config.deployments {
         // Rule 1.
         if !seen.insert(&d.id) {
@@ -663,16 +663,12 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
         }
         validate_deployment(config, d)?;
         // Rule 8.
-        if let Some(other) = services.insert(
-            (&d.host, d.compose.dir.as_str(), d.compose.service.as_str()),
-            &d.id,
-        ) {
-            return Err(ConfigError::DuplicateService {
+        if let Some(other) = dirs.insert((&d.host, d.compose.dir.as_str()), &d.id) {
+            return Err(ConfigError::DuplicateComposeDir {
                 deployment: d.id.clone(),
                 other: other.clone(),
                 host: d.host.clone(),
                 dir: d.compose.dir.clone(),
-                service: d.compose.service.clone(),
             });
         }
     }
@@ -761,7 +757,7 @@ host = "home-1"
 compose = { dir = "/srv/compose/app", service = "app" }
 origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
 rule = { auto = "patch", approve = "minor", approvers = ["operator"] }
-checks = [{ http = "/health", network = "app", expect = 200 }]
+checks = [{ http = "/health", network = "app", port = 8080, expect = 200 }]
 backup = { paths = ["state"], stop = true }
 
 [[deployment]]
@@ -991,7 +987,7 @@ can = ["view", "request", "approve", "rollback"]
 
         // 5: checks non-empty.
         let err = parse_str(&edited(
-            "checks = [{ http = \"/health\", network = \"app\", expect = 200 }]",
+            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]",
             "checks = []",
         ))
         .unwrap_err();
@@ -1014,7 +1010,7 @@ can = ["view", "request", "approve", "rollback"]
         assert!(matches!(err, ConfigError::SelfPromotion(_)), "{err}");
         assert!(err.to_string().contains("app/staging"));
         let cyclic = edited(
-            "checks = [{ http = \"/health\", network = \"app\", expect = 200 }]",
+            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]",
             "checks = [\"container-healthy\"]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
         );
         let err = parse_str(&cyclic).unwrap_err();
@@ -1047,14 +1043,61 @@ can = ["view", "request", "approve", "rollback"]
         );
         assert!(err.to_string().contains("maintainer"));
 
-        // 8: one service per host, compose dir and service.
+        // 8: one deployment per host and compose directory.
         let err = parse_str(&edited(
             "dir = \"/srv/compose/app-staging\"",
             "dir = \"/srv/compose/app\"",
         ))
         .unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateService { .. }), "{err}");
+        assert!(
+            matches!(err, ConfigError::DuplicateComposeDir { .. }),
+            "{err}"
+        );
         assert!(err.to_string().contains("app/staging") && err.to_string().contains("app/prod"));
+    }
+
+    #[test]
+    fn http_check_requires_a_port() {
+        let err = parse_str(&with_staging_checks(
+            "[{ http = \"/h\", network = \"app\", expect = 200 }]",
+        ))
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+        let err = err.to_string();
+        assert!(err.contains("port") && err.contains("app/staging"), "{err}");
+    }
+
+    #[test]
+    fn port_zero_is_rejected() {
+        for port in ["0", "65536", "-1"] {
+            let check =
+                format!("[{{ http = \"/h\", network = \"app\", port = {port}, expect = 200 }}]");
+            assert!(parse_str(&with_staging_checks(&check)).is_err(), "{port}");
+        }
+        for port in ["1", "65535"] {
+            let check =
+                format!("[{{ http = \"/h\", network = \"app\", port = {port}, expect = 200 }}]");
+            assert!(parse_str(&with_staging_checks(&check)).is_ok(), "{port}");
+        }
+    }
+
+    #[test]
+    fn two_deployments_cannot_share_a_directory() {
+        let err = parse_str(&edited(
+            "dir = \"/srv/compose/app-staging\", service = \"app\"",
+            "dir = \"/srv/compose/app\", service = \"other\"",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DuplicateComposeDir { .. }),
+            "{err}"
+        );
+        let err = err.to_string();
+        assert!(
+            err.contains("app/staging") && err.contains("app/prod"),
+            "{err}"
+        );
+        assert!(err.contains("/srv/compose/app"), "{err}");
     }
 
     #[test]
@@ -1097,7 +1140,7 @@ can = ["view", "request", "approve", "rollback"]
 
     #[test]
     fn checks_parse_in_both_forms() {
-        let all = "checks = [\"container-healthy\", { http = \"/health\", network = \"app\", expect = 200 }, { command = [\"/app\", \"healthcheck\"] }, { no_log_match = \"panicked\", within_secs = 30 }]";
+        let all = "checks = [\"container-healthy\", { http = \"/health\", network = \"app\", port = 8080, expect = 200 }, { command = [\"/app\", \"healthcheck\"] }, { no_log_match = \"panicked\", within_secs = 30 }]";
         let config = parse_str(&edited("checks = [\"container-healthy\"]", all)).unwrap();
         let staging = config.deployment(&id("app/staging")).unwrap();
         assert_eq!(
@@ -1107,6 +1150,7 @@ can = ["view", "request", "approve", "rollback"]
                 Check::Http {
                     path: "/health".into(),
                     network: "app".into(),
+                    port: 8080,
                     expect: 200
                 },
                 Check::Command {
@@ -1254,7 +1298,7 @@ can = ["view", "request", "approve", "rollback"]
         for observing in [
             "[\"container-healthy\", { no_log_match = \"panicked\", within_secs = 30 }]",
             "[{ command = [\"/app\", \"healthcheck\"] }, { no_log_match = \"x\", within_secs = 1 }]",
-            "[{ no_log_match = \"x\", within_secs = 1 }, { http = \"/\", network = \"app\", expect = 204 }]",
+            "[{ no_log_match = \"x\", within_secs = 1 }, { http = \"/\", network = \"app\", port = 8080, expect = 204 }]",
         ] {
             assert!(
                 parse_str(&with_staging_checks(observing)).is_ok(),
@@ -1267,52 +1311,52 @@ can = ["view", "request", "approve", "rollback"]
     fn http_checks_validate_path_network_and_status() {
         for (check, field, value) in [
             (
-                "{ http = \"/h\", network = \"app\", expect = 0 }",
+                "{ http = \"/h\", network = \"app\", port = 8080, expect = 0 }",
                 "checks[0].expect",
                 "0",
             ),
             (
-                "{ http = \"/h\", network = \"app\", expect = 99 }",
+                "{ http = \"/h\", network = \"app\", port = 8080, expect = 99 }",
                 "checks[0].expect",
                 "99",
             ),
             (
-                "{ http = \"/h\", network = \"app\", expect = 600 }",
+                "{ http = \"/h\", network = \"app\", port = 8080, expect = 600 }",
                 "checks[0].expect",
                 "600",
             ),
             (
-                "{ http = \"/h\\r\\nX: y\", network = \"app\", expect = 200 }",
+                "{ http = \"/h\\r\\nX: y\", network = \"app\", port = 8080, expect = 200 }",
                 "checks[0].http",
                 "/h\r\nX: y",
             ),
             (
-                "{ http = \"/a b\", network = \"app\", expect = 200 }",
+                "{ http = \"/a b\", network = \"app\", port = 8080, expect = 200 }",
                 "checks[0].http",
                 "/a b",
             ),
             (
-                "{ http = \"/caf\u{e9}\", network = \"app\", expect = 200 }",
+                "{ http = \"/caf\u{e9}\", network = \"app\", port = 8080, expect = 200 }",
                 "checks[0].http",
                 "/caf\u{e9}",
             ),
             (
-                "{ http = \"health\", network = \"app\", expect = 200 }",
+                "{ http = \"health\", network = \"app\", port = 8080, expect = 200 }",
                 "checks[0].http",
                 "health",
             ),
             (
-                "{ http = \"/h\", network = \"n n\", expect = 200 }",
+                "{ http = \"/h\", network = \"n n\", port = 8080, expect = 200 }",
                 "checks[0].network",
                 "n n",
             ),
             (
-                "{ http = \"/h\", network = \"\", expect = 200 }",
+                "{ http = \"/h\", network = \"\", port = 8080, expect = 200 }",
                 "checks[0].network",
                 "",
             ),
             (
-                "{ http = \"/h\", network = \"-net\", expect = 200 }",
+                "{ http = \"/h\", network = \"-net\", port = 8080, expect = 200 }",
                 "checks[0].network",
                 "-net",
             ),
@@ -1328,14 +1372,15 @@ can = ["view", "request", "approve", "rollback"]
         }
         let long = format!("n{}", "x".repeat(128));
         let err = parse_str(&with_staging_checks(&format!(
-            "[{{ http = \"/h\", network = \"{long}\", expect = 200 }}]"
+            "[{{ http = \"/h\", network = \"{long}\", port = 8080, expect = 200 }}]"
         )))
         .unwrap_err();
         assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
         let at_limit = format!("n{}", "x".repeat(127));
         for check in [
-            "{ http = \"/h?a=1&b=%20\", network = \"app_net.1-x\", expect = 100 }".to_owned(),
-            format!("{{ http = \"/\", network = \"{at_limit}\", expect = 599 }}"),
+            "{ http = \"/h?a=1&b=%20\", network = \"app_net.1-x\", port = 8080, expect = 100 }"
+                .to_owned(),
+            format!("{{ http = \"/\", network = \"{at_limit}\", port = 8080, expect = 599 }}"),
         ] {
             assert!(
                 parse_str(&with_staging_checks(&format!("[{check}]"))).is_ok(),
@@ -1395,8 +1440,8 @@ promote_to = { deployment = "app/staging", healthy_for = "1h" }
 id = "app/prod""#;
         let text = edited("\n[[deployment]]\nid = \"app/prod\"", canary);
         let text = text.replacen(
-            "checks = [{ http = \"/health\", network = \"app\", expect = 200 }]",
-            "checks = [{ http = \"/health\", network = \"app\", expect = 200 }]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
+            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]",
+            "checks = [{ http = \"/health\", network = \"app\", port = 8080, expect = 200 }]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
             1,
         );
         let err = parse_str(&text).unwrap_err();
