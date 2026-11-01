@@ -105,6 +105,9 @@ it cannot make a host run a release that is not maintainer-signed, attested and 
 group (Docker socket access is root-equivalent; stated plainly in the docs), with systemd sandboxing
 (`ProtectSystem=strict`, `ReadWritePaths=` limited to the managed compose directories, its state and
 its backup directory, `NoNewPrivileges`). Not a container, so it can't be stopped by its own deploys.
+Files in backed-up directories belong to the users containers run as, so it holds `CAP_CHOWN`,
+`CAP_FOWNER`, `CAP_DAC_OVERRIDE` and `CAP_FSETID` as ambient capabilities, and its
+uid must not be shared with any container's. Linux 5.8 or later. See `docs/operations.md`.
 
 landfall never deploys landfall: the controller and agents are upgraded by hand in v0.
 
@@ -180,7 +183,7 @@ host = "home-1"
 compose = { dir = "/srv/compose/app", service = "app" }
 origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
 rule = { auto = "patch", approve = "minor", approvers = ["operator"] }   # major: manual + approval
-checks = [{ http = "/health", network = "app", expect = 200 }]
+checks = [{ http = "/health", network = "app_app", port = 8080, expect = 200 }]
 backup = { paths = ["state"], stop = true }
 
 [[deployment]]
@@ -244,7 +247,13 @@ Host-side enforcement is later.
   override.
 - `compose.landfall.yaml` is written only by the agent: `image: <repo>@sha256:<index digest>` plus labels.
   Back it up with the host, but keep it out of the host's config repo.
-- Services with `build:` are refused.
+- Services with `build:` are refused, and so is any number of containers of the service but one: `scale` or
+  `deploy.replicas` other than 1, a service scaled by hand, or a container running from the directory
+  under another project's name, through a symlink or not.
+- The compose file lives in the compose directory, and the project's name is that directory's alone: a
+  container of the project started from another directory, running or stopped, is refused, as a deploy would
+  replace it. Rollback and `recover` don't repeat these checks, so a stack started under the same name
+  afterwards isn't noticed.
 - Other image updaters must not manage a service landfall manages.
 - The agent compares the running container's image with its override every minute and reports drift
   as an error.
@@ -261,7 +270,33 @@ Each step recorded with timings and outcome:
    declared**, start, re-run checks, record, notify. A failed rollback is the loudest state:
    notified as critical and logged to the host journal.
 
-Rollback target is always the previously healthy digest.
+Rollback target is always the previously healthy digest. A rollback runs the deployment's checks on it
+too, and starts the service even if an operator had stopped it before the deploy.
+
+**A rollback whose `up` fails.** Whatever is running stays running, with the critical state and deploys
+blocked: the agent does not force a stop. With no backup declared, nothing stopped the service, so that can
+be the failed release, still serving. A failed backup without `stop` happens before the override and `up`, so
+what is left running is the previous version. If it stopped for a backup that then failed, or for the restore of a completed one, nothing of it is running unless the failed `up` started
+something. A later `recover` of a completed restore stops nothing, so the previous version can still be up.
+What `docker compose up` did itself before failing is compose's.
+
+**First deploy.** With no override yet, the agent writes a placeholder that names no service, so a
+`COMPOSE_FILE` naming it works, and treats it as the previous state. If the base compose file gives the
+service an image, rollback starts that. If not, there is nothing to start: rollback stops the service, and
+the outcome is "failed, no previous version", not the critical failed rollback. Declared backup paths must
+exist by then: a missing one fails the backup.
+
+**Interrupted deploy.** Before changing anything the agent records that a deploy is in progress. While
+that record exists further deploys are refused, naming `landfall-agent recover`, which runs the rollback
+path, or finishes the deploy if it had already been recorded as done. So power loss never leaves a
+half-deployed service looking healthy. A failed rollback leaves the record in place, for the same reason.
+The record says how far things got. Once a backup has been restored in full, `recover` only starts and
+checks the previous version: it may have been running since, and restoring again would discard what it wrote.
+With no previous version it stops the service instead.
+
+**One deployment per compose directory on a host** (validation rule 8 of the configuration): overrides and
+backups are per directory. The agent resolves each directory once at start-up and refuses to run if two
+deployments resolve to one directory.
 
 ### 7.3 Backup safety
 Backup directories are writable by the container, and the agent is root-equivalent. Snapshot and
@@ -270,9 +305,20 @@ crate) and preserve ownership and modes. Special files are refused.
 
 ### 7.4 Checks
 Checks are Rust types with typed parameters; configuration chooses and parameterises them, never adds
-code. v0: Docker healthcheck (fails if the image defines none), HTTP probe from inside a Docker network,
+code. v0: Docker healthcheck (fails if the image defines none), HTTP probe of the container's address on a named Docker network and a required port, from the host, with no proxy and no redirects,
 command exit status inside the container, "no log line matching X in the first N seconds". Each check
 reports a short reason string used verbatim in the "why" view.
+
+A false pass is the worst outcome, so passing once is not enough. A round also requires the container
+to be running, and at its end, after any log windows, to be the same container from the same start
+with the same addresses. After the first passing round the agent waits a settle time (10 s) and
+requires a second passing round on that same container and start; any change starts over within the
+deadline. Every deploy therefore takes at least the settle time, and a crash slower than the settle
+time is not caught without a longer `no_log_match` window. That window runs from the container's
+current start or from just before the agent's own `up` or restart, whichever is later, so a container
+that `up` left untouched is still observed for all of it. Logs are scanned from just before that `up`
+or restart, so a panic in an earlier incarnation counts even if the agent never saw it, while old
+lines of a reused container do not; a replaced container's logs are not scanned.
 
 ## 8. Identity and grants
 

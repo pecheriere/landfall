@@ -22,7 +22,17 @@ passkey approvals. Agents drive it through a typed API. Design:
   the audit log, serves the API and the web UI.
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
-  deploys, checks, rolls back.
+  deploys, checks, rolls back. A library plus a thin binary; modules:
+  `state` (the agent's own directory: deployed and in-progress records,
+  the previous override, reports, a per-deployment lock), `safefs` (the only
+  code that may touch a directory a container can write to: no-follow walking
+  by directory descriptor, atomic write, snapshot, restore, prune),
+  `docker` (the only code that runs the Docker CLI, behind a trait), `compose`
+  (the override file the agent owns, compose directory resolution), `checks`
+  (post-deploy checks: health, HTTP probe, command, log window), `deploy` (the
+  sequence, rollback and recovery, recording every step in a report), `journal`
+  (the only code that writes to stderr: syslog-prefixed JSON lines), `cli`
+  (`status` and `recover`, behind the thin `main.rs`).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 
@@ -81,6 +91,29 @@ cargo deny check
 
 Tests specify behavior; no tests that restate implementation or exist for
 coverage.
+
+Tests against a real Docker are `#[ignore]`d and named with a `docker_` prefix,
+which is how CI selects them:
+`cargo test -p landfall-agent --all-features --locked -- --ignored docker`.
+`docker_e2e.rs` lists what each needs. The `foreign_owner` tests need root and
+skip without it, unless `LANDFALL_TEST_REQUIRE_ROOT` is set, as it is in CI, which
+makes that a failure.
+
+### Linux tests on a Mac
+
+Some tests only run on Linux (symlink owners and times through `O_PATH`). Run
+them in the toolchain's image:
+
+```sh
+docker run --rm -v "$PWD":/src:ro -v landfall-linux-target-<checkout>:/target \
+  -v landfall-linux-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target \
+  -w /src rust:1.99-bookworm \
+  sh -c 'cargo test -p landfall-agent --locked 2>&1 | grep -E "test result|FAILED|panicked|^error"'
+```
+
+The target volume must be private to one checkout: with one shared between
+worktrees, the mtimes cargo compares can make it reuse a binary built from another
+checkout's source, which proves nothing about this one.
 
 ## Security review
 

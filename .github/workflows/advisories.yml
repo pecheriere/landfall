@@ -35,6 +35,8 @@ jobs:
   # for the GitHub API's authenticated rate limit.
   live:
     runs-on: ubuntu-latest
+    # A cold build at worst, and tests of a few seconds.
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:

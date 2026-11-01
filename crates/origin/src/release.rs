@@ -14,7 +14,7 @@
 //! index. The first failing step is the error, and it names the step.
 
 use landfall_core::config::{Config, SignerKey};
-use landfall_core::ids::{CommitSha, DeploymentId, PrincipalId, ReleaseTag, TagError};
+use landfall_core::ids::{CommitSha, DeploymentId, PrincipalId, ReleaseTag, RepoName, TagError};
 use landfall_core::release::{
     DigestRuleError, Platform, PlatformError, require_platform, select_release_digest,
 };
@@ -102,6 +102,16 @@ impl ReleaseError {
     }
 }
 
+/// The registry host releases are published to.
+pub const REGISTRY_HOST: &str = "ghcr.io";
+
+/// The image path of a repository's releases on [`REGISTRY_HOST`]: the
+/// repository name in lowercase (`Owner/Repo` is `owner/repo`).
+#[must_use]
+pub fn image_name(repo: &RepoName) -> String {
+    repo.as_ref().to_ascii_lowercase()
+}
+
 /// Verifies release `tag` of `deployment` for a host on `platform`, and
 /// returns where it came from.
 ///
@@ -168,7 +178,7 @@ pub async fn verify_release(
         (commit, None)
     };
 
-    let image = repo.name().as_ref().to_ascii_lowercase();
+    let image = image_name(repo.name());
     let (index_digest, platforms) = fetcher
         .resolve_index(&image, &image_tag)
         .await

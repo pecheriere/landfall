@@ -13,8 +13,8 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, Level, Origin,
-    Permission, Promotion, Repo, Rule, SignerKey,
+    Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, LOG_PATTERN_LIMIT,
+    Level, Origin, Permission, Promotion, Repo, Rule, SignerKey, WITHIN_SECS_LIMIT,
 };
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 
@@ -197,6 +197,7 @@ impl<'de> Deserialize<'de> for RawCheck {
 struct RawCheckTable {
     http: Option<String>,
     network: Option<String>,
+    port: Option<u16>,
     expect: Option<u16>,
     command: Option<Vec<String>>,
     no_log_match: Option<String>,
@@ -423,6 +424,55 @@ fn parse_duration(text: &str) -> Option<u64> {
         .and_then(|n| n.checked_mul(unit))
 }
 
+/// Validates the parts of an HTTP check.
+fn convert_http(
+    id: &DeploymentId,
+    field: &str,
+    path: String,
+    network: String,
+    port: u16,
+    expect: u16,
+) -> Result<Check, ConfigError> {
+    if !is_http_path(&path) {
+        return Err(invalid(
+            id,
+            &format!("{field}.http"),
+            &path,
+            "must start with '/' and contain only visible ASCII (no spaces or control characters)",
+        ));
+    }
+    if !is_network_name(&network) {
+        return Err(invalid(
+            id,
+            &format!("{field}.network"),
+            &network,
+            "must match [A-Za-z0-9][A-Za-z0-9_.-]*, at most 128 bytes",
+        ));
+    }
+    if port == 0 {
+        return Err(invalid(
+            id,
+            &format!("{field}.port"),
+            "0",
+            "must be a TCP port from 1 to 65535",
+        ));
+    }
+    if !(100..=599).contains(&expect) {
+        return Err(invalid(
+            id,
+            &format!("{field}.expect"),
+            &expect.to_string(),
+            "must be an HTTP status code from 100 to 599",
+        ));
+    }
+    Ok(Check::Http {
+        path,
+        network,
+        port,
+        expect,
+    })
+}
+
 fn convert_check(id: &DeploymentId, index: usize, raw: RawCheck) -> Result<Check, ConfigError> {
     let field = format!("checks[{index}]");
     let table = match raw {
@@ -445,44 +495,16 @@ fn convert_check(id: &DeploymentId, index: usize, raw: RawCheck) -> Result<Check
         RawCheckTable {
             http: Some(path),
             network: Some(network),
+            port: Some(port),
             expect: Some(expect),
             command: None,
             no_log_match: None,
             within_secs: None,
-        } => {
-            if !is_http_path(&path) {
-                return Err(invalid(
-                    id,
-                    &format!("{field}.http"),
-                    &path,
-                    "must start with '/' and contain only visible ASCII (no spaces or control characters)",
-                ));
-            }
-            if !is_network_name(&network) {
-                return Err(invalid(
-                    id,
-                    &format!("{field}.network"),
-                    &network,
-                    "must match [A-Za-z0-9][A-Za-z0-9_.-]*, at most 128 bytes",
-                ));
-            }
-            if !(100..=599).contains(&expect) {
-                return Err(invalid(
-                    id,
-                    &format!("{field}.expect"),
-                    &expect.to_string(),
-                    "must be an HTTP status code from 100 to 599",
-                ));
-            }
-            Ok(Check::Http {
-                path,
-                network,
-                expect,
-            })
-        }
+        } => convert_http(id, &field, path, network, port, expect),
         RawCheckTable {
             http: None,
             network: None,
+            port: None,
             expect: None,
             command: Some(argv),
             no_log_match: None,
@@ -496,6 +518,7 @@ fn convert_check(id: &DeploymentId, index: usize, raw: RawCheck) -> Result<Check
         RawCheckTable {
             http: None,
             network: None,
+            port: None,
             expect: None,
             command: None,
             no_log_match: Some(pattern),
@@ -506,13 +529,21 @@ fn convert_check(id: &DeploymentId, index: usize, raw: RawCheck) -> Result<Check
                     "no_log_match needs a pattern and within_secs above zero",
                 ));
             }
+            if pattern.len() > LOG_PATTERN_LIMIT || pattern.contains('\n') {
+                return Err(bad(
+                    "no_log_match must be at most 4096 bytes on a single line",
+                ));
+            }
+            if within_secs > WITHIN_SECS_LIMIT {
+                return Err(bad("within_secs must be at most 3600"));
+            }
             Ok(Check::NoLogMatch {
                 pattern,
                 within_secs,
             })
         }
         _ => Err(bad(
-            "must set exactly one of http (with network, expect), command, or no_log_match (with within_secs)",
+            "must set exactly one of http (with network, port, expect), command, or no_log_match (with within_secs)",
         )),
     }
 }
@@ -524,6 +555,7 @@ impl RawCheckTable {
         for (key, set) in [
             ("http", self.http.is_some()),
             ("network", self.network.is_some()),
+            ("port", self.port.is_some()),
             ("expect", self.expect.is_some()),
             ("command", self.command.is_some()),
             ("no_log_match", self.no_log_match.is_some()),

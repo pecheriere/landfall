@@ -25,7 +25,7 @@ host = "home-1"
 compose = { dir = "/srv/compose/app", service = "app" }
 origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
 rule = { auto = "patch", approve = "minor", approvers = ["operator"] }
-checks = [{ http = "/health", network = "app", expect = 200 }]
+checks = [{ http = "/health", network = "app_app", port = 8080, expect = 200 }]
 backup = { paths = ["state"], stop = true }
 
 [[deployment]]
@@ -148,19 +148,46 @@ Each entry is the string `"container-healthy"` or a table with exactly one of
 - `"container-healthy"`: the container's Docker healthcheck reports healthy.
   The image must define a healthcheck; if it defines none, the check fails at
   deploy time.
-- `{ http = "/health", network = "app", expect = 200 }`: an HTTP probe from
-  inside a Docker network. The path starts with `/` and contains only visible
-  ASCII (no spaces or control characters); the network matches Docker's
-  network name grammar `[A-Za-z0-9][A-Za-z0-9_.-]*`, at most 128 bytes;
+- `{ http = "/health", network = "app_app", port = 8080, expect = 200 }`: an HTTP
+  probe. The agent connects from the host to the container's address on the
+  named Docker network and the given port, with no proxy and no redirects, so
+  the host must be able to reach that network (true for Docker bridge
+  networks on Linux, unless a firewall forbids it). `network` is the name Docker
+  knows, as `docker network ls` shows it, not the key in the compose file:
+  usually `<project>_<key>`, so `app_app` for a network `app` in a project `app`,
+  unless the network sets its own `name:`. The path starts with `/`
+  and contains only visible ASCII (no spaces or control characters); the
+  network matches Docker's network name grammar `[A-Za-z0-9][A-Za-z0-9_.-]*`,
+  at most 128 bytes; `port` is a TCP port from 1 to 65535 and is required;
   `expect` is a status code from 100 to 599.
 - `{ command = ["/app", "healthcheck"] }`: a command run in the container,
   exit 0 is healthy; non-empty argv.
 - `{ no_log_match = "panicked", within_secs = 30 }`: no log line may contain
-  the text during the window. It is a plain substring match, not a regex. Both
-  values are non-empty and above zero.
+  the text during the window, which runs for `within_secs` (rounded out to
+  whole seconds) from the container's current start or from just before the
+  agent brought the service up, whichever is later, so a container that `up`
+  left untouched is observed for the whole window; a line logged later does not
+  count. The scan goes back to just before the agent brought the service up, so
+  the lines of earlier starts since then count too, even if the container
+  restarted before the agent first looked. What a reused container logged
+  before that does not count, and the logs of a container that was replaced are
+  not scanned. It is a plain substring match, not a regex. The text is 1
+  to 4096 bytes on a single line; `within_secs` is from 1 to 3600. The deploy
+  waits for the window to close, on top of the check deadline.
 
 `no_log_match` does not observe the service on its own, so every deployment
 also needs at least one of `"container-healthy"`, `http` or `command`.
+
+Checks must pass twice. After the first round in which they all pass, the agent
+waits a settle time (10 seconds) and runs them again, and the container must
+still be the same one, from the same start. If it restarted, or the second
+round fails, the wait starts over, within the deadline (180 seconds; a first
+pass later than 10 seconds before it fails). So every deploy takes at least the
+settle time, and `http` and `command`, which look at one moment, cannot pass
+on a service that is crash-looping. A crash that comes later than the settle
+time is not caught: to catch slower ones, use a `no_log_match` with a longer
+`within_secs`, since the container must also be unchanged when its window
+closes.
 
 ## `[[grant]]`
 
@@ -194,7 +221,8 @@ The file is refused, with an error naming the deployment and the value, when:
    app/staging`);
 7. a grant has an empty `deployments` or `can`, names a deployment that does
    not exist, or gives `approve` to a principal not in `[approvers]`;
-8. two deployments on one host use the same `compose.dir` and `compose.service`.
+8. two deployments on one host use the same `compose.dir` (the agent keeps
+   overrides and backups per directory, so a directory has one deployment).
 
 Malformed values are refused too, naming the deployment, the key and the
 value: relative or non-canonical paths, an `origin.workflow` outside
