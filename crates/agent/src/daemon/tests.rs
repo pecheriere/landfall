@@ -17,7 +17,7 @@ use landfall_origin::attestation::VerifiedAttestation;
 use landfall_origin::release::ReleaseOrigin;
 use reqwest::StatusCode;
 
-use super::{DaemonOptions, Shutdown, StepOutcome, Verifier, VerifyFailure, step};
+use super::{DaemonOptions, Shutdown, ShutdownTrigger, StepOutcome, Verifier, VerifyFailure, step};
 use crate::checks::CheckOptions;
 use crate::client::{Controller, ControllerError};
 use crate::compose::{self, OVERRIDE_FILE};
@@ -27,6 +27,7 @@ use crate::journal::{Priority, capture};
 use crate::state::{ControllerClaim, Deployed, DeploymentState, InProgress, StateDir};
 use crate::testing::{Call, FakeDocker, running};
 
+mod after_a_deploy;
 mod lifecycle;
 mod refusals;
 mod reports;
@@ -127,8 +128,10 @@ struct FakeController {
     reports: Mutex<Vec<DeployReportBody>>,
     /// Every request fails as an outage does.
     down: Mutex<bool>,
-    /// A report gets this status.
+    /// A report gets this status, with nothing to say it's the API's.
     report_status: Mutex<Option<StatusCode>>,
+    /// A report gets the API's refusal for good.
+    report_rejected: Mutex<bool>,
     report_attempts: Mutex<usize>,
 }
 
@@ -181,7 +184,15 @@ impl Controller for FakeController {
     ) -> impl Future<Output = Result<(), ControllerError>> + Send {
         *self.report_attempts.lock().unwrap() += 1;
         let refused = *self.report_status.lock().unwrap();
+        let rejected = *self.report_rejected.lock().unwrap();
         let result = self.outage().and_then(|()| {
+            if rejected {
+                return Err(ControllerError::Rejected {
+                    status: StatusCode::NOT_FOUND,
+                    code: "unknown_deploy",
+                    title: "\"no\"".to_owned(),
+                });
+            }
             if let Some(status) = refused {
                 return Err(ControllerError::Status {
                     status,
@@ -198,6 +209,8 @@ impl Controller for FakeController {
 struct FakeVerifier {
     result: Result<ReleaseOrigin, VerifyFailure>,
     calls: Mutex<usize>,
+    /// Asks for a stop while it verifies.
+    stop: Mutex<Option<ShutdownTrigger>>,
 }
 
 impl FakeVerifier {
@@ -205,6 +218,7 @@ impl FakeVerifier {
         Self {
             result,
             calls: Mutex::new(0),
+            stop: Mutex::new(None),
         }
     }
 
@@ -226,6 +240,9 @@ impl Verifier for FakeVerifier {
         _: &ReleaseTag,
     ) -> impl Future<Output = Result<ReleaseOrigin, VerifyFailure>> + Send {
         *self.calls.lock().unwrap() += 1;
+        if let Some(trigger) = &*self.stop.lock().unwrap() {
+            trigger.stop();
+        }
         std::future::ready(self.result.clone())
     }
 }
@@ -346,7 +363,7 @@ fn claim(deploy_id: u64) -> ControllerClaim {
         deploy_id: DeployId(deploy_id),
         tag: "v1.2.4".parse().unwrap(),
         digest: NEW_DIGEST.parse().unwrap(),
-        claimed_at: Timestamp::now(),
+        reports_before: Vec::new(),
     }
 }
 

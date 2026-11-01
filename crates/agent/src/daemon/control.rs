@@ -1,12 +1,14 @@
 //! What paces the daemon: the stop signal and the backoff.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use landfall_core::protocol::ReportedOutcome;
 use serde::Serialize;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
+use super::StepOutcome;
 use crate::journal::{self, Priority};
 
 /// Tells the daemon to stop. A deploy in flight finishes first.
@@ -71,6 +73,61 @@ impl Shutdown {
         let mut receiver = self.0.clone();
         if receiver.wait_for(|stop| *stop).await.is_err() {
             std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// How long to wait after each step. A poll that found nothing goes again soon,
+/// and only a release that deployed, or a long enough quiet, resets the backoff.
+/// Everything else makes it grow: a refusal or a rollback that is reported well
+/// must not be able to repeat every second, however the controller mixes them
+/// with answers of no work.
+#[derive(Debug, Clone)]
+pub struct Pacing {
+    floor: Duration,
+    backoff: Backoff,
+    quiet_after: Duration,
+    last_trouble: Option<Instant>,
+}
+
+impl Pacing {
+    /// `floor` between polls that are fine; `backoff` while they aren't, until
+    /// `quiet_after` has gone by without trouble.
+    #[must_use]
+    pub fn new(floor: Duration, backoff: Backoff, quiet_after: Duration) -> Self {
+        Self {
+            floor,
+            backoff,
+            quiet_after,
+            last_trouble: None,
+        }
+    }
+
+    /// The wait after `outcome`, at `now` by the monotonic clock.
+    pub fn after(&mut self, outcome: &StepOutcome, now: Instant) -> Duration {
+        match outcome {
+            StepOutcome::NoWork => {
+                let quiet = self
+                    .last_trouble
+                    .is_none_or(|last| now.duration_since(last) >= self.quiet_after);
+                if quiet {
+                    self.backoff.reset();
+                }
+                self.floor
+            }
+            StepOutcome::Finished {
+                outcome: ReportedOutcome::Deployed {},
+                delivered: true,
+                ..
+            } => {
+                self.backoff.reset();
+                self.last_trouble = None;
+                self.floor
+            }
+            _ => {
+                self.last_trouble = Some(now);
+                self.backoff.next_delay()
+            }
         }
     }
 }

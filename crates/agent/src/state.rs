@@ -21,6 +21,8 @@ use landfall_core::protocol::{DeployId, DeployReportBody};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::journal::{self, Priority};
+
 const DEPLOYED: &str = "deployed.json";
 const IN_PROGRESS: &str = "in-progress.json";
 const PREVIOUS_OVERRIDE: &str = "previous-override.yaml";
@@ -29,10 +31,15 @@ const LOCK: &str = "lock";
 const BACKUPS: &str = "backups";
 const REPORTS: &str = "reports";
 const CLAIM: &str = "controller-claim.json";
+const VERIFICATION_WAIT: &str = "verification-wait.json";
 // Directly in the state directory. A deployment's directory always has `__` in
 // its name, so these can't be taken for one.
 const OUTBOX: &str = "outbox";
+const FINISHED: &str = "finished";
 const DAEMON_LOCK: &str = "daemon.lock";
+
+/// How many finished deploys are remembered by number.
+pub const FINISHED_KEPT: usize = 1024;
 
 /// A failure reading or writing the agent's state.
 #[derive(Debug, thiserror::Error)]
@@ -194,9 +201,24 @@ pub struct ControllerClaim {
     pub tag: ReleaseTag,
     /// Its verified image digest.
     pub digest: ImageDigest,
-    /// When the daemon took it on. Whatever the engine reports for this deploy
-    /// starts later.
-    pub claimed_at: Timestamp,
+    /// The engine's report files that existed when the claim was made. Whatever
+    /// the engine reports for this deploy is not among them, whatever the clock
+    /// did in between.
+    pub reports_before: Vec<String>,
+}
+
+/// How long verification of one work item has been unable to run. The time is
+/// summed from the monotonic clock, one poll to the next, so a wall clock that
+/// jumps doesn't move it, and time the agent was stopped doesn't count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationWait {
+    /// The controller's id for the deploy.
+    pub deploy_id: DeployId,
+    /// How long so far.
+    pub waited_millis: u64,
+    /// How many periods of waiting the journal has been told about.
+    pub warned_periods: u64,
 }
 
 /// The agent's state directory.
@@ -301,12 +323,13 @@ impl StateDir {
         write_atomic(&dir, &name, &bytes)
     }
 
-    /// Every report waiting to be acknowledged, oldest deploy first.
+    /// Every report waiting to be acknowledged, oldest deploy first. One that
+    /// cannot be read as a report is set aside as `<name>.corrupt` and journalled,
+    /// so that it can't stop the others.
     ///
     /// # Errors
     ///
-    /// [`StateError::Corrupt`] if one cannot be read as a report: it is never
-    /// dropped silently.
+    /// [`StateError`] if the directory cannot be read.
     pub fn outbox(&self) -> Result<Vec<DeployReportBody>, StateError> {
         let dir = self.path.join(OUTBOX);
         let entries = match fs::read_dir(&dir) {
@@ -322,15 +345,60 @@ impl StateDir {
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| stem.parse::<u64>().is_ok());
-            if is_report {
-                let bytes = fs::read(&path).map_err(io_err("read", &path))?;
-                let report: DeployReportBody = serde_json::from_slice(&bytes)
-                    .map_err(|source| StateError::Corrupt { path, source })?;
+            if is_report && let Some(report) = read_or_set_aside(&path)? {
                 reports.push(report);
             }
         }
-        reports.sort_by_key(|report| report.deploy_id);
+        reports.sort_by_key(|report: &DeployReportBody| report.deploy_id);
         Ok(reports)
+    }
+
+    /// Records for good how the controller's deploy ended, so that it is answered
+    /// with this report if it is ever delivered again, and never runs again. Only
+    /// the newest [`FINISHED_KEPT`] are kept: a controller can ask for as many
+    /// numbers as it likes, and an older one that comes back is judged afresh, by
+    /// a rule that refuses what ran or failed.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the write fails.
+    pub fn finished_put(&self, report: &DeployReportBody) -> Result<(), StateError> {
+        let dir = self.path.join(FINISHED);
+        create_private(&self.path, &dir)?;
+        let name = format!("{}.json", report.deploy_id);
+        let bytes = serde_json::to_vec_pretty(report).map_err(|source| StateError::Serialise {
+            path: dir.join(&name),
+            source,
+        })?;
+        write_atomic(&dir, &name, &bytes)?;
+        let mut kept = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(io_err("list", &dir))? {
+            let path = entry.map_err(io_err("list", &dir))?.path();
+            if let Some(id) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok())
+            {
+                kept.push(id);
+            }
+        }
+        if kept.len() > FINISHED_KEPT {
+            kept.sort_unstable();
+            for id in &kept[..kept.len() - FINISHED_KEPT] {
+                remove_in(&dir, &format!("{id}.json"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// How the controller's deploy ended, if it is on record. A record that
+    /// cannot be read is set aside and counts as none.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the file cannot be read.
+    pub fn finished(&self, deploy_id: DeployId) -> Result<Option<DeployReportBody>, StateError> {
+        read_or_set_aside(&self.path.join(FINISHED).join(format!("{deploy_id}.json")))
     }
 
     /// Removes an acknowledged report; absent is fine.
@@ -358,6 +426,39 @@ fn lock_file(path: &Path, busy: impl FnOnce() -> StateError) -> Result<DeployLoc
         Ok(()) => Ok(DeployLock { _file: file }),
         Err(TryLockError::WouldBlock) => Err(busy()),
         Err(TryLockError::Error(e)) => Err(io_err("lock", path)(e)),
+    }
+}
+
+/// Reads a JSON file the daemon can do without. One that doesn't parse is renamed
+/// to `<name>.corrupt` and journalled, rather than stop everything else.
+fn read_or_set_aside<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StateError> {
+    #[derive(Serialize)]
+    struct SetAside<'a> {
+        event: &'static str,
+        file: &'a Path,
+        error: String,
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_err("read", path)(e)),
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => {
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".corrupt");
+            fs::rename(path, &aside).map_err(io_err("set aside", path))?;
+            journal::emit(
+                Priority::Error,
+                &SetAside {
+                    event: "state_file_set_aside",
+                    file: path,
+                    error: error.to_string(),
+                },
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -404,13 +505,43 @@ impl DeploymentState {
         lock_file(&self.dir.join(LOCK), || StateError::Busy(self.id.clone()))
     }
 
-    /// The controller's deploy this deployment is working on, if any.
+    /// The controller's deploy this deployment is working on, if any. A claim
+    /// that cannot be read is set aside and counts as none: what the controller
+    /// was told of that deploy is then up to it to redeliver.
     ///
     /// # Errors
     ///
-    /// [`StateError::Corrupt`] if the file exists and is not valid.
+    /// [`StateError`] if the file cannot be read.
     pub fn claim(&self) -> Result<Option<ControllerClaim>, StateError> {
-        self.read_json(CLAIM)
+        read_or_set_aside(&self.dir.join(CLAIM))
+    }
+
+    /// How long verification has been unable to run, if it has. One that cannot
+    /// be read is set aside and counts as none.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the file cannot be read.
+    pub fn verification_wait(&self) -> Result<Option<VerificationWait>, StateError> {
+        read_or_set_aside(&self.dir.join(VERIFICATION_WAIT))
+    }
+
+    /// Records how long verification has been unable to run.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the write fails.
+    pub fn set_verification_wait(&self, wait: &VerificationWait) -> Result<(), StateError> {
+        self.write_json(VERIFICATION_WAIT, wait)
+    }
+
+    /// Removes the record of a wait; absent is fine.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the removal fails.
+    pub fn clear_verification_wait(&self) -> Result<(), StateError> {
+        self.remove(VERIFICATION_WAIT)
     }
 
     /// Records the controller's deploy before the engine starts on it.
@@ -431,37 +562,40 @@ impl DeploymentState {
         self.remove(CLAIM)
     }
 
-    /// The engine's reports of this deployment, as they are on disk, each or
-    /// the reason it can't be read.
+    /// The file names of the engine's reports of this deployment.
     ///
     /// # Errors
     ///
     /// [`StateError`] if the directory cannot be listed.
-    pub fn reports<R: DeserializeOwned>(&self) -> Result<Vec<Result<R, StateError>>, StateError> {
+    pub fn report_names(&self) -> Result<Vec<String>, StateError> {
         let dir = self.dir.join(REPORTS);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(io_err("list", &dir)(e)),
         };
-        let mut reports = Vec::new();
+        let mut names = Vec::new();
         for entry in entries {
-            let path = entry.map_err(io_err("list", &dir))?.path();
-            if path
+            let name = entry.map_err(io_err("list", &dir))?.file_name();
+            let is_report = Path::new(&name)
                 .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                reports.push(
-                    fs::read(&path)
-                        .map_err(io_err("read", &path))
-                        .and_then(|bytes| {
-                            serde_json::from_slice(&bytes)
-                                .map_err(|source| StateError::Corrupt { path, source })
-                        }),
-                );
+                .is_some_and(|extension| extension == "json");
+            if let (true, Some(name)) = (is_report, name.to_str()) {
+                names.push(name.to_owned());
             }
         }
-        Ok(reports)
+        Ok(names)
+    }
+
+    /// One of the engine's reports, by the name [`Self::report_names`] gave.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if it can't be read as an `R`.
+    pub fn report<R: DeserializeOwned>(&self, name: &str) -> Result<R, StateError> {
+        let path = self.dir.join(REPORTS).join(name);
+        let bytes = fs::read(&path).map_err(io_err("read", &path))?;
+        serde_json::from_slice(&bytes).map_err(|source| StateError::Corrupt { path, source })
     }
 
     /// What is deployed, or `None` if nothing ever was.
@@ -908,13 +1042,24 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_report_in_the_outbox_is_an_error_not_empty() {
+    fn a_corrupt_report_in_the_outbox_is_set_aside_and_the_others_carry_on() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StateDir::open(tmp.path()).unwrap();
         dir.outbox_put(&body(1)).unwrap();
+        dir.outbox_put(&body(2)).unwrap();
         fs::write(tmp.path().join("outbox/1.json"), "{").unwrap();
-        let err = dir.outbox().unwrap_err();
-        assert!(matches!(err, StateError::Corrupt { .. }), "{err}");
+        assert_eq!(dir.outbox().unwrap(), vec![body(2)]);
+        assert!(tmp.path().join("outbox/1.json.corrupt").exists());
+        assert_eq!(
+            dir.outbox().unwrap(),
+            vec![body(2)],
+            "and it isn't taken for a report afterwards"
+        );
+        assert_eq!(
+            journal::capture::events("state_file_set_aside").len(),
+            1,
+            "said once"
+        );
     }
 
     #[test]
@@ -937,7 +1082,7 @@ mod tests {
             deploy_id: DeployId(7),
             tag: "v1.2.3".parse().unwrap(),
             digest: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
-            claimed_at: "2026-11-01T10:00:00Z".parse().unwrap(),
+            reports_before: vec!["a.json".to_owned()],
         };
         s.set_claim(&claim).unwrap();
         assert_eq!(s.claim().unwrap(), Some(claim));
@@ -946,25 +1091,48 @@ mod tests {
     }
 
     #[test]
-    fn reports_read_back_one_by_one() {
+    fn a_corrupt_claim_is_set_aside() {
         let tmp = tempfile::tempdir().unwrap();
         let s = state(&tmp);
-        assert_eq!(s.reports::<Deployed>().unwrap().len(), 0);
+        let file = tmp.path().join("example__prod").join(CLAIM);
+        fs::write(&file, "{").unwrap();
+        assert_eq!(s.claim().unwrap(), None);
+        assert!(!file.exists());
+        assert_eq!(
+            fs::read_to_string(file.with_file_name(format!("{CLAIM}.corrupt"))).unwrap(),
+            "{"
+        );
+        let events = journal::capture::events("state_file_set_aside");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, Priority::Error);
+    }
+
+    #[test]
+    fn a_finished_deploy_is_remembered_and_the_oldest_numbers_go_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StateDir::open(tmp.path()).unwrap();
+        assert_eq!(dir.finished(DeployId(1)).unwrap(), None);
+        for id in 1..=u64::try_from(FINISHED_KEPT).unwrap() + 2 {
+            dir.finished_put(&body(id)).unwrap();
+        }
+        assert_eq!(dir.finished(DeployId(1)).unwrap(), None);
+        assert_eq!(dir.finished(DeployId(2)).unwrap(), None);
+        assert_eq!(dir.finished(DeployId(3)).unwrap(), Some(body(3)));
+    }
+
+    #[test]
+    fn reports_read_back_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = state(&tmp);
+        assert_eq!(s.report_names().unwrap(), Vec::<String>::new());
         s.write_report("good", &deployed()).unwrap();
         s.write_report("other", &serde_json::json!({"not": "a report"}))
             .unwrap();
-        let mut good = 0;
-        let mut bad = 0;
-        for report in s.reports::<Deployed>().unwrap() {
-            match report {
-                Ok(report) => {
-                    assert_eq!(report, deployed());
-                    good += 1;
-                }
-                Err(_) => bad += 1,
-            }
-        }
-        assert_eq!((good, bad), (1, 1));
+        let mut names = s.report_names().unwrap();
+        names.sort();
+        assert_eq!(names, ["good.json", "other.json"]);
+        assert_eq!(s.report::<Deployed>("good.json").unwrap(), deployed());
+        assert!(s.report::<Deployed>("other.json").is_err());
     }
 
     #[test]

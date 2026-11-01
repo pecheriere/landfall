@@ -6,12 +6,14 @@ use std::time::{Duration, Instant};
 use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::release::Platform;
-use landfall_origin::fetch::{Endpoints, Fetcher};
+use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin, verify_release};
 use landfall_origin::trust::{Refresh, TrustRoot, load_trusted_root};
+use serde::Serialize;
 
 use super::DaemonError;
 use crate::client::error_chain;
+use crate::journal::{self, Priority};
 
 /// How often the trust root is brought up to date, when a release needs it.
 const TRUST_ROOT_EVERY: Duration = Duration::from_hours(24);
@@ -22,14 +24,29 @@ const TRUST_ROOT_EVERY: Duration = Duration::from_hours(24);
 pub enum VerifyFailure {
     /// The release was refused: a check failed on material that was obtained.
     Refused(String),
-    /// The material could not be obtained, which may work on a later try.
+    /// The registry or GitHub answered that the material isn't there: a release
+    /// still being published, or one that was yanked. Waited for, but not for
+    /// ever.
+    Missing(String),
+    /// The material could not be obtained, as in a network failure or a rate
+    /// limit, which may work on a later try.
     Unavailable(String),
 }
 
 impl From<ReleaseError> for VerifyFailure {
     fn from(error: ReleaseError) -> Self {
+        let missing = matches!(
+            &error,
+            ReleaseError::TagObject(fetch)
+                | ReleaseError::TagCommit(fetch)
+                | ReleaseError::Index(fetch)
+                | ReleaseError::Bundle(fetch)
+                if matches!(fetch, FetchError::NotFound { .. } | FetchError::Bundles { count: 0, .. })
+        );
         if error.is_refusal() {
             Self::Refused(error_chain(&error))
+        } else if missing {
+            Self::Missing(error_chain(&error))
         } else {
             Self::Unavailable(error_chain(&error))
         }
@@ -63,10 +80,15 @@ impl OriginVerifier {
     ///
     /// [`DaemonError`] if the platform has no image or the client can't be built.
     pub fn new(cache_dir: PathBuf) -> Result<Self, DaemonError> {
+        let platform = host_platform(std::env::consts::OS, std::env::consts::ARCH)?;
+        Self::for_platform(cache_dir, platform)
+    }
+
+    fn for_platform(cache_dir: PathBuf, platform: Platform) -> Result<Self, DaemonError> {
         Ok(Self {
             fetcher: Fetcher::new(Endpoints::public().map_err(DaemonError::Fetcher)?)
                 .map_err(DaemonError::Fetcher)?,
-            platform: host_platform(std::env::consts::OS, std::env::consts::ARCH)?,
+            platform,
             cache_dir,
             root: tokio::sync::Mutex::new(None),
         })
@@ -74,8 +96,14 @@ impl OriginVerifier {
 
     /// The trust root, brought up to date if it is a day old. If the update
     /// can't be fetched the cache is read again, which refuses metadata past
-    /// its expiry, and the update is tried at the next release.
+    /// its expiry, the journal is told, and the update is tried at the next
+    /// release.
     async fn root(&self) -> Result<TrustRoot, VerifyFailure> {
+        #[derive(Serialize)]
+        struct NotRefreshed {
+            event: &'static str,
+            error: String,
+        }
         let mut held = self.root.lock().await;
         if let Some((root, refreshed)) = held.as_ref()
             && refreshed.elapsed() < TRUST_ROOT_EVERY
@@ -87,11 +115,21 @@ impl OriginVerifier {
                 *held = Some((root.clone(), Instant::now()));
                 Ok(root)
             }
-            Err(online) => load_trusted_root(&self.cache_dir, Refresh::Offline)
-                .await
-                .map_err(|offline| {
-                    VerifyFailure::Unavailable(format!("trust root: {online}; {offline}"))
-                }),
+            Err(online) => {
+                let cached = load_trusted_root(&self.cache_dir, Refresh::Offline)
+                    .await
+                    .map_err(|offline| {
+                        VerifyFailure::Unavailable(format!("trust root: {online}; {offline}"))
+                    })?;
+                journal::emit(
+                    Priority::Warning,
+                    &NotRefreshed {
+                        event: "trust_root_not_refreshed",
+                        error: online.to_string(),
+                    },
+                );
+                Ok(cached)
+            }
         }
     }
 }
@@ -133,9 +171,72 @@ fn host_platform(os: &'static str, arch: &'static str) -> Result<Platform, Daemo
 
 #[cfg(test)]
 mod tests {
+    use landfall_core::config;
+    use landfall_origin::fetch::FetchError;
     use landfall_origin::release::ReleaseError;
 
-    use super::{VerifyFailure, host_platform};
+    use super::{OriginVerifier, Verifier, VerifyFailure, host_platform};
+
+    #[test]
+    fn what_is_not_there_is_told_from_what_cant_be_reached() {
+        let digest = format!("sha256:{}", "a".repeat(64)).parse().unwrap();
+        let not_found = || FetchError::NotFound {
+            url: "https://registry.example/x".to_owned(),
+        };
+        for error in [
+            ReleaseError::TagObject(not_found()),
+            ReleaseError::TagCommit(not_found()),
+            ReleaseError::Index(not_found()),
+            ReleaseError::Bundle(not_found()),
+            ReleaseError::Bundle(FetchError::Bundles { digest, count: 0 }),
+        ] {
+            let failure = VerifyFailure::from(error);
+            assert!(matches!(failure, VerifyFailure::Missing(_)), "{failure:?}");
+        }
+    }
+
+    /// The attestation fixture's release of `crates/origin`, through the real
+    /// GitHub API, GHCR and Sigstore TUF repository: what the agent's `run` uses.
+    #[tokio::test]
+    #[ignore = "network: run by hand"]
+    async fn live_origin_verifier_verifies_the_fixture_release() {
+        let text = r#"
+[approvers]
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+
+[[deployment]]
+id = "app/prod"
+repo = { name = "dani-garcia/vaultwarden", id = 121898717, owner_id = 725423 }
+host = "host-1"
+compose = { dir = "/srv/app", service = "app" }
+origin = { workflow = ".github/workflows/release.yml", tags = "*", signed_tags = false }
+rule = { approvers = ["operator"] }
+checks = ["container-healthy"]
+"#;
+        let config = config::parse(text.as_bytes()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let verifier =
+            OriginVerifier::for_platform(cache.path().to_owned(), "linux/amd64".parse().unwrap())
+                .unwrap();
+
+        let origin = verifier
+            .verify(
+                &config,
+                &"app/prod".parse().unwrap(),
+                &"1.37.4".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            origin.commit.as_ref(),
+            "7c188967e7a467b19b2757bc3326f9cf3ccae327"
+        );
+        assert_eq!(
+            origin.attestation.digest.as_ref(),
+            "sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055"
+        );
+    }
 
     #[test]
     fn what_was_not_refused_can_still_be_retried() {

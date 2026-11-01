@@ -8,7 +8,9 @@ use std::time::Instant;
 
 use landfall_core::config::{Config, Deployment};
 use landfall_core::ids::DeploymentId;
-use landfall_core::protocol::{DeployedRelease, HeldBack, Phase, RunningState, WorkRequest};
+use landfall_core::protocol::{
+    DeployId, DeployedRelease, HeldBack, Phase, RunningState, WorkRequest,
+};
 use serde::Serialize;
 
 use super::{DaemonOptions, deployment_state, on_thread};
@@ -27,6 +29,9 @@ struct SeenDrift {
 pub(super) struct Memory {
     drift: Mutex<BTreeMap<DeploymentId, SeenDrift>>,
     pub(super) held_back: Mutex<Vec<HeldBack>>,
+    /// The work item verification last could not run for, and when, by the
+    /// monotonic clock.
+    pub(super) verification_seen: Mutex<Option<(DeployId, Instant)>>,
 }
 
 pub(super) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

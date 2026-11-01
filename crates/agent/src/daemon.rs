@@ -20,9 +20,8 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use jiff::Timestamp;
 use landfall_core::config::{self, Config, ConfigError, Deployment};
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
@@ -47,7 +46,7 @@ mod outbox;
 mod running;
 mod verifier;
 
-pub use control::{Backoff, Shutdown, ShutdownTrigger};
+pub use control::{Backoff, Pacing, Shutdown, ShutdownTrigger};
 pub use verifier::{OriginVerifier, Verifier, VerifyFailure};
 
 use judge::{Verdict, judge};
@@ -62,6 +61,8 @@ const BACKOFF_MAX: Duration = Duration::from_mins(5);
 const HEARTBEAT: Duration = Duration::from_secs(10);
 /// How often a deployment's drift is looked at. A deploy always looks first.
 const DRIFT_EVERY: Duration = Duration::from_mins(1);
+/// See [`DaemonOptions::verification_bound`].
+const VERIFICATION_BOUND: Duration = Duration::from_hours(1);
 /// How long a read or write of the state directory may take.
 const FILE_LIMIT: Duration = Duration::from_secs(60);
 /// The most entries of `held_back` that reach the journal.
@@ -80,6 +81,9 @@ pub struct DaemonOptions {
     pub heartbeat: Duration,
     /// How often a deployment's drift is looked at.
     pub drift_every: Duration,
+    /// How long a release that isn't to be found is waited for before it is
+    /// refused, and how often the journal hears of any wait for verification.
+    pub verification_bound: Duration,
     /// What stops the daemon.
     pub shutdown: Shutdown,
     memory: Memory,
@@ -99,6 +103,7 @@ impl DaemonOptions {
             engine: EngineOptions::default(),
             heartbeat: HEARTBEAT,
             drift_every: DRIFT_EVERY,
+            verification_bound: VERIFICATION_BOUND,
             shutdown,
             memory: Memory::default(),
         }
@@ -221,16 +226,21 @@ async fn deploy_approved<D: Docker, C: Controller>(
         dir,
     } = approved;
     let id = deployment.id();
-    let claim = ControllerClaim {
-        deploy_id: work.deploy_id,
-        tag: plan.tag().clone(),
-        digest: plan.digest().clone(),
-        claimed_at: Timestamp::now(),
-    };
-    let (root, owned) = (state_dir.to_owned(), id.clone());
+    let (root, owned, deploy_id, tag, digest) = (
+        state_dir.to_owned(),
+        id.clone(),
+        work.deploy_id,
+        plan.tag().clone(),
+        plan.digest().clone(),
+    );
     let claimed = on_thread("record claim", move || {
         let state = deployment_state(&root, &owned)?;
-        state.set_claim(&claim)?;
+        state.set_claim(&ControllerClaim {
+            deploy_id,
+            tag,
+            digest,
+            reports_before: state.report_names()?,
+        })?;
         Ok(state)
     })
     .await;
@@ -346,6 +356,65 @@ async fn refuse_work<C: Controller>(
     outbox::finish(controller, state_dir, body, None).await
 }
 
+/// Settles what earlier runs left. One deployment's trouble is journalled, and
+/// stands in the way of neither the others nor the controller hearing from this
+/// host.
+async fn settle_claims(state_dir: &Path, options: &DaemonOptions) {
+    #[derive(Serialize)]
+    struct NotSettled<'a> {
+        event: &'static str,
+        deployment: &'a DeploymentId,
+        error: String,
+    }
+    for id in options.dirs.keys() {
+        let (root, owned) = (state_dir.to_owned(), id.clone());
+        let settled = on_thread("settle claim", move || outbox::settle_claim(&root, &owned)).await;
+        if let Err(error) = settled {
+            journal::emit(
+                Priority::Error,
+                &NotSettled {
+                    event: "claim_not_settled",
+                    deployment: id,
+                    error,
+                },
+            );
+        }
+    }
+}
+
+/// A deploy that has finished never runs again: if the controller delivers it
+/// again, it gets its original report.
+async fn answer_finished<C: Controller>(
+    controller: &C,
+    state_dir: &Path,
+    work: &DeployWork,
+) -> Option<StepOutcome> {
+    #[derive(Serialize)]
+    struct AskedAgain {
+        event: &'static str,
+        deploy_id: DeployId,
+    }
+    let (root, deploy_id) = (state_dir.to_owned(), work.deploy_id);
+    let found = on_thread("read finished", move || {
+        StateDir::open(&root)?.finished(deploy_id)
+    })
+    .await;
+    match found {
+        Ok(None) => None,
+        Ok(Some(body)) => {
+            journal::emit(
+                Priority::Warning,
+                &AskedAgain {
+                    event: "finished_work_delivered_again",
+                    deploy_id,
+                },
+            );
+            Some(outbox::finish(controller, state_dir, body, None).await)
+        }
+        Err(error) => Some(StepOutcome::Failed { error }),
+    }
+}
+
 /// One poll: settles what an earlier run left, delivers what is in the outbox,
 /// then asks for work and deals with it. A stop ends the wait for an answer, but
 /// not a deploy, which finishes and is reported first. While a report can't be
@@ -359,13 +428,7 @@ pub async fn step<D: Docker, C: Controller, V: Verifier>(
     state_dir: &Path,
     options: &DaemonOptions,
 ) -> StepOutcome {
-    for id in options.dirs.keys() {
-        let (root, owned) = (state_dir.to_owned(), id.clone());
-        let settled = on_thread("settle claim", move || outbox::settle_claim(&root, &owned)).await;
-        if let Err(error) = settled {
-            return StepOutcome::Failed { error };
-        }
-    }
+    settle_claims(state_dir, options).await;
     if let Err(outcome) = outbox::flush(controller, state_dir).await {
         return outcome;
     }
@@ -394,7 +457,12 @@ pub async fn step<D: Docker, C: Controller, V: Verifier>(
     if options.shutdown.requested() {
         return StepOutcome::ShuttingDown;
     }
+    if let Some(outcome) = answer_finished(controller, state_dir, &work).await {
+        return outcome;
+    }
     match judge(docker, verifier, config, state_dir, options, &work).await {
+        // Verification can take a while, and a stop can have come meanwhile.
+        Verdict::Go { .. } if options.shutdown.requested() => StepOutcome::ShuttingDown,
         Verdict::Go {
             plan,
             deployment,
@@ -435,7 +503,11 @@ pub async fn run_loop<D: Docker, C: Controller, V: Verifier>(
         event: &'static str,
         error: &'a str,
     }
-    let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
+    let mut pacing = Pacing::new(
+        POLL_FLOOR,
+        Backoff::new(BACKOFF_MIN, BACKOFF_MAX),
+        BACKOFF_MAX,
+    );
     loop {
         let outcome = Box::pin(step(
             docker, controller, verifier, config, state_dir, options,
@@ -444,29 +516,20 @@ pub async fn run_loop<D: Docker, C: Controller, V: Verifier>(
         let trouble = |priority, event, error| {
             journal::emit(priority, &Trouble { event, error });
         };
-        let pause = match &outcome {
+        match &outcome {
             StepOutcome::ShuttingDown => return,
-            StepOutcome::NoWork
-            | StepOutcome::Finished {
-                delivered: true, ..
-            } => {
-                backoff.reset();
-                POLL_FLOOR
-            }
-            StepOutcome::Finished { .. } => backoff.next_delay(),
+            StepOutcome::NoWork | StepOutcome::Finished { .. } => {}
             StepOutcome::Waiting { reason, .. } => {
                 trouble(Priority::Warning, "work_waiting", reason);
-                backoff.next_delay()
             }
             StepOutcome::Unavailable { error } => {
                 trouble(Priority::Warning, "controller_unavailable", error);
-                backoff.next_delay()
             }
             StepOutcome::Failed { error } => {
                 trouble(Priority::Error, "daemon_step_failed", error);
-                backoff.next_delay()
             }
-        };
+        }
+        let pause = pacing.after(&outcome, Instant::now());
         tokio::select! {
             () = options.shutdown.wait() => return,
             () = tokio::time::sleep(pause) => {}

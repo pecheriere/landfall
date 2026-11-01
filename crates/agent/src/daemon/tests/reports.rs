@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use jiff::Timestamp;
 use landfall_core::protocol::{
-    DeployId, DeployReportBody, ReportedDetail, ReportedOutcome, WorkRequest, WorkResponse,
+    DeployId, DeployReportBody, MAX_BODY_BYTES, ReportedDetail, ReportedOutcome, WorkRequest,
+    WorkResponse,
 };
 use reqwest::StatusCode;
 
@@ -271,7 +272,7 @@ async fn a_report_the_controller_refuses_for_good_is_dropped_loudly() {
     let f = fixture(PATCH_RULE);
     let verifier = FakeVerifier::passes();
     let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
-    *controller.report_status.lock().unwrap() = Some(StatusCode::NOT_FOUND);
+    *controller.report_rejected.lock().unwrap() = true;
 
     let outcome = poll(&f, &controller, &verifier).await;
 
@@ -291,13 +292,7 @@ async fn a_report_the_controller_refuses_for_good_is_dropped_loudly() {
     assert_eq!(events[0].0, Priority::Error);
     assert_eq!(*controller.report_attempts.lock().unwrap(), 1);
     // The engine's own record stays.
-    assert_eq!(
-        state_of(&f)
-            .reports::<deploy::DeployReport>()
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(state_of(&f).report_names().unwrap().len(), 1);
 }
 
 /// The state a crash leaves: the engine marked the deploy and died.
@@ -409,24 +404,27 @@ async fn a_crash_after_the_record_but_before_the_report_is_reported_as_deployed(
 async fn a_crash_after_the_engines_report_sends_that_report() {
     let f = fixture(PATCH_RULE);
     let state = state_of(&f);
-    let taken = claim(7);
+    let mut taken = claim(7);
+    taken.reports_before = vec!["older.json".to_owned()];
     state.set_claim(&taken).unwrap();
+    // Before the claim by the list, however late its clock says it was.
     let older = deploy::DeployReport {
         deployment: id(),
         tag: taken.tag.clone(),
         digest: taken.digest.clone(),
         outcome: deploy::Outcome::Deployed,
         steps: Vec::new(),
-        started_at: Timestamp::UNIX_EPOCH,
-        finished_at: Timestamp::UNIX_EPOCH,
+        started_at: Timestamp::now(),
+        finished_at: Timestamp::now(),
     };
     state.write_report("older", &older).unwrap();
+    // After the claim by the list, on a clock that has gone back to 1970.
     let report = deploy::DeployReport {
         outcome: deploy::Outcome::RolledBack {
             reason: "check failed".to_owned(),
         },
-        started_at: Timestamp::now(),
-        finished_at: Timestamp::now(),
+        started_at: Timestamp::UNIX_EPOCH,
+        finished_at: Timestamp::UNIX_EPOCH,
         ..older.clone()
     };
     state.write_report("newer", &report).unwrap();
@@ -507,4 +505,92 @@ fn a_report_stays_under_the_limits_of_the_wire() {
     serde_json::from_slice::<DeployReportBody>(&wire).unwrap();
     assert_eq!(bounded("short"), "short");
     assert!(bounded(&long).ends_with("..."));
+}
+
+/// A report of `steps` steps, each saying `text` in a failure and in 64 checks.
+fn wordy_report(steps: usize, text: &str) -> deploy::DeployReport {
+    let step = deploy::Step {
+        name: "checks".to_owned(),
+        started_at: Timestamp::UNIX_EPOCH,
+        millis: 1,
+        result: deploy::StepResult::Failed {
+            reason: text.to_owned(),
+        },
+        detail: Some(deploy::StepDetail::Checks {
+            checks: vec![
+                deploy::CheckTiming {
+                    check: text.to_owned(),
+                    attempts: 1,
+                    millis: 1,
+                };
+                64
+            ],
+        }),
+    };
+    deploy::DeployReport {
+        deployment: id(),
+        tag: "v1.2.4".parse().unwrap(),
+        digest: NEW_DIGEST.parse().unwrap(),
+        outcome: deploy::Outcome::RollbackFailed {
+            reason: text.to_owned(),
+            rollback_reason: text.to_owned(),
+        },
+        steps: vec![step; steps],
+        started_at: Timestamp::UNIX_EPOCH,
+        finished_at: Timestamp::UNIX_EPOCH,
+    }
+}
+
+#[test]
+fn a_body_over_the_limit_loses_details_first_and_says_so() {
+    // Control characters serialise to six bytes each, and this emoji to four.
+    for text in ["\u{1}".repeat(5000), "\u{1F600}".repeat(5000)] {
+        let body = reported(DeployId(7), &wordy_report(8, &text));
+        let wire = serde_json::to_vec(&body).unwrap();
+        assert!(wire.len() <= MAX_BODY_BYTES, "{}", wire.len());
+        assert!(body.steps[..8].iter().all(|step| step.detail.is_none()));
+        assert_eq!(body.steps[8].name, "report_trimmed");
+        assert!(matches!(
+            body.outcome,
+            ReportedOutcome::RollbackFailed { .. }
+        ));
+        assert_eq!(
+            serde_json::from_slice::<DeployReportBody>(&wire).unwrap(),
+            body
+        );
+    }
+}
+
+#[test]
+fn a_body_still_over_the_limit_loses_what_the_steps_say() {
+    let text = "\u{1}".repeat(5000);
+    let body = reported(DeployId(7), &wordy_report(100, &text));
+    let wire = serde_json::to_vec(&body).unwrap();
+    assert!(wire.len() <= MAX_BODY_BYTES, "{}", wire.len());
+    assert!(
+        body.steps[0]
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("withheld")),
+        "{:?}",
+        body.steps[0]
+    );
+    assert_eq!(body.steps.last().unwrap().name, "report_trimmed");
+}
+
+#[test]
+fn a_body_that_small_steps_can_not_save_keeps_its_outcome() {
+    let text = "\u{1}".repeat(5000);
+    let mut report = wordy_report(1, &text);
+    report.steps[0].name = text.clone();
+    report.steps = vec![report.steps[0].clone(); 400];
+    let body = reported(DeployId(7), &report);
+    let wire = serde_json::to_vec(&body).unwrap();
+    assert!(wire.len() <= MAX_BODY_BYTES, "{}", wire.len());
+    assert_eq!(body.steps.len(), 1);
+    assert_eq!(body.steps[0].name, "report_trimmed");
+    assert!(matches!(
+        body.outcome,
+        ReportedOutcome::RollbackFailed { .. }
+    ));
 }

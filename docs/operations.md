@@ -176,8 +176,9 @@ it has. On the controller, make a one-time code for the host, valid for an hour:
 landfall-server enrol-code --host home-1
 ```
 
-Put the code in a file on the host that only the agent's user can read: it is not
-taken on the command line, where any user could see it. Then, as the agent's user:
+Put the code in a regular file on the host that only the agent's user can read (a
+link or a FIFO is refused): it is not taken on the command line, where any user could
+see it. Then, as the agent's user:
 
 ```sh
 landfall-agent enrol --controller https://controller.example --host home-1 --code-file /path/to/code
@@ -254,7 +255,7 @@ controller holds back a host whose file differs from its own, which is logged as
 
 **A stop finishes the deploy first.** SIGTERM ends a wait for the controller at once.
 A deploy in flight runs to its end and is reported before the process exits, and no
-new one starts.
+new one starts, even if the stop comes while a release is being verified.
 
 ### What a compromised controller can and can't do
 
@@ -280,8 +281,22 @@ What it can do: withhold work, ask again, and see what the host reports. It can
 also make the host deploy a release that is allowed by all of the above sooner than
 promotion rules on the controller would, which are controller-enforced only.
 
-Verification that can't run, because the registry or GitHub can't be reached, reports
-nothing: the work comes back and is tried again.
+**A release that rolled back on this host isn't retried automatically; a newer release
+is.** Retrying the same one is a manual action, which plan 05 adds. The host goes by
+the engine's reports under `<deployment>/reports/`, so removing the report of a failed
+deploy by hand also forgets that it failed. The controller can't run a release in
+circles either way: a deploy that has finished never runs again. Delivered again
+under its number, it gets its original report (`finished_work_delivered_again`), from
+a ledger of the newest 1024 under `<state dir>/finished/`. And after a refusal or a
+rollback the agent's polls back off, up to five minutes apart, until a release deploys
+or five minutes pass without trouble.
+
+Verification that can't run, because the registry or GitHub can't be reached or a
+rate limit is in the way, reports nothing: the work comes back and is tried again, for
+as long as that takes, with `verification_still_waiting` in the journal every hour. A
+tag, image or attestation that the service says **isn't there** is waited for as well,
+as a release may still be publishing, but only for an hour, by the monotonic clock and
+counting only while the agent runs. After that it is refused with the reason.
 
 ### Reports
 
@@ -289,9 +304,17 @@ A report goes to the outbox, `<state dir>/outbox/<deploy id>.json`, before it is
 and is removed when the controller acknowledges it. While the controller is down a
 deploy finishes as usual, the agent asks for no more work, and the report is sent
 when the controller is back. It can arrive twice after a crash at the wrong moment:
-reports are idempotent by deploy id. A report the controller refuses for good (a 4xx
-other than 401, 408 or 429) is dropped and journalled as `report_rejected`; the
-engine's own copy stays under `<deployment>/reports/`.
+reports are idempotent by deploy id. Only the API's own refusal for good drops a
+report: a 4xx to the signed request, as `application/problem+json`, with a code
+classified final. It is journalled as `report_rejected`, and the engine's copy stays
+under `<deployment>/reports/`. Any other answer keeps it, a proxy's 404, a failed nonce
+and a connection reset among them.
+
+A report or a claim that can't be read is renamed to `<name>.corrupt` and journalled
+as `state_file_set_aside` at priority 3, and the agent carries on. A report over the
+API's size limit loses the details of its steps, then what its steps say, then the
+steps, and a last step named `report_trimmed` says so. The agent reaches the controller
+directly: proxy variables in its environment are ignored.
 
 The controller's number for a deploy is written to
 `<deployment>/controller-claim.json` before the deploy starts, and the file is removed

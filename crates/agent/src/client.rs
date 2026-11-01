@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use landfall_core::ids::HostId;
 use landfall_core::protocol::{
-    DeployReportBody, HOST_HEADER, NONCE_HEADER, Nonce, SIGNATURE_HEADER, SigningKey, WorkRequest,
+    DeployReportBody, Disposition, HOST_HEADER, MAX_BODY_BYTES, NONCE_HEADER, Nonce, NonceResponse,
+    PROBLEM_CONTENT_TYPE, Problem, ProblemCode, SIGNATURE_HEADER, SigningKey, WorkRequest,
     WorkResponse, sign,
 };
 use landfall_core::text::shown;
@@ -33,7 +34,7 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// `work` is held by the controller for up to 30 seconds.
 const WORK_TIMEOUT: Duration = Duration::from_secs(45);
 /// The agent API's own limit on a body, which holds for what comes back too.
-const BODY_CAP: usize = 1024 * 1024;
+const BODY_CAP: usize = MAX_BODY_BYTES;
 
 /// What the agent asks of the controller. The HTTP client is one; tests have a
 /// fake.
@@ -58,16 +59,30 @@ pub enum ControllerError {
     /// The HTTP client could not be built.
     #[error("cannot build the HTTP client: {0}")]
     Client(String),
-    /// It did not reach the controller, or no full answer came back.
+    /// It did not reach the controller, or no full answer came back, as with a
+    /// connection reset: a server can reset when it closes with a body unread.
+    /// Always worth trying again.
     #[error("controller unreachable: {0}")]
     Transport(String),
-    /// It answered with an error status.
+    /// Something answered with an error status. It may not be the controller at
+    /// all, so this says nothing for good.
     #[error("controller answered {status}: {detail}")]
     Status {
         /// The status.
         status: StatusCode,
         /// What it said, quoted and truncated.
         detail: String,
+    },
+    /// The agent API itself refused a signed request, with a code that means the
+    /// same request will be refused every time.
+    #[error("controller refused the request for good ({status}): {code}: {title}")]
+    Rejected {
+        /// The status.
+        status: StatusCode,
+        /// The stable code.
+        code: &'static str,
+        /// What it said, quoted and truncated.
+        title: String,
     },
     /// It answered success with something this agent can't read.
     #[error("controller's answer is not valid: {0}")]
@@ -79,23 +94,12 @@ pub enum ControllerError {
 
 impl ControllerError {
     /// Whether the controller has read a report and said no for good, so that
-    /// sending it again can't help: a status of 4xx, other than a signature it
-    /// did not accept (401, which a later try with a new nonce can pass), a
-    /// timeout (408) and a rate limit (429).
+    /// sending it again can't help. Only a 4xx to the signed request itself, as
+    /// the API's own problem document with a code classified final, says that. A
+    /// proxy's 404 or a failed nonce says nothing about the report.
     #[must_use]
     pub fn is_rejection(&self) -> bool {
-        match self {
-            Self::Status { status, .. } => {
-                status.is_client_error()
-                    && !matches!(
-                        *status,
-                        StatusCode::UNAUTHORIZED
-                            | StatusCode::REQUEST_TIMEOUT
-                            | StatusCode::TOO_MANY_REQUESTS
-                    )
-            }
-            Self::Client(_) | Self::Transport(_) | Self::BadAnswer(_) | Self::Serialise(_) => false,
-        }
+        matches!(self, Self::Rejected { .. })
     }
 }
 
@@ -208,7 +212,10 @@ fn host_is_private(url: &Url) -> bool {
 /// The HTTP client for a controller: no redirects, a connect timeout, and with
 /// an `https` URL nothing but `https`.
 pub(crate) fn http_client(url: &ControllerUrl) -> Result<Client, ControllerError> {
+    // No proxy from the environment: signed requests and enrolment codes go to
+    // the controller the operator named, directly.
     Client::builder()
+        .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
         .https_only(url.is_https())
         .redirect(redirect::Policy::none())
@@ -249,6 +256,50 @@ pub(crate) async fn answer(response: reqwest::Response) -> Result<Vec<u8>, Contr
     Err(ControllerError::Status { status, detail })
 }
 
+/// The API's own refusal for good, if `body` is one: a 4xx with its content type,
+/// its problem document, the status repeated in it and a code classified final.
+fn final_problem(status: StatusCode, is_problem: bool, body: &[u8]) -> Option<ControllerError> {
+    if !status.is_client_error() || !is_problem {
+        return None;
+    }
+    let problem: Problem = serde_json::from_slice(body).ok()?;
+    let code = ProblemCode::parse(&problem.code)?;
+    (problem.status == status.as_u16() && code.disposition() == Disposition::Final).then(|| {
+        ControllerError::Rejected {
+            status,
+            code: code.as_str(),
+            title: shown(&problem.title),
+        }
+    })
+}
+
+/// [`answer`] for the signed POST itself, the only answer that can be a refusal
+/// for good.
+async fn signed_answer(response: reqwest::Response) -> Result<Vec<u8>, ControllerError> {
+    let status = response.status();
+    if status.is_success() {
+        return read_capped(response).await;
+    }
+    let is_problem = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(PROBLEM_CONTENT_TYPE));
+    let Ok(body) = read_capped(response).await else {
+        return Err(ControllerError::Status {
+            status,
+            detail: "its error could not be read".to_owned(),
+        });
+    };
+    Err(
+        final_problem(status, is_problem, &body).unwrap_or_else(|| ControllerError::Status {
+            status,
+            detail: shown(&String::from_utf8_lossy(&body)),
+        }),
+    )
+}
+
 /// The agent API over HTTP, signing with the host's key. Its `Debug` is not
 /// derived: nothing should print what holds the key.
 pub struct HttpController {
@@ -273,7 +324,7 @@ impl HttpController {
         })
     }
 
-    /// A fresh nonce: the JSON string [`Nonce`] serialises to.
+    /// A fresh nonce. A failure here is never about what the nonce was for.
     async fn nonce(&self) -> Result<Nonce, ControllerError> {
         let response = self
             .http
@@ -283,12 +334,14 @@ impl HttpController {
             .await
             .map_err(|error| ControllerError::Transport(error_chain(&error)))?;
         let body = answer(response).await?;
-        serde_json::from_slice(&body).map_err(|_| {
-            ControllerError::BadAnswer(format!(
-                "not a nonce: {}",
-                shown(&String::from_utf8_lossy(&body))
-            ))
-        })
+        serde_json::from_slice::<NonceResponse>(&body)
+            .map(|answer| answer.nonce)
+            .map_err(|_| {
+                ControllerError::BadAnswer(format!(
+                    "not a nonce: {}",
+                    shown(&String::from_utf8_lossy(&body))
+                ))
+            })
     }
 
     /// A signed POST of `value` as JSON. The signature covers the very bytes
@@ -315,7 +368,7 @@ impl HttpController {
             .send()
             .await
             .map_err(|error| ControllerError::Transport(error_chain(&error)))?;
-        answer(response).await
+        signed_answer(response).await
     }
 }
 
@@ -340,10 +393,14 @@ mod tests {
         WorkRequest, verify,
     };
     use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{Controller, ControllerError, ControllerUrl, HttpController, UrlError};
+    use super::{
+        Controller, ControllerError, ControllerUrl, HttpController, NonceResponse,
+        PROBLEM_CONTENT_TYPE, UrlError,
+    };
 
     const NONCE: [u8; 32] = [0xab; 32];
 
@@ -359,9 +416,16 @@ mod tests {
     async fn serve_nonce(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/agent/v1/nonce"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(Nonce::from_bytes(NONCE)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(NonceResponse {
+                nonce: Nonce::from_bytes(NONCE),
+            }))
             .mount(server)
             .await;
+    }
+
+    fn problem(status: u16, code: &str) -> ResponseTemplate {
+        let document = json!({"code": code, "title": "no", "status": status});
+        ResponseTemplate::new(status).set_body_raw(document.to_string(), PROBLEM_CONTENT_TYPE)
     }
 
     fn request() -> WorkRequest {
@@ -575,28 +639,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_lasting_refusal_counts_as_a_rejection() {
-        for (status, rejected) in [
-            (400, true),
-            (403, true),
-            (404, true),
-            (409, true),
-            (401, false),
-            (408, false),
-            (429, false),
-            (500, false),
-            (503, false),
+    async fn only_the_apis_final_refusal_of_the_post_is_a_rejection() {
+        // Stable codes, with a status of the API's own.
+        for (template, rejected, why) in [
+            (problem(404, "unknown_deploy"), true, "final"),
+            (problem(403, "not_claimed"), true, "final"),
+            (problem(401, "bad_signature"), true, "final"),
+            (problem(400, "bad_nonce"), false, "the code says retry"),
+            (problem(429, "rate_limited"), false, "the code says retry"),
+            (problem(404, "made_up"), false, "not a code of the API's"),
+            (problem(500, "not_claimed"), false, "not a 4xx"),
+            (
+                ResponseTemplate::new(404).set_body_raw(
+                    json!({"code": "not_claimed", "title": "no", "status": 403}).to_string(),
+                    PROBLEM_CONTENT_TYPE,
+                ),
+                false,
+                "the document's status differs",
+            ),
+            (
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"code": "not_claimed", "title": "no", "status": 404})),
+                false,
+                "not the API's content type",
+            ),
+            (ResponseTemplate::new(404), false, "a bare 404: a proxy's"),
+            (ResponseTemplate::new(403), false, "a bare 403: a proxy's"),
+            (
+                ResponseTemplate::new(403).set_body_raw("<html>", PROBLEM_CONTENT_TYPE),
+                false,
+                "not a problem document",
+            ),
+            (ResponseTemplate::new(503), false, "a 5xx"),
         ] {
             let server = MockServer::start().await;
             serve_nonce(&server).await;
             Mock::given(method("POST"))
                 .and(path("/agent/v1/report"))
-                .respond_with(ResponseTemplate::new(status))
+                .respond_with(template)
                 .mount(&server)
                 .await;
             let err = client(&server).report(&report()).await.unwrap_err();
-            assert_eq!(err.is_rejection(), rejected, "{status}");
+            assert_eq!(err.is_rejection(), rejected, "{why}: {err}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_nonce_is_never_a_rejection() {
+        for template in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(403),
+            problem(404, "not_claimed"),
+            problem(403, "bad_signature"),
+            problem(400, "bad_request"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/agent/v1/nonce"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let err = client(&server).report(&report()).await.unwrap_err();
+            assert!(!err.is_rejection(), "{err}");
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.iter().all(|r| r.method.as_str() == "GET"));
+        }
+    }
+
+    /// Serves one nonce, then reads the start of the next request and closes with
+    /// the rest of its body unread, which resets the connection.
+    async fn reset_after_nonce() -> ControllerUrl {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = first.read(&mut buffer).await.unwrap();
+            let body = json!({"nonce": "ab".repeat(32)}).to_string();
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            first.write_all(answer.as_bytes()).await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut start = [0_u8; 16];
+            let _ = second.read(&mut start).await;
+            drop(second);
+        });
+        ControllerUrl::parse(&format!("http://{address}"), true).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_connection_reset_on_a_request_with_a_body_can_be_retried() {
+        let url = reset_after_nonce().await;
+        let controller = HttpController::new(url, "home-1".parse().unwrap(), key()).unwrap();
+        let big = DeployReportBody {
+            outcome: ReportedOutcome::RolledBack {
+                reason: "x".repeat(512 * 1024),
+            },
+            ..report()
+        };
+        let err = controller.report(&big).await.unwrap_err();
+        assert!(matches!(err, ControllerError::Transport(_)), "{err}");
+        assert!(!err.is_rejection(), "{err}");
+
+        let url = reset_after_nonce().await;
+        let controller = HttpController::new(url, "home-1".parse().unwrap(), key()).unwrap();
+        let err = controller.work(&request()).await.unwrap_err();
+        assert!(matches!(err, ControllerError::Transport(_)), "{err}");
     }
 
     #[tokio::test]

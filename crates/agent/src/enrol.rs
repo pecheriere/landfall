@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use landfall_core::ids::HostId;
 use landfall_core::protocol::{EnrolCode, EnrolRequest, SigningKey};
 use reqwest::header::CONTENT_TYPE;
+use rustix::fs::{Mode, OFlags};
 use serde::Serialize;
 
 use crate::client::{self, ControllerError, ControllerUrl};
@@ -66,6 +67,9 @@ pub enum EnrolError {
         /// The underlying error.
         source: io::Error,
     },
+    /// The code file is not a regular file.
+    #[error("code file {} must be a regular file", .0.display())]
+    CodeNotRegular(PathBuf),
     /// The code file does not hold a code. What it does hold is not repeated.
     #[error("code file {} does not hold an enrolment code of 64 lowercase hex digits", .0.display())]
     CodeInvalid(PathBuf),
@@ -153,10 +157,16 @@ pub fn load_or_create_key(state: &StateDir) -> Result<SigningKey, EnrolError> {
     getrandom::fill(&mut seed).map_err(EnrolError::Random)?;
     let path = state.path().join(KEY_FILE);
     let tmp = state.path().join(format!(".{KEY_FILE}.tmp"));
+    // A stale file could have any mode, or be a link to anywhere: it goes, and
+    // this one is new or nothing.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(key_error("remove stale", &tmp)(e)),
+    }
     let mut file = OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&tmp)
         .map_err(key_error("create", &tmp))?;
@@ -177,20 +187,27 @@ pub fn load_or_create_key(state: &StateDir) -> Result<SigningKey, EnrolError> {
 }
 
 /// Reads an enrolment code from its file, without any of its content reaching
-/// an error.
+/// an error. It must be a regular file itself: a link is not followed, and a
+/// FIFO or a device neither blocks the open nor gets read.
 ///
 /// # Errors
 ///
-/// [`EnrolError::CodeFile`] or [`EnrolError::CodeInvalid`].
+/// [`EnrolError::CodeFile`], [`EnrolError::CodeNotRegular`] or
+/// [`EnrolError::CodeInvalid`].
 pub fn read_code(path: &Path) -> Result<EnrolCode, EnrolError> {
     let code_file = |source| EnrolError::CodeFile {
         path: path.to_owned(),
         source,
     };
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = File::from(
+        rustix::fs::open(path, flags, Mode::empty()).map_err(|e| code_file(io::Error::from(e)))?,
+    );
+    if !file.metadata().map_err(code_file)?.is_file() {
+        return Err(EnrolError::CodeNotRegular(path.to_owned()));
+    }
     let mut text = String::new();
-    File::open(path)
-        .map_err(code_file)?
-        .take(CODE_FILE_CAP)
+    file.take(CODE_FILE_CAP)
         .read_to_string(&mut text)
         .map_err(code_file)?;
     text.trim()
@@ -318,6 +335,54 @@ mod tests {
         assert_eq!(again.to_bytes(), key.to_bytes());
         assert_eq!(load_key(&f.state()).unwrap().to_bytes(), key.to_bytes());
         assert!(!f.state_dir().join(".agent.key.tmp").exists());
+    }
+
+    #[test]
+    fn a_stale_temporary_file_cannot_loosen_or_redirect_the_key() {
+        let f = fixture();
+        let tmp = f.state_dir().join(".agent.key.tmp");
+        // Left by something else, readable by everyone.
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, Permissions::from_mode(0o644)).unwrap();
+        load_or_create_key(&f.state()).unwrap();
+        assert_eq!(mode(&f.key_path()), 0o600);
+        assert!(!tmp.exists());
+
+        // A link: the seed must not go through it.
+        let g = fixture();
+        let target = g.state_dir().join("elsewhere");
+        fs::write(&target, b"untouched").unwrap();
+        let tmp = g.state_dir().join(".agent.key.tmp");
+        std::os::unix::fs::symlink(&target, &tmp).unwrap();
+        load_or_create_key(&g.state()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"untouched");
+        assert_eq!(mode(&g.key_path()), 0o600);
+        assert!(fs::symlink_metadata(g.key_path()).unwrap().is_file());
+    }
+
+    #[test]
+    fn a_code_file_that_is_not_a_regular_file_is_refused() {
+        let f = fixture();
+        let dir = f.state_dir().join("dir");
+        fs::create_dir(&dir).unwrap();
+        let err = read_code(&dir).err().unwrap();
+        assert!(matches!(err, EnrolError::CodeNotRegular(_)), "{err}");
+
+        // Would block a plain open for ever.
+        let fifo = f.state_dir().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let err = read_code(&fifo).err().unwrap();
+        assert!(matches!(err, EnrolError::CodeNotRegular(_)), "{err}");
+
+        // A link to a good code is still not followed.
+        let link = f.state_dir().join("link");
+        std::os::unix::fs::symlink(&f.code_file, &link).unwrap();
+        let err = read_code(&link).err().unwrap();
+        assert!(matches!(err, EnrolError::CodeFile { .. }), "{err}");
     }
 
     #[test]

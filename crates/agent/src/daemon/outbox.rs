@@ -1,12 +1,13 @@
 //! Reports on their way to the controller: the engine's report in the wire's
-//! terms, what a crash or a `recover` left of a deploy, and the outbox.
+//! terms, what a crash or a `recover` left of a deploy, the outbox, and the
+//! ledger of what has finished.
 
 use std::path::Path;
 
 use landfall_core::ids::DeploymentId;
 use landfall_core::protocol::{
-    DeployId, DeployReportBody, MAX_REPORTED_CHECKS, ReportedCheck, ReportedDetail,
-    ReportedOutcome, ReportedStep,
+    DeployId, DeployReportBody, MAX_BODY_BYTES, ReportedCheck, ReportedDetail, ReportedOutcome,
+    ReportedStep,
 };
 use serde::Serialize;
 
@@ -16,9 +17,11 @@ use crate::deploy::{DeployReport, Outcome, StepDetail, StepResult};
 use crate::journal::{self, Priority};
 use crate::state::{ControllerClaim, DeploymentState, StateDir, StateError};
 
-/// The longest text of a report. The engine's own reasons are far shorter; a
-/// report must stay under the agent API's limit on a body.
+/// The longest text of a report, in characters. What fits in a body is up to
+/// [`fit_to_the_wire`]: a character can take many bytes once serialised.
 const MAX_REPORT_TEXT: usize = 4096;
+/// The step that says a report had to be trimmed.
+const TRIMMED_STEP: &str = "report_trimmed";
 
 pub(super) fn bounded(text: &str) -> String {
     let mut cut: String = text.chars().take(MAX_REPORT_TEXT).collect();
@@ -55,7 +58,6 @@ fn reported_detail(detail: &StepDetail) -> ReportedDetail {
         StepDetail::Checks { checks } => ReportedDetail::Checks {
             checks: checks
                 .iter()
-                .take(MAX_REPORTED_CHECKS)
                 .map(|check| ReportedCheck {
                     check: bounded(&check.check),
                     attempts: check.attempts,
@@ -72,10 +74,50 @@ fn reported_detail(detail: &StepDetail) -> ReportedDetail {
     }
 }
 
+fn fits(body: &DeployReportBody) -> bool {
+    serde_json::to_vec(body).is_ok_and(|wire| wire.len() <= MAX_BODY_BYTES)
+}
+
+fn trimmed_step() -> ReportedStep {
+    ReportedStep {
+        name: TRIMMED_STEP.to_owned(),
+        millis: 0,
+        failure: None,
+        detail: None,
+    }
+}
+
+/// A body over the API's limit would be refused every time, so it is cut down
+/// until it fits: first the steps' details, then what the steps say beyond their
+/// names, then the steps. A last step says it was done. The outcome stays, and it
+/// fits: two bounded reasons are far under the limit however they serialise.
+fn fit_to_the_wire(mut body: DeployReportBody) -> DeployReportBody {
+    if fits(&body) {
+        return body;
+    }
+    for step in &mut body.steps {
+        step.detail = None;
+    }
+    body.steps.push(trimmed_step());
+    if fits(&body) {
+        return body;
+    }
+    for step in &mut body.steps {
+        if step.failure.is_some() {
+            step.failure = Some("withheld: the report was over the size limit".to_owned());
+        }
+    }
+    if fits(&body) {
+        return body;
+    }
+    body.steps = vec![trimmed_step()];
+    body
+}
+
 /// The engine's report as it goes to the controller, under the controller's
 /// number.
 pub(super) fn reported(deploy_id: DeployId, report: &DeployReport) -> DeployReportBody {
-    DeployReportBody {
+    fit_to_the_wire(DeployReportBody {
         deploy_id,
         outcome: reported_outcome(&report.outcome),
         steps: report
@@ -91,33 +133,21 @@ pub(super) fn reported(deploy_id: DeployId, report: &DeployReport) -> DeployRepo
                 detail: step.detail.as_ref().map(reported_detail),
             })
             .collect(),
-    }
+    })
 }
 
-/// The newest of the engine's reports that belongs to `claim`.
-fn latest_report(
-    state: &DeploymentState,
-    claim: &ControllerClaim,
-) -> Result<Option<DeployReport>, StateError> {
+/// The engine's reports the deployment has, as they read, passing over and
+/// journalling any that can't be read.
+fn engine_reports(state: &DeploymentState) -> Result<Vec<(String, DeployReport)>, StateError> {
     #[derive(Serialize)]
     struct Unreadable {
         event: &'static str,
         error: String,
     }
-    let mut latest: Option<DeployReport> = None;
-    for report in state.reports::<DeployReport>()? {
-        match report {
-            Ok(report) => {
-                let belongs = report.started_at >= claim.claimed_at
-                    && report.tag == claim.tag
-                    && report.digest == claim.digest;
-                let newer = latest
-                    .as_ref()
-                    .is_none_or(|seen| report.started_at > seen.started_at);
-                if belongs && newer {
-                    latest = Some(report);
-                }
-            }
+    let mut reports = Vec::new();
+    for name in state.report_names()? {
+        match state.report(&name) {
+            Ok(report) => reports.push((name, report)),
             Err(error) => journal::emit(
                 Priority::Warning,
                 &Unreadable {
@@ -127,7 +157,51 @@ fn latest_report(
             ),
         }
     }
-    Ok(latest)
+    Ok(reports)
+}
+
+/// The engine's report that ends `claim`: one written since the claim was made.
+/// There can be several, when a rollback failed and a `recover` succeeded later:
+/// with the marker gone, one that isn't a failed rollback ends it, and otherwise
+/// the times between these reports are all there is to go by.
+fn latest_report(
+    state: &DeploymentState,
+    claim: &ControllerClaim,
+) -> Result<Option<DeployReport>, StateError> {
+    Ok(engine_reports(state)?
+        .into_iter()
+        .filter(|(name, report)| {
+            !claim.reports_before.contains(name)
+                && report.tag == claim.tag
+                && report.digest == claim.digest
+        })
+        .map(|(_, report)| report)
+        .max_by_key(|report| {
+            (
+                !matches!(report.outcome, Outcome::RollbackFailed { .. }),
+                report.started_at,
+            )
+        }))
+}
+
+/// Whether this release has already failed on this host, by the engine's own
+/// reports, which a controller has no say in. It stays failed: a newer release is
+/// another matter.
+pub(super) fn failed_before(
+    state: &DeploymentState,
+    tag: &landfall_core::ids::ReleaseTag,
+    digest: &landfall_core::ids::ImageDigest,
+) -> Result<bool, StateError> {
+    Ok(engine_reports(state)?.iter().any(|(_, report)| {
+        report.tag == *tag
+            && report.digest == *digest
+            && matches!(
+                report.outcome,
+                Outcome::RolledBack { .. }
+                    | Outcome::FailedNoPrevious { .. }
+                    | Outcome::RollbackFailed { .. }
+            )
+    }))
 }
 
 /// Deals with what a crash or a `recover` left of a deploy. With its marker
@@ -174,6 +248,7 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), St
         "never started; the controller delivers it again"
     };
     if let Some(body) = &body {
+        root.finished_put(body)?;
         root.outbox_put(body)?;
     }
     journal::emit(
@@ -196,9 +271,9 @@ enum Delivery {
     Kept(String),
 }
 
-/// Sends one report. An acknowledged one is removed. So is one the controller
-/// refuses for good, loudly: repeating it can't help, and the engine's own copy
-/// stays under `reports/`.
+/// Sends one report. An acknowledged one is removed. So is one the API refuses
+/// for good, loudly: repeating it can't help, and the ledger and the engine's own
+/// copy stay. Anything else keeps it, whatever the status.
 async fn send_report<C: Controller>(
     controller: &C,
     state_dir: &Path,
@@ -215,7 +290,10 @@ async fn send_report<C: Controller>(
         deploy_id: report.deploy_id,
         error,
     };
-    let result = controller.report(report).await;
+    // Whatever is in the outbox, nothing over the limit goes out: the controller's
+    // answer to that can arrive as a connection reset, which looks retryable and
+    // would never end.
+    let result = controller.report(&fit_to_the_wire(report.clone())).await;
     match &result {
         Ok(()) => journal::emit(Priority::Info, &event("report_delivered", None)),
         Err(error) if error.is_rejection() => journal::emit(
@@ -260,7 +338,8 @@ pub(super) async fn flush<C: Controller>(
     Ok(())
 }
 
-/// Puts a finished report in the outbox, releases the claim and sends it.
+/// Records a finished report in the ledger and the outbox, releases the claim and
+/// sends it.
 pub(super) async fn finish<C: Controller>(
     controller: &C,
     state_dir: &Path,
@@ -276,6 +355,7 @@ pub(super) async fn finish<C: Controller>(
     let (dir, copy, id) = (state_dir.to_owned(), body.clone(), claimed.cloned());
     let kept = on_thread("keep report", move || {
         let root = StateDir::open(&dir)?;
+        root.finished_put(&copy)?;
         root.outbox_put(&copy)?;
         if let Some(id) = id {
             root.deployment(&id)?.clear_claim()?;
