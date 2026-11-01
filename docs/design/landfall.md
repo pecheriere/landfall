@@ -274,6 +274,14 @@ code. v0: Docker healthcheck (fails if the image defines none), HTTP probe of th
 command exit status inside the container, "no log line matching X in the first N seconds". Each check
 reports a short reason string used verbatim in the "why" view.
 
+A false pass is the worst outcome, so passing once is not enough. A round also requires the container
+to be running, and at its end, after any log windows, to be the same container from the same start
+with the same addresses. After the first passing round the agent waits a settle time (10 s) and
+requires a second passing round on that same container and start; any change starts over within the
+deadline. Every deploy therefore takes at least the settle time, and a crash slower than the settle
+time is not caught without a longer `no_log_match` window. Logs are scanned from the earliest start
+seen in the run, so a panic in an earlier incarnation counts.
+
 ## 8. Identity and grants
 
 ### 8.1 Principals

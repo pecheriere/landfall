@@ -390,12 +390,19 @@ pub enum Check {
     /// It does not observe the service on its own, so a deployment also needs
     /// one of the other checks.
     NoLogMatch {
-        /// Plain substring to look for (not a regex).
+        /// Plain substring to look for (not a regex), on a single line and at
+        /// most [`LOG_PATTERN_LIMIT`] bytes.
         pattern: String,
-        /// Observation window in seconds.
+        /// Observation window in seconds, at most [`WITHIN_SECS_LIMIT`].
         within_secs: u32,
     },
 }
+
+/// The longest `no_log_match` pattern, in bytes.
+pub const LOG_PATTERN_LIMIT: usize = 4096;
+
+/// The longest `no_log_match` window, in seconds. A deploy waits for it.
+pub const WITHIN_SECS_LIMIT: u32 = 3600;
 
 /// Files copied before a deploy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1282,6 +1289,31 @@ can = ["view", "request", "approve", "rollback"]
     }
 
     /// The fixture with app/staging's check list replaced by `checks`.
+    #[test]
+    fn log_checks_stay_within_what_the_agent_can_run() {
+        let long = "x".repeat(LOG_PATTERN_LIMIT + 1);
+        for bad in [
+            format!("[\"container-healthy\", {{ no_log_match = \"{long}\", within_secs = 1 }}]"),
+            "[\"container-healthy\", { no_log_match = \"a\\nb\", within_secs = 1 }]".to_owned(),
+            "[\"container-healthy\", { no_log_match = \"x\", within_secs = 3601 }]".to_owned(),
+        ] {
+            let err = parse_str(&with_staging_checks(&bad)).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Invalid { deployment, field, .. }
+                        if deployment.as_ref() == "app/staging" && field == "checks[1]"
+                ),
+                "{err}"
+            );
+        }
+        let longest = "x".repeat(LOG_PATTERN_LIMIT);
+        let at_the_limits = format!(
+            "[\"container-healthy\", {{ no_log_match = \"{longest}\", within_secs = 3600 }}]"
+        );
+        assert!(parse_str(&with_staging_checks(&at_the_limits)).is_ok());
+    }
+
     fn with_staging_checks(checks: &str) -> String {
         edited(
             "checks = [\"container-healthy\"]",

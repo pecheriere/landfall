@@ -160,11 +160,26 @@ Each entry is the string `"container-healthy"` or a table with exactly one of
 - `{ command = ["/app", "healthcheck"] }`: a command run in the container,
   exit 0 is healthy; non-empty argv.
 - `{ no_log_match = "panicked", within_secs = 30 }`: no log line may contain
-  the text during the window. It is a plain substring match, not a regex. Both
-  values are non-empty and above zero.
+  the text during the window, which runs from the container's start for
+  `within_secs` (rounded out to whole seconds); a line logged later does not
+  count. If the container restarts during the checks, the lines of its earlier
+  starts count too. It is a plain substring match, not a regex. The text is 1
+  to 4096 bytes on a single line; `within_secs` is from 1 to 3600. The deploy
+  waits for the window to close, on top of the check deadline.
 
 `no_log_match` does not observe the service on its own, so every deployment
 also needs at least one of `"container-healthy"`, `http` or `command`.
+
+Checks must pass twice. After the first round in which they all pass, the agent
+waits a settle time (10 seconds) and runs them again, and the container must
+still be the same one, from the same start. If it restarted, or the second
+round fails, the wait starts over, within the deadline (180 seconds; a first
+pass later than 10 seconds before it fails). So every deploy takes at least the
+settle time, and `http` and `command`, which look at one moment, cannot pass
+on a service that is crash-looping. A crash that comes later than the settle
+time is not caught: to catch slower ones, use a `no_log_match` with a longer
+`within_secs`, since the container must also be unchanged when its window
+closes.
 
 ## `[[grant]]`
 

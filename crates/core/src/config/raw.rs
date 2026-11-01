@@ -13,8 +13,8 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, Level, Origin,
-    Permission, Promotion, Repo, Rule, SignerKey,
+    Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, LOG_PATTERN_LIMIT,
+    Level, Origin, Permission, Promotion, Repo, Rule, SignerKey, WITHIN_SECS_LIMIT,
 };
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 
@@ -528,6 +528,14 @@ fn convert_check(id: &DeploymentId, index: usize, raw: RawCheck) -> Result<Check
                 return Err(bad(
                     "no_log_match needs a pattern and within_secs above zero",
                 ));
+            }
+            if pattern.len() > LOG_PATTERN_LIMIT || pattern.contains('\n') {
+                return Err(bad(
+                    "no_log_match must be at most 4096 bytes on a single line",
+                ));
+            }
+            if within_secs > WITHIN_SECS_LIMIT {
+                return Err(bad("within_secs must be at most 3600"));
             }
             Ok(Check::NoLogMatch {
                 pattern,

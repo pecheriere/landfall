@@ -28,6 +28,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use landfall_core::config::LOG_PATTERN_LIMIT;
 use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -40,8 +41,6 @@ const OUTPUT_CAP: usize = 16 * 1024 * 1024;
 const STDERR_TAIL: usize = 4096;
 /// The longest line `logs_contain` holds; longer lines are scanned in chunks.
 const LINE_LIMIT: usize = 1024 * 1024;
-/// The longest needle `logs_contain` accepts.
-const NEEDLE_LIMIT: usize = 4096;
 const READ_CHUNK: usize = 64 * 1024;
 /// How long a killed process group is waited for before giving up on it.
 const KILL_WAIT: Duration = Duration::from_secs(5);
@@ -266,12 +265,14 @@ pub trait Docker: Send + Sync {
         argv: &[String],
     ) -> impl Future<Output = Result<bool, DockerError>> + Send;
 
-    /// Whether any line the container logged (on stdout or stderr) since
-    /// `since`, to the second, contains `needle`.
+    /// Whether any line the container logged (on stdout or stderr) between
+    /// `since` and `until`, both rounded outwards to the second, contains
+    /// `needle`.
     fn logs_contain(
         &self,
         id: &ContainerId,
         since: Timestamp,
+        until: Timestamp,
         needle: &str,
     ) -> impl Future<Output = Result<bool, DockerError>> + Send;
 }
@@ -792,23 +793,34 @@ impl Docker for DockerCli {
         &self,
         id: &ContainerId,
         since: Timestamp,
+        until: Timestamp,
         needle: &str,
     ) -> Result<bool, DockerError> {
         const LABEL: &str = "docker logs";
-        if needle.is_empty() || needle.len() > NEEDLE_LIMIT || needle.contains('\n') {
+        if needle.is_empty() || needle.len() > LOG_PATTERN_LIMIT || needle.contains('\n') {
             return Err(DockerError::BadArgument {
                 command: LABEL,
                 reason: "needle must be 1 to 4096 bytes on a single line",
             });
         }
-        let since =
-            Timestamp::from_second(since.as_second()).map_err(|_| DockerError::BadArgument {
-                command: LABEL,
-                reason: "time out of range",
-            })?;
+        let out_of_range = |_| DockerError::BadArgument {
+            command: LABEL,
+            reason: "time out of range",
+        };
+        let since = Timestamp::from_second(since.as_second()).map_err(out_of_range)?;
+        // Rounded up: a line in the last fraction of the window counts.
+        let until_second = until.as_second() + i64::from(until.subsec_nanosecond() > 0);
+        let until = Timestamp::from_second(until_second).map_err(out_of_range)?;
         let mut cmd = self.command(None);
-        cmd.args(["logs", "--since", &since.to_string(), "--"])
-            .arg(id.as_ref());
+        cmd.args([
+            "logs",
+            "--since",
+            &since.to_string(),
+            "--until",
+            &until.to_string(),
+            "--",
+        ])
+        .arg(id.as_ref());
         let mut child = spawn(LABEL, &mut cmd)?;
         let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
         let needle = needle.as_bytes();
@@ -1195,7 +1207,7 @@ mod tests {
         cli.timeout = Duration::from_millis(300);
         let started = std::time::Instant::now();
         let err = cli
-            .logs_contain(&id(), Timestamp::UNIX_EPOCH, "never")
+            .logs_contain(&id(), Timestamp::UNIX_EPOCH, Timestamp::UNIX_EPOCH, "never")
             .await
             .unwrap_err();
         assert!(matches!(err, DockerError::Timeout { .. }), "{err}");
@@ -1278,9 +1290,10 @@ mod tests {
             Err(DockerError::BadArgument { .. })
         ));
         let since = Timestamp::UNIX_EPOCH;
-        for needle in ["", "a\nb"] {
+        let long = "x".repeat(LOG_PATTERN_LIMIT + 1);
+        for needle in ["", "a\nb", long.as_str()] {
             assert!(matches!(
-                cli.logs_contain(&id(), since, needle).await,
+                cli.logs_contain(&id(), since, since, needle).await,
                 Err(DockerError::BadArgument { .. })
             ));
         }
@@ -1313,16 +1326,25 @@ mod tests {
     #[tokio::test]
     async fn logs_on_either_stream_are_scanned() {
         let since: Timestamp = "2026-11-01T10:00:00.9Z".parse().unwrap();
+        let until: Timestamp = "2026-11-01T10:00:30.1Z".parse().unwrap();
         let on_stderr = Stub::new(
             "echo \"$@\" > \"$(dirname \"$0\")/seen\"\necho out line\necho 'panic: boom' >&2",
         );
         let cli = on_stderr.cli();
-        assert!(cli.logs_contain(&id(), since, "panic:").await.unwrap());
-        assert!(!cli.logs_contain(&id(), since, "absent").await.unwrap());
+        assert!(
+            cli.logs_contain(&id(), since, until, "panic:")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !cli.logs_contain(&id(), since, until, "absent")
+                .await
+                .unwrap()
+        );
         let seen = fs::read_to_string(on_stderr.path("seen")).unwrap();
         assert_eq!(
             seen.trim(),
-            "logs --since 2026-11-01T10:00:00Z -- 0123456789ab"
+            "logs --since 2026-11-01T10:00:00Z --until 2026-11-01T10:00:31Z -- 0123456789ab"
         );
 
         drop(on_stderr);
@@ -1330,7 +1352,7 @@ mod tests {
         assert!(
             on_stdout
                 .cli()
-                .logs_contain(&id(), since, "listening")
+                .logs_contain(&id(), since, until, "listening")
                 .await
                 .unwrap()
         );
@@ -1342,7 +1364,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(
             stub.cli()
-                .logs_contain(&id(), Timestamp::UNIX_EPOCH, "ready")
+                .logs_contain(&id(), Timestamp::UNIX_EPOCH, Timestamp::UNIX_EPOCH, "ready")
                 .await
                 .unwrap()
         );
@@ -1354,7 +1376,7 @@ mod tests {
         let stub = Stub::new("echo 'Error: No such container: SECRET=hunter2' >&2\nexit 1");
         let err = stub
             .cli()
-            .logs_contain(&id(), Timestamp::UNIX_EPOCH, "x")
+            .logs_contain(&id(), Timestamp::UNIX_EPOCH, Timestamp::UNIX_EPOCH, "x")
             .await
             .unwrap_err();
         assert!(matches!(err, DockerError::FailedQuietly { .. }), "{err}");
@@ -1365,98 +1387,30 @@ mod tests {
     /// -- --ignored docker`.
     mod real {
         use std::process::Command as StdCommand;
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         use super::*;
+        use crate::testing::{ComposeProject, TEST_IMAGE};
 
-        const IMAGE: &str = "busybox:1.37";
-
-        /// A compose project with a unique name, removed on drop with its
-        /// network and containers (one-offs included).
-        struct Project {
-            name: String,
-            dir: tempfile::TempDir,
-            image: String,
-        }
-
-        impl Project {
-            async fn new(cli: &DockerCli) -> Self {
-                let nanos = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos();
-                let name = format!("landfall-t3-{}-{nanos}", std::process::id());
-                cli.pull(IMAGE).await.unwrap();
-                let out = StdCommand::new("docker")
-                    .args([
-                        "image",
-                        "inspect",
-                        "--format",
-                        "{{index .RepoDigests 0}}",
-                        IMAGE,
-                    ])
-                    .output()
-                    .unwrap();
-                assert!(out.status.success());
-                let image = String::from_utf8(out.stdout).unwrap().trim().to_owned();
-                assert!(image.contains("@sha256:"), "{image}");
-                let dir = tempfile::tempdir().unwrap();
-                fs::write(
-                    dir.path().join("compose.yaml"),
-                    format!(
-                        "name: {name}\nservices:\n  plain:\n    image: {image}\n    command: [sleep, '300']\n    stop_grace_period: 1s\n    networks: [net]\n  healthy:\n    image: {image}\n    command: [sleep, '300']\n    stop_grace_period: 1s\n    networks: [net]\n    healthcheck:\n      test: [CMD, 'true']\n      interval: 1s\nnetworks:\n  net:\n    name: {name}-net\n"
-                    ),
-                )
-                .unwrap();
-                Self { name, dir, image }
-            }
-
-            fn path(&self) -> &Path {
-                self.dir.path()
-            }
-
-            /// The ids of the project's containers, one-offs included.
-            fn all_containers(&self) -> Vec<String> {
-                let out = StdCommand::new("docker")
-                    .args(["ps", "-a", "-q", "--no-trunc", "--filter"])
-                    .arg(format!("label=com.docker.compose.project={}", self.name))
-                    .output()
-                    .unwrap();
-                String::from_utf8(out.stdout)
-                    .unwrap()
-                    .lines()
-                    .map(str::to_owned)
-                    .collect()
-            }
-        }
-
-        impl Drop for Project {
-            fn drop(&mut self) {
-                let _ = StdCommand::new("docker")
-                    .args([
-                        "compose",
-                        "down",
-                        "--volumes",
-                        "--remove-orphans",
-                        "--timeout",
-                        "1",
-                    ])
-                    .current_dir(self.dir.path())
-                    .output();
-            }
+        /// Two long-running services on the project's network, one with a
+        /// healthcheck.
+        async fn project(cli: &DockerCli) -> ComposeProject {
+            let services = format!(
+                "  plain:\n    image: {TEST_IMAGE}\n    command: [sleep, '300']\n    stop_grace_period: 1s\n    networks: [net]\n  healthy:\n    image: {TEST_IMAGE}\n    command: [sleep, '300']\n    stop_grace_period: 1s\n    networks: [net]\n    healthcheck:\n      test: [CMD, 'true']\n      interval: 1s\n"
+            );
+            ComposeProject::new(cli, &services).await
         }
 
         #[tokio::test]
         #[ignore = "docker: runs in ci.yml"]
         async fn docker_inspect_reads_what_the_template_asks_for() {
             let cli = DockerCli::new();
-            let project = Project::new(&cli).await;
+            let project = project(&cli).await;
             let before = Timestamp::now();
             cli.compose_up(project.path(), "plain").await.unwrap();
             cli.compose_up(project.path(), "healthy").await.unwrap();
 
             let svc = cli.compose_service(project.path(), "plain").await.unwrap();
-            assert_eq!(svc.image.as_deref(), Some(project.image.as_str()));
+            assert_eq!(svc.image.as_deref(), Some(TEST_IMAGE));
             assert!(!svc.has_build);
 
             let plain = cli
@@ -1466,7 +1420,7 @@ mod tests {
                 .unwrap();
             let info = cli.inspect(&plain).await.unwrap();
             // Started by digest: the container keeps the digest reference.
-            assert_eq!(info.image, project.image);
+            assert_eq!(info.image, TEST_IMAGE);
             assert_eq!(info.status, "running");
             assert_eq!(info.health, None);
             assert!(
@@ -1502,7 +1456,7 @@ mod tests {
             assert!(cli.exec(&plain, &["true".into()]).await.unwrap());
             assert!(!cli.exec(&plain, &["false".into()]).await.unwrap());
             assert!(
-                !cli.logs_contain(&plain, before, "never-logged")
+                !cli.logs_contain(&plain, before, Timestamp::now(), "never-logged")
                     .await
                     .unwrap()
             );
@@ -1515,7 +1469,7 @@ mod tests {
         #[ignore = "docker: runs in ci.yml"]
         async fn docker_ps_ignores_one_off_containers() {
             let cli = DockerCli::new();
-            let project = Project::new(&cli).await;
+            let project = project(&cli).await;
             assert_eq!(cli.container(project.path(), "plain").await.unwrap(), None);
             cli.compose_up(project.path(), "plain").await.unwrap();
             let service = cli
