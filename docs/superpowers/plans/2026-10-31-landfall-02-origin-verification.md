@@ -19,6 +19,19 @@
 - `deny.toml` licences gain `ISC`, `BSD-3-Clause`, `MPL-2.0`, `CDLA-Permissive-2.0` (required by rustls, webpki-root-certs and option-ext in the Sigstore tree). Allowing a licence is not exempting a finding.
 - "Exactly one digest per release": this plan ships the pure rule (`select_release_digest`) over the candidates it is given. Enumerating every attested digest for a tag needs the controller's release watcher (plan 04); tracked as an issue opened in Task 5.
 
+## Rulings made during execution
+
+- TUF expiry is its own error, `TrustError::Expired(String)`: the TUF client reports failures as text only, so it is recognised by the client's exact expiry message; other offline failures are `TrustError::Cache`, online ones `TrustError::Fetch`.
+- The registry is looked up by the bare semantic version (`v1.2.3` -> `ghcr.io/<owner>/<repo>:1.2.3`), as `docker/metadata-action` `type=semver` tags it. The tag is a lookup hint only.
+- Bundle selection: among the referrers of the digest, exactly one must have the bundle artifact type and the predicate type annotation `https://slsa.dev/provenance/v1` (SBOMs and unannotated descriptors are skipped, not counted); the selected manifest's own annotation must agree, and the bundle's signed statement is checked again by `verify_bundle`.
+- Tag object ids are computed with `sha1-checked` (SHA-1 with collision detection); a collision attack is refused.
+- The release tag must satisfy the OCI tag grammar `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}` before it is used in a registry path.
+- Bundles must be format v0.3 with exactly one Rekor v1 entry carrying an inclusion proof and an inclusion promise; Rekor v2 entries are refused until supported (#12).
+- The Build Config URI must equal the SAN: the configured workflow attests itself; reusable-workflow pinning is refused in v0.
+- `Platform` lives in `landfall-core` (`release` module) with the digest and platform rules; `landfall-origin` re-exports it once, from its crate root.
+- The trust root is a newtype, `landfall_origin::trust::TrustRoot`, made only by `load_trusted_root` (a test-build constructor reads fixture snapshots); `verify_bundle` and `verify_release` take `&TrustRoot`, so production code verifies only against a root that came through TUF.
+- `landfall verify` exit codes: 0 verified, 1 release refused (a verification check failed on material that was obtained), 2 could not verify (configuration, usage, network, HTTP status including 404, rate limit, trust root). `ReleaseError::is_refusal` and `FetchError::is_unavailable` draw the line; a missing or ambiguous provenance bundle is a refusal.
+
 ## Global Constraints
 
 - `rust-toolchain.toml` 1.99; workspace lints apply (`unsafe_code = "forbid"`, clippy `all` + `pedantic` denied, `unwrap_used`, `expect_used`, `print_stdout`, `print_stderr`, `todo`, `dbg_macro` denied; tests may unwrap). No `#[allow]`/`#[expect]` without `reason = "..."`.
