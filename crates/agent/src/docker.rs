@@ -3,12 +3,17 @@
 //! Commands are argument vectors, never a shell. Their environment loses
 //! `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME` and `COMPOSE_PROFILES`, so the
 //! stack's `.env` decides. Every call has a timeout and every captured
-//! output a cap.
+//! output a cap. Each runs in its own process group, which a timeout kills
+//! whole: `docker compose` is a plugin run by the `docker` client, and a
+//! timed-out call must not keep working under the rollback that follows it.
 //!
 //! Two kinds of output are secret-bearing and treated as such. The JSON of
 //! `docker compose config` holds interpolated secrets: only the service's
 //! image and whether it has a `build` section are read from it, and neither
-//! it, nor its stderr, nor a parser's message about it reaches an error.
+//! it, nor its stderr, nor a parser's message about it reaches an error. The
+//! same holds for every other `docker compose` subcommand, which loads the
+//! same `.env` and compose files and prints their parse errors, values
+//! included: they report their exit status only.
 //! `docker inspect` is asked for a fixed set of fields through `--format`,
 //! so a container's environment is never read.
 
@@ -23,6 +28,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -37,6 +43,8 @@ const LINE_LIMIT: usize = 1024 * 1024;
 /// The longest needle `logs_contain` accepts.
 const NEEDLE_LIMIT: usize = 4096;
 const READ_CHUNK: usize = 64 * 1024;
+/// How long a killed process group is waited for before giving up on it.
+const KILL_WAIT: Duration = Duration::from_secs(5);
 
 /// Environment variables that would make a compose command read something
 /// other than the stack's own files.
@@ -45,14 +53,16 @@ const SCRUBBED_ENV: [&str; 3] = ["COMPOSE_FILE", "COMPOSE_PROJECT_NAME", "COMPOS
 /// The Go template `docker inspect` is given: the fields the agent needs and
 /// nothing else (no `.Config.Env`). `.State.Health` is absent without a
 /// healthcheck, hence the `if`. Networks come as `[name, ip]` pairs ending in
-/// `null`, which keeps the template free of separator logic.
+/// `null`, which keeps the template free of separator logic. Each network
+/// gives `[name, IPv4, global IPv6]`; either address is empty when the
+/// container has none.
 const INSPECT_FORMAT: &str = concat!(
     "{\"image\":{{json .Config.Image}},",
     "\"status\":{{json .State.Status}},",
     "\"health\":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},",
     "\"started_at\":{{json .State.StartedAt}},",
     "\"networks\":[{{range $name, $net := .NetworkSettings.Networks}}",
-    "[{{json $name}},{{json $net.IPAddress}}],{{end}}null]}"
+    "[{{json $name}},{{json $net.IPAddress}},{{json $net.GlobalIPv6Address}}],{{end}}null]}"
 );
 
 /// A failure running Docker.
@@ -101,13 +111,22 @@ pub enum DockerError {
         stderr: String,
     },
     /// The command failed and, because its output can echo secrets or
-    /// container logs, only its exit status is reported.
-    #[error("{command}: {status} (output withheld)")]
+    /// container logs, only its exit status is reported. Run the command by
+    /// hand, in the compose directory for `docker compose`, to see why.
+    #[error("{command}: {status} (output withheld; run it by hand to see why)")]
     FailedQuietly {
         /// The command.
         command: &'static str,
         /// The exit status.
         status: String,
+    },
+    /// The command was killed after an error or timeout, but did not exit
+    /// within a few seconds (a process stuck in the kernel). It may still be
+    /// running.
+    #[error("{command}: did not exit after being killed")]
+    Unkillable {
+        /// The command.
+        command: &'static str,
     },
     /// The command succeeded but its output was not what was asked for.
     /// The output is not quoted: it may hold secrets.
@@ -238,7 +257,9 @@ pub trait Docker: Send + Sync {
         id: &ContainerId,
     ) -> impl Future<Output = Result<ContainerInfo, DockerError>> + Send;
 
-    /// Runs `argv` in the container; whether it exited with status 0.
+    /// Runs `argv` in the container; whether it exited with status 0. Its
+    /// output is discarded. On a timeout only the `docker exec` client is
+    /// killed: the process it started keeps running in the container.
     fn exec(
         &self,
         id: &ContainerId,
@@ -261,8 +282,7 @@ pub struct DockerCli {
     binary: PathBuf,
     /// Timeout of quick calls (config, ps, inspect, exec). Default 60 s.
     pub timeout: Duration,
-    /// Timeout of calls that move data (pull, up, stop, logs). Default
-    /// 600 s.
+    /// Timeout of calls that move data (pull, up, stop). Default 600 s.
     pub long_timeout: Duration,
 }
 
@@ -298,7 +318,8 @@ impl DockerCli {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            .process_group(0);
         if let Some(dir) = dir {
             cmd.current_dir(dir);
         }
@@ -348,9 +369,27 @@ impl DockerCli {
                 after: limit,
             },
         };
-        // Best effort: kill_on_drop covers a failure here.
-        let _ = child.kill().await;
+        kill_group(label, &mut child).await?;
         Err(error)
+    }
+
+    /// [`capture`](Self::capture) for a `docker compose` subcommand: it loads
+    /// the stack's `.env` and compose files and prints their parse errors,
+    /// quoting values, so a failure reports its exit status only.
+    async fn run_compose(
+        label: &'static str,
+        cmd: Command,
+        limit: Duration,
+    ) -> Result<Captured, DockerError> {
+        let captured = Self::capture(label, cmd, limit).await?;
+        if captured.status.success() {
+            Ok(captured)
+        } else {
+            Err(DockerError::FailedQuietly {
+                command: label,
+                status: captured.status.to_string(),
+            })
+        }
     }
 
     /// [`capture`](Self::capture), failing on a non-zero exit with the
@@ -370,6 +409,25 @@ impl DockerCli {
                 stderr: String::from_utf8_lossy(&captured.stderr_tail).into_owned(),
             })
         }
+    }
+}
+
+/// Kills the child's whole process group and waits, for a few seconds, for
+/// the child to be gone.
+async fn kill_group(label: &'static str, child: &mut Child) -> Result<(), DockerError> {
+    let group = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw);
+    if let Some(group) = group {
+        // The group may be gone already.
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+    // Covers a child that was not (or no longer) the leader of a group.
+    let _ = child.start_kill();
+    match tokio::time::timeout(KILL_WAIT, child.wait()).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(DockerError::Unkillable { command: label }),
     }
 }
 
@@ -487,7 +545,7 @@ struct InspectDoc {
     status: String,
     health: Option<String>,
     started_at: String,
-    networks: Vec<Option<(String, String)>>,
+    networks: Vec<Option<(String, String, String)>>,
 }
 
 fn bad_inspect(reason: &'static str) -> DockerError {
@@ -505,12 +563,16 @@ fn parse_inspect(raw: &[u8]) -> Result<ContainerInfo, DockerError> {
         .parse::<Timestamp>()
         .map_err(|_| bad_inspect("unreadable start time"))?;
     let mut networks = BTreeMap::new();
-    for (name, ip) in doc.networks.into_iter().flatten() {
-        let ip = if ip.is_empty() {
+    for (name, v4, v6) in doc.networks.into_iter().flatten() {
+        // Docker keeps the IPv4 and the global IPv6 address apart: IPv4
+        // wins when both are there.
+        let address = if v4.is_empty() { v6 } else { v4 };
+        let ip = if address.is_empty() {
             None
         } else {
             Some(
-                ip.parse::<IpAddr>()
+                address
+                    .parse::<IpAddr>()
                     .map_err(|_| bad_inspect("unreadable network address"))?,
             )
         };
@@ -645,14 +707,7 @@ impl Docker for DockerCli {
     ) -> Result<ServiceConfig, DockerError> {
         const LABEL: &str = "docker compose config";
         let cmd = self.compose(dir, &["config", "--format", "json"]);
-        let captured = Self::capture(LABEL, cmd, self.timeout).await?;
-        if !captured.status.success() {
-            // Its stderr can echo interpolated values.
-            return Err(DockerError::FailedQuietly {
-                command: LABEL,
-                status: captured.status.to_string(),
-            });
-        }
+        let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
         parse_config(&captured.stdout, service)
     }
 
@@ -660,14 +715,18 @@ impl Docker for DockerCli {
         const LABEL: &str = "docker compose up";
         not_a_flag(LABEL, service)?;
         let cmd = self.compose(dir, &["up", "-d", "--no-deps", "--", service]);
-        Self::run(LABEL, cmd, self.long_timeout).await.map(drop)
+        Self::run_compose(LABEL, cmd, self.long_timeout)
+            .await
+            .map(drop)
     }
 
     async fn compose_stop(&self, dir: &Path, service: &str) -> Result<(), DockerError> {
         const LABEL: &str = "docker compose stop";
         not_a_flag(LABEL, service)?;
         let cmd = self.compose(dir, &["stop", "--", service]);
-        Self::run(LABEL, cmd, self.long_timeout).await.map(drop)
+        Self::run_compose(LABEL, cmd, self.long_timeout)
+            .await
+            .map(drop)
     }
 
     async fn container(
@@ -677,8 +736,10 @@ impl Docker for DockerCli {
     ) -> Result<Option<ContainerId>, DockerError> {
         const LABEL: &str = "docker compose ps";
         not_a_flag(LABEL, service)?;
-        let cmd = self.compose(dir, &["ps", "--all", "--quiet", "--", service]);
-        let captured = Self::run(LABEL, cmd, self.timeout).await?;
+        // Without `--all`: that also lists the one-off containers of
+        // `compose run`, and a service is only ever up as a long-running one.
+        let cmd = self.compose(dir, &["ps", "--quiet", "--", service]);
+        let captured = Self::run_compose(LABEL, cmd, self.timeout).await?;
         parse_container(&captured.stdout)
     }
 
@@ -703,9 +764,28 @@ impl Docker for DockerCli {
         // After the container id Docker reads no more flags of its own, so
         // an argument starting with '-' belongs to the command.
         let mut cmd = self.command(None);
-        cmd.args(["exec", "--", id.as_ref()]).args(argv);
-        let captured = Self::capture(LABEL, cmd, self.timeout).await?;
-        Ok(captured.status.success())
+        cmd.args(["exec", "--", id.as_ref()])
+            .args(argv)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn(LABEL, &mut cmd)?;
+        match tokio::time::timeout(self.timeout, child.wait()).await {
+            Ok(Ok(status)) => Ok(status.success()),
+            Ok(Err(source)) => {
+                kill_group(LABEL, &mut child).await?;
+                Err(DockerError::Io {
+                    command: LABEL,
+                    source,
+                })
+            }
+            Err(_) => {
+                kill_group(LABEL, &mut child).await?;
+                Err(DockerError::Timeout {
+                    command: LABEL,
+                    after: self.timeout,
+                })
+            }
+        }
     }
 
     async fn logs_contain(
@@ -754,10 +834,10 @@ impl Docker for DockerCli {
             }
             Ok(false)
         };
-        let result = tokio::time::timeout(self.long_timeout, work).await;
+        let result = tokio::time::timeout(self.timeout, work).await;
         let error = match result {
             Ok(Ok(true)) => {
-                let _ = child.kill().await;
+                kill_group(LABEL, &mut child).await?;
                 return Ok(true);
             }
             Ok(Ok(false)) => {
@@ -773,7 +853,7 @@ impl Docker for DockerCli {
                         source,
                     }),
                     Err(_) => {
-                        let _ = child.kill().await;
+                        kill_group(LABEL, &mut child).await?;
                         Err(DockerError::Timeout {
                             command: LABEL,
                             after: self.timeout,
@@ -787,10 +867,10 @@ impl Docker for DockerCli {
             },
             Err(_) => DockerError::Timeout {
                 command: LABEL,
-                after: self.long_timeout,
+                after: self.timeout,
             },
         };
-        let _ = child.kill().await;
+        kill_group(LABEL, &mut child).await?;
         Err(error)
     }
 }
@@ -884,7 +964,7 @@ mod tests {
 
     #[test]
     fn inspect_output_parses() {
-        let raw = br#"{"image":"ghcr.io/example/app@sha256:00","status":"running","health":null,"started_at":"2026-11-01T10:00:00.123456789Z","networks":[["app_default","172.18.0.2"],["host-only",""],["v6","fd00::2"],null]}
+        let raw = br#"{"image":"ghcr.io/example/app@sha256:00","status":"running","health":null,"started_at":"2026-11-01T10:00:00.123456789Z","networks":[["app_default","172.18.0.2",""],["host-only","",""],["v6","","fd00::2"],["dual","172.19.0.3","fd00::3"],null]}
 "#;
         let info = parse_inspect(raw).unwrap();
         assert_eq!(info.image, "ghcr.io/example/app@sha256:00");
@@ -894,13 +974,14 @@ mod tests {
             info.started_at,
             "2026-11-01T10:00:00.123456789Z".parse().unwrap()
         );
-        assert_eq!(info.networks.len(), 3);
+        assert_eq!(info.networks.len(), 4);
         assert_eq!(
             info.networks["app_default"],
             Some("172.18.0.2".parse().unwrap())
         );
         assert_eq!(info.networks["host-only"], None);
         assert_eq!(info.networks["v6"], Some("fd00::2".parse().unwrap()));
+        assert_eq!(info.networks["dual"], Some("172.19.0.3".parse().unwrap()));
 
         let healthy = br#"{"image":"i","status":"running","health":"healthy","started_at":"2026-11-01T10:00:00Z","networks":[null]}"#;
         let info = parse_inspect(healthy).unwrap();
@@ -913,13 +994,26 @@ mod tests {
         for raw in [
             &br#"{"image":"i"}"#[..],
             br#"{"image":"i","status":"s","health":null,"started_at":"yesterday","networks":[null]}"#,
-            br#"{"image":"i","status":"s","health":null,"started_at":"2026-11-01T10:00:00Z","networks":[["n","999.1.1.1"],null]}"#,
+            br#"{"image":"i","status":"s","health":null,"started_at":"2026-11-01T10:00:00Z","networks":[["n","999.1.1.1",""],null]}"#,
             b"not json",
         ] {
             assert!(matches!(
                 parse_inspect(raw),
                 Err(DockerError::BadOutput { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn commands_lose_the_compose_selection_variables() {
+        let cli = DockerCli::with_binary("docker");
+        let cmd = cli.command(None);
+        let envs: Vec<_> = cmd.as_std().get_envs().collect();
+        for var in SCRUBBED_ENV {
+            assert!(
+                envs.iter().any(|(k, v)| *k == var && v.is_none()),
+                "{var} is not removed"
+            );
         }
     }
 
@@ -1016,6 +1110,34 @@ mod tests {
         );
     }
 
+    /// Whether `pid` still exists, polling briefly for a reaper to finish.
+    async fn gone(pid: i32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        for _ in 0..40 {
+            if rustix::process::test_kill_process(pid).is_err() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        // The stub stands for `docker`, the sleeper for the compose plugin.
+        let stub = Stub::new("sleep 30 &\necho $! > \"$(dirname \"$0\")/grandchild\"\nwait");
+        let mut cli = stub.cli();
+        cli.long_timeout = Duration::from_millis(500);
+        let err = cli.compose_up(stub.dir.path(), "app").await.unwrap_err();
+        assert!(matches!(err, DockerError::Timeout { .. }), "{err}");
+        let pid: i32 = fs::read_to_string(stub.path("grandchild"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(gone(pid).await, "the grandchild is still running");
+    }
+
     #[tokio::test]
     async fn oversized_output_is_refused() {
         let stub = Stub::new("head -c 17000000 /dev/zero");
@@ -1035,6 +1157,64 @@ mod tests {
         assert!(matches!(err, DockerError::FailedQuietly { .. }), "{text}");
         assert!(!text.contains("hunter2"), "{text}");
         assert!(text.contains('3'), "{text}");
+    }
+
+    #[tokio::test]
+    async fn compose_siblings_never_quote_stderr() {
+        let stub = Stub::new(
+            "echo 'failed to read .env: line 3: unterminated quoted value \"hunter2' >&2\nexit 1",
+        );
+        let cli = stub.cli();
+        let dir = stub.dir.path();
+        let errors = [
+            cli.compose_up(dir, "app").await.unwrap_err(),
+            cli.compose_stop(dir, "app").await.unwrap_err(),
+            cli.container(dir, "app").await.unwrap_err(),
+        ];
+        for err in errors {
+            let text = format!("{err} {err:?}");
+            assert!(matches!(err, DockerError::FailedQuietly { .. }), "{text}");
+            assert!(!text.contains("hunter2"), "{text}");
+            assert!(text.contains("docker compose"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn container_lookup_leaves_out_one_off_containers() {
+        let stub = Stub::new("echo \"$@\" > \"$(dirname \"$0\")/seen\"\necho 0123456789ab");
+        let found = stub.cli().container(stub.dir.path(), "app").await.unwrap();
+        assert_eq!(found, Some(id()));
+        let seen = fs::read_to_string(stub.path("seen")).unwrap();
+        assert_eq!(seen.trim(), "compose ps --quiet -- app");
+    }
+
+    #[tokio::test]
+    async fn logs_use_the_short_timeout() {
+        let stub = Stub::new("exec sleep 30");
+        let mut cli = stub.cli();
+        cli.timeout = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let err = cli
+            .logs_contain(&id(), Timestamp::UNIX_EPOCH, "never")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DockerError::Timeout { .. }), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn exec_output_is_discarded_not_buffered() {
+        let stub = Stub::new("head -c 40000000 /dev/zero\nexit 0");
+        assert!(stub.cli().exec(&id(), &["true".into()]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn exec_times_out() {
+        let stub = Stub::new("exec sleep 30");
+        let mut cli = stub.cli();
+        cli.timeout = Duration::from_millis(300);
+        let err = cli.exec(&id(), &["true".into()]).await.unwrap_err();
+        assert!(matches!(err, DockerError::Timeout { .. }), "{err}");
     }
 
     #[tokio::test]
@@ -1179,5 +1359,183 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DockerError::FailedQuietly { .. }), "{err}");
         assert!(!format!("{err} {err:?}").contains("hunter2"));
+    }
+
+    /// Tests against a real Docker daemon: `cargo test -p landfall-agent
+    /// -- --ignored docker`.
+    mod real {
+        use std::process::Command as StdCommand;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use super::*;
+
+        const IMAGE: &str = "busybox:1.37";
+
+        /// A compose project with a unique name, removed on drop with its
+        /// network and containers (one-offs included).
+        struct Project {
+            name: String,
+            dir: tempfile::TempDir,
+            image: String,
+        }
+
+        impl Project {
+            async fn new(cli: &DockerCli) -> Self {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let name = format!("landfall-t3-{}-{nanos}", std::process::id());
+                cli.pull(IMAGE).await.unwrap();
+                let out = StdCommand::new("docker")
+                    .args([
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{index .RepoDigests 0}}",
+                        IMAGE,
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success());
+                let image = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+                assert!(image.contains("@sha256:"), "{image}");
+                let dir = tempfile::tempdir().unwrap();
+                fs::write(
+                    dir.path().join("compose.yaml"),
+                    format!(
+                        "name: {name}\nservices:\n  plain:\n    image: {image}\n    command: [sleep, '300']\n    stop_grace_period: 1s\n    networks: [net]\n  healthy:\n    image: {image}\n    command: [sleep, '300']\n    stop_grace_period: 1s\n    networks: [net]\n    healthcheck:\n      test: [CMD, 'true']\n      interval: 1s\nnetworks:\n  net:\n    name: {name}-net\n"
+                    ),
+                )
+                .unwrap();
+                Self { name, dir, image }
+            }
+
+            fn path(&self) -> &Path {
+                self.dir.path()
+            }
+
+            /// The ids of the project's containers, one-offs included.
+            fn all_containers(&self) -> Vec<String> {
+                let out = StdCommand::new("docker")
+                    .args(["ps", "-a", "-q", "--no-trunc", "--filter"])
+                    .arg(format!("label=com.docker.compose.project={}", self.name))
+                    .output()
+                    .unwrap();
+                String::from_utf8(out.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
+
+        impl Drop for Project {
+            fn drop(&mut self) {
+                let _ = StdCommand::new("docker")
+                    .args([
+                        "compose",
+                        "down",
+                        "--volumes",
+                        "--remove-orphans",
+                        "--timeout",
+                        "1",
+                    ])
+                    .current_dir(self.dir.path())
+                    .output();
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "docker: runs in ci.yml"]
+        async fn docker_inspect_reads_what_the_template_asks_for() {
+            let cli = DockerCli::new();
+            let project = Project::new(&cli).await;
+            let before = Timestamp::now();
+            cli.compose_up(project.path(), "plain").await.unwrap();
+            cli.compose_up(project.path(), "healthy").await.unwrap();
+
+            let svc = cli.compose_service(project.path(), "plain").await.unwrap();
+            assert_eq!(svc.image.as_deref(), Some(project.image.as_str()));
+            assert!(!svc.has_build);
+
+            let plain = cli
+                .container(project.path(), "plain")
+                .await
+                .unwrap()
+                .unwrap();
+            let info = cli.inspect(&plain).await.unwrap();
+            // Started by digest: the container keeps the digest reference.
+            assert_eq!(info.image, project.image);
+            assert_eq!(info.status, "running");
+            assert_eq!(info.health, None);
+            assert!(
+                info.started_at
+                    >= before
+                        .checked_sub(jiff::SignedDuration::from_secs(5))
+                        .unwrap()
+            );
+            assert!(info.started_at <= Timestamp::now());
+            let net = format!("{}-net", project.name);
+            assert_eq!(info.networks.len(), 1, "{:?}", info.networks);
+            assert!(
+                matches!(info.networks[&net], Some(IpAddr::V4(_))),
+                "{:?}",
+                info.networks
+            );
+
+            let healthy = cli
+                .container(project.path(), "healthy")
+                .await
+                .unwrap()
+                .unwrap();
+            let mut health = None;
+            for _ in 0..30 {
+                health = cli.inspect(&healthy).await.unwrap().health;
+                if health.as_deref() == Some("healthy") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            assert_eq!(health.as_deref(), Some("healthy"));
+
+            assert!(cli.exec(&plain, &["true".into()]).await.unwrap());
+            assert!(!cli.exec(&plain, &["false".into()]).await.unwrap());
+            assert!(
+                !cli.logs_contain(&plain, before, "never-logged")
+                    .await
+                    .unwrap()
+            );
+
+            cli.compose_stop(project.path(), "plain").await.unwrap();
+            assert_eq!(cli.container(project.path(), "plain").await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        #[ignore = "docker: runs in ci.yml"]
+        async fn docker_ps_ignores_one_off_containers() {
+            let cli = DockerCli::new();
+            let project = Project::new(&cli).await;
+            assert_eq!(cli.container(project.path(), "plain").await.unwrap(), None);
+            cli.compose_up(project.path(), "plain").await.unwrap();
+            let service = cli
+                .container(project.path(), "plain")
+                .await
+                .unwrap()
+                .unwrap();
+
+            let run = StdCommand::new("docker")
+                .args(["compose", "run", "-d", "--no-deps", "plain", "sleep", "300"])
+                .current_dir(project.path())
+                .output()
+                .unwrap();
+            assert!(run.status.success());
+            assert_eq!(project.all_containers().len(), 2);
+
+            assert_eq!(
+                cli.container(project.path(), "plain").await.unwrap(),
+                Some(service)
+            );
+        }
     }
 }

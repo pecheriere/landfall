@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 use landfall_core::config::Config;
@@ -18,12 +19,19 @@ use landfall_origin::release::{REGISTRY_HOST, image_name};
 /// The override's file name, in the compose directory.
 pub const OVERRIDE_FILE: &str = "compose.landfall.yaml";
 
-const HEADER: &str =
-    "# Managed by landfall. Do not edit: the agent rewrites this file on every deploy.\n";
+/// The comment the override starts with. A macro so that [`PLACEHOLDER`] can
+/// be spelled from the same text with `concat!`.
+macro_rules! header {
+    () => {
+        "# Managed by landfall. Do not edit: the agent rewrites this file on every deploy.\n"
+    };
+}
+
+const HEADER: &str = header!();
 
 /// The override of a service nothing has been deployed to yet: it names no
 /// service, so a `COMPOSE_FILE` listing it still works.
-pub const PLACEHOLDER: &str = "# Managed by landfall. Do not edit: the agent rewrites this file on every deploy.\nservices: {}\n";
+pub const PLACEHOLDER: &str = concat!(header!(), "services: {}\n");
 
 /// A failure resolving the compose directories of a host.
 #[derive(Debug, thiserror::Error)]
@@ -122,7 +130,9 @@ pub fn resolve_dirs(
     host: &HostId,
 ) -> Result<BTreeMap<DeploymentId, PathBuf>, ComposeError> {
     let mut resolved: BTreeMap<DeploymentId, PathBuf> = BTreeMap::new();
-    let mut owners: BTreeMap<PathBuf, DeploymentId> = BTreeMap::new();
+    // Keyed on the directory's identity, which unlike its canonical path is
+    // the same through a bind mount.
+    let mut owners: BTreeMap<(u64, u64), DeploymentId> = BTreeMap::new();
     for d in config.deployments_for_host(host) {
         let dir = d.compose().dir();
         let unusable = |source| ComposeError::Unusable {
@@ -131,13 +141,14 @@ pub fn resolve_dirs(
             source,
         };
         let canonical = fs::canonicalize(dir).map_err(unusable)?;
-        if !fs::metadata(&canonical).map_err(unusable)?.is_dir() {
+        let meta = fs::metadata(&canonical).map_err(unusable)?;
+        if !meta.is_dir() {
             return Err(ComposeError::NotADirectory {
                 deployment: d.id().clone(),
                 dir: dir.to_owned(),
             });
         }
-        if let Some(first) = owners.insert(canonical.clone(), d.id().clone()) {
+        if let Some(first) = owners.insert((meta.dev(), meta.ino()), d.id().clone()) {
             return Err(ComposeError::Aliased {
                 first,
                 second: d.id().clone(),

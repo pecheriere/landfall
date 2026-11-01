@@ -37,8 +37,6 @@ pub const MANIFEST_LIMIT: usize = 1024 * 1024;
 
 /// The public GitHub REST API.
 const GITHUB_API: &str = "https://api.github.com";
-/// The GitHub container registry.
-const GHCR: &str = "https://ghcr.io";
 
 /// Connect timeout for every request.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -348,7 +346,10 @@ impl Endpoints {
                 reason: "not a URL",
             })
         };
-        Self::new(parse(GITHUB_API)?, parse(GHCR)?)
+        Self::new(
+            parse(GITHUB_API)?,
+            parse(&format!("https://{}", crate::release::REGISTRY_HOST))?,
+        )
     }
 
     /// Endpoints over plain `http`, for mock servers. Test builds only.
