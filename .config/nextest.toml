@@ -1,3 +1,9 @@
 # A hung test fails instead of stalling the run: nextest has no limit by default.
+# The slowest normal test takes about 3 s, so this leaves room for a busy machine.
 [profile.default]
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "5s", terminate-after = 3 }
+
+# Real-Docker tests pull images and wait out check windows; the slowest takes about 26 s.
+[[profile.default.overrides]]
+filter = "test(docker_) | test(live_)"
+slow-timeout = { period = "30s", terminate-after = 3 }
