@@ -184,10 +184,9 @@ fn load_config(path: &Path) -> Result<Config, CliError> {
 async fn on_thread<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, CliError> + Send + 'static,
 ) -> Result<T, CliError> {
-    match tokio::time::timeout(LOCAL_READ_LIMIT, tokio::task::spawn_blocking(work)).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) | Err(_) => Err(CliError::LocalRead(LOCAL_READ_LIMIT)),
-    }
+    deploy::on_thread_within(LOCAL_READ_LIMIT, work)
+        .await
+        .map_err(|_| CliError::LocalRead(LOCAL_READ_LIMIT))?
 }
 
 /// Fills in `row` as far as it can be read; the first failure ends it.

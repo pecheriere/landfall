@@ -413,7 +413,7 @@ impl<D: Docker> Run<'_, D> {
                 Ok(Some(id)) => Ok(id),
                 Ok(None) => Err(retry(
                     "container",
-                    format!("service {} has no container", quote(self.service)),
+                    format!("service {} has no running container", quote(self.service)),
                 )),
                 Err(e) => Err(docker_failure("container", &e)),
             }

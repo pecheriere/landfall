@@ -261,8 +261,9 @@ pub trait Docker: Send + Sync {
         service: &str,
     ) -> impl Future<Output = Result<(), DockerError>> + Send;
 
-    /// The service's container, running or not; none if it has never been
-    /// created. More than one (a scaled service) is an error.
+    /// The service's running container; none if it isn't running, which
+    /// includes a stopped one and one never created. More than one (a scaled
+    /// service) is an error.
     fn container(
         &self,
         dir: &Path,

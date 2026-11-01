@@ -529,25 +529,11 @@ const DRIFT_READ_LIMIT: Duration = Duration::from_secs(60);
 /// [`DriftError`] when the override or the container cannot be read.
 pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<Drift, DriftError> {
     let owned = dir.to_owned();
-    let read = tokio::task::spawn_blocking(move || {
-        let root = Root::open(&owned)?;
-        let name = RelPath::new(compose::OVERRIDE_FILE)?;
-        safefs::read_file(&root, &name, OVERRIDE_CAP)
-    });
-    let file = match tokio::time::timeout(DRIFT_READ_LIMIT, read).await {
-        Ok(Ok(file)) => file?,
-        Ok(Err(_)) => {
-            return Err(DriftError::File(FileFailure::Panicked {
-                op: "read override",
-            }));
-        }
-        Err(_) => {
-            return Err(DriftError::File(FileFailure::Deadline {
-                op: "read override",
-                after: DRIFT_READ_LIMIT,
-            }));
-        }
-    };
+    let file = on_thread_within(DRIFT_READ_LIMIT, move || read_override_file(&owned))
+        .await
+        .map_err(|unfinished| {
+            DriftError::File(unfinished.failure("read override", DRIFT_READ_LIMIT))
+        })??;
     let pin = file
         .as_deref()
         .map(|file| compose::pinned_image(file, service));
@@ -580,6 +566,13 @@ pub async fn drift<D: Docker>(docker: &D, dir: &Path, service: &str) -> Result<D
 /// The largest override the agent reads. It writes far less; the file is in a
 /// directory others can write to.
 const OVERRIDE_CAP: usize = 1024 * 1024;
+
+/// The bytes of the override in `dir`, if there is one.
+fn read_override_file(dir: &Path) -> Result<Option<Vec<u8>>, SafeFsError> {
+    let root = Root::open(dir)?;
+    let name = RelPath::new(compose::OVERRIDE_FILE)?;
+    safefs::read_file(&root, &name, OVERRIDE_CAP)
+}
 const OVERRIDE_MODE: u32 = 0o644;
 const WRONG_PREVIOUS_IMAGE: &str =
     "the container does not run the image the compose project resolves to";
@@ -649,9 +642,39 @@ async fn take_lock(
     }
 }
 
-/// Runs blocking file work on a thread of its own, up to `deadline`. A thread
-/// cannot be cancelled, so past the deadline the work may still be running:
-/// that is reported as a failure, and the thread keeps its share of the
+/// Why blocking work given to [`on_thread_within`] has no result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unfinished {
+    /// The thread doing it panicked.
+    Panicked,
+    /// It ran past its deadline and may still be running.
+    Deadline,
+}
+
+impl Unfinished {
+    fn failure(self, op: &'static str, after: Duration) -> FileFailure {
+        match self {
+            Self::Panicked => FileFailure::Panicked { op },
+            Self::Deadline => FileFailure::Deadline { op, after },
+        }
+    }
+}
+
+/// Runs blocking work on a thread, waiting for it up to `deadline`. A thread
+/// cannot be cancelled, so past the deadline the work may still be running.
+pub(crate) async fn on_thread_within<T: Send + 'static>(
+    deadline: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Unfinished> {
+    match tokio::time::timeout(deadline, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(Unfinished::Panicked),
+        Err(_) => Err(Unfinished::Deadline),
+    }
+}
+
+/// Runs blocking file work on a thread of its own, up to `deadline`. Work past
+/// the deadline is reported as a failure, and the thread keeps its share of the
 /// deployment's lock until it ends, so no other process starts on the same
 /// files in the meantime.
 async fn off_thread<T, E>(
@@ -667,18 +690,13 @@ where
     #[cfg(test)]
     let (work, deadline) = faults::inject(op, deadline, work);
     let held = Arc::clone(lock);
-    let task = tokio::task::spawn_blocking(move || {
+    on_thread_within(deadline, move || {
         let _held = held;
         work()
-    });
-    match tokio::time::timeout(deadline, task).await {
-        Ok(Ok(result)) => result.map_err(Into::into),
-        Ok(Err(_)) => Err(FileFailure::Panicked { op }),
-        Err(_) => Err(FileFailure::Deadline {
-            op,
-            after: deadline,
-        }),
-    }
+    })
+    .await
+    .map_err(|unfinished| unfinished.failure(op, deadline))?
+    .map_err(Into::into)
 }
 
 /// `time` as a plain name that sorts by time: fixed width, UTC. Backups are
@@ -830,12 +848,8 @@ impl<D: Docker> Engine<'_, D> {
 
     async fn read_override(&self) -> Result<Option<Vec<u8>>, FileFailure> {
         let dir = self.dir.to_owned();
-        self.file("read override", move || {
-            let root = Root::open(&dir)?;
-            let name = RelPath::new(compose::OVERRIDE_FILE)?;
-            safefs::read_file(&root, &name, OVERRIDE_CAP)
-        })
-        .await
+        self.file("read override", move || read_override_file(&dir))
+            .await
     }
 
     async fn write_override(&self, bytes: Vec<u8>) -> Result<(), FileFailure> {
@@ -1292,7 +1306,7 @@ impl<D: Docker> Engine<'_, D> {
             .container(self.dir, self.service())
             .await
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("service {} has no container", quote(self.service())))?;
+            .ok_or_else(|| format!("service {} has no running container", quote(self.service())))?;
         let info = self.docker.inspect(&id).await.map_err(|e| e.to_string())?;
         Ok(info.image)
     }

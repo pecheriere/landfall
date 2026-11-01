@@ -59,7 +59,7 @@ pub fn pinned_image<'a>(file: &'a [u8], service: &str) -> Pin<'a> {
     if text.lines().filter(|line| is_image(line)).count() != 1 {
         return Pin::Unrecognised;
     }
-    let key = format!("  {}:", quote(service));
+    let key = format!("  {}:", yaml_string(service));
     let mut lines = text.lines().skip_while(|line| *line != key);
     lines.next();
     let image = lines
@@ -126,16 +126,16 @@ pub fn render_override(
 ) -> String {
     format!(
         "{HEADER}services:\n  {}:\n    image: {}\n    labels:\n      dev.landfall.deployment: {}\n      dev.landfall.version: {}\n      dev.landfall.commit: {}\n",
-        quote(service),
-        quote(image),
-        quote(deployment.as_ref()),
-        quote(tag.as_ref()),
-        quote(commit.as_ref()),
+        yaml_string(service),
+        yaml_string(image),
+        yaml_string(deployment.as_ref()),
+        yaml_string(tag.as_ref()),
+        yaml_string(commit.as_ref()),
     )
 }
 
 /// A YAML double-quoted scalar for `text`.
-fn quote(text: &str) -> String {
+fn yaml_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
