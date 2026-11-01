@@ -86,6 +86,10 @@ cargo deny check
   or other details of anyone's infrastructure in code, docs, tests or
   commit messages.
 - Commits: conventional-commit subject, no AI attribution trailers.
+- Keep files small: split a source file by responsibility before it passes
+  about 800 lines of code, and move a large test module into its own file. When
+  a change would push a file past that, split it in the same change, or track
+  the split as an issue (#18 lists the current ones).
 
 ## Testing rules
 
