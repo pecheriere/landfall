@@ -1241,6 +1241,7 @@ dependencies = [
  "landfall-core",
  "landfall-origin",
  "memchr",
+ "reqwest",
  "rustix",
  "semver",
  "serde",

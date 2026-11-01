@@ -21,6 +21,7 @@ jiff.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
 memchr.workspace = true
+reqwest.workspace = true
 rustix.workspace = true
 semver.workspace = true
 serde.workspace = true
@@ -30,6 +31,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "t
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "test-util"] }
 
 [lints]
 workspace = true

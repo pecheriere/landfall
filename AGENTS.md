@@ -28,7 +28,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   code that may touch a directory a container can write to: no-follow walking
   by directory descriptor, atomic write, snapshot, restore, prune),
   `docker` (the only code that runs the Docker CLI, behind a trait), `compose`
-  (the override file the agent owns, compose directory resolution).
+  (the override file the agent owns, compose directory resolution), `checks`
+  (post-deploy checks: health, HTTP probe, command, log window).
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 
