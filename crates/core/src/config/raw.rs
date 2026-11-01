@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::{
     Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, Level, Origin,
-    Permission, Promotion, Repo, Rule,
+    Permission, Promotion, Repo, Rule, SignerKey,
 };
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 
@@ -22,13 +22,34 @@ use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 /// identifies the bytes the text came from.
 pub(super) fn build(text: &str, hash: String) -> Result<Config, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Toml(e.to_string()))?;
+    let signers = raw
+        .signers
+        .into_iter()
+        .map(|(name, text)| match SignerKey::parse(&text) {
+            Ok(key) => Ok((name, key)),
+            Err(reason) => Err(ConfigError::InvalidSigner {
+                signer: name,
+                reason,
+            }),
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let mut seen: Vec<(&PrincipalId, &SignerKey)> = Vec::new();
+    for (name, key) in &signers {
+        if let Some((first, _)) = seen.iter().find(|(_, other)| *other == key) {
+            return Err(ConfigError::DuplicateSignerKey {
+                first: (*first).clone(),
+                second: name.clone(),
+            });
+        }
+        seen.push((name, key));
+    }
     let deployments = raw
         .deployments
         .into_iter()
         .map(convert_deployment)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Config {
-        signers: raw.signers,
+        signers,
         approvers: raw
             .approvers
             .into_iter()
@@ -132,6 +153,9 @@ struct RawCompose {
 struct RawOrigin {
     workflow: String,
     tags: TagPattern,
+    #[serde(default = "default_true")]
+    signed_tags: bool,
+    #[serde(default)]
     signers: Vec<PrincipalId>,
 }
 
@@ -343,6 +367,7 @@ fn convert_origin(id: &DeploymentId, origin: RawOrigin) -> Result<Origin, Config
     Ok(Origin {
         workflow: origin.workflow,
         tags: origin.tags,
+        signed_tags: origin.signed_tags,
         signers: origin.signers,
     })
 }

@@ -34,6 +34,51 @@ file is documented in [`docs/configuration.md`](docs/configuration.md).
 | `landfall-agent` | every target host (systemd service) | verifies, deploys, checks, rolls back |
 | `landfall` | anywhere | command-line client |
 
+## Verifying a release
+
+`landfall verify` runs the origin checks a host runs before deploying, against
+one release, and prints what it verified as JSON (tag signer and key
+fingerprint, release commit, image index digest, certificate identity, workflow
+run, transparency-log entry, platforms):
+
+```sh
+landfall verify --config fleet.toml --deployment app/prod --tag v1.2.3 \
+  [--platform linux/arm64] [--cache-dir <dir>] [--offline]
+```
+
+The exit status says what happened, and on failure the failing step and its
+reason go to stderr:
+
+| Exit | Meaning |
+|---|---|
+| 0 | the release is verified |
+| 1 | the release is refused: a verification check failed |
+| 2 | the release could not be verified: configuration, usage, network, rate limit or trust root error, or no provenance bundle published yet; it may verify on a later try |
+
+`--platform` defaults to the running machine's on Linux and is required
+elsewhere. The Sigstore trust root is refreshed through TUF into `--cache-dir`
+(default `$XDG_CACHE_HOME/landfall/tuf` or `~/.cache/landfall/tuf`).
+`--offline` means the trust root comes from that cache only, without
+refreshing it, and fails when the cache is missing or expired; tags, image
+indexes and bundles are still fetched from GitHub and the registry.
+
+Anonymous GitHub API requests are limited to 60 an hour per address. When
+`GITHUB_TOKEN` is set and non-empty, it is sent to the GitHub API (never to the
+registry) for the authenticated limit; it is never printed. A token with no
+scopes is enough for public repositories. Keep it out of shell history, for
+example with a secret manager that injects it for one command:
+
+```sh
+GITHUB_TOKEN="$(gh auth token)" landfall verify --config fleet.toml ...
+op run --env-file=landfall.env -- landfall verify --config fleet.toml ...
+```
+
+A rate limit is reported with the time it resets.
+
+The host needs a synchronised clock (NTP). The transparency log's integrated
+time must not be in the future, so a clock running behind refuses a fresh
+release with "integrated time … in the future".
+
 ## Development
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup and the checks every

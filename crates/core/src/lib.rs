@@ -6,4 +6,7 @@ pub mod config;
 mod hex;
 pub mod ids;
 pub mod intent;
+pub mod release;
 pub mod rule;
+pub mod tag;
+mod text;

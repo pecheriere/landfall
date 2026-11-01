@@ -1,3 +1,5 @@
 # Tests may unwrap: a panic is how a test reports an unexpected failure.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+# Product names written as words in docs; ".." keeps clippy's default list.
+doc-valid-idents = ["OpenPGP", ".."]

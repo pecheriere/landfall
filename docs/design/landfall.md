@@ -123,6 +123,9 @@ All must pass:
    tag -s` with an SSH key produces; OpenPGP later). The signed tag names
    a commit; that commit is "the release commit". A stolen GitHub token or a compromised workflow
    therefore cannot produce a deployable release.
+   This check is on by default and can be turned off per deployment (`origin.signed_tags = false`)
+   for projects that don't sign their tags. The release commit is then the commit the tag ref points
+   to, and that deployment loses the protection above against a stolen token or compromised workflow.
 2. **Attestation found by digest, digest found by tag.** The controller resolves the image's semver tag
    in the registry to a digest as a lookup hint only. Nothing trusts the mutable tag: the binding is
    step 3.
@@ -137,7 +140,10 @@ All must pass:
      renamed or re-created account can't take over;
    - Build Trigger = `push`; Runner Environment = `github-hosted`.
    The configured `workflow` is the file that attests. A deployment may instead pin a reusable workflow
-   (SAN = reusable workflow, Build Config URI = caller); the config says which.
+   (SAN = reusable workflow, Build Config URI = caller); the config says which. v0 refuses
+   reusable-workflow pinning: the Build Config URI must equal the SAN.
+   The bundle must be in format v0.3 with exactly one Rekor v1 transparency log entry carrying an
+   inclusion proof and an inclusion promise; Rekor v2 entries are refused until supported (#12).
 4. **Exactly one digest per release.** If several validly attested digests exist for one (repo, tag)
    (a re-run release workflow), the release is refused with that reason.
 5. **Platform present.** The digest is a multi-arch index containing the host's platform. The index
@@ -325,7 +331,7 @@ window. Without VictoriaLogs the logs view says logs aren't configured.
 
 | Threat | Mitigation | Residual |
 |---|---|---|
-| Stolen GitHub token / compromised workflow | Host verifies the maintainer's tag signature + cert identity bound to the signed commit | none beyond the maintainer's signing key |
+| Stolen GitHub token / compromised workflow | Host verifies the maintainer's tag signature + cert identity bound to the signed commit | none beyond the maintainer's signing key; with `origin.signed_tags = false`, anyone who can push a tag and run the release workflow can ship a deployable release |
 | Compromised controller | Host re-verifies origin, signature, rule, approval; upward-only auto; running-digest binding | can trigger allowed auto deploys, delay, lie in UI, mislead an approval to another maintainer-signed release, bypass promotion |
 | Stolen agent API token | Agents can't approve; per-deployment grants; optional warden-only | can request deploys the rules allow |
 | Replayed approval | Running-digest binding + nonce log | none |

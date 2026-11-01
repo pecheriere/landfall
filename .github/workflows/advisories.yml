@@ -27,3 +27,24 @@ jobs:
           arguments: --all-features --locked
           command: check
           command-arguments: advisories
+
+  # The live tests talk to the real Sigstore TUF repository, GitHub API and
+  # GHCR, so they cannot run on pull requests without making them depend on
+  # third-party services. Run nightly instead: a change in those services or
+  # in the clients shows up here first. The job's read-only token is passed
+  # for the GitHub API's authenticated rate limit.
+  live:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Build without the token, so only the test run itself sees it.
+      - run: cargo test -p landfall-origin --locked --no-run
+      - run: cargo test -p landfall-origin --locked -- --ignored
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
