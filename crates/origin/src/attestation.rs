@@ -97,6 +97,14 @@ pub enum AttestationError {
     /// The Sigstore verification failed.
     #[error("bundle does not verify: {0}")]
     Signature(String),
+    /// The signed statement is not a SLSA build provenance attestation.
+    #[error("attestation predicate type is {found:?}, expected {expected:?}")]
+    PredicateType {
+        /// [`SLSA_PROVENANCE`].
+        expected: String,
+        /// The statement's predicate type.
+        found: String,
+    },
     /// The bundle attests another digest.
     #[error("bundle attests {found}, not {expected}")]
     Subject {
@@ -124,6 +132,9 @@ pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 /// around 10 KiB.
 pub const MAX_BUNDLE_BYTES: usize = 4 << 20;
 
+/// The in-toto predicate type of a SLSA build provenance attestation.
+pub const SLSA_PROVENANCE: &str = "https://slsa.dev/provenance/v1";
+
 /// The in-toto payload type of an attestation.
 const IN_TOTO_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 
@@ -134,8 +145,8 @@ const ABSENT: &str = "<absent>";
 ///
 /// In order: the bundle parses as a DSSE in-toto attestation of at most
 /// [`MAX_BUNDLE_BYTES`], in bundle format v0.3 only (the media type is not
-/// signed, and older formats need no inclusion proof); its statement names
-/// `digest` as a subject; it has exactly one transparency log entry, a Rekor
+/// signed, and older formats need no inclusion proof); its statement has
+/// predicate type [`SLSA_PROVENANCE`] and names `digest` as a subject; it has exactly one transparency log entry, a Rekor
 /// v1 entry with an inclusion proof, its signed checkpoint and an inclusion
 /// promise (signed entry timestamp), all required (Rekor v2 entries, which
 /// carry no promise, are refused); the Sigstore verification passes (certificate chain to the Fulcio roots,
@@ -164,7 +175,7 @@ pub fn verify_bundle(
     expected: &Expected<'_>,
 ) -> Result<VerifiedAttestation, AttestationError> {
     let bundle = parse_bundle(bundle_json)?;
-    check_subject(&bundle, digest)?;
+    check_statement(&bundle, digest)?;
     let rekor_log_index = single_log_index(&bundle)?;
 
     let hex = digest
@@ -380,10 +391,12 @@ fn parse_bundle(bundle_json: &[u8]) -> Result<Bundle, AttestationError> {
     }
 }
 
-/// Refuses a bundle whose in-toto statement does not name `digest`. The
-/// Sigstore verification checks the same binding again, over the signed
-/// payload; checking first lets the refusal say which digests it names.
-fn check_subject(bundle: &Bundle, digest: &ImageDigest) -> Result<(), AttestationError> {
+/// Refuses a bundle whose in-toto statement is not a SLSA build provenance
+/// attestation or does not name `digest`. The statement is the DSSE payload,
+/// so the signature checked after this covers both; the Sigstore
+/// verification checks the subject binding again, and checking first lets
+/// the refusal say which predicate type or digests it found.
+fn check_statement(bundle: &Bundle, digest: &ImageDigest) -> Result<(), AttestationError> {
     let SignatureContent::DsseEnvelope(envelope) = &bundle.content else {
         return Err(AttestationError::Bundle(
             "not a DSSE attestation".to_owned(),
@@ -396,6 +409,12 @@ fn check_subject(bundle: &Bundle, digest: &ImageDigest) -> Result<(), Attestatio
     }
     let statement: Statement = serde_json::from_slice(envelope.payload.as_bytes())
         .map_err(|e| AttestationError::Bundle(format!("in-toto statement: {e}")))?;
+    if statement.predicate_type != SLSA_PROVENANCE {
+        return Err(AttestationError::PredicateType {
+            expected: SLSA_PROVENANCE.to_owned(),
+            found: statement.predicate_type,
+        });
+    }
     let named: Vec<String> = statement
         .subject
         .iter()
@@ -710,6 +729,26 @@ mod tests {
         assert_eq!(
             mismatched_field(match_identity(&identity, &config.expected())),
             "san"
+        );
+    }
+
+    #[test]
+    fn other_predicate_type_is_refused() {
+        let config = Config::fixture();
+        let sbom = edited_bundle(|b| {
+            let payload = &mut b["dsseEnvelope"]["payload"];
+            let mut statement: Value =
+                serde_json::from_slice(&STANDARD.decode(payload.as_str().unwrap()).unwrap())
+                    .unwrap();
+            statement["predicateType"] = Value::from("https://spdx.dev/Document/v2.3");
+            *payload = Value::from(STANDARD.encode(serde_json::to_vec(&statement).unwrap()));
+        });
+        assert_eq!(
+            verify(&sbom, &config),
+            Err(AttestationError::PredicateType {
+                expected: "https://slsa.dev/provenance/v1".to_owned(),
+                found: "https://spdx.dev/Document/v2.3".to_owned(),
+            })
         );
     }
 

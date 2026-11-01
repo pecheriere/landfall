@@ -28,10 +28,11 @@ jobs:
           command: check
           command-arguments: advisories
 
-  # The trust root test talks to the real Sigstore TUF repository, so it cannot
-  # run on pull requests without making them depend on a third-party service.
-  # Run nightly instead: a change in the repository or in the TUF client shows
-  # up here first.
+  # The live tests talk to the real Sigstore TUF repository, GitHub API and
+  # GHCR, so they cannot run on pull requests without making them depend on
+  # third-party services. Run nightly instead: a change in those services or
+  # in the clients shows up here first. The job's read-only token is passed
+  # for the GitHub API's authenticated rate limit.
   live:
     runs-on: ubuntu-latest
     permissions:
@@ -43,3 +44,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test -p landfall-origin --locked -- --ignored
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

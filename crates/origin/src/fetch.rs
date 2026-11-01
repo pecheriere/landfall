@@ -18,11 +18,14 @@ use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode, Url, redirect};
 use serde::Deserialize;
-use sha1::Sha1;
+use sha1_checked::Digest as _;
+use sha1_checked::Sha1;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use landfall_core::release::Platform;
+
+use crate::attestation::SLSA_PROVENANCE;
 
 /// Cap on a GitHub API response for a tag ref or tag object.
 pub const TAG_OBJECT_LIMIT: usize = 64 * 1024;
@@ -51,6 +54,9 @@ const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 const DOCKER_LIST: &str = "application/vnd.docker.distribution.manifest.list.v2+json";
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+/// The annotation on a bundle's referrer manifest and its descriptor naming
+/// the predicate type of the attestation inside.
+const PREDICATE_TYPE_ANNOTATION: &str = "dev.sigstore.bundle.predicateType";
 /// The annotation buildx puts on the attestation manifests it adds to an
 /// index; they declare the platform `unknown/unknown` and run nowhere.
 const REFERENCE_TYPE_ANNOTATION: &str = "vnd.docker.reference.type";
@@ -127,6 +133,10 @@ pub enum FetchError {
         /// What is wrong with it.
         reason: String,
     },
+    /// The release tag cannot name an image in a registry: OCI tags are
+    /// `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+    #[error("tag {0} is not a valid OCI image tag: expected [A-Za-z0-9_][A-Za-z0-9._-]{{0,127}}")]
+    OciTag(ReleaseTag),
     /// The tag ref points straight at a commit: there is no tag object.
     #[error("tag {tag} is a lightweight tag, not a tag object")]
     LightweightTag {
@@ -138,6 +148,13 @@ pub enum FetchError {
     /// as "tag is not signed".
     #[error("tag {tag} is not signed: GitHub serves no signed payload for it")]
     NotSigned {
+        /// The tag.
+        tag: ReleaseTag,
+    },
+    /// The reconstructed tag object is a SHA-1 collision attempt: its hash
+    /// is not trustworthy as an object id.
+    #[error("tag {tag}: the tag object's bytes contain a SHA-1 collision attack")]
+    Sha1Collision {
         /// The tag.
         tag: ReleaseTag,
     },
@@ -185,8 +202,8 @@ pub enum FetchError {
         /// The sha256 of the bytes served.
         computed: String,
     },
-    /// Not exactly one Sigstore bundle refers to the digest.
-    #[error("expected exactly one Sigstore bundle for {digest}, found {count}")]
+    /// Not exactly one SLSA provenance bundle refers to the digest.
+    #[error("expected exactly one SLSA provenance bundle for {digest}, found {count}")]
     Bundles {
         /// The image digest.
         digest: ImageDigest,
@@ -354,7 +371,8 @@ impl Fetcher {
         };
         let mut raw = payload.into_bytes();
         raw.extend_from_slice(signature.as_bytes());
-        let computed = git_tag_id(&raw);
+        let computed =
+            git_tag_id(&raw).ok_or_else(|| FetchError::Sha1Collision { tag: tag.clone() })?;
         if computed != reference.sha {
             return Err(FetchError::ObjectId {
                 expected: reference.sha,
@@ -378,7 +396,8 @@ impl Fetcher {
         tag: &ReleaseTag,
     ) -> Result<CommitSha, FetchError> {
         let mut object = self.tag_ref(repo, tag).await?;
-        for _ in 0..=MAX_TAG_DEPTH {
+        let mut followed = 0;
+        loop {
             match object.kind.as_str() {
                 "commit" => {
                     return object.sha.parse().map_err(|_| FetchError::Malformed {
@@ -389,7 +408,13 @@ impl Fetcher {
                         ),
                     });
                 }
-                "tag" => object = self.git_tag(repo, &object.sha).await?.object,
+                "tag" if followed == MAX_TAG_DEPTH => {
+                    return Err(FetchError::TagDepth { tag: tag.clone() });
+                }
+                "tag" => {
+                    object = self.git_tag(repo, &object.sha).await?.object;
+                    followed += 1;
+                }
                 other => {
                     return Err(FetchError::ObjectType {
                         tag: tag.clone(),
@@ -398,7 +423,6 @@ impl Fetcher {
                 }
             }
         }
-        Err(FetchError::TagDepth { tag: tag.clone() })
     }
 
     /// The digest of the multi-arch image index `image:tag` and the
@@ -411,21 +435,20 @@ impl Fetcher {
     ///
     /// # Errors
     ///
-    /// [`FetchError::MediaType`] for a single-platform manifest or any other
-    /// media type, [`FetchError::Digest`] when the header disagrees with the
-    /// bytes, and the transport and parsing errors.
+    /// [`FetchError::OciTag`] when `tag` is not a valid OCI tag (checked
+    /// before any request), [`FetchError::MediaType`] for a single-platform
+    /// manifest or any other media type, [`FetchError::Digest`] when the
+    /// header disagrees with the bytes, [`FetchError::Malformed`] for an
+    /// index that lists no platform, and the transport and parsing errors.
     pub async fn resolve_index(
         &self,
         image: &str,
         tag: &ReleaseTag,
     ) -> Result<(ImageDigest, Vec<Platform>), FetchError> {
         check_image(image)?;
+        check_oci_tag(tag)?;
         let token = self.registry_token(image).await?;
-        let mut segments = vec!["v2"];
-        segments.extend(image.split('/'));
-        segments.push("manifests");
-        segments.extend(tag.as_ref().split('/'));
-        let url = join(&self.endpoints.registry, &segments)?;
+        let url = self.manifest_url(image, tag.as_ref())?;
         let accept = format!("{OCI_INDEX}, {DOCKER_LIST}");
         let response = self
             .registry_get(&url, &accept, Some(&token), MANIFEST_LIMIT)
@@ -447,15 +470,26 @@ impl Fetcher {
             .into_iter()
             .filter(|m| !m.is_attestation_manifest())
             .filter_map(|m| m.platform)
-            .collect();
+            .collect::<Vec<_>>();
+        if platforms.is_empty() {
+            return Err(FetchError::Malformed {
+                url: url.to_string(),
+                reason: "the index lists no platforms".to_owned(),
+            });
+        }
         Ok((digest, platforms))
     }
 
     /// The Sigstore bundle attached to `digest` in `image`, found through
     /// the referrers tag schema: the tag `sha256-<hex>` names an index of
     /// referrer manifests (or one manifest); exactly one of them must have
-    /// the bundle artifact type, refer to `digest`, and hold one layer, the
-    /// bundle, whose bytes must match its descriptor.
+    /// the bundle artifact type and the predicate type annotation
+    /// `https://slsa.dev/provenance/v1` (other attestations, such as SBOMs,
+    /// and descriptors without the annotation are skipped, not counted). The
+    /// manifest's own annotation must agree; it must refer to `digest` and
+    /// hold one layer, the bundle, whose bytes must match its descriptor.
+    /// The annotations only select: the bundle's signed statement is checked
+    /// again by [`crate::attestation::verify_bundle`].
     ///
     /// # Errors
     ///
@@ -488,7 +522,11 @@ impl Fetcher {
                 let bundles: Vec<Descriptor> = index
                     .manifests
                     .into_iter()
-                    .filter(|m| m.artifact_type.as_deref() == Some(BUNDLE_TYPE))
+                    .filter(|m| {
+                        m.artifact_type.as_deref() == Some(BUNDLE_TYPE)
+                            && annotation(m.annotations.as_ref(), PREDICATE_TYPE_ANNOTATION)
+                                == Some(SLSA_PROVENANCE)
+                    })
                     .collect();
                 let [descriptor] = bundles.as_slice() else {
                     return Err(FetchError::Bundles {
@@ -510,11 +548,23 @@ impl Fetcher {
                 }
                 descriptor.check_content(&manifest_url, &response.body)?;
                 let manifest: Manifest = parse(&manifest_url, &response.body)?;
+                let found = manifest.predicate_type();
+                if found != Some(SLSA_PROVENANCE) {
+                    return Err(FetchError::Malformed {
+                        url: manifest_url.to_string(),
+                        reason: format!(
+                            "the manifest's predicate type {found:?} disagrees with its \
+                             descriptor's {SLSA_PROVENANCE}"
+                        ),
+                    });
+                }
                 (manifest_url, manifest)
             }
             OCI_MANIFEST => {
                 let manifest: Manifest = parse(&url, &response.body)?;
-                if manifest.artifact_type() != BUNDLE_TYPE {
+                if manifest.artifact_type() != BUNDLE_TYPE
+                    || manifest.predicate_type() != Some(SLSA_PROVENANCE)
+                {
                     return Err(no_bundle());
                 }
                 (url, manifest)
@@ -754,12 +804,21 @@ fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex(&Sha256::digest(bytes)))
 }
 
-/// The git object id of a tag object with content `raw`.
-fn git_tag_id(raw: &[u8]) -> String {
+/// The git object id of a tag object with content `raw`, or `None` when the
+/// bytes carry a SHA-1 collision attack.
+fn git_tag_id(raw: &[u8]) -> Option<String> {
+    checked_sha1(&[format!("tag {}\0", raw.len()).as_bytes(), raw])
+}
+
+/// The SHA-1 of `parts` concatenated, as lowercase hex, or `None` when
+/// collision detection finds a collision attack (SHAttered-style) in them.
+fn checked_sha1(parts: &[&[u8]]) -> Option<String> {
     let mut hasher = Sha1::new();
-    hasher.update(format!("tag {}\0", raw.len()).as_bytes());
-    hasher.update(raw);
-    hex(&hasher.finalize())
+    for part in parts {
+        hasher.update(part);
+    }
+    let result = hasher.try_finalize();
+    (!result.has_collision()).then(|| hex(result.hash()))
 }
 
 /// Lowercase hex.
@@ -786,6 +845,25 @@ fn check_object_id(url: &Url, sha: &str) -> Result<(), FetchError> {
             url: url.to_string(),
             reason: format!("object id {sha:?} is not 40 lowercase hex digits"),
         })
+    }
+}
+
+/// Refuses a release tag that is not an OCI tag,
+/// `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`: a `/` would change the registry
+/// path the request goes to, and `+` is not allowed in an image tag.
+fn check_oci_tag(tag: &ReleaseTag) -> Result<(), FetchError> {
+    let bytes = tag.as_ref().as_bytes();
+    let valid = (1..=128).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(FetchError::OciTag(tag.clone()))
     }
 }
 
@@ -843,6 +921,10 @@ struct RegistryToken {
     token: String,
 }
 
+fn annotation<'a>(annotations: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
+    annotations.and_then(|a| a.get(key)).map(String::as_str)
+}
+
 /// An OCI image index or Docker manifest list.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -887,10 +969,8 @@ struct Descriptor {
 
 impl Descriptor {
     fn is_attestation_manifest(&self) -> bool {
-        self.annotations
-            .as_ref()
-            .and_then(|a| a.get(REFERENCE_TYPE_ANNOTATION))
-            .is_some_and(|kind| kind == ATTESTATION_MANIFEST)
+        annotation(self.annotations.as_ref(), REFERENCE_TYPE_ANNOTATION)
+            == Some(ATTESTATION_MANIFEST)
     }
 
     /// The bytes fetched for this descriptor have its size and digest.
@@ -923,6 +1003,7 @@ struct Manifest {
     config: Descriptor,
     layers: Vec<Descriptor>,
     subject: Option<Descriptor>,
+    annotations: Option<HashMap<String, String>>,
 }
 
 impl Manifest {
@@ -932,6 +1013,10 @@ impl Manifest {
         self.artifact_type
             .as_deref()
             .unwrap_or(&self.config.media_type)
+    }
+
+    fn predicate_type(&self) -> Option<&str> {
+        annotation(self.annotations.as_ref(), PREDICATE_TYPE_ANNOTATION)
     }
 
     /// The one bundle layer of a referrer manifest for `subject`.
@@ -993,15 +1078,16 @@ mod tests {
     use landfall_core::ids::{CommitSha, ImageDigest, ReleaseTag, RepoName};
     use reqwest::Url;
     use serde_json::json;
-    use sha1::Sha1;
+    use sha1_checked::Digest as _;
+    use sha1_checked::Sha1;
     use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        BUNDLE_TYPE, DOCKER_LIST, Endpoints, FetchError, Fetcher, MANIFEST_LIMIT, OCI_INDEX,
-        OCI_MANIFEST, Platform, TAG_OBJECT_LIMIT, hex,
+        BUNDLE_TYPE, DOCKER_LIST, Endpoints, FetchError, Fetcher, MANIFEST_LIMIT, MAX_TAG_DEPTH,
+        OCI_INDEX, OCI_MANIFEST, Platform, SLSA_PROVENANCE, TAG_OBJECT_LIMIT, checked_sha1, hex,
     };
 
     const VALID_TAG: &[u8] = include_bytes!("../../core/tests/fixtures/tag/valid.tag");
@@ -1029,6 +1115,8 @@ mod tests {
         hasher.update(raw);
         hex(&hasher.finalize())
     }
+
+    const SBOM: &str = "https://spdx.dev/Document/v2.3";
 
     fn fetcher_for(github: &str, registry: &str) -> Fetcher {
         Fetcher::new(Endpoints::plain_http(
@@ -1154,8 +1242,9 @@ mod tests {
     }
 
     /// A referrer manifest holding `bundle` as its one layer, shaped like the
-    /// ones `actions/attest-build-provenance` pushes.
-    fn bundle_manifest(subject: &ImageDigest, bundle: &[u8]) -> Vec<u8> {
+    /// ones `actions/attest-build-provenance` pushes, annotated with
+    /// `predicate`.
+    fn bundle_manifest(subject: &ImageDigest, bundle: &[u8], predicate: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": OCI_MANIFEST,
@@ -1169,21 +1258,33 @@ mod tests {
                 { "mediaType": BUNDLE_TYPE, "digest": sha256(bundle), "size": bundle.len() },
             ],
             "subject": { "mediaType": OCI_INDEX, "digest": subject.as_ref(), "size": 3161 },
-            "annotations": { "dev.sigstore.bundle.predicateType": "https://slsa.dev/provenance/v1" },
+            "annotations": {
+                "dev.sigstore.bundle.content": "dsse-envelope",
+                "dev.sigstore.bundle.predicateType": predicate,
+            },
         }))
         .unwrap()
     }
 
-    fn referrers_index(manifests: &[&[u8]]) -> Vec<u8> {
-        let manifests: Vec<_> = manifests
+    /// A referrers index listing each manifest, its descriptor annotated with
+    /// the predicate type given (none when `None`), as GHCR serves it.
+    fn referrers_index(entries: &[(&[u8], Option<&str>)]) -> Vec<u8> {
+        let manifests: Vec<_> = entries
             .iter()
-            .map(|m| {
-                json!({
+            .map(|(manifest, predicate)| {
+                let mut descriptor = json!({
                     "mediaType": OCI_MANIFEST,
-                    "digest": sha256(m),
-                    "size": m.len(),
+                    "digest": sha256(manifest),
+                    "size": manifest.len(),
                     "artifactType": BUNDLE_TYPE,
-                })
+                });
+                if let Some(predicate) = predicate {
+                    descriptor["annotations"] = json!({
+                        "dev.sigstore.bundle.content": "dsse-envelope",
+                        "dev.sigstore.bundle.predicateType": predicate,
+                    });
+                }
+                descriptor
             })
             .collect();
         serde_json::to_vec(&json!({
@@ -1194,11 +1295,16 @@ mod tests {
         .unwrap()
     }
 
-    /// Mounts the token, the referrers index and every manifest and blob.
-    async fn mount_bundles(server: &MockServer, digest: &ImageDigest, bundles: &[&[u8]]) {
+    /// Mounts the token, the referrers index and every manifest and blob,
+    /// each `(bundle, predicate type)` in a manifest and descriptor annotated
+    /// with that predicate type.
+    async fn mount_bundles(server: &MockServer, digest: &ImageDigest, bundles: &[(&[u8], &str)]) {
         mount_token(server).await;
-        let manifests: Vec<Vec<u8>> = bundles.iter().map(|b| bundle_manifest(digest, b)).collect();
-        for (manifest, bundle) in manifests.iter().zip(bundles) {
+        let manifests: Vec<Vec<u8>> = bundles
+            .iter()
+            .map(|(bundle, predicate)| bundle_manifest(digest, bundle, predicate))
+            .collect();
+        for (manifest, (bundle, _)) in manifests.iter().zip(bundles) {
             mount_manifest(
                 server,
                 &sha256(manifest),
@@ -1209,12 +1315,16 @@ mod tests {
             .await;
             mount_blob(server, &sha256(bundle), bundle.to_vec()).await;
         }
-        let refs: Vec<&[u8]> = manifests.iter().map(Vec::as_slice).collect();
+        let entries: Vec<(&[u8], Option<&str>)> = manifests
+            .iter()
+            .zip(bundles)
+            .map(|(manifest, (_, predicate))| (manifest.as_slice(), Some(*predicate)))
+            .collect();
         mount_manifest(
             server,
             &referrers_tag(digest),
             OCI_INDEX,
-            referrers_index(&refs),
+            referrers_index(&entries),
             None,
         )
         .await;
@@ -1410,7 +1520,7 @@ mod tests {
     async fn single_arch_manifest_is_refused() {
         let (github, registry) = (MockServer::start().await, MockServer::start().await);
         mount_token(&registry).await;
-        let body = bundle_manifest(&release_digest(), b"{}");
+        let body = bundle_manifest(&release_digest(), b"{}", SLSA_PROVENANCE);
         mount_manifest(&registry, "v1.2.3", OCI_MANIFEST, body, None).await;
 
         let result = fetcher(&github, &registry)
@@ -1444,7 +1554,7 @@ mod tests {
     async fn bundle_is_found_by_referrers_tag() {
         let (github, registry) = (MockServer::start().await, MockServer::start().await);
         let digest = release_digest();
-        mount_bundles(&registry, &digest, &[BUNDLE]).await;
+        mount_bundles(&registry, &digest, &[(BUNDLE, SLSA_PROVENANCE)]).await;
 
         let bundle = fetcher(&github, &registry)
             .bundle(IMAGE, &digest)
@@ -1458,7 +1568,7 @@ mod tests {
         let (github, registry) = (MockServer::start().await, MockServer::start().await);
         let digest = release_digest();
         mount_token(&registry).await;
-        let manifest = bundle_manifest(&digest, BUNDLE);
+        let manifest = bundle_manifest(&digest, BUNDLE, SLSA_PROVENANCE);
         mount_manifest(
             &registry,
             &referrers_tag(&digest),
@@ -1480,7 +1590,15 @@ mod tests {
     async fn two_bundles_are_refused() {
         let (github, registry) = (MockServer::start().await, MockServer::start().await);
         let digest = release_digest();
-        mount_bundles(&registry, &digest, &[BUNDLE, b"{\"another\":\"bundle\"}"]).await;
+        mount_bundles(
+            &registry,
+            &digest,
+            &[
+                (BUNDLE, SLSA_PROVENANCE),
+                (b"{\"another\":\"bundle\"}", SLSA_PROVENANCE),
+            ],
+        )
+        .await;
 
         let result = fetcher(&github, &registry).bundle(IMAGE, &digest).await;
         assert!(
@@ -1509,7 +1627,7 @@ mod tests {
         let digest = release_digest();
         let other: ImageDigest = sha256(b"another index").parse().unwrap();
         mount_token(&registry).await;
-        let manifest = bundle_manifest(&other, BUNDLE);
+        let manifest = bundle_manifest(&other, BUNDLE, SLSA_PROVENANCE);
         mount_manifest(
             &registry,
             &referrers_tag(&digest),
@@ -1532,7 +1650,7 @@ mod tests {
         let (github, registry) = (MockServer::start().await, MockServer::start().await);
         let digest = release_digest();
         mount_token(&registry).await;
-        let manifest = bundle_manifest(&digest, BUNDLE);
+        let manifest = bundle_manifest(&digest, BUNDLE, SLSA_PROVENANCE);
         mount_manifest(
             &registry,
             &referrers_tag(&digest),
@@ -1634,7 +1752,7 @@ mod tests {
         .await;
         mount_manifest(&registry, "v1.2.3", OCI_INDEX, index_body(), None).await;
         let digest = release_digest();
-        mount_bundles(&registry, &digest, &[BUNDLE]).await;
+        mount_bundles(&registry, &digest, &[(BUNDLE, SLSA_PROVENANCE)]).await;
 
         let fetcher = fetcher(&github, &registry)
             .with_github_token(GITHUB_TOKEN)
@@ -1715,13 +1833,152 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn release_tag_outside_oci_grammar_is_refused() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        mount_token(&registry).await;
+        mount_manifest(&registry, "y", OCI_INDEX, index_body(), None).await;
+        let fetcher = fetcher(&github, &registry);
+        for bad in ["x/manifests/y", "a+b"] {
+            let tag: ReleaseTag = bad.parse().unwrap();
+            let result = fetcher.resolve_index(IMAGE, &tag).await;
+            match result {
+                Err(FetchError::OciTag(refused)) => assert_eq!(refused, tag),
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
+        let requests = registry.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "{} requests reached the registry",
+            requests.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn index_without_platforms_is_refused() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        mount_token(&registry).await;
+        let mut index: serde_json::Value = serde_json::from_slice(&index_body()).unwrap();
+        // Only the attestation manifest is left, which is not a platform.
+        let attestation = index["manifests"][1].clone();
+        index["manifests"] = json!([attestation]);
+        let body = serde_json::to_vec(&index).unwrap();
+        mount_manifest(&registry, "v1.2.3", OCI_INDEX, body, None).await;
+
+        let result = fetcher(&github, &registry)
+            .resolve_index(IMAGE, &tag())
+            .await;
+        assert!(
+            matches!(result, Err(FetchError::Malformed { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deeply_nested_tag_is_refused_without_extra_requests() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        let shas: Vec<String> = (1..=MAX_TAG_DEPTH + 1)
+            .map(|n| n.to_string().repeat(40))
+            .collect();
+        mount_ref(&github, "tag", &shas[0]).await;
+        for pair in shas.windows(2) {
+            mount_tag(&github, &pair[0], (&pair[1], "tag"), None).await;
+        }
+        mount_tag(
+            &github,
+            &shas[MAX_TAG_DEPTH],
+            (RELEASE_COMMIT, "commit"),
+            None,
+        )
+        .await;
+
+        let result = fetcher(&github, &registry)
+            .tag_commit(&repo(), &tag())
+            .await;
+        assert!(
+            matches!(result, Err(FetchError::TagDepth { .. })),
+            "{result:?}"
+        );
+        // The ref, then exactly MAX_TAG_DEPTH tag objects.
+        let requests = github.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1 + MAX_TAG_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn provenance_bundle_is_selected_over_sbom() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        let digest = release_digest();
+        let sbom: &[u8] = b"{\"an\":\"sbom bundle\"}";
+        mount_bundles(
+            &registry,
+            &digest,
+            &[(sbom, SBOM), (BUNDLE, SLSA_PROVENANCE)],
+        )
+        .await;
+
+        let bundle = fetcher(&github, &registry)
+            .bundle(IMAGE, &digest)
+            .await
+            .unwrap();
+        assert_eq!(bundle, BUNDLE);
+    }
+
+    #[tokio::test]
+    async fn bundle_descriptor_without_predicate_type_is_not_counted() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        let digest = release_digest();
+        mount_token(&registry).await;
+        let manifest = bundle_manifest(&digest, BUNDLE, SLSA_PROVENANCE);
+        let index = referrers_index(&[(&manifest, None)]);
+        mount_manifest(&registry, &referrers_tag(&digest), OCI_INDEX, index, None).await;
+
+        let result = fetcher(&github, &registry).bundle(IMAGE, &digest).await;
+        assert!(
+            matches!(result, Err(FetchError::Bundles { count: 0, .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_annotation_disagreeing_with_descriptor_is_refused() {
+        let (github, registry) = (MockServer::start().await, MockServer::start().await);
+        let digest = release_digest();
+        mount_token(&registry).await;
+        let manifest = bundle_manifest(&digest, BUNDLE, SBOM);
+        let index = referrers_index(&[(&manifest, Some(SLSA_PROVENANCE))]);
+        mount_manifest(&registry, &referrers_tag(&digest), OCI_INDEX, index, None).await;
+        mount_manifest(&registry, &sha256(&manifest), OCI_MANIFEST, manifest, None).await;
+        mount_blob(&registry, &sha256(BUNDLE), BUNDLE.to_vec()).await;
+
+        let result = fetcher(&github, &registry).bundle(IMAGE, &digest).await;
+        assert!(
+            matches!(result, Err(FetchError::Malformed { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn sha1_collision_is_detected() {
+        let prefix = include_bytes!("../tests/fixtures/sha1/shattered-1-prefix.bin");
+        assert!(checked_sha1(&[prefix]).is_none());
+        assert_eq!(
+            checked_sha1(&[b"hello ", b"world"]).as_deref(),
+            Some("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+        );
+    }
+
     /// The attestation fixture's release, fetched from the real GitHub API
     /// and GHCR: the tag object, its commit, the index digest and the bundle.
     #[tokio::test]
     #[ignore = "network: runs nightly in advisories.yml"]
     async fn live_fixture_release() {
         const INDEX_DIGEST: &str = include_str!("../tests/fixtures/attestation/index-digest.txt");
-        let fetcher = Fetcher::new(Endpoints::public().unwrap()).unwrap();
+        let mut fetcher = Fetcher::new(Endpoints::public().unwrap()).unwrap();
+        // The nightly job passes its token for the higher API rate limit.
+        if let Some(token) = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()) {
+            fetcher = fetcher.with_github_token(&token).unwrap();
+        }
         let repo: RepoName = "dani-garcia/vaultwarden".parse().unwrap();
         let tag: ReleaseTag = "1.37.4".parse().unwrap();
 
