@@ -212,6 +212,35 @@ async fn not_now_is_recorded_once_for_each_time_and_leaves_a_newer_release_free(
     assert_eq!(h.deploys(PROD).await[1].0, "v1.2.5");
 }
 
+/// So that a run of tags can't each take its own hour of the host in turn.
+#[tokio::test]
+async fn a_lower_release_waits_behind_a_higher_one_that_was_put_off() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.6"]);
+    assert_eq!(h.tick().await.queued.len(), 1);
+    deferred(&h).await;
+
+    h.fake.tags(PROD, &["v1.2.4", "v1.2.5", "v1.2.6"]);
+    assert_eq!(h.tick().await.queued, []);
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+    let held = h.hold_reason(PROD, "").await.unwrap();
+    assert!(held.contains("not now"), "{held}");
+
+    // At its next try, it is the higher one that goes, and the hold is gone.
+    let start = i64::try_from(TICK_INTERVAL.as_secs()).unwrap();
+    h.clock.advance(start);
+    assert_eq!(h.tick().await.queued.len(), 1);
+    let deploys = h.deploys(PROD).await;
+    assert_eq!(deploys.last().unwrap().0, "v1.2.6");
+    assert_eq!(h.hold_reason(PROD, "").await, None);
+
+    // With a higher one than that, the wait isn't for it.
+    deferred(&h).await;
+    h.fake.tags(PROD, &["v1.2.4", "v1.2.5", "v1.2.6", "v1.2.7"]);
+    assert_eq!(h.tick().await.queued.len(), 1);
+    assert_eq!(h.deploys(PROD).await.last().unwrap().0, "v1.2.7");
+}
+
 #[tokio::test]
 async fn a_refusal_after_not_now_is_final_whatever_came_before() {
     let h = Harness::running("v1.2.3").await;

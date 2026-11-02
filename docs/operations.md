@@ -564,8 +564,8 @@ What isn't so is answered in one of two ways, and nothing runs either way:
   or 4, warning, for a clock or a wait, and the host's next poll is backed off. The
   controller records the release as `deferred`, and asks again under a new number after a
   wait of one look, five minutes, doubling each time it is told so, up to six hours.
-  There is no last try. A newer release doesn't wait for it, and the host judges each try
-  as it would any other.
+  There is no last try. A newer release doesn't wait for it, older ones do, and the host
+  judges each try as it would any other.
 
 What it can do: withhold work, ask again, and see what the host reports. It can
 also make the host deploy a release that is allowed by all of the above sooner than

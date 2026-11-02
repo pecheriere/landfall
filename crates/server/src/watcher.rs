@@ -81,6 +81,8 @@ const DEFERRED_COOLDOWN_MAX_SECS: i64 = 6 * 60 * 60;
 
 const HOST_DEFERRED: &str =
     "its host said not now, for the reason in its last deploy_finished; asked again after a wait";
+const BEHIND_DEFERRED: &str =
+    "lower releases wait behind a higher one that its host said not now to";
 const NOT_REPORTED: &str = "its host has not reported this deployment yet";
 const RUNNING_TAG_UNREADABLE: &str = "the running tag does not match the deployment's tag pattern";
 const RATE_LIMITED: &str = "rate limited: waiting for the limit to lift";
@@ -288,6 +290,8 @@ struct DeploymentWatch<'a, S> {
     budget: usize,
     /// The wait after a host's first "not now", seconds.
     cooldown_start: i64,
+    /// The highest release its host has put off and that waits to be asked again.
+    highest_deferred: Option<Version>,
     summary: TickSummary,
 }
 
@@ -634,6 +638,11 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             });
             self.record(&listed.tag, decision, &reason, seen.as_ref())
                 .await?;
+            if decision == ReleaseDecision::Deferred
+                && self.highest_deferred.as_ref().is_none_or(|v| version > v)
+            {
+                self.highest_deferred = Some(version.clone());
+            }
             if decision == ReleaseDecision::Auto {
                 autos.push(AutoRelease {
                     version: version.clone(),
@@ -704,13 +713,21 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
     }
 
     /// Queues the highest of `autos` that can go. One refused or on hold is skipped,
-    /// and is not queued. Gives what to hold the deployment for, and what stopped it.
+    /// and is not queued. None lower than a release its host has only put off goes: it
+    /// is still on its way, and each lower one could otherwise take its own turn at
+    /// holding the host. Gives what to hold the deployment for, and what stopped it.
     async fn queue_highest(
         &mut self,
-        autos: Vec<AutoRelease>,
+        mut autos: Vec<AutoRelease>,
     ) -> Result<(Option<&'static str>, Option<Stop>), StoreError> {
         if autos.is_empty() {
             return Ok((None, None));
+        }
+        if let Some(deferred) = &self.highest_deferred {
+            autos.retain(|auto| auto.version > *deferred);
+            if autos.is_empty() {
+                return Ok((Some(BEHIND_DEFERRED), None));
+            }
         }
         match self.host_readiness() {
             HostReadiness::Ready => {}
@@ -837,6 +854,7 @@ async fn watch_deployment<S: ReleaseSource>(
         stored: store.releases_of(id).await?,
         budget: VERIFICATIONS_PER_TICK,
         cooldown_start,
+        highest_deferred: None,
         summary,
     };
     let (autos, stopped) = watch.go_through(&releases).await?;
