@@ -87,8 +87,11 @@ Three binaries from one workspace:
 | `landfall` (CLI) | anywhere | API client for humans and agents |
 
 Connections:
-- Agent → controller only (outbound HTTPS, long poll or WebSocket). The controller never connects to
-  a host. A private network such as Tailscale is recommended; the product only assumes HTTPS.
+- Agent → controller only, by long poll: `POST /agent/v1/work` holds for up to 30 s. It needs no
+  connection state, survives proxies, and every request is signed the same way. The controller never
+  connects to a host. The controller serves plain HTTP, for a private network such as Tailscale or a
+  TLS-terminating proxy; the agent insists on `https://`, or `http://` to a loopback address or a
+  tailnet name with an explicit flag, since requests are signed but work contents are visible.
 - Controller → GitHub API and registry (read-only; an optional read-only token for rate limits).
 - Agent → GitHub (tag and commit objects, public, read-only), registry (pull by digest, attestation),
   Sigstore TUF mirror.
@@ -284,6 +287,14 @@ Each step recorded with timings and outcome:
 Rollback target is always the previously healthy digest. A rollback runs the deployment's checks on it
 too, and starts the service even if an operator had stopped it before the deploy.
 
+**A release that rolled back isn't retried automatically; a newer release is.** Both ends remember: the
+controller doesn't queue it again, and the host refuses it by its own record if asked, whatever a
+controller says. Retrying the same one is a manual action. A deploy that finished never runs again under
+its number, and its report is sent again instead.
+
+**Reports survive an outage.** A report is on disk before it is sent and leaves when acknowledged, and
+reports are idempotent by deploy id, so a controller that was down during a deploy hears of it once.
+
 **A rollback whose `up` fails.** Whatever is running stays running, with the critical state and deploys
 blocked: the agent does not force a stop. With no backup declared, nothing stopped the service, so that can
 be the failed release, still serving. A failed backup without `stop` happens before the override and `up`, so
@@ -338,7 +349,9 @@ lines of a reused container do not; a replaced container's logs are not scanned.
 - Agents: an API token per agent (hashed at rest, shown once). Identity through a
   trusted reverse-proxy header is out of v0.
 - Host agents: an Ed25519 key generated on the host; the public key is enrolled with a one-time code
-  and requests are signed. A host agent can only fetch its own host's work and report on it.
+  bound to that host and requests are signed. A request signs a single-use nonce from the controller,
+  not the clock, as a Pi may have no RTC. A host agent can only fetch its own host's work and report on
+  it: identity comes from the signature, never from a body.
 
 ### 8.2 Grants
 Per principal and deployment (exact ids, no globs in v0): `view`, `request`, `approve` (humans
@@ -350,6 +363,12 @@ Every event (release seen, verification result, rule decision, request, approval
 rollback, config change) is appended to a hash-chained log in SQLite, as in warden, and exposed via the
 API. The agent also writes each decision and failure to its host's journal, so the host's own alerting
 sees refusals even if the controller is down or lying.
+
+The chain finds a row edited, deleted or reordered by anyone who did not also rewrite every later one. It
+holds no secret, so alone it can't show rows cut from the end with the sequence record lowered, a dropped
+table, an old backup restored or a whole forged history. `audit verify` prints the head for the operator
+to keep somewhere the controller can't write, and `audit verify --at <seq>` compares it later. An external
+anchor is out of scope for v0.
 
 ### 8.4 Warden integration (optional)
 - Warden holds an agent's landfall token and injects it on proxied API calls, so the agent never has it.
@@ -395,6 +414,7 @@ window. Without VictoriaLogs the logs view says logs aren't configured.
 | Registry swaps an image | Pull by index digest; digest is the attestation subject | none |
 | Container attacks the agent via backups | No symlink following, no special files | none known |
 | Rule loosened quietly | Rules only in reviewed repo; hash drift blocks deploys | a reviewer approving a bad PR |
+| Audit log rewritten | Hash chain; a head kept elsewhere, compared with `audit verify --at` | without a kept head, a restored backup, rows cut from the end or a whole forged history look intact |
 | Host agent compromised | Only that host; key only reads its own work | that host |
 
 ## 13. Left to the builder

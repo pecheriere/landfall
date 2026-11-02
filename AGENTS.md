@@ -46,7 +46,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   and the enrolment request), `daemon` (`run`: one poll is `daemon::step`, which
   judges each work item by the host's own rule and records, deploys, and keeps
   reports in an outbox until acknowledged), `cli` (`status`, `recover`, `enrol`
-  and `run`, behind the thin `main.rs`).
+  and `run`, behind the thin `main.rs`). `daemon::run_with` and the server's
+  `cli::run_watching` take a fake verifier and source, for the end-to-end tests;
+  nothing on a command line leads to them.
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 
@@ -116,6 +118,14 @@ which is how CI selects them:
 `docker_e2e.rs` lists what each needs. The `foreign_owner` tests need root and
 skip without it, unless `LANDFALL_TEST_REQUIRE_ROOT` is set, as it is in CI, which
 makes that a failure.
+
+Tests against the real GitHub, GHCR and Sigstore are `#[ignore]`d and named with a
+`live_` prefix, which is how the nightly job in `advisories.yml` selects them: `live_`
+must not appear in the name of any other test.
+
+`crates/agent/tests/e2e/` runs the controller and the agent together as real
+processes, over loopback and a real SQLite file. The agent has `landfall-server` as a
+dev-dependency for it; the server depends on nothing of the agent's.
 
 ### Linux tests on a Mac
 

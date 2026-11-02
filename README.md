@@ -79,15 +79,29 @@ The host needs a synchronised clock (NTP). The transparency log's integrated
 time must not be in the future, so a clock running behind refuses a fresh
 release with "integrated time … in the future".
 
-## Running the agent
+## Running the controller and the agent
 
-The agent's engine deploys, checks and rolls back, and its binary reports and
-repairs; the controller that will drive it is still to come.
+The controller watches releases, verifies them and queues what its rules make
+automatic. Each host's agent asks for that work, verifies it again for itself,
+deploys, checks, rolls back and reports. Approvals, the human API and the web UI are
+still to come, so only automatic deploys run, and only for a deployment with a release
+on record.
 
 ```sh
+landfall-server serve --config fleet.toml --db controller.db --listen 127.0.0.1:8080
+landfall-server enrol-code --host home-1 --db controller.db
+landfall-server audit verify --db controller.db [--at <seq>]
+
+landfall-agent enrol --controller https://controller.example --host home-1 --code-file <file>
+landfall-agent run --config fleet.toml --controller https://controller.example --host home-1
 landfall-agent status --config fleet.toml --host home-1 [--state-dir <dir>]
 landfall-agent recover --config fleet.toml --deployment app/prod [--state-dir <dir>]
 ```
+
+Set `GITHUB_TOKEN` for the controller: the anonymous limit runs out on first contact.
+Keep the head `audit verify` prints somewhere the controller can't write: the chain
+alone can't show a backup restored or a history rewritten whole.
+[`docs/operations.md`](docs/operations.md) has all of this, and the systemd units.
 
 `status` prints one JSON object per deployment of the host: its directory, what
 is deployed, whether a deploy is unfinished, what the override file is, the running
