@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/origin", "crates/server", "crates/agent", "crates/cli"]
+members = ["crates/core", "crates/approval", "crates/origin", "crates/server", "crates/agent", "crates/cli"]
 
 [workspace.package]
 version = "0.0.0"
@@ -30,6 +30,7 @@ print_stderr = "deny"
 
 [workspace.dependencies]
 landfall-core = { path = "crates/core", version = "0.0.0" }
+landfall-approval = { path = "crates/approval", version = "0.0.0" }
 landfall-origin = { path = "crates/origin", version = "0.0.0" }
 landfall-server = { path = "crates/server", version = "0.0.0" }
 clap = { version = "4.6.7", features = ["derive"] }
@@ -79,3 +80,9 @@ futures-core = { version = "0.3.34", default-features = false }
 # Enrolment codes. The operating system's generator, nothing seeded.
 getrandom = "0.4.3"
 hex = "0.4.3"
+# WebAuthn verification: ES256 and Ed25519 signatures. The same library rustls
+# already brings into the tree, so no new cryptography.
+aws-lc-rs = { version = "1.18.2", default-features = false, features = ["aws-lc-sys"] }
+# COSE keys and attestation objects. No `alloc`: its `skip` then refuses nested
+# indefinite-length items rather than keeping a stack for them.
+minicbor = { version = "2.3.1", default-features = false }

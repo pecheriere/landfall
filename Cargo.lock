@@ -1474,6 +1474,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "landfall-approval"
+version = "0.0.0"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "ed25519-dalek",
+ "landfall-core",
+ "minicbor",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "landfall-cli"
 version = "0.0.0"
 dependencies = [
@@ -1646,6 +1660,12 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "minicbor"
+version = "2.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7244eafd1e09e7c4e33043881997aa6ab6dffff3ed2cee3395a278980481d6e"
 
 [[package]]
 name = "mio"
