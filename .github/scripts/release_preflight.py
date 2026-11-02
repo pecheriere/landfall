@@ -68,7 +68,7 @@ PRINCIPAL = "landfall-release"
 NAMESPACE = "git"
 # One block and nothing else: `ssh-keygen` reads the first block, and `verify_tag` the last.
 SSH_SIGNATURE = re.compile(
-    r"-----BEGIN SSH SIGNATURE-----\n[A-Za-z0-9+/=\n]+-----END SSH SIGNATURE-----\n?"
+    r"-----BEGIN SSH SIGNATURE-----\n(?:[A-Za-z0-9+/=]+\n)+-----END SSH SIGNATURE-----\n?"
 )
 
 # Edwards25519, for what a key must be. The checks are `landfall-approval`'s for a passkey, and

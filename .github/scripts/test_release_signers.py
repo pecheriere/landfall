@@ -70,13 +70,31 @@ class SignerTests(unittest.TestCase):
             "a trailing space": f"{good} \n",
             "a carriage return": f"{good}\r\n",
             "a comment after a key on the line": f"{good} # the key\n",
-            "a form feed between lines": f"{good}\f{good}\n",
-            "a line separator between lines": f"{good}{LINE_SEPARATOR}{good}\n",
             "a type in another case": f"SSH-ED25519 {encoded}\n",
             "the same key twice": f"{good}\n{good}\n",
         }.items():
             with self.subTest(name=name), self.assertRaises(RefusedError):
                 parse_signers(text)
+
+    def test_only_a_newline_ends_a_line(self) -> None:
+        """A key hidden after any other separator is neither trusted nor let through."""
+        key = line()
+        stranger = line(RFC_KEY_2)
+        for name, separator in {
+            "a vertical tab": chr(0x0B),
+            "a form feed": chr(0x0C),
+            "a file separator": chr(0x1C),
+            "a group separator": chr(0x1D),
+            "a record separator": chr(0x1E),
+            "a next line": chr(0x85),
+            "a line separator": LINE_SEPARATOR,
+            "a paragraph separator": chr(0x2029),
+        }.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RefusedError, "holds no key"):
+                    parse_signers(f"# old{separator}{key}\n")
+                with self.assertRaisesRegex(RefusedError, "line 1"):
+                    parse_signers(f"{stranger}{separator}{key}\n")
 
     def test_blank_means_empty_and_a_comment_starts_the_line(self) -> None:
         """The one rule, for the Rust parser too: what else looks blank or commented is refused."""

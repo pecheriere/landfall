@@ -305,6 +305,10 @@ class TagSignatureTests(RepositoryLayout):
             "text before": f"text\n{good}",
             "CRLF line ends": good.replace("\n", "\r\n"),
             "no end armor": good.split("-----END")[0],
+            "a blank line in the base64": good.replace("\n", "\n\n", 2).replace(
+                "-----\n\n", "-----\n", 1
+            ),
+            "two final newlines": f"{good}\n",
         }.items():
             with self.subTest(name=name):
                 github = FakeGitHub(annotated_ref(), tag_answer(payload, signature))
