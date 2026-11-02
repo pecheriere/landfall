@@ -16,9 +16,11 @@ passkey approvals. Agents drive it through a typed API. Design:
   a key from local configuration, and parses an attestation, trusting none of it,
   for its key.
   No I/O: `cose` (COSE keys, ES256 and EdDSA only), `client_data`,
-  `authenticator_data`, `assertion`, `registration`, and `software`, a software
-  authenticator for tests, behind the `test-support` feature, which only
-  dev-dependencies may enable.
+  `authenticator_data`, `assertion`, `registration`, `config` (`parse_config`, how
+  every binary loads a configuration: core takes this crate's key check as a
+  required argument, because the check needs cryptography core doesn't link), and
+  `software`, a software authenticator for tests, behind the `test-support`
+  feature, which only dev-dependencies may enable.
 - `landfall-origin` (`crates/origin`): release origin verification that needs
   the Sigstore stack or the network: build-provenance bundles and their
   Fulcio certificate identity, the TUF trust root, and the fetchers for

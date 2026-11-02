@@ -47,7 +47,6 @@ pub fn router(state: ApiState) -> Router {
 mod tests {
     use axum::body::Body;
     use axum::http::Request;
-    use landfall_core::config;
     use tower::ServiceExt as _;
 
     use super::{ApiState, Router, StatusCode, Store, router};
@@ -55,11 +54,11 @@ mod tests {
 
     const CONFIG: &str = r#"
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 "#;
 
     fn app(store: Store) -> Router {
-        let config = config::parse(CONFIG.as_bytes()).unwrap();
+        let config = landfall_approval::parse_config(CONFIG.as_bytes()).unwrap();
         router(ApiState::new(store, config, Limits::default()))
     }
 

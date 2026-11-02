@@ -1456,6 +1456,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "jiff",
+ "landfall-approval",
  "landfall-core",
  "landfall-origin",
  "landfall-server",
@@ -1492,9 +1493,11 @@ name = "landfall-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "landfall-approval",
  "landfall-core",
  "landfall-origin",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -1503,6 +1506,7 @@ dependencies = [
 name = "landfall-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "ed25519-dalek",
  "semver",
  "serde",
@@ -1520,6 +1524,7 @@ dependencies = [
  "base64 0.23.1",
  "futures-util",
  "jiff",
+ "landfall-approval",
  "landfall-core",
  "reqwest",
  "serde",
@@ -1546,6 +1551,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "landfall-approval",
  "landfall-core",
  "landfall-origin",
  "semver",

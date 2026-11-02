@@ -18,7 +18,8 @@ use landfall_agent::daemon::{DaemonOptions, Shutdown, StepOutcome, Verifier, Ver
 use landfall_agent::deploy::{self, DeployPlan, EngineOptions, Outcome};
 use landfall_agent::docker::{Docker, DockerCli};
 use landfall_agent::state::{DeploymentState, StateDir};
-use landfall_core::config::{Config, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, DeployWork, Phase, ReportedOutcome, WorkRequest, WorkResponse,
@@ -137,7 +138,8 @@ fn stack() -> Stack {
         .unwrap();
     let text = format!(
         "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+         [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
          [[deployment]]\nid = \"{DEPLOYMENT}\"\nrepo = {{ name = \"{REPO}\", id = 1, owner_id = 2 }}\n\
          host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
          origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
@@ -145,7 +147,7 @@ fn stack() -> Stack {
          [[grant]]\nprincipal = \"operator\"\ndeployments = [\"{DEPLOYMENT}\"]\ncan = [\"approve\"]\n",
         dir.to_str().unwrap()
     );
-    let config = parse(text.as_bytes()).unwrap();
+    let config = parse_config(text.as_bytes()).unwrap();
     let dirs: BTreeMap<_, _> = resolve_dirs(&config, &"home-1".parse().unwrap()).unwrap();
     let (trigger, shutdown) = Shutdown::channel();
     drop(trigger);

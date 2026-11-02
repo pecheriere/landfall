@@ -1,6 +1,7 @@
 //! Release verification against a mock GitHub and a mock registry.
 
-use landfall_core::config::{self, Config};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::release::Platform;
 use wiremock::MockServer;
@@ -49,8 +50,12 @@ fn config(repo: &str, origin: &str) -> Config {
 [signers]
 maintainer = "{}"
 
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}
+operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }}
 
 [[deployment]]
 id = "app/prod"
@@ -63,7 +68,7 @@ checks = ["container-healthy"]
 "#,
         SIGNER.trim()
     );
-    config::parse(text.as_bytes()).unwrap()
+    parse_config(text.as_bytes()).unwrap()
 }
 
 /// A signed deployment of `example/app`, releases `v*`.

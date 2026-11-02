@@ -10,6 +10,7 @@
 //! canonical encoding, which is what's stored and shown, and the only form
 //! [`CoseKey::parse`] takes at config load.
 
+use landfall_core::config::MAX_CREDENTIAL_ID_LEN;
 use landfall_core::text::shown;
 use minicbor::Decoder;
 
@@ -19,8 +20,6 @@ use crate::cose::{CoseError, CoseKey};
 
 /// `aaguid` (16) and `credentialIdLength` (2).
 const CREDENTIAL_HEADER_LEN: usize = 18;
-/// 7.1: a relying party refuses a longer credential id.
-const MAX_CREDENTIAL_ID_LEN: usize = 1023;
 
 /// What a registration yields, for the operator to copy into the configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]

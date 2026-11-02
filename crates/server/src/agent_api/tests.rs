@@ -16,7 +16,6 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode};
-use landfall_core::config;
 use landfall_core::ids::HostId;
 use landfall_core::protocol::{
     self, DeployId, DeployReportBody, EnrolRequest, HOST_HEADER, NONCE_HEADER, Nonce,
@@ -40,8 +39,12 @@ const CONFIG: &str = r#"
 [signers]
 maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
 
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 
 [[deployment]]
 id = "app/prod"
@@ -131,7 +134,7 @@ impl Harness {
     pub(super) fn on_store(store: Store, limits: Limits) -> Self {
         let clock = ManualClock::at(1_800_000_000);
         let store = store.with_clock(clock.clone());
-        let config = config::parse(CONFIG.as_bytes()).unwrap();
+        let config = landfall_approval::parse_config(CONFIG.as_bytes()).unwrap();
         let config_hash: [u8; 32] = hex::decode(config.hash()).unwrap().try_into().unwrap();
         let state = ApiState::new(store.clone(), config, limits);
         Self {

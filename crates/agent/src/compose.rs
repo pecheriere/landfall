@@ -214,7 +214,7 @@ pub fn resolve_dirs(
 
 #[cfg(test)]
 mod tests {
-    use landfall_core::config::parse;
+    use landfall_approval::parse_config;
     use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag, RepoName};
 
     use super::*;
@@ -316,20 +316,22 @@ mod tests {
         let dir = dir.to_str().unwrap();
         let text = format!(
             "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+             [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
              [[deployment]]\nid = \"app/prod\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
              host = \"home-1\"\ncompose = {{ dir = \"{dir}\", service = \"app\" }}\n\
              origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
              rule = {{ auto = \"any\", approvers = [\"operator\"] }}\nchecks = [\"container-healthy\"]\n\
              [[grant]]\nprincipal = \"operator\"\ndeployments = [\"app/prod\"]\ncan = [\"approve\"]\n"
         );
-        parse(text.as_bytes()).unwrap().deployments()[0].clone()
+        parse_config(text.as_bytes()).unwrap().deployments()[0].clone()
     }
 
     fn config(dirs: &[(&str, &str)]) -> Config {
         let mut text = String::from(
             "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-             [approvers]\noperator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }\n",
+             [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+             [approvers]\noperator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }\n",
         );
         for (id, dir) in dirs {
             write!(
@@ -350,7 +352,7 @@ mod tests {
                 .join(", ")
         )
         .unwrap();
-        parse(text.as_bytes()).unwrap()
+        parse_config(text.as_bytes()).unwrap()
     }
 
     #[test]

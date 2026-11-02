@@ -82,6 +82,10 @@ mod tests {
 [signers]
 maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
 
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
 operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}
 
@@ -97,7 +101,7 @@ checks = ["container-healthy"]
             level("auto", auto),
             level("approve", approve),
         );
-        let config = config::parse(text.as_bytes()).unwrap();
+        let config = config::parse(text.as_bytes(), |_| Ok(())).unwrap();
         config.deployments()[0].rule().clone()
     }
 

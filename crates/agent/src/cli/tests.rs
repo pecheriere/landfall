@@ -6,6 +6,7 @@ use std::time::Instant;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use jiff::Timestamp;
+use landfall_core::config::ConfigError;
 use serde_json::Value;
 
 use super::{
@@ -53,7 +54,8 @@ fn fixture() -> Fixture {
 fn fleet(compose: &std::path::Path) -> String {
     format!(
         "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+         [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
          [[deployment]]\nid = \"app/prod\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
          host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
          origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
@@ -61,6 +63,25 @@ fn fleet(compose: &std::path::Path) -> String {
          [[grant]]\nprincipal = \"operator\"\ndeployments = [\"app/prod\"]\ncan = [\"approve\"]\n",
         compose.to_str().unwrap()
     )
+}
+
+#[test]
+fn a_key_the_verifier_would_refuse_is_refused_at_load() {
+    let f = fixture();
+    let bad = fs::read_to_string(&f.config_file).unwrap().replace(
+        "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+        "cHVibGljLWtleQ",
+    );
+    fs::write(&f.config_file, bad).unwrap();
+    let err = load_config(&f.config_file).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CliError::Config { source: ConfigError::InvalidApprover { approver, .. }, .. }
+                if approver.to_string() == "operator"
+        ),
+        "{err}"
+    );
 }
 
 fn container(image: &str) -> ContainerInfo {

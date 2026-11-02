@@ -14,7 +14,8 @@ use landfall_agent::deploy::{
 };
 use landfall_agent::docker::{ContainerId, Docker, DockerCli};
 use landfall_agent::state::{DeploymentState, StateDir};
-use landfall_core::config::{Config, Deployment, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::{Config, Deployment};
 use landfall_origin::attestation::VerifiedAttestation;
 use landfall_origin::release::ReleaseOrigin;
 use serde_json::Value;
@@ -152,7 +153,8 @@ impl Stack {
     fn fleet(&self, rest: &str) -> String {
         format!(
             "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+             [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
              [[deployment]]\nid = \"{DEPLOYMENT}\"\nrepo = {{ name = \"{REPO}\", id = 1, owner_id = 2 }}\n\
              host = \"home-1\"\ncompose = {{ dir = {dir:?}, service = \"app\" }}\n\
              origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
@@ -163,7 +165,7 @@ impl Stack {
     }
 
     fn config(&self, rest: &str) -> Config {
-        parse(self.fleet(rest).as_bytes()).unwrap()
+        parse_config(self.fleet(rest).as_bytes()).unwrap()
     }
 
     pub(super) fn deployment(&self, rest: &str) -> Deployment {

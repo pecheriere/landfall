@@ -27,7 +27,7 @@ fn non_utf8_bytes_are_refused() {
     let mut bytes = EXAMPLE.as_bytes().to_vec();
     bytes.insert(10, 0xff);
     assert_eq!(
-        parse(&bytes).unwrap_err(),
+        parse(&bytes, |_| Ok(())).unwrap_err(),
         ConfigError::NotUtf8 { offset: 10 }
     );
 }

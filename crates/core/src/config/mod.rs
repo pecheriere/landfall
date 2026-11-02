@@ -13,6 +13,7 @@
 //! // Struct literals are refused: the fields are private.
 //! let _ = Config {
 //!     signers: BTreeMap::new(),
+//!     approval: None,
 //!     approvers: BTreeMap::new(),
 //!     deployments: vec![],
 //!     grants: vec![],
@@ -31,15 +32,19 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
+pub use approval::{Approval, Approver, KeyCheck, MAX_CREDENTIAL_ID_LEN};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 pub use signer::SignerKey;
 use thiserror::Error;
 
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
+use crate::text::shown;
 
 #[cfg(test)]
 mod tests;
+
+mod approval;
 
 mod raw;
 
@@ -48,6 +53,7 @@ mod signer;
 /// Why a configuration file was refused. Every variant names the deployment
 /// (or section) and the offending value.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The file is not UTF-8.
     #[error("configuration is not UTF-8: invalid byte at offset {offset}")]
@@ -84,6 +90,56 @@ pub enum ConfigError {
     /// Two `[signers]` names hold the same key.
     #[error("signers {first} and {second} hold the same key")]
     DuplicateSignerKey {
+        /// The first name, in name order.
+        first: PrincipalId,
+        /// The second name.
+        second: PrincipalId,
+    },
+    /// There are deployments and no `[approval]`: any of them can need an approval, since
+    /// a first deploy always does.
+    #[error(
+        "[approval] is missing; a first deploy always needs an approval, so set rp_id and origin"
+    )]
+    MissingApproval,
+    /// `approval.origin` is not an origin as a browser writes it.
+    #[error("approval.origin {}: {reason}", shown(.origin))]
+    InvalidApprovalOrigin {
+        /// The value in the file.
+        origin: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
+    /// `approval.rp_id` is not exactly the hostname of `approval.origin`.
+    #[error(
+        "approval.rp_id {} must be exactly the hostname of approval.origin, {}",
+        shown(.rp_id),
+        shown(.host)
+    )]
+    RpIdNotOriginHost {
+        /// The value in the file.
+        rp_id: String,
+        /// The hostname of `approval.origin`.
+        host: String,
+    },
+    /// An `[approvers]` value can't be used. Never repeats the key.
+    #[error("approver {approver}: {reason}")]
+    InvalidApprover {
+        /// The approver's name in `[approvers]`.
+        approver: PrincipalId,
+        /// Why the value is refused.
+        reason: String,
+    },
+    /// Two `[approvers]` names hold the same credential id.
+    #[error("approvers {first} and {second} hold the same credential id")]
+    DuplicateCredentialId {
+        /// The first name, in name order.
+        first: PrincipalId,
+        /// The second name.
+        second: PrincipalId,
+    },
+    /// Two `[approvers]` names hold the same key.
+    #[error("approvers {first} and {second} hold the same public key")]
+    DuplicateApproverKey {
         /// The first name, in name order.
         first: PrincipalId,
         /// The second name.
@@ -196,6 +252,17 @@ pub enum ConfigError {
         /// The grant's principal.
         principal: PrincipalId,
     },
+    /// Rule 7: `approve` granted on a deployment whose `rule.approvers` doesn't list the
+    /// principal. The rule is what the host checks, so the two can't be let disagree.
+    #[error(
+        "grant for {principal}: can include \"approve\" on {deployment}, but rule.approvers of {deployment} does not list {principal}"
+    )]
+    ApproveNotListed {
+        /// The grant's principal.
+        principal: PrincipalId,
+        /// The deployment.
+        deployment: DeploymentId,
+    },
     /// Rule 8: two deployments use the same compose directory on one host.
     #[error(
         "deployment {deployment}: compose directory {dir:?} on host {host} is already used by {other}"
@@ -233,6 +300,8 @@ impl fmt::Display for Chain<'_> {
 pub struct Config {
     /// Trusted tag-signing keys, by name.
     signers: BTreeMap<PrincipalId, SignerKey>,
+    /// The relying party approvals are checked against.
+    approval: Option<Approval>,
     /// Passkey approvers, by name.
     approvers: BTreeMap<PrincipalId, Approver>,
     /// Every deployment, in file order.
@@ -250,6 +319,12 @@ impl Config {
         self.signers.get(id)
     }
 
+    /// The approver named `id` in `[approvers]`.
+    #[must_use]
+    pub fn approver(&self, id: &PrincipalId) -> Option<&Approver> {
+        self.approvers.get(id)
+    }
+
     /// The deployment with this id.
     #[must_use]
     pub fn deployment(&self, id: &DeploymentId) -> Option<&Deployment> {
@@ -263,15 +338,6 @@ impl Config {
     ) -> impl Iterator<Item = &'a Deployment> {
         self.deployments.iter().filter(move |d| &d.host == host)
     }
-}
-
-/// A passkey approver. Both values are opaque base64url text here.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Approver {
-    /// `WebAuthn` credential id.
-    credential_id: String,
-    /// COSE public key.
-    public_key: String,
 }
 
 /// One deployed service.
@@ -471,6 +537,8 @@ macro_rules! getters {
 getters!(Config, c {
     /// Trusted tag-signing keys, by name.
     signers: &BTreeMap<PrincipalId, SignerKey> => &c.signers,
+    /// The relying party approvals are checked against: there whenever a deployment is.
+    approval: Option<&Approval> => c.approval.as_ref(),
     /// Passkey approvers, by name.
     approvers: &BTreeMap<PrincipalId, Approver> => &c.approvers,
     /// Every deployment, in file order.
@@ -480,13 +548,6 @@ getters!(Config, c {
     /// Lowercase hex SHA-256 of exactly the bytes given to [`parse`];
     /// agents and the controller compare these to detect configuration drift.
     hash: &str => &c.hash,
-});
-
-getters!(Approver, a {
-    /// `WebAuthn` credential id (opaque base64url text).
-    credential_id: &str => &a.credential_id,
-    /// COSE public key (opaque base64url text).
-    public_key: &str => &a.public_key,
 });
 
 getters!(Deployment, d {
@@ -578,18 +639,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Parses and validates a configuration file from its exact bytes, which
-/// [`Config::hash`] then identifies.
+/// [`Config::hash`] then identifies. `check` judges each approver's key; a program loads
+/// its configuration with `landfall_approval::parse_config`, which supplies the
+/// verifier's own.
 ///
 /// # Errors
 ///
 /// [`ConfigError::NotUtf8`] when the bytes are not UTF-8,
 /// [`ConfigError::Toml`] for syntax, unknown keys and wrongly typed values,
 /// otherwise the variant of the first validation rule that fails.
-pub fn parse(bytes: &[u8]) -> Result<Config, ConfigError> {
+pub fn parse(bytes: &[u8], check: KeyCheck) -> Result<Config, ConfigError> {
     let text = std::str::from_utf8(bytes).map_err(|e| ConfigError::NotUtf8 {
         offset: e.valid_up_to(),
     })?;
-    let config = raw::build(text, sha256_hex(bytes))?;
+    let config = raw::build(text, sha256_hex(bytes), check)?;
     validate(&config)?;
     Ok(config)
 }
@@ -673,6 +736,9 @@ fn validate_deployment(config: &Config, d: &Deployment) -> Result<(), ConfigErro
 }
 
 fn validate(config: &Config) -> Result<(), ConfigError> {
+    if !config.deployments.is_empty() && config.approval.is_none() {
+        return Err(ConfigError::MissingApproval);
+    }
     let mut seen = HashSet::new();
     let mut dirs: HashMap<(&HostId, &str), &DeploymentId> = HashMap::new();
     for d in &config.deployments {
@@ -725,15 +791,32 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                 deployment: missing.clone(),
             });
         }
-        if grant.can.contains(&Permission::Approve)
-            && !config.approvers.contains_key(&grant.principal)
-        {
-            return Err(ConfigError::ApproveWithoutApprover {
-                principal: grant.principal.clone(),
-            });
+        if grant.can.contains(&Permission::Approve) {
+            validate_approve_grant(config, grant)?;
         }
     }
     Ok(())
+}
+
+/// `approve` is for someone in `[approvers]`, on deployments whose rule lists them.
+fn validate_approve_grant(config: &Config, grant: &Grant) -> Result<(), ConfigError> {
+    if !config.approvers.contains_key(&grant.principal) {
+        return Err(ConfigError::ApproveWithoutApprover {
+            principal: grant.principal.clone(),
+        });
+    }
+    let unlisted = grant
+        .deployments
+        .iter()
+        .filter_map(|id| config.deployment(id))
+        .find(|d| !d.rule.approvers.contains(&grant.principal));
+    match unlisted {
+        Some(deployment) => Err(ConfigError::ApproveNotListed {
+            principal: grant.principal.clone(),
+            deployment: deployment.id.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Follows the promotion chain from `start`. When it loops, returns the

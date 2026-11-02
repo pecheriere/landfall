@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use landfall_core::config::{self, Config, ConfigError};
+use landfall_core::config::{Config, ConfigError};
 use landfall_core::ids::{DeploymentId, HostId};
 use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
@@ -265,7 +265,7 @@ fn load_config(path: &Path) -> Result<Config, CliError> {
         path: path.to_owned(),
         source,
     })?;
-    config::parse(&bytes).map_err(|source| CliError::Config {
+    landfall_approval::parse_config(&bytes).map_err(|source| CliError::Config {
         path: path.to_owned(),
         source,
     })

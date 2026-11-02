@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use jiff::Timestamp;
-use landfall_core::config::{Config, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, DeployWork, ReportedOutcome, WorkRequest, WorkResponse,
@@ -60,7 +61,8 @@ fn deployment_text(id: &str, dir: &Path, rule: &str) -> String {
 fn fleet(deployments: &str, ids: &str) -> String {
     format!(
         "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+         [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
          {deployments}\
          [[grant]]\nprincipal = \"operator\"\ndeployments = [{ids}]\ncan = [\"approve\"]\n"
     )
@@ -288,7 +290,7 @@ fn bare_fixture(rule: &str) -> Fixture {
     let state_dir = root.join("state");
     fs::create_dir(&state_dir).unwrap();
     let text = fleet(&deployment_text(ID, &compose, rule), &format!("\"{ID}\""));
-    let config = parse(text.as_bytes()).unwrap();
+    let config = parse_config(text.as_bytes()).unwrap();
     fs::write(
         compose.join(OVERRIDE_FILE),
         compose::render_override(

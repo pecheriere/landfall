@@ -310,6 +310,30 @@ fn write_fleet(dir: &Path, deployments: &[(&str, &Path)]) -> PathBuf {
 }
 
 #[test]
+fn a_key_the_verifier_would_refuse_refuses_to_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let file = write_fleet(tmp.path(), &[("app/prod", &real)]);
+    let bad = fs::read_to_string(&file).unwrap().replace(
+        "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+        "cHVibGljLWtleQ",
+    );
+    fs::write(&file, bad).unwrap();
+    let err = start_up(&file, &"home-1".parse().unwrap(), tmp.path()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DaemonError::Config {
+                source: landfall_core::config::ConfigError::InvalidApprover { approver, .. },
+                ..
+            } if approver.to_string() == "operator"
+        ),
+        "{err}"
+    );
+}
+
+#[test]
 fn aliased_directories_refuse_to_start() {
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().join("real");

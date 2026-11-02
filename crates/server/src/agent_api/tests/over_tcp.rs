@@ -108,7 +108,7 @@ async fn a_body_a_little_over_the_limit_gets_its_answer_over_tcp() {
     let store = Store::open(&dir.path().join("controller.db"))
         .await
         .unwrap();
-    let config = landfall_core::config::parse(super::CONFIG.as_bytes()).unwrap();
+    let config = landfall_approval::parse_config(super::CONFIG.as_bytes()).unwrap();
     let state = ApiState::new(store, config, test_limits());
     let app = crate::router(state.clone());
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -154,7 +154,7 @@ async fn an_agent_enrols_polls_and_reports_over_tcp() {
     let store = Store::open(&dir.path().join("controller.db"))
         .await
         .unwrap();
-    let config = landfall_core::config::parse(super::CONFIG.as_bytes()).unwrap();
+    let config = landfall_approval::parse_config(super::CONFIG.as_bytes()).unwrap();
     let config_hash: [u8; 32] = hex::decode(config.hash()).unwrap().try_into().unwrap();
     let limits = Limits {
         long_poll: Duration::from_secs(30),

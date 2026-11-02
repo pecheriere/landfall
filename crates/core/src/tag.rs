@@ -475,7 +475,7 @@ mod tests {
             ))
             .unwrap()
         );
-        let config: Config = config::parse(text.as_bytes()).unwrap();
+        let config: Config = config::parse(text.as_bytes(), |_| Ok(())).unwrap();
         let id = maintainer();
         let key = config.signer(&id).unwrap();
         assert!(verify_tag(VALID, &tag("v1.2.3"), &[(id, key)]).is_ok());

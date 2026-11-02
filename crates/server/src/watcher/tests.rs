@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use landfall_core::config;
+use landfall_approval::parse_config;
 use landfall_core::protocol::{
     DeployReportBody, DeployedRelease, Phase, ReportedOutcome, RunningState,
 };
@@ -38,8 +38,12 @@ const RUN_2: &str = "https://github.com/example/app/actions/runs/2/attempts/1";
 fn config_text(rule: &str) -> String {
     format!(
         r#"
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}
+operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }}
 
 [[deployment]]
 id = "app/prod"
@@ -264,7 +268,7 @@ impl Harness {
         Self {
             store,
             clock,
-            config: Arc::new(config::parse(config_text.as_bytes()).unwrap()),
+            config: Arc::new(parse_config(config_text.as_bytes()).unwrap()),
             fake: Arc::new(Fake::default()),
             state: Arc::new(WatcherState::default()),
         }

@@ -187,6 +187,10 @@ deployment and blocks deploys there until fixed.
 [signers]
 maintainer = "ssh-ed25519 AAAA… (tag signing key)"
 
+[approval]
+rp_id = "landfall.example.com"
+origin = "https://landfall.example.com"
+
 [approvers]
 operator = { credential_id = "…", public_key = "…cose…" }
 

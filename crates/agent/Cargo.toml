@@ -20,6 +20,7 @@ clap.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 jiff.workspace = true
+landfall-approval.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
 memchr.workspace = true

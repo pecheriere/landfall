@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use landfall_core::config::{Deployment, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::Deployment;
 use serde_json::Value;
 
 use super::{DeployError, DeployPlan, EngineOptions, StepResult, recover, run};
@@ -61,14 +62,15 @@ fn deployment(backup: &str) -> Deployment {
 fn deployment_with_checks(rest: &str) -> Deployment {
     let text = format!(
         "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+             [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
              [[deployment]]\nid = \"app/prod\"\nrepo = {{ name = \"example/app\", id = 1, owner_id = 2 }}\n\
              host = \"home-1\"\ncompose = {{ dir = \"/srv/compose/app\", service = \"app\" }}\n\
              origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
              rule = {{ auto = \"any\", approvers = [\"operator\"] }}\n{rest}\
              [[grant]]\nprincipal = \"operator\"\ndeployments = [\"app/prod\"]\ncan = [\"approve\"]\n"
     );
-    parse(text.as_bytes()).unwrap().deployments()[0].clone()
+    parse_config(text.as_bytes()).unwrap().deployments()[0].clone()
 }
 
 /// A compose directory with a previous override and `data/db` holding

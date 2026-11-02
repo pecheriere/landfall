@@ -7,8 +7,12 @@ use super::{HOST, Harness, PROD};
 
 /// `app/staging` promoting to `app/prod` after a day, both of one repository.
 pub(super) const PROMOTING: &str = r#"
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 
 [[deployment]]
 id = "app/prod"

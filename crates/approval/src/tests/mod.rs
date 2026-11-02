@@ -3,6 +3,7 @@
 
 mod assertion;
 mod client_data;
+mod config;
 mod cose;
 mod malformed;
 mod registration;

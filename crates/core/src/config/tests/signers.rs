@@ -55,9 +55,9 @@ fn garbage_signer_is_rejected() {
 fn duplicate_signer_keys_are_rejected() {
     let key = fixture_key("signer.pub");
     let text = EXAMPLE.replacen(
-        "[approvers]",
+        "[approval]",
         &format!(
-            "backup = {:?}\n\n[approvers]",
+            "backup = {:?}\n\n[approval]",
             format!("{} spare", key.trim_end())
         ),
         1,

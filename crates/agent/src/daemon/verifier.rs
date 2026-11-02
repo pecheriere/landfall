@@ -200,7 +200,6 @@ fn host_platform(os: &'static str, arch: &'static str) -> Result<Platform, Daemo
 
 #[cfg(test)]
 mod tests {
-    use landfall_core::config;
     use landfall_origin::attestation::AttestationError;
     use landfall_origin::fetch::FetchError;
     use landfall_origin::release::ReleaseError;
@@ -235,8 +234,12 @@ mod tests {
     #[ignore = "network: run by hand"]
     async fn live_origin_verifier_verifies_the_fixture_release() {
         let text = r#"
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 
 [[deployment]]
 id = "app/prod"
@@ -247,7 +250,7 @@ origin = { workflow = ".github/workflows/release.yml", tags = "*", signed_tags =
 rule = { approvers = ["operator"] }
 checks = ["container-healthy"]
 "#;
-        let config = config::parse(text.as_bytes()).unwrap();
+        let config = landfall_approval::parse_config(text.as_bytes()).unwrap();
         let cache = tempfile::tempdir().unwrap();
         let verifier =
             OriginVerifier::for_platform(cache.path().to_owned(), "linux/amd64".parse().unwrap())

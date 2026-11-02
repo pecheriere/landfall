@@ -14,10 +14,14 @@
 //! The signature counter is not checked: synced passkeys report 0, and a replay is
 //! stopped by the host's nonce log and the running digest named in the intent.
 //! Nothing here reads a clock or does I/O. Callers cap the size of what they pass.
+//!
+//! [`parse_config`] is how a binary loads its configuration, because the keys in it are
+//! judged by the parser that verifying uses.
 
 mod assertion;
 mod authenticator_data;
 mod client_data;
+mod config;
 mod cose;
 mod registration;
 #[cfg(any(test, feature = "test-support"))]
@@ -29,6 +33,7 @@ mod wire;
 pub use assertion::{Assertion, AssertionError, Expect, verify};
 pub use authenticator_data::AuthenticatorDataError;
 pub use client_data::ClientDataError;
+pub use config::parse_config;
 pub use cose::{Algorithm, CoseError, CoseKey};
 pub use registration::{Registered, RegistrationError, parse_registration};
 #[cfg(any(test, feature = "test-support"))]

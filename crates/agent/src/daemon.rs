@@ -23,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use landfall_core::config::{self, Config, ConfigError, Deployment};
+use landfall_core::config::{Config, ConfigError, Deployment};
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, DeployWork, HeldBack, ReportedOutcome, SigningKey,
@@ -715,7 +715,7 @@ fn start_up(config_path: &Path, host: &HostId, state_dir: &Path) -> Result<Start
         path: config_path.to_owned(),
         source,
     })?;
-    let config = config::parse(&bytes).map_err(|source| DaemonError::Config {
+    let config = landfall_approval::parse_config(&bytes).map_err(|source| DaemonError::Config {
         path: config_path.to_owned(),
         source,
     })?;

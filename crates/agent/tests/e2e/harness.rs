@@ -17,7 +17,8 @@ use landfall_agent::daemon;
 use landfall_agent::deploy::{self, DeployPlan, EngineOptions, Outcome};
 use landfall_agent::docker::{Docker, DockerCli};
 use landfall_agent::state::{DeploymentState, StateDir};
-use landfall_core::config::{Config, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use rustix::process::{Pid, Signal, kill_process};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -285,7 +286,8 @@ impl Fleet {
             compose
         });
         let text = format!(
-            "[approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+            "[approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
              [[deployment]]\nid = \"{DEPLOYMENT}\"\n\
              repo = {{ name = \"{repo}\", id = {repo_id}, owner_id = {owner_id} }}\n\
              host = \"{HOST}\"\ncompose = {{ dir = {compose:?}, service = \"app\" }}\n\
@@ -299,7 +301,7 @@ impl Fleet {
         );
         let config_path = root.join("fleet.toml");
         fs::write(&config_path, &text).unwrap();
-        let config = parse(text.as_bytes()).unwrap();
+        let config = parse_config(text.as_bytes()).unwrap();
         let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
             .local_addr()

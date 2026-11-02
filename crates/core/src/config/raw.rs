@@ -12,16 +12,39 @@ use serde::de::value::MapAccessDeserializer;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use super::approval::check_distinct;
 use super::{
-    Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, LOG_PATTERN_LIMIT,
-    Level, Origin, Permission, Promotion, Repo, Rule, SignerKey, WITHIN_SECS_LIMIT,
+    Approval, Approver, Backup, Check, Compose, Config, ConfigError, Deployment, Grant, KeyCheck,
+    LOG_PATTERN_LIMIT, Level, Origin, Permission, Promotion, Repo, Rule, SignerKey,
+    WITHIN_SECS_LIMIT,
 };
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 
+/// What's wrong and on which line. Not the error's own text, which shows the line, or
+/// serde's mention of a string it didn't expect, which quotes it: either could be a key.
+fn toml_error(text: &str, error: &toml::de::Error) -> ConfigError {
+    let message = error.message();
+    let message = match (
+        message.strip_prefix("invalid type: string "),
+        message.rfind(", expected"),
+    ) {
+        (Some(_), Some(end)) => format!("invalid type: string{}", &message[end..]),
+        _ => message.to_owned(),
+    };
+    let line = error
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| before.matches('\n').count() + 1);
+    ConfigError::Toml(match line {
+        Some(line) => format!("line {line}: {message}"),
+        None => message,
+    })
+}
+
 /// Parses the text into a [`Config`] that is not validated yet; `hash`
 /// identifies the bytes the text came from.
-pub(super) fn build(text: &str, hash: String) -> Result<Config, ConfigError> {
-    let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Toml(e.to_string()))?;
+pub(super) fn build(text: &str, hash: String, check: KeyCheck) -> Result<Config, ConfigError> {
+    let raw: RawConfig = toml::from_str(text).map_err(|e| toml_error(text, &e))?;
     let signers = raw
         .signers
         .into_iter()
@@ -43,6 +66,19 @@ pub(super) fn build(text: &str, hash: String) -> Result<Config, ConfigError> {
         }
         seen.push((name, key));
     }
+    let approval = raw
+        .approval
+        .map(|a| Approval::new(a.rp_id, a.origin))
+        .transpose()?;
+    let approvers = raw
+        .approvers
+        .into_iter()
+        .map(|(name, a)| {
+            let approver = Approver::parse(&name, &a.credential_id, &a.public_key, check)?;
+            Ok((name, approver))
+        })
+        .collect::<Result<BTreeMap<_, _>, ConfigError>>()?;
+    check_distinct(&approvers)?;
     let deployments = raw
         .deployments
         .into_iter()
@@ -50,19 +86,8 @@ pub(super) fn build(text: &str, hash: String) -> Result<Config, ConfigError> {
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Config {
         signers,
-        approvers: raw
-            .approvers
-            .into_iter()
-            .map(|(name, a)| {
-                (
-                    name,
-                    Approver {
-                        credential_id: a.credential_id,
-                        public_key: a.public_key,
-                    },
-                )
-            })
-            .collect(),
+        approval,
+        approvers,
         deployments,
         grants: raw
             .grants
@@ -83,11 +108,20 @@ struct RawConfig {
     #[serde(default)]
     signers: BTreeMap<PrincipalId, String>,
     #[serde(default)]
+    approval: Option<RawApproval>,
+    #[serde(default)]
     approvers: BTreeMap<PrincipalId, RawApprover>,
     #[serde(default, rename = "deployment")]
     deployments: Vec<RawDeployment>,
     #[serde(default, rename = "grant")]
     grants: Vec<RawGrant>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawApproval {
+    rp_id: String,
+    origin: String,
 }
 
 #[derive(Deserialize)]

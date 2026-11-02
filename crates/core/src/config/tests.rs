@@ -3,6 +3,7 @@
 use super::{Config, ConfigError, parse};
 use crate::ids::DeploymentId;
 
+mod approval;
 mod checks;
 mod parsing;
 mod promotion;
@@ -12,6 +13,10 @@ mod validation;
 const EXAMPLE: &str = r#"
 [signers]
 maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
+
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
 
 [approvers]
 operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
@@ -47,7 +52,7 @@ fn id(s: &str) -> DeploymentId {
 }
 
 fn parse_str(text: &str) -> Result<Config, ConfigError> {
-    parse(text.as_bytes())
+    parse(text.as_bytes(), |_| Ok(()))
 }
 
 fn edited(from: &str, to: &str) -> String {
