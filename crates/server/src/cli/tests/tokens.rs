@@ -299,6 +299,23 @@ async fn an_older_database_gets_told_to_run_serve() {
 }
 
 #[tokio::test]
+async fn a_database_newer_than_this_program_counts_as_current() {
+    let files = Files::new().await;
+    let store = Store::open_existing(&files.db).await.unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99, 'from later', 1, x'00', 0)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(store.schema_is_current().await.unwrap());
+    store.close().await;
+    let (result, _) = files.create("ci").await;
+    assert_eq!(result.unwrap(), EXIT_OK);
+}
+
+#[tokio::test]
 async fn a_database_never_migrated_gets_told_to_run_serve() {
     let files = Files::new().await;
     std::fs::remove_file(&files.db).unwrap();

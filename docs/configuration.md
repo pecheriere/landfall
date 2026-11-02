@@ -144,6 +144,12 @@ is back. Drift clearing and a rollback start the time again for what then runs. 
 promotion is enforced by the controller only, and trusts that host: a compromised source
 host can say what it likes.
 
+**A release seen healthy for the full time has passed, for good.** It still counts after the
+source has moved on from it, and that includes the source going back to an older release:
+promotion says this release ran well there for that long, and not that the source still runs
+it or still wants it. So rolling the source back doesn't hold back its promotion. Say no to
+that one by not approving it, or cancel its request.
+
 Anything outside `auto` and `approve` (major releases by default) is manual: a
 grant holder requests it and an approver approves it.
 

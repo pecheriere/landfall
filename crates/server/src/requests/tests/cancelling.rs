@@ -193,18 +193,35 @@ async fn a_rollback_supersedes_an_open_request() {
 async fn nothing_else_supersedes_an_open_request() {
     let h = Harness::new().await;
     let open = rollback_stage(&h).await;
-    // A higher release, even from someone who can roll back or approve.
+    // A higher release, even from someone who can approve, or can both ask and roll back.
     h.verified(PROD, HOST, "v1.3.0", '3').await;
-    assert_eq!(
-        h.ask(&h.token("alice").await, "v1.3.0").await.code(),
-        "request_open"
-    );
+    for name in ["alice", "frank"] {
+        assert_eq!(
+            h.ask(&h.token(name).await, "v1.3.0").await.code(),
+            "request_open",
+            "{name}"
+        );
+    }
     // A lower one, from someone without the rollback grant.
     assert_eq!(
         h.ask(&h.token("carol").await, "v1.0.0").await.code(),
         "request_open"
     );
     assert_eq!(h.request_state(open).await, "awaiting_approval");
+}
+
+#[tokio::test]
+async fn cancelling_one_past_its_time_finds_it_expired() {
+    let h = Harness::new().await;
+    h.ready().await;
+    let id = h.asked_by_carol().await;
+    h.clock.advance(crate::store::REQUEST_LIFETIME_SECS);
+    let answer = h.cancel(id, &h.token("carol").await).await;
+    assert_eq!(answer.status, StatusCode::CONFLICT, "{answer:?}");
+    assert_eq!(answer.code(), "request_expired");
+    assert_eq!(h.request_state(id).await, "expired");
+    assert_eq!(h.audited("request_expired").await.len(), 1);
+    assert_eq!(h.audited("request_cancelled").await.len(), 0);
 }
 
 #[tokio::test]

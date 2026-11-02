@@ -34,16 +34,16 @@ struct AskBody {
     tag: ReleaseTag,
 }
 
-/// Everything about a request but its nonce, judged in `tx`: the intent to record. A
-/// rollback by someone who may do one cancels the open request it finds, once nothing else
-/// stands in its way.
+/// Everything about a request but its nonce, judged in `tx`: the intent to record, and
+/// whether it is a rollback. A rollback by someone who may do one cancels the open request it
+/// finds, once nothing else stands in its way.
 async fn judge_request(
     state: &ApiState,
     tx: &mut Transaction<'_, Sqlite>,
     principal: &Principal,
     (d, tag, version): (&Deployment, &ReleaseTag, &Version),
     nonce: [u8; 32],
-) -> Result<DeployIntent, Stop> {
+) -> Result<(DeployIntent, bool), Stop> {
     let store = state.store();
     let snapshot = store.request_snapshot(tx, (d.id(), d.host(), tag)).await?;
     let running_tag = snapshot.running.as_ref().and_then(|r| r.tag.as_ref());
@@ -125,14 +125,15 @@ async fn judge_request(
             .cancel_open_request(tx, (d.id(), None), &principal.audited(), &reason)
             .await?;
     }
-    Ok(DeployIntent {
+    let intent = DeployIntent {
         deployment: d.id().clone(),
         tag: tag.clone(),
         commit: commit.clone(),
         digest: digest.clone(),
         expected_running: running.digest.clone(),
         nonce,
-    })
+    };
+    Ok((intent, downgrade))
 }
 
 /// The handler.
@@ -197,12 +198,13 @@ pub(super) async fn ask(
     let mut tx = store.begin().await?;
     store.expire_requests(&mut tx, now).await?;
     match judge_request(&state, &mut tx, &principal, (d, tag, &version), nonce).await {
-        Ok(intent) => {
+        Ok((intent, is_rollback)) => {
             let request = NewRequest {
                 host: d.host(),
                 intent,
                 requested_by: principal.id(),
                 audited_by: principal.audited(),
+                is_rollback,
             };
             let stored = store.insert_request(&mut tx, &request).await?;
             tx.commit().await.map_err(StoreError::from)?;

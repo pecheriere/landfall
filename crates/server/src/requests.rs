@@ -56,7 +56,7 @@ use serde::Serialize;
 use serde_json::json;
 use sqlx::{Sqlite, Transaction};
 
-use crate::agent_api::{ApiProblem, ApiState, deadline, json as json_answer, read_body};
+use crate::agent_api::{ApiProblem, ApiState, deadline, json as json_answer, log, read_body};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
 use crate::store::{RequestSnapshot, RequestState, StoreError, StoredRequest, WatchedRunning};
@@ -250,11 +250,45 @@ fn request_number(raw: &str) -> Option<i64> {
     canonical.then(|| raw.parse().ok()).flatten()
 }
 
-/// The request a path names, as it is now.
-async fn named_request(state: &ApiState, raw: &str) -> Result<Option<StoredRequest>, StoreError> {
-    match request_number(raw) {
-        Some(id) => state.store().request(id).await,
-        None => Ok(None),
+/// The request a path names, as it is now. One nothing can read gets a clear refusal, in the
+/// audit log as `kind`, for who may know of it, and for anyone else reads as one that isn't
+/// there.
+async fn named_request(
+    state: &ApiState,
+    principal: &Principal,
+    raw: &str,
+    kind: EventKind,
+) -> Result<Option<StoredRequest>, HumanProblem> {
+    let Some(id) = request_number(raw) else {
+        return Ok(None);
+    };
+    let store = state.store();
+    match store.request(id).await {
+        Ok(found) => Ok(found),
+        Err(error @ StoreError::UnreadableRequest { .. }) => {
+            log(&format!("API: {error}"));
+            let config = state.config();
+            let seen = store.request_deployment(id).await?.and_then(|id| {
+                config
+                    .deployment(&id)
+                    .filter(|d| sees(config, principal, d.id()))
+            });
+            let problem = if seen.is_some() {
+                HumanProblem::RequestUnreadable
+            } else {
+                HumanProblem::NotFound
+            };
+            let subject = Subject {
+                kind,
+                deployment: seen,
+                about: Some(raw),
+                request: Some(id),
+                tag: None,
+            };
+            let why = "the request's record cannot be read";
+            Err(refuse_alone(state, principal, subject, problem, why).await)
+        }
+        Err(other) => Err(other.into()),
     }
 }
 

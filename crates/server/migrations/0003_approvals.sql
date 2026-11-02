@@ -43,7 +43,9 @@ CREATE INDEX sessions_by_expiry ON sessions (expires_at);
 --
 -- Nothing leaves the last four: asking again makes a new row with a new nonce.
 -- `expected_running` is NULL for a first deploy. `closed_reason` is the controller's own
--- text.
+-- text. `is_rollback` says it asked for a lower version than ran when it was made, which is
+-- what exempts it from promotion, then and when it is approved: what a host says later
+-- doesn't make a request one.
 CREATE TABLE deploy_requests (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     deployment       TEXT NOT NULL,
@@ -52,7 +54,8 @@ CREATE TABLE deploy_requests (
     commit_sha       TEXT NOT NULL,
     digest           TEXT NOT NULL,
     expected_running TEXT,
-    nonce            BLOB NOT NULL UNIQUE CHECK (length(nonce) = 32),
+    is_rollback      INTEGER NOT NULL CHECK (is_rollback IN (0, 1)),
+    nonce           BLOB NOT NULL UNIQUE CHECK (length(nonce) = 32),
     state            TEXT NOT NULL
         CHECK (state IN ('awaiting_approval', 'approved', 'stale', 'expired', 'cancelled')),
     requested_by     TEXT NOT NULL,

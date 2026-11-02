@@ -72,8 +72,9 @@ pub struct Limits {
     pub max_sources: usize,
     /// State changes one principal may ask for each second, sustained, on the human API, its
     /// tokens and its session apart. It is what a credential gone wrong can cost for as long
-    /// as it lasts: one write transaction a second beside the agents', and at a few hundred
-    /// bytes a row, some tens of MiB of audit log a day.
+    /// as it lasts: one write transaction a second beside the agents'. A hostile caller's
+    /// worst rows are one to two KiB, and superseding a request writes two a call, so that is
+    /// some 80 to 170 MB of audit log a day, for each credential, until it is revoked.
     pub principal_rate_per_second: u32,
     /// State changes one principal may ask for at once. A person signs a few approvals an
     /// hour, and a script asks for at most one release per deployment and then waits, as a
@@ -198,6 +199,14 @@ impl ApiState {
             // Counts, valid at every step.
             .unwrap_or_else(PoisonError::into_inner)
             .spend(principal, human, now)
+    }
+
+    /// Takes every count of dropped calls there is, to write down.
+    pub(crate) fn take_dropped(&self) -> Vec<(PrincipalId, bool, u64)> {
+        self.budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_dropped()
     }
 
     /// Puts back a count of dropped calls that couldn't be written down.

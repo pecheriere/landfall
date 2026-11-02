@@ -131,6 +131,15 @@ pub enum StoreError {
     /// edited the file, or the code and the data disagree.
     #[error("database row is not readable: {0}")]
     Corrupt(&'static str),
+    /// A deploy request holds a value the code cannot read. It names the row, for whoever
+    /// has to look at it.
+    #[error("deploy request {id} is not readable: {column}")]
+    UnreadableRequest {
+        /// Its number.
+        id: i64,
+        /// What can't be read of it.
+        column: &'static str,
+    },
     /// There is no API token with this id.
     #[error("there is no API token with this id")]
     UnknownToken,

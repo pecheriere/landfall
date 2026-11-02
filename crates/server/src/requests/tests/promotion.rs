@@ -118,6 +118,54 @@ async fn a_source_that_moved_on_after_the_whole_time_does_not_hold_it_back() {
 }
 
 #[tokio::test]
+async fn a_first_deploy_does_not_skip_the_look() {
+    let h = on_promotion().await;
+    h.reports(None).await;
+    h.verified(PROD, HOST, "v1.1.0", '1').await;
+    staging_healthy_for(&h, 3600).await;
+    let (id, intent) = opened(&h).await;
+    assert_eq!(intent.expected_running, None);
+    staging_says(&h, ("v1.1.0", '1'), true).await;
+    let answer = h
+        .approve(id, &h.session("alice").await, &h.keys.alice, &intent)
+        .await;
+    assert_eq!(answer.status, StatusCode::CONFLICT, "{answer:?}");
+    assert_eq!(answer.code(), "promotion_pending");
+    assert_eq!(h.count_deploys().await, 0);
+}
+
+#[tokio::test]
+async fn a_host_calling_what_it_runs_higher_does_not_make_a_request_a_rollback() {
+    let h = on_promotion().await;
+    h.ready().await;
+    staging_healthy_for(&h, 3600).await;
+    let (id, intent) = opened(&h).await;
+    staging_says(&h, ("v1.1.0", '1'), true).await;
+    // The same digest, so it isn't stale, under a tag that would make this one a downgrade.
+    h.reports(Some(("v9.0.0", '0'))).await;
+    let answer = h
+        .approve(id, &h.session("alice").await, &h.keys.alice, &intent)
+        .await;
+    assert_eq!(answer.status, StatusCode::CONFLICT, "{answer:?}");
+    assert_eq!(answer.code(), "promotion_pending");
+}
+
+#[tokio::test]
+async fn a_rollback_stays_one_whatever_the_host_calls_what_it_runs_later() {
+    let h = on_promotion().await;
+    h.reports(Some(("v1.1.0", '1'))).await;
+    h.verified(PROD, HOST, "v1.0.0", '0').await;
+    let answer = h.ask(&h.token("erin").await, "v1.0.0").await;
+    let (id, intent) = request_of(&answer.json());
+    // The same digest, under a tag that would make this one an upgrade.
+    h.reports(Some(("v0.9.0", '1'))).await;
+    let answer = h
+        .approve(id, &h.session("alice").await, &h.keys.alice, &intent)
+        .await;
+    assert_eq!(answer.status, StatusCode::OK, "{answer:?}");
+}
+
+#[tokio::test]
 async fn a_rollback_does_not_wait_for_promotion_to_be_approved_either() {
     let h = on_promotion().await;
     h.reports(Some(("v1.1.0", '1'))).await;

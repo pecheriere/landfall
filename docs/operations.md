@@ -487,7 +487,8 @@ Send a token as `Authorization: Bearer <token>`. No credentials, or a token that
 unknown or revoked, all get the same `401 unauthenticated`. With credentials and no grant at
 all on a deployment, the answer is the same `404 not_found` as for one that doesn't exist;
 with another grant on it, `403 forbidden`. Every refusal to someone who proved who they are
-is in the audit log (`request_refused`, `approval_refused`, `access_refused`).
+is in the audit log (`request_refused`, `approval_refused`, `cancel_refused`,
+`access_refused`), within the budget below.
 
 **To ask for a deploy,** a principal with `request` sends
 `POST /api/v1/deployments/{name}/{stage}/requests` with `{"tag": "v1.2.3"}`; a lower version
@@ -529,8 +530,28 @@ number.
 the audit log or crowd out the agents' writes: 120 at once, refilling at one a second, with a
 principal's tokens and its person's session counted apart. Reads don't count, and neither use
 comes near it in normal work. Over it, a call gets `429 rate_limited` with `Retry-After`, and
-writes nothing. The first call back within it writes an `access_throttled` audit row saying how
-many were `dropped`. That count is kept in memory, so a restart loses one not yet written.
+writes nothing. The count of those goes in an `access_throttled` audit row, with how many were
+`dropped`, at the next call within the budget or within one watcher interval, whichever is
+first, and when the controller stops. It names the principal and whether by token or session,
+and no particular token, since it can be another of the principal's that comes next: to find
+which, look at the rows around it. The count is kept in memory, so a crash loses one not yet
+written.
+
+The budget is what bounds a credential gone wrong, not a promise of a small log: one write
+transaction a second, with rows of one to two KiB from a hostile caller and two rows a call for
+a rollback that supersedes a request. That is **some 80 to 170 MB of audit log a day for each
+credential** until it is revoked. `access_throttled` and a jump in `request_refused`,
+`approval_refused` or `request_cancelled` rows are worth an alert.
+
+A state change with a session and a bad `Origin` spends that session's budget too. It is the
+fair price of bounding those `access_refused` rows, and the session's alone: not the principal's
+tokens', and it is back within minutes. It takes the person's cookie to do, which a browser
+doesn't send from another site, as the cookie is `SameSite=Strict`.
+
+**A request nothing can read** (`request_unreadable`, 500), from a hand-edited or damaged
+database, costs only itself. The controller's log names its row, it is left out of `GET
+/api/v1/approvals`, and it can't be approved or cancelled by id. It still ends by itself, and a
+rollback can still take its place, and reports from hosts are recorded whatever it holds.
 
 ## Running the agent
 

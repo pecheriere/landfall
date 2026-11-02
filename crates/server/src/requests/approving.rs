@@ -170,18 +170,13 @@ async fn judge_approval(
             "the deployment has a deploy queued or running",
         ));
     }
-    let running = ready_host(&snapshot)?;
+    ready_host(&snapshot)?;
     // Promotion is the controller's alone, so nothing after this would catch it. It stays
     // open when this refuses: the source's report may come back, or its time may yet run,
-    // and whether it never will isn't known here. Time or a cancel ends it if so.
-    let tags = d.origin().tags();
-    let downgrade = match (tags.parse_tag(&intent.tag), &running.tag) {
-        (Ok(version), Some(running)) => tags
-            .parse_tag(running)
-            .is_ok_and(|running| version < running),
-        _ => false,
-    };
-    if !downgrade
+    // and whether it never will isn't known here. Time or a cancel ends it if so. Whether
+    // this is a rollback was settled when it was asked for: a host calling what it runs
+    // something else now, on the same digest, doesn't change what was asked.
+    if !request.is_rollback
         && store
             .promotion_waits_for_on(tx, state.config(), d.id(), (&intent.tag, &intent.digest))
             .await?
@@ -227,7 +222,7 @@ pub(super) async fn approve(
     let config = state.config();
     let store = state.store();
     let raw = path.map_or_else(|_| String::new(), |Path(raw)| raw);
-    let stored = named_request(&state, &raw).await?;
+    let stored = named_request(&state, &principal, &raw, EventKind::ApprovalRefused).await?;
     let deployment = stored
         .as_ref()
         .and_then(|request| config.deployment(&request.intent.deployment));

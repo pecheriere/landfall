@@ -16,11 +16,11 @@ async fn a_tick_ends_a_request_past_its_time_with_its_audit_row() {
         "INSERT INTO releases (deployment, tag, decision, reason, seen_at)
          VALUES ('app/prod', 'v1.3.0', 'manual', 'why', 0)",
         "INSERT INTO deploy_requests
-             (deployment, host, tag, commit_sha, digest, nonce, state, requested_by, created_at,
-              expires_at)
+             (deployment, host, tag, commit_sha, digest, is_rollback, nonce, state, requested_by,
+              created_at, expires_at)
          VALUES ('app/prod', 'host-a', 'v1.3.0', '0000000000000000000000000000000000000000',
                  'sha256:0000000000000000000000000000000000000000000000000000000000000000',
-                 zeroblob(32), 'awaiting_approval', 'someone', 0, 1)",
+                 0, zeroblob(32), 'awaiting_approval', 'someone', 0, 1)",
     ] {
         sqlx::query(statement)
             .execute(h.store.pool())

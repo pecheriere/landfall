@@ -23,7 +23,9 @@ mod principal;
 mod problem;
 mod token;
 
-pub(crate) use self::budget::{Budget, Spent};
+#[cfg(test)]
+pub(crate) use self::budget::flush_dropped;
+pub(crate) use self::budget::{Budget, Spent, keep_flushing};
 pub(crate) use self::grants::{can, named_in_config, sees};
 pub(crate) use self::principal::Principal;
 #[cfg(test)]

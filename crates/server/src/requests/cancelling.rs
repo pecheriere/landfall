@@ -37,7 +37,7 @@ pub(super) async fn cancel(
     let config = state.config();
     let store = state.store();
     let raw = path.map_or_else(|_| String::new(), |Path(raw)| raw);
-    let stored = named_request(&state, &raw).await?;
+    let stored = named_request(&state, &principal, &raw, EventKind::CancelRefused).await?;
     let deployment = stored
         .as_ref()
         .and_then(|request| config.deployment(&request.intent.deployment));

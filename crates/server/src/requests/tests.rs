@@ -11,6 +11,7 @@ mod hostile;
 mod promotion;
 mod requesting;
 mod staleness;
+mod unreadable;
 
 use std::sync::Arc;
 
@@ -106,6 +107,11 @@ deployments = ["app/prod"]
 can = ["view"]
 
 [[grant]]
+principal = "frank"
+deployments = ["app/prod"]
+can = ["request", "rollback"]
+
+[[grant]]
 principal = "erin"
 deployments = ["app/prod"]
 can = ["rollback"]
@@ -192,6 +198,7 @@ pub(super) struct Harness {
     pub(super) keys: Keys,
     pub(super) config: Config,
     pub(super) limits: Limits,
+    pub(super) state: ApiState,
 }
 
 impl Harness {
@@ -208,7 +215,8 @@ impl Harness {
         let limits = Limits::default();
         let state = ApiState::new(store.clone(), config.clone(), limits);
         Self {
-            app: crate::router(state),
+            app: crate::router(state.clone()),
+            state,
             store,
             clock,
             keys,

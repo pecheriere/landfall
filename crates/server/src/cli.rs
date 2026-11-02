@@ -25,6 +25,7 @@ use tokio::sync::watch;
 use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
 use crate::audit::AuditReport;
+use crate::auth::keep_flushing;
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 use crate::watcher::{self, LiveSource, ReleaseSource};
@@ -369,6 +370,7 @@ async fn serve_watching<S: ReleaseSource>(
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
 
     let (stop_watcher, stop_watching) = watch::channel(false);
+    let stop_flushing = stop_watching.clone();
     let watching = tokio::spawn(watcher::run(
         store.clone(),
         watched,
@@ -380,6 +382,7 @@ async fn serve_watching<S: ReleaseSource>(
     let closing = store.clone();
     let state = ApiState::new(store, config, Limits::default());
     let app = crate::router(state.clone());
+    let flushing = tokio::spawn(keep_flushing(state.clone(), interval, stop_flushing));
     let shutdown = async move {
         tokio::select! {
             _ = terminate.recv() => {}
@@ -392,6 +395,7 @@ async fn serve_watching<S: ReleaseSource>(
     // Told to stop as the serving began to, it lets go at once. If the watcher
     // had already stopped, that was a panic and it was logged by the runtime.
     drop(watching.await);
+    drop(flushing.await);
     // So that the main file holds everything. A request still running past the
     // drain has its connection for a while yet, and stopping does not wait for that:
     // the next start reads what is left in the write-ahead log.

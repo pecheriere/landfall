@@ -40,6 +40,8 @@ pub(crate) enum HumanProblem {
     RequestClosed,
     /// The request was cancelled: ask again.
     RequestCancelled,
+    /// The request's own row can't be read.
+    RequestUnreadable,
     /// The assertion isn't one by this principal for this request's intent.
     AssertionRefused,
     /// The configuration has no `[approval]`.
@@ -126,6 +128,12 @@ impl HumanProblem {
                 conflict,
                 "request_cancelled",
                 "this request was cancelled; ask again for a new one",
+            ),
+            Self::RequestUnreadable => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request_unreadable",
+                "the controller cannot read this request; its log names the row, and it ends by \
+                 itself when its time is up",
             ),
             Self::AssertionRefused => (
                 StatusCode::FORBIDDEN,

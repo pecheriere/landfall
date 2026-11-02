@@ -12,15 +12,25 @@
 //! bounded by the configuration. The limits are in
 //! [`Limits`](crate::agent_api::Limits), with why they are what they are.
 //!
-//! Going over writes nothing. The count is kept here, and the next call within the budget
-//! writes it to the log first, so that nothing is lost in silence. It lives in memory: a
-//! restart loses a count not yet written, and gives every budget back.
+//! Going over writes nothing. The count is kept here, and whichever comes first writes it to
+//! the log: the next call within the budget, the flush each watcher interval, or stopping.
+//! So nothing is lost in silence, even if the spender goes quiet. It is the whole spender's
+//! and names no token, as another token of the principal may be the one to write it. It lives
+//! in memory: a crash loses a count not yet written, and a restart gives every budget back.
+//!
+//! Everything that isn't safe counts, a bad `Origin` too. That is the fair price of bounding
+//! those rows: someone able to send a person's cookie with a bad `Origin` can spend that
+//! person's budget, though not their token's or anyone else's, and it is back in minutes.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use landfall_core::ids::PrincipalId;
+use serde_json::json;
+use tokio::sync::watch;
 
-use crate::agent_api::RateLimiter;
+use crate::agent_api::{ApiState, RateLimiter, log};
+use crate::audit::{AuditEvent, EventKind};
 
 /// Whose budget.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -83,6 +93,58 @@ impl Budget {
         let dropped = self.dropped.entry(spender).or_insert(0);
         *dropped = dropped.saturating_add(count);
     }
+
+    /// Takes every count there is, to write down.
+    pub(crate) fn take_dropped(&mut self) -> Vec<(PrincipalId, bool, u64)> {
+        self.dropped
+            .drain()
+            .map(|(spender, count)| (spender.principal, spender.human, count))
+            .collect()
+    }
+}
+
+/// The audit row of a count.
+pub(crate) fn throttled_event(principal: &PrincipalId, human: bool, dropped: u64) -> AuditEvent {
+    let via = if human { "session" } else { "token" };
+    AuditEvent {
+        kind: EventKind::AccessThrottled,
+        deployment: None,
+        host: None,
+        detail: json!({ "by": { "principal": principal, "via": via }, "dropped": dropped }),
+    }
+}
+
+/// Writes down every count, and keeps any it can't for next time.
+pub(crate) async fn flush_dropped(state: &ApiState) {
+    for (principal, human, dropped) in state.take_dropped() {
+        let event = throttled_event(&principal, human, dropped);
+        if let Err(error) = state.store().record(&event).await {
+            log(&format!("API: writing down dropped calls: {error}"));
+            state.keep_dropped(&principal, human, dropped);
+        }
+    }
+}
+
+/// Writes down every count each `every`, and once more when `stop` says so.
+pub(crate) async fn keep_flushing(
+    state: ApiState,
+    every: Duration,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(every) => flush_dropped(&state).await,
+            () = until_stopped(&mut stop) => {
+                flush_dropped(&state).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Ends when `stop` says so, or when nobody is left to say it.
+async fn until_stopped(stop: &mut watch::Receiver<bool>) {
+    drop(stop.wait_for(|stop| *stop).await);
 }
 
 #[cfg(test)]

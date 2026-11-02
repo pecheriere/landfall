@@ -3,6 +3,7 @@
 use axum::http::{Method, StatusCode, header};
 
 use super::{Harness, PROD_REQUESTS};
+use crate::auth::{flush_dropped, keep_flushing};
 
 /// How many of `count` calls refused for want of a grant got which answer.
 async fn refused_calls(h: &Harness, name: &str, count: usize) -> (usize, usize) {
@@ -48,6 +49,90 @@ async fn a_thousand_refused_calls_leave_a_bounded_log_and_a_count_of_the_rest() 
     refused_calls(&h, "otto", 1).await;
     assert_eq!(h.audited("access_throttled").await.len(), 1);
     assert_eq!(h.store.verify_audit().await.unwrap().first_bad, None);
+}
+
+#[tokio::test]
+async fn the_budget_refills_at_one_a_second() {
+    let h = Harness::new().await;
+    assert_eq!(h.limits.principal_rate_per_second, 1);
+    let burst = usize::try_from(h.limits.principal_burst).unwrap();
+    assert_eq!(refused_calls(&h, "otto", burst + 1).await, (burst, 1));
+    h.clock.advance(1);
+    assert_eq!(refused_calls(&h, "otto", 2).await, (1, 1));
+    h.clock.advance(3);
+    assert_eq!(refused_calls(&h, "otto", 4).await, (3, 1));
+}
+
+#[tokio::test]
+async fn the_count_names_no_token_as_it_is_the_whole_principals() {
+    let h = Harness::new().await;
+    let burst = usize::try_from(h.limits.principal_burst).unwrap();
+    refused_calls(&h, "otto", burst + 5).await;
+    h.clock.advance(10);
+    // Another of otto's tokens, which did nothing to earn this.
+    refused_calls(&h, "otto", 1).await;
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dropped"], 5);
+    assert_eq!(
+        rows[0]["by"],
+        serde_json::json!({ "principal": "otto", "via": "token" })
+    );
+}
+
+#[tokio::test]
+async fn a_count_is_written_if_the_spender_goes_quiet() {
+    let h = Harness::new().await;
+    let burst = usize::try_from(h.limits.principal_burst).unwrap();
+    refused_calls(&h, "otto", burst + 5).await;
+    flush_dropped(&h.state).await;
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dropped"], 5);
+    // Once: neither the next flush nor the next call says it again.
+    flush_dropped(&h.state).await;
+    h.clock.advance(10);
+    refused_calls(&h, "otto", 1).await;
+    assert_eq!(h.audited("access_throttled").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_count_that_cannot_be_written_waits_for_the_next_flush() {
+    let h = Harness::new().await;
+    let burst = usize::try_from(h.limits.principal_burst).unwrap();
+    refused_calls(&h, "otto", burst + 5).await;
+    let refuse_it = "CREATE TRIGGER no_throttled BEFORE INSERT ON audit_events
+                     WHEN NEW.kind = 'access_throttled'
+                     BEGIN SELECT RAISE(ABORT, 'not now'); END";
+    sqlx::query(refuse_it)
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    flush_dropped(&h.state).await;
+    sqlx::query("DROP TRIGGER no_throttled")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    flush_dropped(&h.state).await;
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["dropped"], 5);
+}
+
+#[tokio::test]
+async fn stopping_writes_what_is_left() {
+    let h = Harness::new().await;
+    let burst = usize::try_from(h.limits.principal_burst).unwrap();
+    refused_calls(&h, "otto", burst + 5).await;
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let flushing = tokio::spawn(keep_flushing(
+        h.state.clone(),
+        std::time::Duration::from_hours(1),
+        stopped,
+    ));
+    stop.send_replace(true);
+    flushing.await.unwrap();
+    assert_eq!(h.audited("access_throttled").await[0]["dropped"], 5);
 }
 
 #[tokio::test]

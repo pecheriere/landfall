@@ -13,7 +13,7 @@ use landfall_core::config::Config;
 use landfall_core::ids::PrincipalId;
 use serde_json::{Value, json};
 
-use super::budget::Spent;
+use super::budget::{Spent, throttled_event};
 use super::grants::named_in_config;
 use super::problem::HumanProblem;
 use super::token::{ApiToken, SessionToken};
@@ -72,12 +72,7 @@ impl Principal {
             }
             Spent::Within { dropped: 0 } => Ok(()),
             Spent::Within { dropped } => {
-                let event = AuditEvent {
-                    kind: EventKind::AccessThrottled,
-                    deployment: None,
-                    host: None,
-                    detail: json!({ "by": self.audited(), "dropped": dropped }),
-                };
+                let event = throttled_event(&self.id, human, dropped);
                 if let Err(error) = store.record(&event).await {
                     state.keep_dropped(&self.id, human, dropped);
                     return Err(error.into());
