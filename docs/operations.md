@@ -560,7 +560,9 @@ What isn't so is answered in one of two ways, and nothing runs either way:
   failed, or the release is on this host's record of failures. It is journalled as
   `controller_work_refused`, and the controller doesn't ask again. For a request the rule,
   an approval or verification refuses that is priority 2, critical: **treat it as an
-  alert**, since an honest controller decides by the same rule and doesn't ask.
+  alert**, since an honest controller decides by the same rule and doesn't ask. There is one
+  honest way to get there, a crash just as an approval was spent: see
+  [telling a crash from a replay](#telling-a-crash-from-a-replay).
 - **`deferred`, not now:** an unfinished deploy, drift, state or evidence that can't be
   read, a clock behind the release, or a wait for verification that has reached its bound.
   All of these pass. It is journalled as `controller_work_deferred`, at priority 3, error,
@@ -605,37 +607,79 @@ row 64, where two different origins can read the same.
   decoded.
 - Its nonce isn't in the [nonce log](#the-nonce-log).
 
-An approval attached to a deploy the rule makes automatic is ignored, garbled or not, and
-isn't spent. One never overrides the version already running or a pre-release.
+An approval attached to a deploy the rule makes automatic is ignored and isn't spent, even
+if its assertion is garbled: the assertion's fields are only read when the approval is. Its
+`intent` is another matter. It is parsed with the rest of the work, so an intent that doesn't
+parse, a bad nonce say, fails the whole answer, whatever the rule says of the deploy. The
+host reads that as `controller_unavailable` at priority 4, warning, and retries with its
+backoff, and nothing runs. An approval never overrides the version already running or a
+pre-release.
 
 **An approval works once, whichever way the deploy ends.** It is spent after everything
 above has passed, and before the deploy touches a file or Docker. A deploy that then fails
 or is interrupted has used it, and a crash between the two leaves it spent with the service
-as it was: the controller delivers the work again, the host refuses it as already used, and
-it takes a new approval. Refused or deferred on the way there, an approval is not spent, so
-someone without the passkey can't use it up by asking wrongly.
+as it was: the controller delivers the work again, the host refuses it as already spent, and
+it takes a new approval.
+
+**Refused or deferred on the way there, an approval is not spent,** so someone without the
+passkey can't use it up by asking wrongly. There are two exceptions, both at the moment of
+spending, and both fail safe, since nothing runs: writing the nonce running past its
+60-second deadline on a hung disk, which defers, and an error from syncing it to disk, which
+refuses. The nonce may be on disk or not after either. If it is, the approval is spent, and
+it takes a new one.
+
+**An approval has no expiry, as the host has no clock it trusts.** One that was never spent,
+held back by a controller say, stays good indefinitely. It works if it is delivered later,
+as long as what it names as running is running then, and that includes a digest that has
+gone and come back. What it can install is still only the one release it names, verified here.
+
+#### Telling a crash from a replay
+
+Both are refused with `was already spent on this host, either by a replay or by a crash before
+that deploy started`, and name the nonce. The refusal itself changed nothing on the service.
+The host can't tell them apart, and you can, from its journal, by searching for that nonce:
+
+- The journal says `approval_about_to_be_spent` for a nonce just before it is spent, naming
+  the approver, the deployment and the release.
+- **A crash:** after that line, this tag has no `deploy_step` lines and the agent restarted.
+  Honest: the controller redelivered work the host had claimed. Ask for a new approval.
+- **A replay:** after that line, the tag has `deploy_step` lines and a `deploy_finished`: the
+  approval did its work, and has been sent again. A controller doing that on a later number
+  is an alert. It gets nothing from it, as the approval is spent.
+- **No such line at all, for a nonce in the log:** the log was changed by something other
+  than the agent, or the journal has lost it. Treat it as an alert.
 
 ### The nonce log
 
 `approval-nonces.log` in the state directory has one line per spent nonce, 64 lowercase
 hex digits and a newline, for the whole host. A line is appended and synced to disk before
 the deploy starts. Only an approval that has verified is written, so what grows it takes a
-person with a passkey, and it is refused at 65,000,000 bytes, a million approvals.
+person with a passkey. It is full at 65,000,000 bytes, a million approvals.
 
-**A log that can't be trusted refuses every approval, and automatic deploys go on.** That is
-one that is torn, holds anything but those lines, is past its bound, is a symlink or anything
-else but a regular file, belongs to another user, or is writable by group or others. The
-journal says `nonce_log_unusable` at priority 2 when the agent starts and at each approval
-refused for it, naming the file. Nothing repairs it for you:
+**A log that can't be used refuses every approval, and automatic deploys go on.** That is one
+that is torn, holds anything but those lines, is full, is a symlink or anything else but a
+regular file, belongs to another user, or is writable by group or others. The journal says
+`nonce_log_unusable` at priority 2 when the agent starts and at each approval refused for it,
+naming the file, and its `error` says which. Nothing repairs it for you:
 
 - **A torn last line** is what a crash in the middle of an append leaves, and the file's
   size isn't a multiple of 65 bytes. The deploy it was for never started. Remove only that
-  partial last line, and leave the whole lines alone.
-- **Anything else** means something other than the agent has written there. Find out what,
-  and restore the file from a backup if you have one.
+  partial last line, and leave the whole lines alone. A write that merely fails, on a full
+  disk say, takes its partial line back by itself; this is only for when that failed too.
+- **Full** is a log doing its job for a long time, not damage. To go on, move the oldest
+  lines to an archive, keeping them. See below for what that gives up. Keep the mode 0600,
+  and stop the agent while you do it, so that nothing appends to the file in between.
+- **A wrong owner or mode, or a symlink or other file in its place:** put right what it is.
+  Nothing written by the agent gets to be any of these, so find out what did it.
+- **Any other line that isn't a nonce** means something other than the agent has written
+  there. Find out what, and restore the file from a backup if you have one.
 
-Every line removed is an approval that could be replayed, as long as the digest it names as
-running is running again. Removing the whole file forgets them all. The agent reads the file
+**Taking a line out of the log reopens replay for that nonce.** The agent doesn't read an
+archive. What still bounds it: the approval has to have been kept by someone, and it only
+works while the digest it names as running is the one on record, so it can only ever take the
+deployment from that same running digest to the one signed release it names. The oldest
+lines name digests that are the least likely to be running again, which is why those are the
+ones to move. Removing the whole file forgets every approval this way. The agent reads the file
 afresh for each approval, so none of this needs a restart.
 
 ### A release that rolled back isn't retried

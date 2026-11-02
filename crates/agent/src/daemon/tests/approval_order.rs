@@ -14,12 +14,13 @@ use super::approvals::{
     Keys, OTHER_DIGEST, asked, assert_deployed, bare_keyed, carrying, intent, keyed, signed, spent,
 };
 use super::{
-    FakeVerifier, NEW_DIGEST, OLD_DIGEST, PATCH_RULE, assert_deferred, assert_refused, claim,
-    container, deployed_at, id, marker, state_of, touched,
+    COMMIT, FakeVerifier, NEW_DIGEST, OLD_DIGEST, PATCH_RULE, assert_deferred, assert_refused,
+    claim, container, deployed_at, id, marker, origin, state_of, touched, when_the_engine_starts,
 };
 use crate::compose::OVERRIDE_FILE;
+use crate::deploy::{self, DeployError, DeployPlan};
 use crate::journal::{Priority, capture};
-use crate::state::{DeployLock, Deployed, FailedRelease, NonceSpend, Phase, StateDir};
+use crate::state::{DeployLock, Deployed, FailedRelease, NonceSpend, Phase, StateDir, StateError};
 use crate::testing::Call;
 
 fn approved_minor(keys: &Keys, number: u64) -> DeployWork {
@@ -64,6 +65,58 @@ async fn the_nonce_is_on_disk_before_anything_changes_and_the_lock_is_held_from_
     );
 }
 
+/// With the lock let go anywhere between the spending and the engine, and the engine taking
+/// its own, everything else about a deploy looks the same.
+#[tokio::test]
+async fn the_lock_the_nonce_was_spent_under_is_the_one_the_engine_starts_with() {
+    let (f, keys) = keyed(PATCH_RULE);
+    let (log, state) = (StateDir::open(&f.state_dir).unwrap(), state_of(&f));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let copy = Arc::clone(&seen);
+    when_the_engine_starts(move || {
+        copy.lock().unwrap().push((
+            log.nonce_used(&[1; 32]).unwrap(),
+            matches!(state.lock(), Err(StateError::Busy(_))),
+        ));
+    });
+
+    let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
+
+    assert_deployed(&outcome);
+    assert_eq!(*seen.lock().unwrap(), [(true, true)]);
+}
+
+#[tokio::test]
+async fn a_deploy_handed_another_lock_never_starts() {
+    let (f, _keys) = keyed(PATCH_RULE);
+    let root = StateDir::open(&f.state_dir).unwrap();
+    let deployment = f.config.deployment(&id()).unwrap();
+    let plan = DeployPlan::from_verified(
+        deployment,
+        &"v1.2.4".parse().unwrap(),
+        semver::Version::new(1, 2, 4),
+        &origin(NEW_DIGEST, COMMIT),
+    );
+    let other = root.deployment(&"app/stage".parse().unwrap()).unwrap();
+    for lock in [other.lock().unwrap(), root.lock_daemon().unwrap()] {
+        let result = deploy::run_holding(
+            &f.docker,
+            &state_of(&f),
+            deployment,
+            &f.compose,
+            &plan,
+            &f.options.engine,
+            Some(lock),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DeployError::WrongLock(_))),
+            "{result:?}"
+        );
+    }
+    assert_eq!(f.docker.calls(), []);
+}
+
 #[tokio::test]
 async fn a_nonce_that_cannot_be_recorded_changes_nothing() {
     let (mut f, keys) = bare_keyed(PATCH_RULE);
@@ -78,6 +131,7 @@ async fn a_nonce_that_cannot_be_recorded_changes_nothing() {
         fs::write(&during, "torn").unwrap();
     }));
     let seen = capture::events("nonce_log_unusable").len();
+    let spending = capture::events("approval_about_to_be_spent").len();
     let approval = signed(&keys.operator, &intent("v1.2.3", None, 1));
 
     let (reason, priority) = assert_refused(&f, &verifier, carrying(7, approval)).await;
@@ -85,6 +139,11 @@ async fn a_nonce_that_cannot_be_recorded_changes_nothing() {
     assert!(reason.contains("nonce log"), "{reason}");
     assert_eq!(priority, Priority::Critical);
     assert_eq!(capture::events("nonce_log_unusable").len(), seen + 1);
+    // The journal went first: nothing got onto the disk, and it has said so already.
+    assert_eq!(
+        capture::events("approval_about_to_be_spent").len(),
+        spending + 1
+    );
     assert!(!f.compose.join(OVERRIDE_FILE).exists(), "no file changed");
     assert_eq!(
         f.docker.count(|c| matches!(c, Call::ComposeService { .. })),

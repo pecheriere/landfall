@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use landfall_core::protocol::{DeployId, DeployReportBody, MAX_BODY_BYTES, Phase, ReportedOutcome};
 
+use super::super::outbox::{FailureEvidence, failure_evidence};
 use super::super::running::work_request;
 use super::super::{Backoff, Pacing, StepOutcome};
 use super::{
@@ -232,6 +233,50 @@ async fn a_report_found_after_a_crash_goes_on_the_record() {
             digest: taken.digest,
         }]
     );
+}
+
+#[test]
+fn a_failed_report_counts_unless_a_later_one_says_it_deployed() {
+    let at = |seconds| jiff::Timestamp::from_second(seconds).unwrap();
+    for (failed, deployed, stands) in [
+        // Equal stamps can't say which came first, so the failure stands.
+        (100, 100, true),
+        (101, 100, true),
+        (100, 101, false),
+    ] {
+        let f = fixture(PATCH_RULE);
+        let state = state_of(&f);
+        let report = |outcome, started_at| deploy::DeployReport {
+            deployment: id(),
+            tag: "v1.2.4".parse().unwrap(),
+            digest: NEW_DIGEST.parse().unwrap(),
+            outcome,
+            steps: Vec::new(),
+            started_at,
+            finished_at: started_at,
+        };
+        let rolled_back = deploy::Outcome::RolledBack {
+            reason: "check failed".to_owned(),
+        };
+        state
+            .write_report("failed", &report(rolled_back, at(failed)))
+            .unwrap();
+        state
+            .write_report("deployed", &report(deploy::Outcome::Deployed, at(deployed)))
+            .unwrap();
+
+        let evidence = failure_evidence(
+            &state,
+            &"v1.2.4".parse().unwrap(),
+            &NEW_DIGEST.parse().unwrap(),
+        );
+
+        assert_eq!(
+            matches!(evidence, FailureEvidence::Failed),
+            stands,
+            "failed at {failed}, deployed at {deployed}"
+        );
+    }
 }
 
 #[tokio::test]

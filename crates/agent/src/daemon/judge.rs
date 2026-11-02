@@ -34,8 +34,8 @@ pub(super) struct Ready<'a> {
     pub(super) plan: Box<DeployPlan>,
     pub(super) deployment: &'a Deployment,
     pub(super) dir: &'a Path,
-    /// The deployment's lock, held since an approval was spent. `None` for an automatic
-    /// deploy, whose engine takes the lock itself.
+    /// The deployment's lock, held since an approval was spent. `None` for a deploy that
+    /// took no approval, whose engine takes the lock itself.
     pub(super) lock: Option<DeployLock>,
 }
 

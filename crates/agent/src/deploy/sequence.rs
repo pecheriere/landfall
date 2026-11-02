@@ -51,11 +51,11 @@ pub async fn run<D: Docker>(
 
 /// [`run`], going on with the deployment's lock if the caller holds it already: what the
 /// caller checked under it is then still so when this starts, and nothing can come
-/// between. It must be `state`'s lock.
+/// between.
 ///
 /// # Errors
 ///
-/// As [`run`].
+/// As [`run`], and [`DeployError::WrongLock`] if `lock` isn't `state`'s.
 pub async fn run_holding<D: Docker>(
     docker: &D,
     state: &DeploymentState,
@@ -73,7 +73,8 @@ pub async fn run_holding<D: Docker>(
             });
         }
         let lock = match lock {
-            Some(lock) => Arc::new(lock),
+            Some(lock) if state.is_locked_by(&lock) => Arc::new(lock),
+            Some(_) => return Err(DeployError::WrongLock(deployment.id().clone())),
             None => take_lock(state, deployment.id()).await?,
         };
         let engine = Engine {

@@ -239,9 +239,12 @@ pub(super) enum FailureEvidence {
 /// Goes by the daemon's own record first, which holds what the outcome said
 /// whatever became of the report, and by the engine's reports second, which also
 /// know of a `recover` the daemon didn't see. Of those, a failure counts unless the
-/// release has deployed since, as an approved retry does: their times are all there is to
-/// go by, and a tie or a clock gone back leaves the failure standing. A controller has
-/// no say in either. A report that can't be read could be of this very release.
+/// release has deployed since, as an approved retry does. Their times are all there is to
+/// go by, and a tie leaves the failure standing. A clock gone back between a success and a
+/// later failure makes the failure look older, so these reports say the release is clean.
+/// The record still says otherwise: it takes that clock and a lost `failed-releases.json`
+/// together for the failure to be forgotten, and a controller can cause neither. A report
+/// that can't be read could be of this very release.
 pub(super) fn failure_evidence(
     state: &DeploymentState,
     tag: &ReleaseTag,

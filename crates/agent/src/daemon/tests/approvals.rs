@@ -193,7 +193,7 @@ async fn first_deploy_with_an_approval_runs() {
     assert_eq!(deployed.tag.as_ref(), "v1.2.3");
     assert_eq!(deployed.digest.as_ref(), NEW_DIGEST);
     assert!(spent(&f, 1));
-    let events = capture::events("approval_accepted");
+    let events = capture::events("approval_about_to_be_spent");
     let (_, event) = events.last().unwrap();
     assert_eq!(event["approver"], "operator", "whose approval it was");
 }
@@ -568,6 +568,9 @@ async fn crash_after_recording_the_nonce_spends_the_approval() {
     // The future is gone, as the process would be. Docker answers the next one.
     f.docker.hang_when(|_| false);
     assert!(spent(&f, 1), "the approval is spent");
+    let events = capture::events("approval_about_to_be_spent");
+    let (_, line) = events.last().expect("the journal has a line for the crash");
+    assert_eq!(line["nonce"], hex::encode([1_u8; 32]));
     assert_eq!(
         f.docker.count(|c| matches!(
             c,

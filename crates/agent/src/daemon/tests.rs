@@ -1,6 +1,7 @@
 //! The daemon against a fake controller, a fake verifier and a fake Docker. A
 //! compromised controller is the case these are mostly about: see [`refusals`].
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,24 @@ mod failure_evidence;
 mod lifecycle;
 mod refusals;
 mod reports;
+
+thread_local! {
+    static AT_ENGINE_START: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Runs what the test on this thread gave [`when_the_engine_starts`]. The daemon calls this
+/// just before it hands over to the engine.
+pub(super) fn at_engine_start() {
+    AT_ENGINE_START.with_borrow(|hook| {
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+}
+
+fn when_the_engine_starts(hook: impl Fn() + 'static) {
+    AT_ENGINE_START.set(Some(Box::new(hook)));
+}
 
 const ID: &str = "app/prod";
 const OLD_DIGEST: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";

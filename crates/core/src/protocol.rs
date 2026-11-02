@@ -12,8 +12,9 @@
 //! The path is signed exactly as sent, so when the request has a query
 //! string it is part of what is signed: `/p?a=1` does not verify against `/p`.
 //!
-//! This is a wire contract between controller and agent: [`signing_bytes`]
-//! and the JSON shapes never change without bumping the domain tag.
+//! This is a wire contract between controller and agent. From the first release on,
+//! [`signing_bytes`] and the JSON shapes don't change without bumping the domain tag. Nothing
+//! is released yet, so until then they may change under `landfall-agent-v1`.
 //!
 //! Everything an agent or a controller sends is hostile to the other side:
 //! free text in these types ([`HeldBack::reason`], [`ReportedOutcome`]'s

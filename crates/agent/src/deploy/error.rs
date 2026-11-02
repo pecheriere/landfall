@@ -54,6 +54,9 @@ pub enum DeployError {
     /// Another process holds the deployment's lock.
     #[error("deployment {0} is busy: another agent process holds its lock")]
     Busy(DeploymentId),
+    /// The lock handed to the deploy is not this deployment's, so it protects nothing.
+    #[error("deployment {0}: the lock handed to this deploy is not this deployment's")]
+    WrongLock(DeploymentId),
     /// An earlier deploy did not finish.
     #[error(
         "deployment {deployment}: the deploy of {tag} did not finish; run `landfall-agent recover --deployment {deployment}`"

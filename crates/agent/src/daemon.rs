@@ -213,8 +213,8 @@ async fn heartbeats<D: Docker, C: Controller>(
     }
 }
 
-/// A work item the host has said yes to.
-struct Approved<'a> {
+/// A work item the host has said yes to, on its rule or on an approval.
+struct Accepted<'a> {
     work: &'a DeployWork,
     plan: &'a DeployPlan,
     deployment: &'a Deployment,
@@ -224,13 +224,13 @@ struct Approved<'a> {
 }
 
 /// The claim, the engine beside its heartbeats, and the report.
-async fn deploy_approved<D: Docker, C: Controller>(
+async fn run_deploy<D: Docker, C: Controller>(
     docker: &D,
     controller: &C,
     config: &Config,
     state_dir: &Path,
     options: &DaemonOptions,
-    approved: Approved<'_>,
+    accepted: Accepted<'_>,
 ) -> StepOutcome {
     #[derive(Serialize)]
     struct LeftBlocked<'a> {
@@ -239,13 +239,13 @@ async fn deploy_approved<D: Docker, C: Controller>(
         deploy_id: DeployId,
         error: String,
     }
-    let Approved {
+    let Accepted {
         work,
         plan,
         deployment,
         dir,
         lock,
-    } = approved;
+    } = accepted;
     let id = deployment.id();
     let (root, owned, deploy_id, tag, digest) = (
         state_dir.to_owned(),
@@ -269,6 +269,8 @@ async fn deploy_approved<D: Docker, C: Controller>(
         Ok(state) => state,
         Err(error) => return StepOutcome::Failed { error },
     };
+    #[cfg(test)]
+    tests::at_engine_start();
     let result = tokio::select! {
         biased;
         result = Box::pin(deploy::run_holding(docker, &state, deployment, dir, plan, &options.engine, lock)) => result,
@@ -568,15 +570,15 @@ pub async fn step<D: Docker, C: Controller, V: Verifier>(
             dir,
             lock,
         }) => {
-            let approved = Approved {
+            let accepted = Accepted {
                 work: &work,
                 plan: &plan,
                 deployment,
                 dir,
                 lock,
             };
-            Box::pin(deploy_approved(
-                docker, controller, config, state_dir, options, approved,
+            Box::pin(run_deploy(
+                docker, controller, config, state_dir, options, accepted,
             ))
             .await
         }

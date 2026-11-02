@@ -19,7 +19,9 @@
 //!    is held when step 3 comes, nothing is spent, and the work waits.
 //!
 //! From step 3 on the approval is spent whatever comes next, a crash included: it works
-//! once, whichever way the deploy ends.
+//! once, whichever way the deploy ends. The journal says so just before the append, so a
+//! crash right after it leaves a line for that nonce, and a later refusal of it can be
+//! told from a replay of something that ran.
 
 use std::path::Path;
 
@@ -42,15 +44,18 @@ const SHOWN_CREDENTIAL_ID: usize = 128;
 /// How to get a log that can't be used going again, which only the operator can do.
 const CLEAR: &str = "see \"The nonce log\" in docs/operations.md; approvals stay refused until it is put right, and automatic deploys go on";
 
-/// How a deploy the host has said yes to may start.
+/// What an approval has to do with this work item.
 pub(super) enum Gate {
-    /// By itself. No approval is looked at.
-    Automatic,
-    /// On this approval, which has been verified and not yet spent.
+    /// Nothing: none is looked at. Either the rule makes this automatic and it isn't on the
+    /// record of failures, or it is on that record and no approval came with it, which
+    /// [`judge`](super::judge) refuses next, going by that record.
+    NoApproval,
+    /// It goes on this approval, which has been verified and not yet spent.
     Approved(Box<Cleared>),
 }
 
 /// An approval that passed everything [`gate`] checks.
+#[derive(Clone)]
 pub(super) struct Cleared {
     intent: DeployIntent,
     approver: PrincipalId,
@@ -88,8 +93,8 @@ pub(super) async fn gate(
         running,
     } = asked;
     let approval = match (&not_auto, &work.approval) {
-        (None, _) if !on_failure_record => return Ok(Gate::Automatic),
-        (None, None) => return Ok(Gate::Automatic),
+        (None, _) if !on_failure_record => return Ok(Gate::NoApproval),
+        (None, None) => return Ok(Gate::NoApproval),
         (Some(why), None) => {
             return Err(refuse(
                 Priority::Critical,
@@ -122,7 +127,7 @@ fn replayed(id: &DeploymentId, nonce: &[u8; 32]) -> Stop {
     refuse(
         Priority::Critical,
         format!(
-            "approval refused: {id}: nonce {} was already used on this host, and an approval works once; it takes a new one",
+            "approval refused: {id}: nonce {} was already spent on this host, either by a replay or by a crash before that deploy started; this delivery changed nothing on the service, and it takes a new approval",
             hex::encode(nonce),
         ),
     )
@@ -268,40 +273,30 @@ pub(super) fn journal_nonce_log(root: &StateDir) {
     }
 }
 
-/// What came of trying to spend an approval.
-enum Spending {
-    Spent(DeployLock),
-    Stopped(Stop),
-    /// The log wouldn't have it, or wouldn't say: to go in the journal back on the daemon's
-    /// own thread, with the rest of the answer.
-    LogUnusable(StateError),
-}
-
-/// The last look, under the lock the engine goes on to hold, and the spending of the nonce.
-fn spend(
+/// The last look, under the lock the engine goes on to hold.
+fn last_look(
     state_dir: &Path,
     work: &DeployWork,
     rule: &Rule,
     cleared: &Cleared,
-) -> Result<Spending, StateError> {
-    let root = StateDir::open(state_dir)?;
-    let state = root.deployment(&work.deployment)?;
+) -> Result<Result<DeployLock, Stop>, StateError> {
+    let state = StateDir::open(state_dir)?.deployment(&work.deployment)?;
     let lock = match state.lock() {
         Ok(lock) => lock,
         Err(error @ StateError::Busy(_)) => {
-            return Ok(Spending::Stopped(Stop::Wait {
+            return Ok(Err(Stop::Wait {
                 reason: error.to_string(),
             }));
         }
         Err(error) => return Err(error),
     };
     if let Some(stop) = held_up(work, state.in_progress()?.as_ref(), state.claim()?.as_ref()) {
-        return Ok(Spending::Stopped(stop));
+        return Ok(Err(stop));
     }
     let deployed = state.deployed()?;
     let running = deployed.as_ref().map(|deployed| &deployed.digest);
     if let Some(why) = differs_from_record(&cleared.intent, running) {
-        return Ok(Spending::Stopped(refuse(
+        return Ok(Err(refuse(
             Priority::Critical,
             format!("approval refused: {why}"),
         )));
@@ -311,20 +306,16 @@ fn spend(
     if let (Decision::Refused(_), Some(why)) =
         (decision, not_auto(decision, version, &cleared.version))
     {
-        return Ok(Spending::Stopped(refuse(Priority::Critical, why)));
+        return Ok(Err(refuse(Priority::Critical, why)));
     }
-    Ok(match root.spend_nonce(&cleared.intent.nonce) {
-        Ok(NonceSpend::Recorded) => Spending::Spent(lock),
-        Ok(NonceSpend::AlreadyUsed) => {
-            Spending::Stopped(replayed(&work.deployment, &cleared.intent.nonce))
-        }
-        Err(error) => Spending::LogUnusable(error),
-    })
+    Ok(Ok(lock))
 }
 
-fn journal_accepted(cleared: &Cleared) {
+/// Comes before the append, so that an approval spent by a crash has a line in the journal
+/// saying whose it was and what it was for.
+fn journal_spending(cleared: &Cleared) {
     #[derive(Serialize)]
-    struct Accepted<'a> {
+    struct Spending<'a> {
         event: &'static str,
         deployment: &'a DeploymentId,
         tag: &'a ReleaseTag,
@@ -336,8 +327,8 @@ fn journal_accepted(cleared: &Cleared) {
     let intent = &cleared.intent;
     journal::emit(
         Priority::Info,
-        &Accepted {
-            event: "approval_accepted",
+        &Spending {
+            event: "approval_about_to_be_spent",
             deployment: &intent.deployment,
             tag: &intent.tag,
             digest: &intent.digest,
@@ -346,6 +337,41 @@ fn journal_accepted(cleared: &Cleared) {
             nonce: hex::encode(intent.nonce),
         },
     );
+}
+
+/// The last look under the lock, the line in the journal, and the nonce on disk.
+async fn spend(
+    cleared: &Cleared,
+    deployment: &Deployment,
+    state_dir: &Path,
+    work: &DeployWork,
+) -> Result<DeployLock, Stop> {
+    let (root, asked, rule, copy) = (
+        state_dir.to_owned(),
+        work.clone(),
+        deployment.rule().clone(),
+        cleared.clone(),
+    );
+    let looked = on_thread("take the last look at the approval", move || {
+        last_look(&root, &asked, &rule, &copy)
+    })
+    .await;
+    let lock = match looked {
+        Ok(lock) => lock?,
+        Err(error) => return Err(defer(Priority::Error, error)),
+    };
+    journal_spending(cleared);
+    let (root, nonce) = (state_dir.to_owned(), cleared.intent.nonce);
+    let spent = on_thread("spend the approval", move || {
+        Ok((StateDir::open(&root)?.spend_nonce(&nonce), lock))
+    })
+    .await;
+    match spent {
+        Ok((Ok(NonceSpend::Recorded), lock)) => Ok(lock),
+        Ok((Ok(NonceSpend::AlreadyUsed), _)) => Err(replayed(&work.deployment, &nonce)),
+        Ok((Err(error), _)) => Err(unusable_log(&error, state_dir)),
+        Err(error) => Err(defer(Priority::Error, error)),
+    }
 }
 
 /// The point of no return for a deploy on an approval. See the module's docs.
@@ -361,30 +387,8 @@ pub(super) async fn commit<'a>(
         gate,
     } = go;
     let lock = match gate {
-        Gate::Automatic => None,
-        Gate::Approved(cleared) => {
-            let (root, asked, rule) = (
-                state_dir.to_owned(),
-                work.clone(),
-                deployment.rule().clone(),
-            );
-            let spending = on_thread("spend the approval", move || {
-                let spending = spend(&root, &asked, &rule, &cleared)?;
-                Ok((spending, cleared))
-            })
-            .await;
-            match spending {
-                Ok((Spending::Spent(lock), cleared)) => {
-                    journal_accepted(&cleared);
-                    Some(lock)
-                }
-                Ok((Spending::Stopped(stop), _)) => return Err(stop),
-                Ok((Spending::LogUnusable(error), _)) => {
-                    return Err(unusable_log(&error, state_dir));
-                }
-                Err(error) => return Err(defer(Priority::Error, error)),
-            }
-        }
+        Gate::NoApproval => None,
+        Gate::Approved(cleared) => Some(spend(&cleared, deployment, state_dir, work).await?),
     };
     Ok(Ready {
         plan,

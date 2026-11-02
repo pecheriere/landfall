@@ -7,7 +7,7 @@
 //! passkey, and a compromised controller can neither fill it nor burn a real approval.
 //!
 //! Nothing here reads as empty when it can't be trusted: a log that is torn, malformed,
-//! past its bound, or not a private regular file is an error, and is left as it is
+//! full, or not a private regular file is an error, and is left as it is
 //! for the operator. A crash in the middle of an append leaves a torn last line. The
 //! deploy it was for never started, since a deploy waits for the `fsync`, so the partial
 //! line can safely be removed by hand, which `docs/operations.md` says how to do. Doing it
@@ -18,7 +18,7 @@
 //! line at a time, so the size of the log takes no memory.
 
 use std::fs::File;
-use std::io::{BufReader, Read as _, Write as _};
+use std::io::{BufReader, Read as _, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -32,8 +32,8 @@ use super::{NONCE_LOG, StateDir, StateError};
 /// The bytes of one line.
 const LINE_BYTES: usize = 65;
 
-/// The longest the log may be: a million approvals, or 27 a day for a hundred years. Past
-/// this it refuses, and an approval is what it refuses.
+/// The longest the log gets: a million approvals, or 27 a day for a hundred years. At this
+/// length it refuses, and an approval is what it refuses, so no line goes past it.
 pub const MAX_NONCE_LOG_BYTES: u64 = 65_000_000;
 
 /// What [`StateDir::spend_nonce`] found.
@@ -89,10 +89,10 @@ fn open(path: &Path, flags: OFlags) -> Result<Option<File>, StateError> {
 /// holds, and says whether `nonce` is in it.
 fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> {
     let len = file.metadata().map_err(io_err("inspect", path))?.len();
-    if len > MAX_NONCE_LOG_BYTES {
+    if len >= MAX_NONCE_LOG_BYTES {
         return Err(unusable(
             path,
-            format!("it is {len} bytes, past its bound of {MAX_NONCE_LOG_BYTES}"),
+            format!("it is {len} bytes, and it is full at {MAX_NONCE_LOG_BYTES}"),
         ));
     }
     if len % LINE_BYTES as u64 != 0 {
@@ -117,6 +117,32 @@ fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> 
         found |= digits == wanted.as_bytes();
     }
     Ok(found)
+}
+
+/// Writes `line` through `out`, which ends up in `file`. Called under the file's lock. A
+/// write that fails, on a full disk say, can leave part of the line, which would refuse
+/// every approval until someone repaired it by hand, so the file goes back to the length
+/// it had. Nothing else writes to it meanwhile. If that fails too, the partial line stays,
+/// and the log refuses, as for a crash.
+pub(super) fn append_line(
+    file: &File,
+    out: &mut impl Write,
+    line: &[u8],
+    path: &Path,
+) -> Result<(), StateError> {
+    let prior = file.metadata().map_err(io_err("inspect", path))?.len();
+    let Err(failed) = out.write_all(line) else {
+        return Ok(());
+    };
+    match file.set_len(prior) {
+        Ok(()) => Err(io_err("write", path)(failed)),
+        Err(truncate) => Err(unusable(
+            path,
+            format!(
+                "writing to it failed: {failed}, and so did taking back what was written: {truncate}"
+            ),
+        )),
+    }
 }
 
 impl StateDir {
@@ -153,8 +179,7 @@ impl StateDir {
     /// on disk, directory entry included, when this returns. The check and the append
     /// are one step under the file's lock.
     ///
-    /// After an error, the nonce may or may not be on disk, and the line may be torn.
-    /// Nothing may run on it.
+    /// After an error, the nonce may or may not be on disk. Nothing may run on it.
     ///
     /// # Errors
     ///
@@ -162,7 +187,7 @@ impl StateDir {
     pub fn spend_nonce(&self, nonce: &[u8; 32]) -> Result<NonceSpend, StateError> {
         let path = self.nonce_log_path();
         let flags = OFlags::RDWR | OFlags::APPEND | OFlags::CREATE;
-        let Some(mut file) = open(&path, flags)? else {
+        let Some(file) = open(&path, flags)? else {
             return Err(unusable(&path, "it isn't there after creating it"));
         };
         file.lock().map_err(io_err("lock", &path))?;
@@ -170,8 +195,8 @@ impl StateDir {
             return Ok(NonceSpend::AlreadyUsed);
         }
         let line = format!("{}\n", hex::encode(nonce));
-        file.write_all(line.as_bytes())
-            .map_err(io_err("write", &path))?;
+        let mut out = &file;
+        append_line(&file, &mut out, line.as_bytes(), &path)?;
         file.sync_all().map_err(io_err("sync", &path))?;
         sync_dir(self.path())?;
         Ok(NonceSpend::Recorded)

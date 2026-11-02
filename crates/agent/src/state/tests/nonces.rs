@@ -2,10 +2,13 @@
 //! that can't be trusted refuses rather than reads as empty.
 
 use std::fs;
+use std::io::{self, Write};
 use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::super::nonces::append_line;
 use super::super::{MAX_NONCE_LOG_BYTES, NONCE_LOG, NonceSpend, StateDir, StateError};
 
 const NONCE: [u8; 32] = [7; 32];
@@ -101,8 +104,95 @@ fn a_log_past_its_bound_refuses_without_being_read() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
     let file = fs::File::create(root.nonce_log_path()).unwrap();
-    // Whole lines' worth, so this can only be the bound: sparse, and not read.
-    file.set_len((MAX_NONCE_LOG_BYTES / 65 + 1) * 65).unwrap();
+    // Sparse: whole lines' worth of zeros. Read, line 1 would refuse it for what it holds,
+    // so what is refused for its length wasn't read.
+    let says = |root: &StateDir| match root.nonce_used(&NONCE) {
+        Err(StateError::NonceLog { reason, .. }) => reason,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(MAX_NONCE_LOG_BYTES % 65, 0, "the bound falls between lines");
+
+    // One line short of the bound it may take one more, which brings it to the bound.
+    file.set_len(MAX_NONCE_LOG_BYTES - 65).unwrap();
+    assert!(says(&root).contains("line 1"), "{}", says(&root));
+
+    // At the bound it takes no more, so it never gets past it.
+    file.set_len(MAX_NONCE_LOG_BYTES).unwrap();
+    assert!(says(&root).contains("full"), "{}", says(&root));
+    assert_refused(&root);
+    assert_eq!(file.metadata().unwrap().len(), MAX_NONCE_LOG_BYTES);
+
+    file.set_len(MAX_NONCE_LOG_BYTES + 65).unwrap();
+    assert!(says(&root).contains("full"), "{}", says(&root));
+}
+
+/// Writes part of what it's given to the log, as a disk that has just filled up does.
+struct FullDisk<'a>(&'a fs::File);
+
+impl Write for FullDisk<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut log = self.0;
+        if log.metadata()?.len() % 65 == 0 {
+            log.write(&bytes[..20])
+        } else {
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn appender(path: &Path) -> fs::File {
+    fs::OpenOptions::new().append(true).open(path).unwrap()
+}
+
+#[test]
+fn a_failed_write_takes_back_what_it_wrote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dir(&tmp);
+    assert_eq!(root.spend_nonce(&[1; 32]).unwrap(), NonceSpend::Recorded);
+    let log = root.nonce_log_path();
+    let line = self::line(2);
+
+    let error = append_line(
+        &appender(&log),
+        &mut FullDisk(&appender(&log)),
+        line.as_bytes(),
+        &log,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(error, StateError::Io { op: "write", .. }),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap(), self::line(1));
+    // So the next one, with room on the disk, goes through.
+    assert!(!root.nonce_used(&[2; 32]).unwrap());
+    assert_eq!(root.spend_nonce(&[2; 32]).unwrap(), NonceSpend::Recorded);
+}
+
+#[test]
+fn a_failed_write_that_cannot_be_taken_back_stays_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dir(&tmp);
+    assert_eq!(root.spend_nonce(&[1; 32]).unwrap(), NonceSpend::Recorded);
+    let log = root.nonce_log_path();
+    let line = self::line(2);
+    // Not open for writing, so it can't be truncated.
+    let read_only = fs::File::open(&log).unwrap();
+
+    let error = append_line(
+        &read_only,
+        &mut FullDisk(&appender(&log)),
+        line.as_bytes(),
+        &log,
+    )
+    .unwrap_err();
+
+    assert!(matches!(error, StateError::NonceLog { .. }), "{error}");
     assert_refused(&root);
 }
 
