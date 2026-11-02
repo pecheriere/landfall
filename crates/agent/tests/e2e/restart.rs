@@ -1,5 +1,6 @@
 //! The agent stopped or killed while a deploy is in flight.
 
+use std::net::{Ipv4Addr, TcpListener};
 use std::time::Duration;
 
 use landfall_agent::deploy::{self, Outcome};
@@ -121,5 +122,31 @@ async fn a_kill_during_a_deploy_waits_for_recover_and_reports_under_the_same_num
     assert_eq!(fleet.audit_verify(None).status, 0);
 
     agent.stop().await;
+    controller.stop().await;
+}
+
+/// A controller comes back to its port, as the agents have its URL, and something else has the
+/// port for a moment. That isn't a controller that can't start.
+#[tokio::test]
+async fn a_controller_coming_back_waits_for_its_port() {
+    let fleet = Fleet::new();
+    let mut controller = fleet.controller().await;
+    let port = fleet.port();
+    controller.stop().await;
+
+    let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).unwrap();
+    let letting_go = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(taken);
+    });
+
+    let mut controller = fleet.controller().await;
+    letting_go.join().unwrap();
+    assert_eq!(fleet.port(), port);
+    assert!(
+        fleet.log("controller").contains("Address already in use"),
+        "{}",
+        fleet.log("controller")
+    );
     controller.stop().await;
 }
