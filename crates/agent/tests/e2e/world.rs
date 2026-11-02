@@ -31,6 +31,7 @@ const FAILING: &str = "failing";
 const HOLD_UP: &str = "hold-up";
 const AT_UP: &str = "at-up";
 const UPS: &str = "ups";
+const VERIFY_FAILS: &str = "verify-fails";
 
 /// How often a held `up` looks whether it may go on.
 const HOLD_POLL: Duration = Duration::from_millis(20);
@@ -123,6 +124,17 @@ impl World {
     /// Whether a held `up` has been reached.
     pub fn at_up(&self) -> bool {
         self.file(AT_UP).exists()
+    }
+
+    /// The host's verification fails, from now on, in the way `how` says: `missing`,
+    /// `shape` or `clock`.
+    pub fn fail_verification(&self, how: &str) {
+        write_whole(&self.file(VERIFY_FAILS), how.as_bytes());
+    }
+
+    /// The host's verification goes by the releases again.
+    pub fn pass_verification(&self) {
+        fs::remove_file(self.file(VERIFY_FAILS)).unwrap();
     }
 
     /// How many `up`s have gone through.
@@ -230,6 +242,13 @@ impl Verifier for FileVerifier {
         _: &DeploymentId,
         tag: &ReleaseTag,
     ) -> impl Future<Output = Result<ReleaseOrigin, VerifyFailure>> + Send {
+        if let Ok(how) = fs::read_to_string(self.0.file(VERIFY_FAILS)) {
+            return ready(Err(match how.as_str() {
+                "missing" => VerifyFailure::Missing("the registry says 404".to_owned()),
+                "clock" => VerifyFailure::ClockBehind("the log is ahead".to_owned()),
+                _ => VerifyFailure::Unavailable("expected exactly one bundle, found 2".to_owned()),
+            }));
+        }
         ready(
             self.0
                 .origin_of(tag)

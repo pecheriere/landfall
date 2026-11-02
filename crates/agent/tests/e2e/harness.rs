@@ -415,11 +415,18 @@ impl Fleet {
 
     /// Runs `landfall-server` to its end, and gives its status and the last line it
     /// wrote to stdout: before that, the test harness says it is running one test.
-    fn server_command(&self, args: Vec<String>) -> (i32, String) {
+    pub fn server_command(&self, args: Vec<String>) -> (i32, String) {
         let output = self.child(Role::ServerCli, args).output().unwrap();
         let stdout = String::from_utf8(output.stdout).unwrap();
         let last = stdout.lines().last().unwrap_or_default().to_owned();
         (output.status.code().unwrap_or(-1), last)
+    }
+
+    /// All that a `landfall-server` command that must succeed wrote to stdout.
+    pub fn server_output(&self, args: Vec<String>) -> String {
+        let output = self.child(Role::ServerCli, args).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
     }
 
     /// A real `serve` that is expected to end by itself. Gives its status.
@@ -589,7 +596,12 @@ impl Fleet {
 
     /// A real `audit verify`, with `--at` if given.
     pub fn audit_verify(&self, at: Option<i64>) -> Verified {
-        let mut args = ["audit", "verify", "--db", self.db.to_str().unwrap()]
+        self.audit_verify_of(&self.db, at)
+    }
+
+    /// [`audit_verify`](Self::audit_verify) of the database at `db`.
+    pub fn audit_verify_of(&self, db: &Path, at: Option<i64>) -> Verified {
+        let mut args = ["audit", "verify", "--db", db.to_str().unwrap()]
             .map(str::to_owned)
             .to_vec();
         if let Some(at) = at {

@@ -35,6 +35,15 @@ async fn the_real_commands_enrol_run_and_stop_on_a_signal() {
         })
         .await;
 
+    // And it says so where an operator is looking.
+    assert!(
+        fleet
+            .log("controller")
+            .contains("hold: app/prod everything:"),
+        "{}",
+        fleet.log("controller")
+    );
+
     // A plain http URL is refused unless asked for, and nothing is sent.
     let code = fleet.enrol_code();
     let refused = Command::new(AGENT_BINARY)
@@ -95,6 +104,52 @@ async fn the_real_commands_enrol_run_and_stop_on_a_signal() {
         .await;
     again.stop().await;
     assert_eq!(fleet.audit_verify(None).status, 0);
+}
+
+/// `enrol` with no CA certificates on the system, as on a slim image: an empty file
+/// is all the certificates it can find. Linux reads them when the client is built; on
+/// other systems the first `https` request would, so this can only fail there.
+fn enrol_without_ca_certificates(fleet: &Fleet, controller: &str, code: &std::path::Path) -> i32 {
+    let empty = fleet.state_dir.with_file_name("no-certificates.pem");
+    fs::write(&empty, "").unwrap();
+    let output = Command::new(AGENT_BINARY)
+        .args(["enrol", "--allow-insecure-controller", "--host", HOST])
+        .args(["--controller", controller])
+        .arg("--code-file")
+        .arg(code)
+        .arg("--state-dir")
+        .arg(&fleet.state_dir)
+        .env("SSL_CERT_FILE", &empty)
+        .env_remove("SSL_CERT_DIR")
+        .output()
+        .unwrap();
+    output.status.code().unwrap_or(-1)
+}
+
+#[tokio::test]
+async fn enrolling_without_ca_certificates_leaves_no_key_and_needs_none_over_loopback() {
+    let fleet = Fleet::new();
+    let cache = no_refresh_due(&fleet);
+    let mut controller = fleet
+        .real_controller(&["--trust-cache", cache.to_str().unwrap()])
+        .await;
+    let code = fleet.enrol_code();
+
+    if cfg!(target_os = "linux") {
+        // Port 1: this fails however far it gets, and must fail before any key.
+        assert_eq!(
+            enrol_without_ca_certificates(&fleet, "https://127.0.0.1:1", &code),
+            2
+        );
+        assert!(!fleet.state_dir.join("agent.key").exists());
+    }
+
+    assert_eq!(
+        enrol_without_ca_certificates(&fleet, &fleet.url(), &code),
+        0
+    );
+    assert!(fleet.state_dir.join("agent.key").exists());
+    controller.stop().await;
 }
 
 /// A controller that can't serve exits 2: its port is in use, here.

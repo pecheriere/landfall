@@ -28,6 +28,7 @@ mod live;
 mod outage;
 mod restart;
 mod rollback;
+mod seams;
 mod world;
 
 /// Not a test: what [`harness`] runs as a process. It does nothing without its

@@ -62,6 +62,28 @@ async fn a_new_patch_is_queued_deployed_reported_and_audited() {
     fleet.let_the_watcher_look().await;
     assert_eq!(fleet.deploys().await.len(), 1);
 
+    // An operator can see why nothing moves: on stderr, a line for each decision...
+    let log = fleet.log("controller");
+    let said = log
+        .lines()
+        .filter(|line| line.contains("decision: app/prod v1.3.0: manual:"))
+        .count();
+    assert_eq!(said, 1, "{log}");
+    // ...and in the log itself, without writing to it.
+    let rows = [
+        "audit",
+        "show",
+        "--db",
+        fleet.db.to_str().unwrap(),
+        "--deployment",
+        "app/prod",
+        "--limit",
+        "1000",
+    ];
+    let output = fleet.server_output(rows.map(str::to_owned).to_vec());
+    assert!(output.contains("\"kind\":\"rule_decision\""), "{output}");
+    assert!(output.contains("v1.3.0"), "{output}");
+
     // The chain verifies, and names each step of the way.
     let verified = fleet.audit_verify(None);
     assert_eq!(verified.status, 0, "{:?}", verified.printed);
