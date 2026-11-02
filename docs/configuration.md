@@ -148,8 +148,9 @@ against anything the workflow writes itself:
 
 To check a deployment's `repo` and `origin` against a real release, run
 [`landfall verify`](../README.md#verifying-a-release). Hosts need a
-synchronised clock (NTP): a clock running behind refuses a fresh release with
-"integrated time … in the future".
+synchronised clock (NTP): with a clock running behind a fresh release can't be
+verified until it is right ("the transparency log's time is ahead of this
+machine's clock").
 
 ### `origin.signed_tags = false`
 

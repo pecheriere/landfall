@@ -76,8 +76,9 @@ op run --env-file=landfall.env -- landfall verify --config fleet.toml ...
 A rate limit is reported with the time it resets.
 
 The host needs a synchronised clock (NTP). The transparency log's integrated
-time must not be in the future, so a clock running behind refuses a fresh
-release with "integrated time … in the future".
+time must not be in the future, so with a clock running behind a fresh release
+can't be verified, and exit status 2 says "the transparency log's time is ahead
+of this machine's clock".
 
 ## Running the controller and the agent
 

@@ -25,8 +25,8 @@ landfall-server serve --config /etc/landfall/fleet.toml \
 - `--config` is the fleet configuration, the same file every host has, byte for byte.
   It is read once: restart after changing it. A host whose file differs gets no work
   until the two agree.
-- `--db` is the database, created mode 0600 if it is missing. Back it up, and see
-  [the audit log's limit](#keeping-the-audit-head-elsewhere) before relying on a backup.
+- `--db` is the database, created mode 0600 if it is missing. [Back it up](#backing-up-and-restoring)
+  with `landfall-server backup`, as a copy of the file is not a backup.
 - `--listen` serves plain HTTP: see [the transport rule](#the-transport-rule).
 - `--trust-cache` is where the Sigstore trust root is kept, by default `<db>.tuf` beside
   the database. It is refreshed at most once a day. With no root that verifies, nothing
@@ -36,8 +36,27 @@ It looks at releases when it starts and every five minutes after that, so a host
 reports for the first time is looked at on the next round. SIGTERM ends it in seconds:
 long polls are answered at once, and requests in flight have five seconds. Agents wait
 and try again, so stopping it never interrupts a deploy. Exit status 0 after a stop, 2
-if it could not start. It logs to stderr. `GET /healthz` answers 200 while the database
-does.
+if it could not start. `GET /healthz` answers 200 while the database does.
+
+It logs to stderr, one line each, every decision about a release and every hold, when it
+changes, as well as trouble it has serving:
+
+```text
+landfall-server: decision: app/prod v1.3.0: manual: "beyond the rule's levels: it needs an operator"
+landfall-server: hold: app/prod everything: "its host's configuration differs from the controller's"
+```
+
+So when nothing deploys, look there first. The whole story is in the audit log, which
+this prints as JSON lines, newest last, without writing to the database, whether or not
+`serve` is running:
+
+```sh
+landfall-server audit show --db controller.db --deployment app/prod --limit 50
+```
+
+Without `--deployment` it shows every row, and `--limit` defaults to 100. A host's reason
+for putting a release off, or refusing it, is the `reason` of its `deploy_finished` or
+`deploy_refused`.
 
 As a unit, `/etc/systemd/system/landfall-server.service`, with a dedicated user
 (`useradd --system --no-create-home --shell /usr/sbin/nologin landfall-server`):
@@ -94,13 +113,33 @@ printf 'GITHUB_TOKEN=%s\n' "$token" | sudo tee /etc/landfall/server.env > /dev/n
 It is sent to the GitHub API only, never to the registry, and never printed. A value that
 can't be used stops `serve` from starting.
 
-An agent doesn't use a token. It verifies one release when it is asked to, in a few
-requests, so it stays well under the limit on its own. But the limit goes by address, so
-hosts behind one address share it with each other and with anything else there that asks
-GitHub without a token. A host that meets it waits, with
-`verification could not run: ... rate limit reached` and the time it resets in the journal
-as `work_waiting`, and its polls back off up to five minutes apart meanwhile, so the
-deploy can start that long after the reset.
+An agent verifies one release when it is asked to, in a few requests, so it stays well
+under the limit on its own. But the limit goes by address, so hosts behind one address
+share it with each other and with anything else there that asks GitHub without a token. A
+host that meets it waits, with `verification could not run: ... rate limit reached` and
+the time it resets in the journal as `work_waiting`, and its polls back off up to five
+minutes apart meanwhile, so the deploy can start that long after the reset.
+
+So `landfall-agent run` also reads `GITHUB_TOKEN`, when it is set and not empty. It goes
+to the GitHub API only, not to the registry and not to the controller, and it is kept out
+of the environment of the `docker` commands the agent runs, where a compose file could ask
+for it. A value that can't be used stops `run` from starting. Use a token that can only
+read public repositories, and never put it on a command line, where any user can see it.
+Either give the unit a file at mode 0600 owned by root:
+
+```ini
+[Service]
+EnvironmentFile=/etc/landfall/agent.env
+```
+
+or a credential, which systemd keeps from the unit's other users, read into the variable as
+the agent starts. `$$` is how a unit file says a `$` for the shell:
+
+```ini
+[Service]
+LoadCredential=github-token:/etc/landfall/github-token
+ExecStart=/bin/sh -c 'GITHUB_TOKEN="$$(cat "$$CREDENTIALS_DIRECTORY/github-token")" exec /usr/local/bin/landfall-agent run --config /etc/landfall/fleet.toml --controller https://controller.example --host home-1'
+```
 
 ### The transport rule
 
@@ -139,6 +178,60 @@ no longer has that row prints `"at_hash":null` and exits 1. Past the last head k
 nothing is vouched for, and an external anchor is out of scope for this version. After
 restoring a backup on purpose, expect the check to fail, and keep a new head.
 
+### Backing up and restoring
+
+**A copy of `controller.db` isn't a backup.** While the controller runs, and after it
+was killed, its latest changes are in `controller.db-wal` beside it, and a host can be
+missing from a copy of the one file. Use the command, which needs no `sqlite3` and works
+while `serve` runs, also in its container (`docker exec landfall landfall-server backup
+...`, to a path on the volume):
+
+```sh
+landfall-server backup --db /var/lib/landfall-server/controller.db /backups/controller-2026-11-01.db
+```
+
+```json
+{"empty":false,"first_bad":null,"head_hash":"8c1f...","head_seq":412,"rows":412}
+```
+
+It writes one whole file, as of one moment, private to the user who runs it, and refuses a
+destination that exists. It prints what `audit verify` would of the copy, having checked
+it, and exits 1 if the chain doesn't hold. The trust cache beside the database need not be
+kept: it is fetched again.
+
+That `head_hash` is the head of the backup. **Keep it somewhere the backup isn't**, as it
+is what can tell later that the backup is the one you took: a backup is as easy to edit as
+the database. Until you overwrite it with a restore, `audit verify --at <head_seq>` on the
+live database must print the same hash, or the log has been changed since.
+
+To restore, with the controller stopped:
+
+```sh
+rm -f controller.db-wal controller.db-shm
+cp /backups/controller-2026-11-01.db controller.db
+```
+
+Removing the other two files first matters: `SQLite` would apply a log of the old database
+to the new. Then start it. Hosts stay enrolled as of the backup, and tell it what runs on
+their next poll. Whatever happened since is gone from the log, so `audit verify --at`
+with a head kept since fails, as it should: keep a new head. Deploy numbers start over from
+the backup, which hosts cope with: [a number goes with its release](#a-release-that-rolled-back-isnt-retried).
+
+### Rebuilding a controller from nothing
+
+With no backup, an empty database does: the releases are in GitHub, and what runs and what
+failed are on the hosts. The audit log starts again, and hosts have to enrol again, each
+with the key it has. On each host, in this order:
+
+1. Stop the agent: `enrol` needs the lock `run` holds. If `status` shows `in_progress`, run
+   [`recover`](#recover) now, so that no report under an old number is waiting.
+2. On the controller, [make a code](#enrolling-a-host) for the host.
+3. `landfall-agent enrol` with it.
+4. Start the agent.
+
+A host's memory of what failed stays, so a release that rolled back there isn't tried
+again. Approvals and anything else only the controller knew are gone.
+
 ## Upgrading
 
 Upgrade the agents and the controller together. Neither accepts a request or an
@@ -176,9 +269,14 @@ Behind a TLS-terminating proxy, the proxy is the one address all agents share. S
   the previous version; the data is not touched.
 - **Docker with the compose plugin**, reached through the `docker` client on the
   agent's `PATH`.
+- **CA certificates**, as in the `ca-certificates` package, which slim images leave
+  out: `run` reaches GitHub and the registry over TLS, and neither it nor `enrol` with an
+  `https://` controller can start without them (`No CA certificates were loaded`). `enrol`
+  says so before it writes a key. Only `enrol` to an `http://` controller goes without.
 - **A synchronised clock (NTP).** Origin verification compares the transparency
-  log's time with the host's: a clock running behind refuses a fresh release.
-  Log windows and backup names also go by the host's clock.
+  log's time with the host's: a clock running behind a fresh release, as on a machine
+  with no battery for it that has just started, puts the release off until the clock
+  is right. Log windows and backup names also go by the host's clock.
 
 ## The compose directory
 
@@ -324,8 +422,12 @@ The agent connects out to the controller, and signs every request with a key onl
 it has. On the controller, make a one-time code for the host, valid for an hour:
 
 ```sh
-landfall-server enrol-code --host home-1
+landfall-server enrol-code --host home-1 --db /var/lib/landfall-server/controller.db
 ```
+
+Run it as the controller's user, as the database is private to it, while `serve` runs or
+not; in a container, `docker exec landfall landfall-server enrol-code --host home-1 --db
+/data/controller.db`. The database has to exist, so start `serve` once first.
 
 Put the code in a regular file on the host that only the agent's user can read (a
 link or a FIFO is refused): it is not taken on the command line, where any user could
@@ -444,11 +546,21 @@ nothing unless all of this holds:
 - The release verifies, with this host's own trust root, and to the digest and the
   commit the controller named.
 
-A refusal is reported as `refused` with the reason, and journalled as
-`controller_work_refused`. For a request the rule or the verification refuses that
-is priority 2, critical: **treat it as an alert**, since an honest controller decides
-by the same rule and doesn't ask. A refusal because of a marker or drift is priority
-3, error: the controller can have asked before it heard.
+What isn't so is answered in one of two ways, and nothing runs either way:
+
+- **`refused`, for good:** the rule says no, a verification result failed, or the
+  release is on this host's record of failures. It is journalled as
+  `controller_work_refused`, and the controller doesn't ask again. For a request the rule
+  or verification refuses that is priority 2, critical: **treat it as an alert**, since
+  an honest controller decides by the same rule and doesn't ask.
+- **`deferred`, not now:** an unfinished deploy, drift, state or evidence that can't be
+  read, a clock behind the release, or a wait for verification that has reached its bound.
+  All of these pass. It is journalled as `controller_work_deferred`, at priority 3, error,
+  or 4, warning, for a clock or a wait, and the host's next poll is backed off. The
+  controller records the release as `deferred`, and asks again under a new number after a
+  wait of one look, five minutes, doubling each time it is told so, up to six hours.
+  There is no last try. A newer release doesn't wait for it, and the host judges each try
+  as it would any other.
 
 What it can do: withhold work, ask again, and see what the host reports. It can
 also make the host deploy a release that is allowed by all of the above sooner than
@@ -473,9 +585,9 @@ failed here, written before the report is sent; and after that by the engine's r
 under `<deployment>/reports/`, in case a `recover` the daemon didn't see ended one. The
 record is what counts, so removing old reports doesn't forget a failure.
 
-**Evidence that can't be read refuses the deploy.** If the record or any of the engine's
+**Evidence that can't be read holds up the deploy.** If the record or any of the engine's
 reports can't be read, it could be about the release at hand, or the next one, so no
-automatic deploy of that deployment goes ahead. The journal says
+automatic deploy of that deployment goes ahead: each is deferred. The journal says
 `failure_evidence_unreadable` at priority 3, naming the file. Read or restore the file if
 you can; removing it clears this, and forgets any failure it recorded, so a release that
 failed can then deploy again.
@@ -490,19 +602,24 @@ usual way past a release that failed is a newer one.
 The controller can't run a release in circles either. A deploy that has finished never
 runs again: delivered again under its number, it gets its original report
 (`finished_work_delivered_again`), from a ledger under `<state dir>/finished/` of the
-1,024 finished most recently, whatever their numbers. The same number naming another
-deployment, tag or digest is refused and the ledger left as it is, so a controller whose
-database was rebuilt and reuses numbers gets refusals until those numbers leave the
-ledger. And polls back off, up to five minutes apart, after a refusal, a rollback, a
-replay or a report refused for good. Only a release that deploys in that very step, with
-its report acknowledged, or five minutes without trouble, starts the backoff over.
+1,024 finished most recently, whatever their numbers. The ledger goes by number and
+release. The same number naming another deployment, tag or digest is new, and is judged
+like any other, which is what lets a controller rebuilt or restored from a backup, whose
+numbers start over, go on deploying. A hostile controller gains nothing from it, as it
+could already pick a number it hasn't used. And polls back off, up to five minutes apart,
+after a refusal, a deferral, a rollback, a replay or a report refused for good. Only a
+release that deploys in that very step, with its report acknowledged, or five minutes
+without trouble, starts the backoff over.
 
-Verification that can't run, because the registry or GitHub can't be reached or a
-rate limit is in the way, reports nothing: the work comes back and is tried again, for
-as long as that takes, with `verification_still_waiting` in the journal every hour. A
-tag, image or attestation that the service says **isn't there** is waited for as well,
-as a release may still be publishing, but only for an hour, by the monotonic clock and
-counting only while the agent runs. After that it is refused with the reason.
+Verification that can't run reports nothing at first: the work comes back and is tried
+again, as `work_waiting` in the journal. That goes for a registry or GitHub that can't be
+reached or a rate limit; a tag, image or attestation that the service says **isn't there**,
+as a release may still be publishing; and an answer of the wrong shape, such as a bundle
+that doesn't parse, two bundles, or a 401 or 403 from a private package. Meanwhile the
+claim blocks every other deployment of this host. So every such wait has a bound of an
+hour, by the monotonic clock and counting only while the agent runs. After that the work
+is deferred with the reason, which frees the host, and the controller's growing wait paces
+any further try. Nothing runs either way.
 
 ### Reports
 
@@ -520,7 +637,7 @@ A report in the outbox, a claim or a ledger entry that can't be read is renamed 
 `<name>.corrupt.<n>`, the newest 8 of a name being kept, and journalled as
 `state_file_set_aside` at priority 3, and the agent carries on. **A corrupt claim with its
 marker still there** means the controller's number for that deploy is gone: when the
-controller delivers the work again it ends in `refused`, because of the marker, and the
+controller delivers the work again it ends in `deferred`, because of the marker, and the
 real outcome of `recover` later has no number to be reported under. That fails closed;
 `recover`'s report is under `<deployment>/reports/`.
 

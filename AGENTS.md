@@ -29,7 +29,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   handlers, problem answers, rate limit), `watcher` (release discovery, origin
   verification, rule decisions and queueing, behind a `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `cli`
-  (`serve`, `enrol-code`, `audit verify`, behind the thin `main.rs`).
+  (`serve`, `enrol-code`, `backup`, `audit verify`, `audit show`, behind the thin
+  `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:
