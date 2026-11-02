@@ -123,9 +123,11 @@ cargo deny check
   that suit a kernel with 16 KiB pages, mode 0755, and a size within its
   `MAX_BYTES` budget. PIE comes from `RUSTFLAGS` in the Dockerfile's builder, as
   `.cargo/` stays out of the build and a profile can't set it.
-- zig and the libraries that are its compiler and linker are pinned by version in
-  the Dockerfile. Alpine keeps only its newest, so a rebuild of one fails the build:
-  bump the version on purpose, and read what changed.
+- zig, which is the C compiler and linker, is upstream's tarball, by `ADD --checksum`
+  for each platform a build runs on, so no package repository can change it. Dependabot
+  can't bump it: take the hashes from `index.json` at ziglang.org and verify each file's
+  `.minisig` against the key published there. CI also runs the arm64 binaries' `--version`
+  under the QEMU in the pinned BuildKit image, which is a third copy of that reference.
 - `macos.yml` tests and builds the CLI on an arm64 Mac, only when a change can
   reach it. It is filtered by path, so it can't be a required check, and isn't.
 - `crate-age` refuses `Cargo.lock` versions younger than 7 days (README,

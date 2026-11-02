@@ -142,3 +142,16 @@ jobs:
         run: |
           dist/linux_amd64/landfall --version
           dist/linux_amd64/landfall-agent --version
+      # The header check can't see bad relocations or a failure at start-up, and nothing else
+      # runs these. The image the builder runs in, pinned and already pulled, holds a QEMU. This
+      # is a start, not a real kernel: it has no ASLR to show, and no 16 KiB pages. A file whose
+      # code is broken can hang under it rather than fail, hence the limit.
+      - name: Run the arm64 binaries under QEMU
+        env:
+          # The same reference as .github/buildkit/Dockerfile, which a test checks.
+          BUILDKIT: moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+        run: |
+          for binary in landfall landfall-agent; do
+            timeout --kill-after=10 60 docker run --rm --entrypoint /usr/bin/buildkit-qemu-aarch64 \
+              -v "$PWD/dist/linux_arm64:/d:ro" "$BUILDKIT" "/d/$binary" --version
+          done

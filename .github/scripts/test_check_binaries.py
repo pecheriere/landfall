@@ -24,8 +24,10 @@ PT_LOAD = 1
 PT_DYNAMIC = 2
 PT_INTERP = 3
 PT_TLS = 7
+PT_GNU_STACK = 0x6474E551
 PF_RX = 5
 PF_RW = 6
+PF_RWX = 7
 ALIGN_4K = 0x1000
 ALIGN_16K = 0x4000
 ALIGN_64K = 0x10000
@@ -52,8 +54,8 @@ E_SHENTSIZE_OFFSET = 58
 E_SHNUM_OFFSET = 60
 P_OFFSET_OFFSET = 8
 P_FILESZ_OFFSET = 32
-# The PT_DYNAMIC `elf` adds, when there is the one load segment before it.
-SECOND_PROGRAM_HEADER = ELF_HEADER_SIZE + PROGRAM_HEADER_SIZE
+# The PT_DYNAMIC `elf` adds, with the one load segment and its PT_GNU_STACK before it.
+DYNAMIC_PROGRAM_HEADER = ELF_HEADER_SIZE + 2 * PROGRAM_HEADER_SIZE
 DYNAMIC_ENTRY_SIZE = 16
 MACHINES = {"linux_arm64": ARM64, "linux_amd64": AMD64}
 NAMES = ("landfall", "landfall-agent", "landfall-server")
@@ -61,9 +63,9 @@ NAMES = ("landfall", "landfall-agent", "landfall-server")
 # The size of each binary on the larger platform when its budget was set. Here as well as beside
 # the budget, so raising a budget takes a second, deliberate edit.
 MEASURED_BYTES = {
-    "landfall-agent": 12893464,
-    "landfall": 10331728,
-    "landfall-server": 15720928,
+    "landfall-agent": 12893624,
+    "landfall": 10331888,
+    "landfall-server": 15721088,
 }
 
 STATIC_PIE = ((DT_FLAGS_1, DF_1_PIE),)
@@ -82,6 +84,10 @@ class Seg:
     align: int = ALIGN_64K
 
 
+# What every real binary has, so what `elf` adds to its segments unless they name their own.
+NO_EXEC_STACK = Seg(PT_GNU_STACK, PF_RW, filesz=0, align=16)
+
+
 def elf(
     machine: int,
     segments: tuple[Seg, ...] = (Seg(),),
@@ -94,8 +100,20 @@ def elf(
     By default this is what a static PIE looks like, with its entry point at the end of the
     header. `dynamic` is its dynamic entries before the DT_NULL, added as a PT_DYNAMIC after
     `segments`; None leaves that segment out. The gap up to `phoff` is 0xCC, which reads as
-    nothing this check accepts.
+    nothing this check accepts. Without a PT_GNU_STACK in `segments`, a good one is added, last.
     """
+    stack = () if any(s.p_type == PT_GNU_STACK for s in segments) else (NO_EXEC_STACK,)
+    return _elf(machine, (*segments, *stack), dynamic, phoff, padding)
+
+
+def _elf(
+    machine: int,
+    segments: tuple[Seg, ...],
+    dynamic: tuple[tuple[int, int], ...] | None,
+    phoff: int,
+    padding: bytes,
+) -> bytes:
+    """Lay out exactly the segments given."""
     count = len(segments) + (dynamic is not None)
     table_end = phoff + PROGRAM_HEADER_SIZE * count
     tail = b""
@@ -209,7 +227,7 @@ class StaticLinkingTests(DistTestCase):
         entry = struct.pack("<QQ", DT_NEEDED, 1)
         content = elf(AMD64, padding=entry)
         size = 2 * DYNAMIC_ENTRY_SIZE + len(entry)
-        at = SECOND_PROGRAM_HEADER + P_FILESZ_OFFSET
+        at = DYNAMIC_PROGRAM_HEADER + P_FILESZ_OFFSET
         self.write("linux_amd64", "landfall", with_bytes(content, at, struct.pack("<Q", size)))
         self.assert_passes()
 
@@ -278,13 +296,72 @@ class PieTests(DistTestCase):
         content = elf(AMD64, padding=entry)
         moved = with_bytes(
             content,
-            SECOND_PROGRAM_HEADER + P_OFFSET_OFFSET,
+            DYNAMIC_PROGRAM_HEADER + P_OFFSET_OFFSET,
             struct.pack("<Q", len(content) - len(entry)),
         )
-        at = SECOND_PROGRAM_HEADER + P_FILESZ_OFFSET
+        at = DYNAMIC_PROGRAM_HEADER + P_FILESZ_OFFSET
         moved = with_bytes(moved, at, struct.pack("<Q", len(entry)))
         self.write("linux_amd64", "landfall", moved)
         self.assertIn("DT_NEEDED", " ".join(check_binaries.check_dist(self.dist)))
+
+
+class DynamicReadTests(DistTestCase):
+    """The dynamic section is what its header says, no more and no less."""
+
+    def with_dynamic_size(self, content: bytes, size: int) -> bytes:
+        """Return a file whose PT_DYNAMIC claims this size."""
+        at = DYNAMIC_PROGRAM_HEADER + P_FILESZ_OFFSET
+        return with_bytes(content, at, struct.pack("<Q", size))
+
+    def test_a_dt_null_past_the_end_of_the_section_does_not_end_it(self) -> None:
+        """What follows the segment isn't part of it, even if it would look right."""
+        one_entry = self.with_dynamic_size(elf(AMD64), DYNAMIC_ENTRY_SIZE)
+        self.write("linux_amd64", "landfall", one_entry)
+        self.assert_one_failure("linux_amd64/landfall", "DT_NULL")
+
+    def test_a_size_that_is_not_a_multiple_of_an_entry_does_not_crash(self) -> None:
+        """The odd bytes at the end are ignored, as they are no entry."""
+        odd = self.with_dynamic_size(elf(AMD64, padding=bytes(8)), 2 * DYNAMIC_ENTRY_SIZE + 8)
+        self.write("linux_amd64", "landfall", odd)
+        self.assert_passes()
+
+    def test_a_file_over_budget_has_its_dynamic_section_left_unread(self) -> None:
+        """It could claim gigabytes, and the budget has already refused it."""
+        needed = ((DT_NEEDED, 1), (DT_FLAGS_1, DF_1_PIE))
+        content = elf(AMD64, dynamic=needed)
+        with mock.patch.dict(check_binaries.MAX_BYTES, {"landfall": len(content) - 1}):
+            self.write("linux_amd64", "landfall", content)
+            self.write("linux_arm64", "landfall", elf(ARM64))
+            failures = [f for f in check_binaries.check_dist(self.dist) if "amd64" in f]
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("over its budget", failures[0])
+
+
+class HardeningTests(DistTestCase):
+    """The stack and writable code: a PIE that gives these up has given up much of the point."""
+
+    def test_an_executable_stack_is_refused(self) -> None:
+        """An assembly object with no note can bring this in without anyone asking."""
+        stack = Seg(PT_GNU_STACK, PF_RWX, filesz=0, align=16)
+        self.write("linux_amd64", "landfall-agent", elf(AMD64, (Seg(), stack)))
+        self.assert_one_failure("linux_amd64/landfall-agent", "PT_GNU_STACK", "executable")
+
+    def test_a_missing_stack_header_is_refused(self) -> None:
+        """Without one, a kernel gives the file an executable stack."""
+        raw = _elf(AMD64, (Seg(),), STATIC_PIE, ELF_HEADER_SIZE, b"")
+        self.write("linux_amd64", "landfall-agent", raw)
+        self.assert_one_failure("linux_amd64/landfall-agent", "no PT_GNU_STACK")
+
+    def test_a_writable_executable_load_segment_is_refused(self) -> None:
+        """Code that can be written to is what W^X is meant to rule out."""
+        self.write("linux_amd64", "landfall-agent", elf(AMD64, (Seg(flags=PF_RWX),)))
+        self.assert_one_failure("linux_amd64/landfall-agent", "writable and executable")
+
+    def test_a_writable_segment_beside_the_code_is_fine(self) -> None:
+        """Data has to live somewhere, and each real binary has two such segments."""
+        data = Seg(flags=PF_RW, filesz=0)
+        self.write("linux_amd64", "landfall-agent", elf(AMD64, (Seg(), data)))
+        self.assert_passes()
 
 
 class ArchitectureTests(DistTestCase):
@@ -341,6 +418,12 @@ class PageSizeTests(DistTestCase):
         self.assert_one_failure("linux_arm64/landfall", "16 KiB page")
         self.write("linux_amd64", "landfall", elf(AMD64, (Seg(), odd), padding=room))
         self.write("linux_arm64", "landfall", elf(ARM64))
+        self.assert_passes()
+
+    def test_address_and_offset_a_whole_16k_apart_are_fine(self) -> None:
+        """The one page size this is about, so nothing larger may be asked for."""
+        data = Seg(flags=PF_RW, offset=0, vaddr=ALIGN_16K, filesz=0)
+        self.write("linux_arm64", "landfall", elf(ARM64, (Seg(), data)))
         self.assert_passes()
 
     def test_only_load_segments_need_the_alignment(self) -> None:
@@ -516,6 +599,15 @@ class MalformedTests(DistTestCase):
         self.write("linux_amd64", "landfall", content)
         self.assert_one_failure("linux_amd64/landfall", "truncated", "section")
 
+    def test_a_section_table_ending_exactly_at_the_end_of_the_file_is_fine(self) -> None:
+        """Which is where a real binary's ends."""
+        content = elf(AMD64, padding=bytes(1000))
+        content = with_bytes(content, E_SHOFF_OFFSET, struct.pack("<Q", len(content) - 128))
+        content = with_bytes(content, E_SHENTSIZE_OFFSET, struct.pack("<H", 64))
+        content = with_bytes(content, E_SHNUM_OFFSET, struct.pack("<H", 2))
+        self.write("linux_amd64", "landfall", content)
+        self.assert_passes()
+
     def test_a_segment_claiming_more_than_the_file_is_refused(self) -> None:
         """A valid header with a load segment 1 GiB past the end."""
         self.write("linux_amd64", "landfall", elf(AMD64, (Seg(filesz=1 << 30),)))
@@ -523,7 +615,7 @@ class MalformedTests(DistTestCase):
 
     def test_a_dynamic_section_past_the_end_is_refused(self) -> None:
         """It would be read by offset, so an offset out of the file is refused first."""
-        at = SECOND_PROGRAM_HEADER + P_OFFSET_OFFSET
+        at = DYNAMIC_PROGRAM_HEADER + P_OFFSET_OFFSET
         content = with_bytes(elf(AMD64), at, struct.pack("<Q", 2**64 - 1))
         self.write("linux_amd64", "landfall", content)
         self.assert_one_failure("linux_amd64/landfall", "truncated", "segment")

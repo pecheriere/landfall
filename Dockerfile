@@ -4,20 +4,39 @@
 # rust-toolchain.toml (1.99). No `# syntax=` line: the Dockerfile frontend
 # built into BuildKit covers everything used here, so no unpinned frontend
 # image is pulled at build time.
+
+# zig is upstream's own release, one directory with its LLVM, clang and lld in
+# it, fixed by checksum for each platform a build can run on, so nothing from a
+# package repository can change the compiler or linker. These hashes were checked
+# against the release's minisign signatures. To bump it, take each file's hash
+# from a new release's index.json at ziglang.org and verify its `.minisig`
+# against the key published there.
+ARG BUILDARCH
+
+FROM scratch AS zig-arm64
+ADD --checksum=sha256:958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz /zig.tar.xz
+
+FROM scratch AS zig-amd64
+ADD --checksum=sha256:02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239 https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz /zig.tar.xz
+
+FROM zig-${BUILDARCH} AS zig
+
 FROM --platform=$BUILDPLATFORM rust:1.99.0-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS build
 
 ARG TARGETARCH
 
-# zig and the libraries that are its C compiler and linker are pinned to the
-# versions in Alpine 3.23, so a repository update cannot change them under a
-# digest-pinned base image. Alpine drops an old version when it publishes a new
-# one, so one of these can make this line fail, and that is the point: bump the
-# version on purpose. What stays free is in plan 06's "Left mutable" list: what
-# those libraries load (libffi, xz-libs, libxml2), musl-dev, and the targets,
-# which the digest-pinned toolchain's own channel manifest decides.
-RUN apk add --no-cache musl-dev zig=0.15.2-r0 llvm20-libs=20.1.8-r0 clang20-libs=20.1.8-r1 lld20-libs=20.1.8-r1 \
+COPY --from=zig /zig.tar.xz /zig.tar.xz
+
+# What stays free is in plan 06's "Left mutable" list: musl-dev, for build scripts
+# only, and the targets, which the digest-pinned toolchain's channel decides.
+RUN apk add --no-cache musl-dev \
+    && mkdir /opt/zig \
+    && tar -xJf /zig.tar.xz -C /opt/zig --strip-components=1 \
+    && rm /zig.tar.xz \
     && cargo install --locked --version 0.24.0 cargo-zigbuild \
     && rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+
+ENV PATH="/opt/zig:$PATH"
 
 # Static and position-independent, so that where the agent, which is
 # root-equivalent, sits in memory differs on every run. rustc's own request for

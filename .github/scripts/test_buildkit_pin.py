@@ -4,7 +4,9 @@ Dependabot can't read a workflow's `driver-opts`, so it bumps that Dockerfile an
 pull request fails here until the workflows follow. This also refuses the usual ways of
 building round the pin. The standard library has no YAML parser, so a step is read by its
 indentation, and whatever can't be read as the expected shape is a failure. It reads the
-text of a workflow, so it can't see a builder chosen some way nobody wrote down here.
+text of a workflow, so it can't see a builder chosen some way nobody wrote down here, such as
+BUILDX_BUILDER in an `env:` or a composite action, and a comment or name saying "docker build"
+trips it, which is only a nuisance.
 """
 
 import re
@@ -23,9 +25,15 @@ BUILDX_STEP = re.compile(
 )
 BUILD_STEP = re.compile(r"""^\s*(?:-\s+)?uses:\s*["']?docker/build-push-action@""", re.IGNORECASE)
 ANY_MENTION = re.compile(r"docker/(?:setup-buildx|build-push)-action", re.IGNORECASE)
-# A build this file can't see the builder of: `docker build`, `docker buildx build`, `bake`,
-# `create`. A job name such as docker-build doesn't match, as there is no space in it.
-OWN_BUILDER = re.compile(r"\bdocker\s+(?:buildx\s+)?(?:build|bake|create)\b")
+# A build this file can't see the builder of, in the forms people write. A job name such as
+# docker-build doesn't match, as there is no space in it. This doesn't try for completeness.
+OWN_BUILDER = re.compile(
+    r"\bdocker\s+(?:image\s+|builder\s+|compose\s+(?:\S+\s+)*?)?build\b"
+    r"|\bdocker\s+buildx\s+(?:--builder[=\s]\S+\s+)?(?:build|bake|create|use)\b"
+    r"|\bbuildctl\b"
+)
+# Any mention of the image, which also holds the QEMU that CI runs the arm64 binaries under.
+IMAGE_MENTION = re.compile(r"moby/buildkit\S*", re.IGNORECASE)
 # Each would choose another builder or client than the pin.
 REFUSED_BUILDX_INPUTS = ("version", "driver", "endpoint")
 STEP_START = re.compile(r"^(\s*)-\s")
@@ -165,6 +173,12 @@ def problems(text: str, reference: str) -> list[str]:
         for line in lines
         if OWN_BUILDER.search(line)
     )
+    found.extend(
+        f"names {mention}, wanted {reference}"
+        for line in lines
+        for mention in IMAGE_MENTION.findall(line)
+        if strip_comment(mention) != reference
+    )
     for step in buildx_steps(text):
         found.extend(buildx_step_problems(step, reference))
     for job in jobs(lines):
@@ -195,6 +209,13 @@ class RepositoryTests(unittest.TestCase):
             self.assertEqual(problems(text, reference), [], workflow.name)
         for name in MUST_USE_BUILDX:
             self.assertGreater(found[name], 0, f"{name} has no buildx step to check")
+
+    def test_ci_runs_the_arm64_binaries_under_the_pinned_images_qemu(self) -> None:
+        """A third place for the reference, and the only run the arm64 files get in CI."""
+        reference = pinned_reference(PIN_FILE.read_text(encoding="utf-8"))
+        lines = significant((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
+        self.assertIn(f"BUILDKIT: {reference}", [line.strip() for line in lines])
+        self.assertTrue(any("buildkit-qemu-aarch64" in line for line in lines))
 
 
 class ReadingTests(unittest.TestCase):
@@ -249,7 +270,10 @@ steps:
       driver-opts: image={other}
       cache-binary: false
 """
-        self.assertEqual(len(problems(text, REFERENCE)), 1)
+        found = problems(text, REFERENCE)
+        self.assertEqual(len(found), 2, found)
+        self.assertIn("driver-opts is", found[1])
+        self.assertIn("names moby/buildkit:v1.2.4", found[0])
 
     def test_a_second_driver_option_fails(self) -> None:
         """Exactly the reference: another option could change what the builder is."""
@@ -394,7 +418,21 @@ jobs:
 
     def test_a_build_or_builder_in_a_run_step_is_refused(self) -> None:
         """None of these goes through the steps read above."""
-        for command in ("docker build .", "docker buildx build .", "docker buildx create --use"):
+        commands = (
+            "docker build .",
+            "docker image build .",
+            "docker builder build .",
+            "docker compose build",
+            "docker compose -f x.yml build app",
+            "docker buildx build .",
+            "docker buildx --builder x build .",
+            "docker buildx --builder=x build .",
+            "docker buildx bake",
+            "docker buildx create --use",
+            "docker buildx use other",
+            "buildctl build",
+        )
+        for command in commands:
             with self.subTest(command=command):
                 text = f"steps:\n  - run: {command}\n"
                 self.assertEqual(len(problems(text, REFERENCE)), 1)
@@ -403,6 +441,28 @@ jobs:
         """`ci.yml` has one, and a run step can mention Docker."""
         text = "jobs:\n  docker-build:\n    steps:\n      - run: docker version\n"
         self.assertEqual(problems(text, REFERENCE), [])
+
+    def test_docker_run_and_create_are_not_builds(self) -> None:
+        """Neither builds anything, and CI runs the arm64 binaries with one."""
+        for command in ("docker run --rm alpine true", "docker create alpine"):
+            with self.subTest(command=command):
+                text = f"steps:\n  - run: {command}\n"
+                self.assertEqual(problems(text, REFERENCE), [])
+
+    def test_any_other_mention_of_the_image_must_be_the_reference(self) -> None:
+        """The QEMU step's copy, as much as the steps' own, whether or not it is quoted."""
+        text = f"""
+steps:
+  - env:
+      BUILDKIT: {REFERENCE}
+      QUOTED: "{REFERENCE}" # with a comment
+    run: true
+"""
+        self.assertEqual(problems(text, REFERENCE), [])
+        for other in ("moby/buildkit:latest", "moby/buildkit:v1.2.3", "Moby/BuildKit"):
+            with self.subTest(other=other):
+                text = f"steps:\n  - env:\n      BUILDKIT: {other}\n    run: true\n"
+                self.assertEqual(len(problems(text, REFERENCE)), 1)
 
     def test_two_from_lines_are_refused(self) -> None:
         """Which of two would be the pin isn't something to guess."""

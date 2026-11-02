@@ -6,7 +6,8 @@ and nothing else that merely starts like one:
 - an ELF for the architecture its directory names, with the type and flags of a PIE, an entry
   point in code that is really in the file, and every load segment within the file, so a
   truncated download or a shared library fails;
-- no loader and no libraries (no PT_INTERP, no DT_NEEDED), and no text relocations;
+- no loader and no libraries (no PT_INTERP, no DT_NEEDED), no text relocations, a stack it says
+  isn't executable, and no load segment both writable and executable;
 - on arm64, load segments that suit a kernel with 16 KiB pages, which fails only there;
 - mode 0755, and within its size budget.
 
@@ -34,9 +35,9 @@ MIB = 1024 * 1024
 # in test_check_binaries.py as well. A budget per name, because the server is meant to be larger
 # than the agent.
 MAX_BYTES = {
-    "landfall-agent": 16 * MIB,  # 12893464 bytes
-    "landfall": 13 * MIB,  # 10331728 bytes
-    "landfall-server": 19 * MIB,  # 15720928 bytes
+    "landfall-agent": 16 * MIB,  # 12893624 bytes
+    "landfall": 13 * MIB,  # 10331888 bytes
+    "landfall-server": 19 * MIB,  # 15721088 bytes
 }
 
 BINARY_MODE = 0o755
@@ -53,7 +54,9 @@ ET_DYN = 3
 PT_LOAD = 1
 PT_DYNAMIC = 2
 PT_INTERP = 3
+PT_GNU_STACK = 0x6474E551
 PF_X = 1
+PF_W = 2
 DT_NULL = 0
 DT_NEEDED = 1
 DT_TEXTREL = 22
@@ -167,15 +170,30 @@ def has_entry_in_code(loads: list[Segment], entry: int) -> bool:
     return any(s.flags & PF_X and s.vaddr <= entry < s.vaddr + s.filesz for s in loads)
 
 
+def stack_failure(segments: list[Segment]) -> str | None:
+    """Say why the stack may be executable, if so: a kernel makes it so if nothing says not."""
+    stacks = [s for s in segments if s.p_type == PT_GNU_STACK]
+    if not stacks:
+        return "has no PT_GNU_STACK, so its stack is executable"
+    if any(s.flags & PF_X for s in stacks):
+        return "has a PT_GNU_STACK with PF_X, so its stack is executable"
+    return None
+
+
 def check_segments(segments: list[Segment], header: Header, *, needs_16k_pages: bool) -> list[str]:
     """Check what a program header table says, with one failure for each kind of fault."""
     failures = []
     if any(s.p_type == PT_INTERP for s in segments):
         failures.append("has PT_INTERP, so it needs a loader and is not static")
+    stack = stack_failure(segments)
+    if stack is not None:
+        failures.append(stack)
     loads = [s for s in segments if s.p_type == PT_LOAD]
     if not loads:
         failures.append("has no PT_LOAD segment")
         return failures
+    if any(s.flags & PF_W and s.flags & PF_X for s in loads):
+        failures.append("has a PT_LOAD that is both writable and executable")
     if any(s.filesz > s.memsz for s in loads):
         failures.append("has a PT_LOAD with more bytes in the file than in memory")
     if not has_entry_in_code(loads, header.entry):
@@ -210,7 +228,11 @@ def check_dynamic(raw: bytes) -> list[str]:
 
 
 def check_elf(path: Path, directory: str, size: int) -> list[str]:
-    """Check an ELF's identity, headers and dynamic section, reading only the bytes those need."""
+    """Check an ELF's identity, headers and dynamic section, reading only the bytes those need.
+
+    A file over its budget could claim any amount of dynamic section, within what it holds, so
+    that one isn't read: being over budget already refuses it.
+    """
     with path.open("rb") as file:
         raw = file.read(ELF_HEADER_SIZE)
         failure = identity_failure(raw)
@@ -239,6 +261,8 @@ def check_elf(path: Path, directory: str, size: int) -> list[str]:
         dynamic = [s for s in segments if s.p_type == PT_DYNAMIC]
         if len(dynamic) != 1:
             failures.append(f"has {len(dynamic)} PT_DYNAMIC segments, where a PIE has one")
+            return failures
+        if size > MAX_BYTES[path.name]:
             return failures
         file.seek(dynamic[0].offset)
         return failures + check_dynamic(file.read(dynamic[0].filesz))
