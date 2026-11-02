@@ -17,6 +17,32 @@ fn principal(name: &str) -> PrincipalId {
     name.parse().unwrap()
 }
 
+#[test]
+fn trusted_proxies_default_to_none_and_are_read_in_canonical_form() {
+    assert_eq!(parse_str(EXAMPLE).unwrap().trusted_proxies().len(), 0);
+    let text = format!(
+        "[server]\ntrusted_proxies = [\"192.0.2.1\", \"2001:db8::1\", \"::ffff:192.0.2.2\"]\n{EXAMPLE}"
+    );
+    let expected: Vec<std::net::IpAddr> = ["192.0.2.1", "2001:db8::1", "192.0.2.2"]
+        .iter()
+        .map(|text| text.parse().unwrap())
+        .collect();
+    assert_eq!(parse_str(&text).unwrap().trusted_proxies(), expected);
+}
+
+#[test]
+fn a_trusted_proxy_must_be_one_address() {
+    for bad in ["10.0.0.0/8", "proxy.example", "", "*", "192.0.2.1:443"] {
+        let text = format!("[server]\ntrusted_proxies = [\"{bad}\"]\n{EXAMPLE}");
+        assert!(
+            matches!(parse_str(&text), Err(ConfigError::Toml(_))),
+            "{bad}"
+        );
+    }
+    let unknown = format!("[server]\nnonsense = true\n{EXAMPLE}");
+    assert!(matches!(parse_str(&unknown), Err(ConfigError::Toml(_))));
+}
+
 fn with_operator(credential_id: &str, public_key: &str) -> String {
     edited(
         OPERATOR,

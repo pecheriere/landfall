@@ -36,10 +36,13 @@ async fn a_wrong_used_or_expired_code_gets_one_answer() {
     let used = h.invite("gina").await;
     h.register(&used, &SoftwareAuthenticator::es256().unwrap())
         .await;
-    let expired = h.invite("carol").await;
-    h.clock.advance(INVITE_LIFETIME);
     let replaced = h.invite("dave").await;
     h.invite("dave").await;
+    let expired = h.invite("carol").await;
+    // Issuing another clears out what's past its time, so nothing does after this: carol's row
+    // is still there, and it is its time that refuses it.
+    h.clock.advance(INVITE_LIFETIME);
+    assert_eq!(h.count("passkey_invites").await, 2);
 
     for code in [
         used.as_str(),
@@ -67,6 +70,94 @@ async fn a_wrong_used_or_expired_code_gets_one_answer() {
                 }),
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn an_invite_is_good_until_the_last_second_of_its_hour() {
+    let h = Harness::new().await;
+    let code = h.invite("gina").await;
+    h.clock.advance(INVITE_LIFETIME - 1);
+    let begun = h.post(REGISTER_BEGIN, None, &json!({ "code": code })).await;
+    assert_eq!(begun.status, StatusCode::OK, "{begun:?}");
+}
+
+/// Expiring between the look at the code and the transaction that spends it.
+#[tokio::test]
+async fn redeeming_goes_by_the_clock_too() {
+    let h = Harness::new().await;
+    let code = h.invite("gina").await;
+    let key = SoftwareAuthenticator::es256().unwrap().key().unwrap();
+    h.clock.advance(INVITE_LIFETIME);
+    let outcome = h
+        .store
+        .redeem_invite(
+            &PasskeyInvite::parse(&code).unwrap(),
+            &NewPasskey {
+                credential_id: &[1; 16],
+                key: &key,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, Redeemed::InviteGone);
+    assert_eq!(h.count("passkeys").await, 0);
+}
+
+#[tokio::test]
+async fn a_body_just_over_each_cap_is_refused_before_it_is_parsed() {
+    use crate::web::registration::{MAX_BEGIN_BODY_BYTES, MAX_FINISH_BODY_BYTES};
+
+    /// A JSON object of exactly `size` bytes, parsing or not.
+    fn body_of(size: usize) -> Vec<u8> {
+        let empty = r#"{"code":""}"#;
+        format!("{{\"code\":\"{}\"}}", "x".repeat(size - empty.len())).into_bytes()
+    }
+
+    let h = Harness::new().await;
+    for (path, cap) in [
+        (REGISTER_BEGIN, MAX_BEGIN_BODY_BYTES),
+        (REGISTER_FINISH, MAX_FINISH_BODY_BYTES),
+    ] {
+        for (size, too_large) in [(cap, false), (cap + 1, true)] {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(axum::http::header::ORIGIN, ORIGIN)
+                .body(axum::body::Body::from(body_of(size)))
+                .unwrap();
+            let answer = h.send(request).await;
+            if too_large {
+                assert_eq!(
+                    answer.status,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "{path} {size}"
+                );
+            } else {
+                assert_ne!(
+                    answer.status,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "{path} {size}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_sent_code_stays_out_of_debug() {
+    use crate::web::registration::{BeginBody, FinishBody};
+    let secret = "a".repeat(64);
+    let begin: BeginBody = serde_json::from_value(json!({ "code": secret })).unwrap();
+    let finish: FinishBody = serde_json::from_value(json!({
+        "code": secret,
+        "attestation_object": "",
+        "client_data_json": "",
+    }))
+    .unwrap();
+    for shown in [format!("{begin:?}"), format!("{finish:?}")] {
+        assert!(!shown.contains(&secret), "{shown}");
+        assert!(shown.contains("redacted"), "{shown}");
     }
 }
 
@@ -248,6 +339,32 @@ async fn someone_elses_credential_id_is_refused_and_spends_nothing() {
         assert_eq!(h.count("passkey_invites").await, 1);
         assert_eq!(h.count("passkeys").await, 1);
     }
+}
+
+#[tokio::test]
+async fn an_approver_may_register_the_files_key_and_no_other_under_that_id() {
+    let h = Harness::new().await;
+    let code = h.invite("alice").await;
+
+    // Their own credential id, with a key the file doesn't hold for it.
+    let challenge = h.begin_registration(&code).await;
+    let mut ceremony = Ceremony::new(RP_ID, ORIGIN, &challenge);
+    ceremony.credential_id = Some(h.alice.credential_id().to_vec());
+    let other = SoftwareAuthenticator::es256().unwrap();
+    let answer = h
+        .post(
+            REGISTER_FINISH,
+            None,
+            &attestation_body(&code, &other, &ceremony),
+        )
+        .await;
+    assert_eq!(answer.code(), "registration_refused", "{answer:?}");
+    assert_eq!(h.count("passkeys").await, 0);
+
+    // The very key the file holds.
+    let answer = h.register(&code, &h.alice).await;
+    assert_eq!(answer.status, StatusCode::OK, "{answer:?}");
+    assert_eq!(h.count("passkeys").await, 1);
 }
 
 #[tokio::test]

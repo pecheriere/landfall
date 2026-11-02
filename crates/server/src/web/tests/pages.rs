@@ -192,6 +192,27 @@ fn pages_have_no_inline_script_or_style() {
     }
 }
 
+/// The server refuses any other field, so a page that sent one could never sign anyone in.
+#[test]
+fn the_script_sends_exactly_the_four_assertion_fields() {
+    let (_, rest) = SCRIPT.split_once("function assertionText").unwrap();
+    let (body, _) = rest.split_once("};").unwrap();
+    let fields: Vec<&str> = body
+        .lines()
+        .filter_map(|line| line.trim().split_once(": "))
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "credential_id",
+            "authenticator_data",
+            "client_data_json",
+            "signature"
+        ]
+    );
+}
+
 #[test]
 fn the_script_only_ever_sets_text() {
     for banned in [

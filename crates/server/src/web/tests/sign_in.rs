@@ -8,6 +8,7 @@ use super::{
     Answer, Harness, ORIGIN, RP_ID, SIGN_IN_BEGIN, SIGN_IN_FINISH, answer_of, assertion_text, b64,
     config_text, post_request, sign_in_body, sign_in_ceremony_body,
 };
+use crate::agent_api::Limits;
 
 const CHALLENGE_LIFETIME: i64 = 5 * 60;
 
@@ -60,7 +61,7 @@ async fn a_key_the_file_doesnt_hold_for_an_approver_cannot_sign_in() {
     assert_eq!(h.try_sign_in(&h.alice).await.status, StatusCode::OK);
 
     crate::web::tend(&h.state).await;
-    let rows = h.audited("sign_in_refused").await;
+    let rows = h.audited("sign_in_barred_key").await;
     assert_eq!(rows[0]["principal"], "alice");
     assert_eq!(rows[0]["attempts"], 1);
 }
@@ -95,6 +96,138 @@ async fn a_key_registered_before_the_file_names_its_person_cannot_sign_in_until_
     )
     .await;
     assert_eq!(finished.status, StatusCode::OK, "{finished:?}");
+}
+
+/// The file's word on a credential id beats any row: here one for someone else, which registering
+/// refuses, so only a hand-edited or older database could hold it.
+#[tokio::test]
+async fn a_stored_row_cannot_take_a_credential_id_the_file_gives_to_someone() {
+    let h = Harness::new().await;
+    let thief = SoftwareAuthenticator::es256().unwrap();
+    sqlx::query(
+        "INSERT INTO passkeys (credential_id, principal, public_key, created_at)
+         VALUES (?, 'gina', ?, 0)",
+    )
+    .bind(h.alice.credential_id())
+    .bind(thief.key().unwrap().as_bytes())
+    .execute(h.store.pool())
+    .await
+    .unwrap();
+
+    let challenge = h.begin_sign_in().await;
+    let mut forged = Ceremony::new(RP_ID, ORIGIN, &challenge);
+    forged.credential_id = Some(h.alice.credential_id().to_vec());
+    let answer = h
+        .post(
+            SIGN_IN_FINISH,
+            None,
+            &sign_in_ceremony_body(&thief, &challenge, &forged),
+        )
+        .await;
+    assert_eq!(answer.code(), "sign_in_refused", "{answer:?}");
+    assert_eq!(h.count("sessions").await, 0);
+
+    let real = h.try_sign_in(&h.alice).await;
+    assert_eq!(real.status, StatusCode::OK, "{real:?}");
+    assert_eq!(real.json()["principal"], "alice");
+}
+
+/// Signing in over and over takes a passkey each time, and is bounded for whoever holds one.
+#[tokio::test]
+async fn a_passkey_signing_in_over_and_over_is_held_to_a_budget() {
+    let h = Harness::with_limits(Limits {
+        principal_burst: 2,
+        ..Limits::default()
+    })
+    .await;
+    let session = h.signed_in(&h.alice).await;
+    h.signed_in(&h.alice).await;
+    let over = h.try_sign_in(&h.alice).await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS, "{over:?}");
+    assert_eq!(over.code(), "rate_limited");
+    assert_eq!(h.count("sessions").await, 2);
+    assert_eq!(h.audited("signed_in").await.len(), 2);
+
+    // Sessions have budgets of their own: this one is whole.
+    let used = h
+        .post("/api/v1/approvals/1/cancel", Some(&session), &json!({}))
+        .await;
+    assert_ne!(used.status, StatusCode::TOO_MANY_REQUESTS, "{used:?}");
+
+    crate::auth::flush_dropped(&h.state).await;
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(
+        rows[0]["by"],
+        json!({ "principal": "alice", "via": "sign_in" })
+    );
+    assert_eq!(rows[0]["dropped"], 1);
+}
+
+/// The strongest signal there is: it can't be washed out by what the sender does next.
+#[tokio::test]
+async fn a_barred_key_that_verifies_stays_apart_from_bad_signatures() {
+    let h = Harness::new().await;
+    let thief = h.registered("alice").await;
+    let started = h.store.now().unwrap();
+
+    assert_eq!(h.try_sign_in(&thief).await.code(), "sign_in_refused");
+    h.clock.advance(7);
+    // Then bad signatures on the same credential, the same as the signature that verified.
+    for _ in 0..3 {
+        let challenge = h.begin_sign_in().await;
+        let mut forged = Ceremony::new(RP_ID, ORIGIN, &challenge);
+        forged.credential_id = Some(thief.credential_id().to_vec());
+        let other = SoftwareAuthenticator::es256().unwrap();
+        h.post(
+            SIGN_IN_FINISH,
+            None,
+            &sign_in_ceremony_body(&other, &challenge, &forged),
+        )
+        .await;
+    }
+
+    crate::web::tend(&h.state).await;
+    let barred = h.audited("sign_in_barred_key").await;
+    assert_eq!(barred.len(), 1);
+    assert_eq!(barred[0]["principal"], "alice");
+    assert_eq!(barred[0]["attempts"], 1);
+    assert_eq!(barred[0]["first_seen"], started);
+    assert_eq!(barred[0]["sources"], json!(["0.0.0.0"]));
+    assert!(
+        barred[0]["reason"].as_str().unwrap().contains("other than"),
+        "{barred:?}"
+    );
+    let bad = h.audited("sign_in_refused").await;
+    assert_eq!(bad.len(), 1);
+    assert_eq!(bad[0]["attempts"], 3);
+    assert_eq!(bad[0]["first_seen"], started + 7);
+}
+
+/// A count says who from, as far as it has room.
+#[test]
+fn a_count_names_a_bounded_number_of_sources() {
+    use crate::agent_api::Limits as ApiLimits;
+    use crate::web::{Ceremonies, FailureKind};
+
+    let mut ceremonies = Ceremonies::new(&ApiLimits::default());
+    let alice = "alice".parse().unwrap();
+    for n in 0..20_u8 {
+        let source = std::net::IpAddr::from([192, 0, 2, n]);
+        ceremonies.count_failure(
+            &alice,
+            FailureKind::SignIn,
+            "bad",
+            source,
+            100 + i64::from(n),
+        );
+    }
+    let taken = ceremonies.take_failures();
+    assert_eq!(taken.len(), 1);
+    let event = taken[0].event();
+    assert_eq!(event.detail["attempts"], 20);
+    assert_eq!(event.detail["first_seen"], 100);
+    assert_eq!(event.detail["sources"].as_array().unwrap().len(), 8);
+    assert_eq!(event.detail["from_others"], 12);
 }
 
 /// An unknown credential is checked against this, so that it takes as long as a known one.

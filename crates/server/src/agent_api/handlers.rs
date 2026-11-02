@@ -1,12 +1,12 @@
 //! The four endpoints.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::PoisonError;
 
 use axum::Extension;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use landfall_core::config::Deployment;
@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use tokio::time::{Instant, sleep_until};
 
 use super::ApiState;
+use super::client_source::ClientSource;
 use super::problem::{ApiProblem, log};
 use super::signed::{Signed, read_body};
 use crate::report::BoundedReport;
@@ -33,8 +34,8 @@ const MAX_ENROL_BODY_BYTES: usize = 4 * 1024;
 const CONFIG_DRIFT_REASON: &str =
     "this host's configuration hash differs from the controller's configuration";
 
-/// The peer of the connection, as `serve` provides it.
-type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
+/// Who a request is from: see [`ClientSource`].
+type Peer = Option<Extension<ClientSource>>;
 
 /// A `200` with a JSON body.
 pub(crate) fn json<T: Serialize>(value: &T, extra: &[(HeaderName, &'static str)]) -> Response {
@@ -58,13 +59,13 @@ pub(crate) fn json<T: Serialize>(value: &T, extra: &[(HeaderName, &'static str)]
     }
 }
 
-/// Takes a token for the connection's source. A request with no peer can only
+/// Takes a token for the request's source. A request with no peer can only
 /// come from a test or a misconfigured `serve`; such requests share one
 /// allowance.
 fn check_source(state: &ApiState, peer: &Peer) -> Result<(), ApiProblem> {
     let source = peer
         .as_ref()
-        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |p| p.0.0.ip());
+        .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |p| p.0.0);
     let now = state.store.now()?;
     let allowed = state
         .limiter

@@ -62,17 +62,17 @@ async fn wrong_origin_is_refused_on_every_state_change() {
         .append(header::ORIGIN, "https://elsewhere.example".parse().unwrap());
     refused(&h.send(twice).await);
 
-    // Nothing moved. Only the session's refusals are in the log, each as `access_refused`.
+    // Nothing moved, and nothing was written.
     assert_eq!(h.count("sessions").await, 1);
     assert_eq!(h.count("passkey_invites").await, 1);
     assert_eq!(h.count("passkeys").await, 0);
-    let added = h.count("audit_events").await - audit_rows_before;
-    assert_eq!(added, i64::try_from(WRONG.len()).unwrap());
-    assert_eq!(
-        h.audited("access_refused").await.len(),
-        WRONG.len(),
-        "only someone with a session can be held to a refusal"
-    );
+    assert_eq!(h.count("audit_events").await, audit_rows_before);
+
+    // Only someone with a session can be held to a refusal, and it comes to one count.
+    crate::web::tend(&h.state).await;
+    let rows = h.audited("access_refused").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["attempts"], WRONG.len());
 
     // The challenges weren't used up: the real page still finishes both.
     let finished = h.post(REGISTER_FINISH, None, &attestation).await;

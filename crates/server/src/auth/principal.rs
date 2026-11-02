@@ -13,12 +13,12 @@ use landfall_core::config::Config;
 use landfall_core::ids::PrincipalId;
 use serde_json::{Value, json};
 
-use super::budget::{Spent, throttled_event};
+use super::budget::{Spender, Spent, throttled_event};
 use super::grants::named_in_config;
 use super::problem::HumanProblem;
 use super::token::{ApiToken, SessionToken};
-use crate::agent_api::ApiState;
-use crate::audit::{AuditEvent, EventKind};
+use crate::agent_api::{ApiState, source_of};
+use crate::web::FailureKind;
 
 /// The session cookie. `__Host-` makes a browser refuse it unless it is `Secure`, from
 /// this very host, with no `Domain` and `Path=/`.
@@ -76,20 +76,19 @@ impl Principal {
 pub(crate) async fn spend_budget(
     state: &ApiState,
     extensions: &Extensions,
-    id: &PrincipalId,
-    human: bool,
+    spender: &Spender,
 ) -> Result<(), HumanProblem> {
     let store = state.store();
-    match state.spend_budget(id, human, store.now()?) {
+    match state.spend_budget(spender, store.now()?) {
         Spent::Over => {
-            state.note_refusal(extensions, "an API call over its principal's budget");
+            state.note_refusal(extensions, "a call over its budget");
             Err(HumanProblem::OverBudget)
         }
         Spent::Within { dropped: 0 } => Ok(()),
         Spent::Within { dropped } => {
-            let event = throttled_event(id, human, dropped);
+            let event = throttled_event(spender, dropped);
             if let Err(error) = store.record(&event).await {
-                state.keep_dropped(id, human, dropped);
+                state.keep_dropped(spender.clone(), dropped);
                 return Err(error.into());
             }
             Ok(())
@@ -167,56 +166,102 @@ pub(crate) fn origin_matches(headers: &HeaderMap, config: &Config) -> bool {
     }
 }
 
+/// Who a request's credential says it is, with a session's token if that's what it is, and with
+/// the `Origin` check made on a session's state change. That comes before any budget: a page on
+/// a sibling subdomain can send a person's cookie with a bad `Origin`, as `SameSite` doesn't stop
+/// it, and that must cost them nothing. It writes no row either, only a count.
+async fn identified(
+    parts: &Parts,
+    state: &ApiState,
+) -> Result<(Principal, Option<SessionToken>), HumanProblem> {
+    let store = state.store();
+    let found = match presented(&parts.headers) {
+        None => None,
+        Some(Credential::Token(token)) => store
+            .token_holder(&token)
+            .await?
+            .map(|(id, principal)| (principal, Via::Token(id), None)),
+        Some(Credential::Session(session)) => store
+            .session_holder(&session)
+            .await?
+            .map(|principal| (principal, Via::Session, Some(session))),
+    };
+    let Some((id, via, session)) =
+        found.filter(|(principal, _, _)| named_in_config(state.config(), principal))
+    else {
+        // Anyone can send these, so they go to the capped log and not the audit log.
+        state.note_refusal(
+            &parts.extensions,
+            "an API request with no valid credentials",
+        );
+        return Err(HumanProblem::Unauthenticated);
+    };
+    let principal = Principal { id, via };
+    if principal.is_human()
+        && !is_safe(&parts.method)
+        && !origin_matches(&parts.headers, state.config())
+    {
+        count_bad_origin(state, parts, &principal.id)?;
+        return Err(HumanProblem::BadOrigin);
+    }
+    Ok((principal, session))
+}
+
+/// Counts a session's state change from another origin. It goes in the capped log now and the
+/// audit log as a count, by [`tend`](crate::web::tend).
+fn count_bad_origin(
+    state: &ApiState,
+    parts: &Parts,
+    principal: &PrincipalId,
+) -> Result<(), HumanProblem> {
+    let reason = "a state change with a session, not from the configured origin";
+    state.note_refusal(&parts.extensions, &format!("{reason}, for {principal}"));
+    let source = source_of(&parts.extensions);
+    let now = state.store().now()?;
+    state
+        .ceremonies()
+        .count_failure(principal, FailureKind::BadOrigin, reason, source, now);
+    Ok(())
+}
+
 impl FromRequestParts<ApiState> for Principal {
     type Rejection = HumanProblem;
 
     async fn from_request_parts(parts: &mut Parts, state: &ApiState) -> Result<Self, HumanProblem> {
-        let store = state.store();
-        let found = match presented(&parts.headers) {
-            None => None,
-            Some(Credential::Token(token)) => store
-                .token_holder(&token)
-                .await?
-                .map(|(id, principal)| (principal, Via::Token(id))),
-            Some(Credential::Session(session)) => store
-                .session_holder(&session)
-                .await?
-                .map(|principal| (principal, Via::Session)),
-        };
-        let Some((id, via)) =
-            found.filter(|(principal, _)| named_in_config(state.config(), principal))
-        else {
-            // Anyone can send these, so they go to the capped log and not the audit log.
-            state.note_refusal(
-                &parts.extensions,
-                "an API request with no valid credentials",
-            );
-            return Err(HumanProblem::Unauthenticated);
-        };
-        let principal = Self { id, via };
-        if is_safe(&parts.method) {
-            return Ok(principal);
-        }
-        spend_budget(
-            state,
-            &parts.extensions,
-            &principal.id,
-            principal.is_human(),
-        )
-        .await?;
-        if principal.is_human() && !origin_matches(&parts.headers, state.config()) {
-            let event = AuditEvent {
-                kind: EventKind::AccessRefused,
-                deployment: None,
-                host: None,
-                detail: json!({
-                    "by": principal.audited(),
-                    "reason": "a state change with a session, not from the configured origin",
-                }),
+        let (principal, session) = identified(parts, state).await?;
+        if !is_safe(&parts.method) {
+            let spender = match session {
+                Some(session) => Spender::Session {
+                    hash: session.hash(),
+                    principal: principal.id.clone(),
+                },
+                None => Spender::Tokens(principal.id.clone()),
             };
-            store.record(&event).await?;
-            return Err(HumanProblem::BadOrigin);
+            spend_budget(state, &parts.extensions, &spender).await?;
         }
         Ok(principal)
+    }
+}
+
+/// Who is asking to sign out, and the session to end, if it is a session that asks. Its `Origin`
+/// was checked, and that is all: ending a session is never refused by a budget, so that someone
+/// who sees their cookie is being used up can always end it. It can't write much, since it ends
+/// what it would need to come again. A token has nothing to end, and pays as usual to be told.
+#[derive(Debug)]
+pub(crate) struct Leaving {
+    pub(crate) principal: Principal,
+    pub(crate) session: Option<SessionToken>,
+}
+
+impl FromRequestParts<ApiState> for Leaving {
+    type Rejection = HumanProblem;
+
+    async fn from_request_parts(parts: &mut Parts, state: &ApiState) -> Result<Self, HumanProblem> {
+        let (principal, session) = identified(parts, state).await?;
+        if session.is_none() {
+            let spender = Spender::Tokens(principal.id.clone());
+            spend_budget(state, &parts.extensions, &spender).await?;
+        }
+        Ok(Self { principal, session })
     }
 }

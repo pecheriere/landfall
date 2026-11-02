@@ -169,17 +169,62 @@ async fn a_stolen_token_does_not_spend_the_persons_budget_or_anyone_elses() {
     assert_eq!(answer.status, StatusCode::OK, "{answer:?}");
 }
 
+/// A page on a sibling subdomain can send a person's cookie, so this must cost them nothing.
 #[tokio::test]
-async fn bad_origins_are_within_the_budget_too() {
+async fn bad_origins_cost_no_budget_and_write_one_count() {
     let h = Harness::new().await;
     let session = h.store.begin_session_for_test("alice", 3600).await.reveal();
-    let caller = super::Caller::SessionFrom(session, None);
+    let caller = super::Caller::SessionFrom(session.clone(), None);
     let burst = usize::try_from(h.limits.principal_burst).unwrap();
     for _ in 0..burst + 5 {
-        h.call(Method::POST, PROD_REQUESTS, &caller, Vec::new())
+        let answer = h
+            .call(Method::POST, PROD_REQUESTS, &caller, Vec::new())
+            .await;
+        assert_eq!(answer.code(), "bad_origin");
+    }
+    assert_eq!(h.audited("access_refused").await.len(), 0);
+    assert_eq!(h.audited("access_throttled").await.len(), 0);
+
+    // The whole budget is there for the real page.
+    let real = super::Caller::Session(session);
+    for _ in 0..burst {
+        let answer = h.call(Method::POST, PROD_REQUESTS, &real, Vec::new()).await;
+        assert_ne!(answer.status, StatusCode::TOO_MANY_REQUESTS, "{answer:?}");
+    }
+
+    crate::web::tend(&h.state).await;
+    let rows = h.audited("access_refused").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["attempts"], burst + 5);
+}
+
+#[tokio::test]
+async fn a_session_exhausts_only_itself() {
+    let h = Harness::new().await;
+    let burst = usize::try_from(h.limits.principal_burst).unwrap();
+    let stolen = h.session("alice").await;
+    for _ in 0..burst {
+        h.call(Method::POST, PROD_REQUESTS, &stolen, Vec::new())
             .await;
     }
-    assert_eq!(h.audited("access_refused").await.len(), burst);
+    let over = h
+        .call(Method::POST, PROD_REQUESTS, &stolen, Vec::new())
+        .await;
+    assert_eq!(over.code(), "rate_limited");
+
+    // The same person's other session, and their token, are untouched.
+    for other in [h.session("alice").await, h.token("alice").await] {
+        let answer = h
+            .call(Method::POST, PROD_REQUESTS, &other, Vec::new())
+            .await;
+        assert_ne!(answer.status, StatusCode::TOO_MANY_REQUESTS, "{answer:?}");
+    }
+
+    flush_dropped(&h.state).await;
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["by"]["via"], "session");
+    assert_eq!(rows[0]["dropped"], 1);
 }
 
 #[tokio::test]

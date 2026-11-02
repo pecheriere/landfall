@@ -41,6 +41,99 @@ async fn a_source_over_its_allowance_is_told_to_wait_and_others_arent() {
     assert_eq!(later.status, StatusCode::OK);
 }
 
+/// A real tap isn't wasted by someone else's flood, behind a proxy that makes them one source.
+#[tokio::test]
+async fn a_finish_with_a_live_challenge_gets_through_any_flood() {
+    let h = Harness::with_limits(Limits {
+        ceremony_rate_per_second: 1,
+        ceremony_burst: 3,
+        ..Limits::default()
+    })
+    .await;
+    let code = h.invite("gina").await;
+    let key = SoftwareAuthenticator::es256().unwrap();
+    let signing_in = h.begin_sign_in().await;
+    let registering = h.begin_registration(&code).await;
+    h.begin_sign_in().await;
+    let flood = h.post(SIGN_IN_BEGIN, None, &json!({})).await;
+    assert_eq!(flood.status, StatusCode::TOO_MANY_REQUESTS);
+
+    let finished = h
+        .post(SIGN_IN_FINISH, None, &sign_in_body(&h.alice, &signing_in))
+        .await;
+    assert_eq!(finished.status, StatusCode::OK, "{finished:?}");
+    let finished = h
+        .post(
+            super::REGISTER_FINISH,
+            None,
+            &super::attestation_body(
+                &code,
+                &key,
+                &landfall_approval::Ceremony::new(super::RP_ID, ORIGIN, &registering),
+            ),
+        )
+        .await;
+    assert_eq!(finished.status, StatusCode::OK, "{finished:?}");
+}
+
+#[tokio::test]
+async fn a_bad_finish_pays_for_itself() {
+    let h = Harness::with_limits(Limits {
+        ceremony_rate_per_second: 1,
+        ceremony_burst: 3,
+        ..Limits::default()
+    })
+    .await;
+    let unknown = sign_in_body(&h.alice, &[9; 32]);
+    for _ in 0..3 {
+        let answer = h.post(SIGN_IN_FINISH, None, &unknown).await;
+        assert_eq!(answer.code(), "sign_in_refused");
+    }
+    let over = h.post(SIGN_IN_FINISH, None, &unknown).await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS);
+
+    // As does each other way of being bad, whichever route it comes by.
+    for (path, body) in [
+        (SIGN_IN_FINISH, json!([])),
+        (super::REGISTER_FINISH, json!({})),
+        (
+            super::REGISTER_FINISH,
+            json!({ "code": "0", "attestation_object": "", "client_data_json": "" }),
+        ),
+    ] {
+        h.clock.advance(1);
+        let first = h.post(path, None, &body).await;
+        assert_ne!(first.status, StatusCode::TOO_MANY_REQUESTS, "{path} {body}");
+        let second = h.post(path, None, &body).await;
+        assert_eq!(
+            second.status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{path} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_full_table_answers_at_once_and_time_alone_empties_it() {
+    let h = Harness::with_limits(Limits {
+        max_sign_in_challenges: 2,
+        ..Limits::default()
+    })
+    .await;
+    h.begin_sign_in().await;
+    h.begin_sign_in().await;
+    let full = h.post(SIGN_IN_BEGIN, None, &json!({})).await;
+    assert_eq!(full.code(), "ceremonies_busy");
+
+    h.clock.advance(5 * 60 - 1);
+    let full = h.post(SIGN_IN_BEGIN, None, &json!({})).await;
+    assert_eq!(full.code(), "ceremonies_busy");
+    h.clock.advance(1);
+    h.begin_sign_in().await;
+    h.begin_sign_in().await;
+    assert_eq!(h.state.ceremonies().held().0, 2);
+}
+
 #[tokio::test]
 async fn a_flood_of_ceremonies_leaves_the_agents_allowance_alone() {
     let h = Harness::with_limits(Limits {

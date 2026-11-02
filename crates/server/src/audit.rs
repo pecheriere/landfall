@@ -111,6 +111,9 @@ pub enum EventKind {
     SignedIn,
     /// Signing in as a principal failed, this many times since the last such row.
     SignInRefused,
+    /// A signature verified by a key that may not sign in, this many times since the last such
+    /// row: someone holds a key registered for this principal. Treat it as an alert.
+    SignInBarredKey,
     /// A person signed out, and their session ended.
     SignedOut,
 }
@@ -152,6 +155,7 @@ impl EventKind {
             Self::RegistrationRefused => "registration_refused",
             Self::SignedIn => "signed_in",
             Self::SignInRefused => "sign_in_refused",
+            Self::SignInBarredKey => "sign_in_barred_key",
             Self::SignedOut => "signed_out",
         }
     }

@@ -10,6 +10,8 @@
 //! for the operator to review and copy into the configuration. Registration is only as trusted
 //! as the link: whoever holds it can store a key for that name. `sign_in` says what that opens.
 
+use std::fmt;
+
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
@@ -23,36 +25,47 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
-use super::ceremonies::{CHALLENGE_LIFETIME_SECS, Ceremony};
-use super::{NO_STORE, admit, parsed};
+use super::ceremonies::{CHALLENGE_LIFETIME_SECS, FailureKind};
+use super::{NO_STORE, admit, charge, charged, count_failure, parsed};
 use crate::agent_api::{ApiState, json as json_answer};
 use crate::auth::{HumanProblem, PasskeyInvite};
 use crate::store::{NewPasskey, Redeemed, StoreError};
 
 /// A code in JSON.
-const MAX_BEGIN_BODY_BYTES: usize = 1024;
+pub(super) const MAX_BEGIN_BODY_BYTES: usize = 1024;
 /// The longest attestation object off the wire. It's short with `attestation: "none"`, which
 /// some authenticators answer with a statement anyway, and certificates are a few KiB.
 const MAX_ATTESTATION_BYTES: usize = 32 * 1024;
 /// Both fields at their limits, in base64url and JSON.
-const MAX_FINISH_BODY_BYTES: usize = 72 * 1024;
+pub(super) const MAX_FINISH_BODY_BYTES: usize = 72 * 1024;
 
 const _: () = assert!(
     (MAX_ATTESTATION_BYTES + MAX_CLIENT_DATA_BYTES).div_ceil(3) * 4 + 1024 <= MAX_FINISH_BODY_BYTES
 );
 
+/// An invite's code as it was sent, whatever it holds: `Debug` doesn't print it.
+#[derive(Deserialize)]
+#[serde(transparent)]
+pub(super) struct SentCode(String);
+
+impl fmt::Debug for SentCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SentCode(<redacted>)")
+    }
+}
+
 /// The body of `begin`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BeginBody {
-    code: String,
+pub(super) struct BeginBody {
+    code: SentCode,
 }
 
 /// The body of `finish`, as the browser gives it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FinishBody {
-    code: String,
+pub(super) struct FinishBody {
+    code: SentCode,
     attestation_object: String,
     client_data_json: String,
 }
@@ -130,8 +143,9 @@ pub(super) async fn begin(
 ) -> Result<Response, HumanProblem> {
     let (parts, body) = request.into_parts();
     let settings = admit(&state, &parts)?;
+    charge(&state, &parts)?;
     let sent: BeginBody = parsed(&state, body, MAX_BEGIN_BODY_BYTES).await?;
-    let (invite, principal) = invite_of(&state, &parts, &sent.code).await?;
+    let (invite, principal) = invite_of(&state, &parts, &sent.code.0).await?;
     let challenge = new_challenge()?;
     let now = state.store().now()?;
     state
@@ -188,15 +202,25 @@ pub(super) async fn finish(
 ) -> Result<Response, HumanProblem> {
     let (parts, body) = request.into_parts();
     let settings = admit(&state, &parts)?;
-    let sent: FinishBody = parsed(&state, body, MAX_FINISH_BODY_BYTES).await?;
-    let (invite, principal) = invite_of(&state, &parts, &sent.code).await?;
+    let sent: FinishBody = match parsed(&state, body, MAX_FINISH_BODY_BYTES).await {
+        Ok(sent) => sent,
+        Err(problem) => return Err(charged(&state, &parts, problem)),
+    };
+    let (invite, principal) = match invite_of(&state, &parts, &sent.code.0).await {
+        Ok(found) => found,
+        Err(problem) => return Err(charged(&state, &parts, problem)),
+    };
     let store = state.store();
 
     let refuse = |reason: &'static str| {
-        state
-            .ceremonies()
-            .count_failure(&principal, Ceremony::Registration, reason);
-        HumanProblem::RegistrationRefused
+        count_failure(
+            &state,
+            &parts,
+            &principal,
+            FailureKind::Registration,
+            reason,
+        );
+        charged(&state, &parts, HumanProblem::RegistrationRefused)
     };
     let now = store.now()?;
     let waiting = state.ceremonies().take_registration(&invite.hash(), now);
@@ -232,11 +256,14 @@ pub(super) async fn finish(
         key: &registered.key,
     };
     match store.redeem_invite(&invite, &passkey).await? {
-        Redeemed::Registered { principal } => Ok(json_answer(
-            &shown(&principal, &registered.credential_id, &registered.key),
-            &NO_STORE,
-        )),
-        Redeemed::InviteGone => Err(HumanProblem::InviteRefused),
+        Redeemed::Registered { principal, ended } => {
+            state.forget_sessions(&ended);
+            Ok(json_answer(
+                &shown(&principal, &registered.credential_id, &registered.key),
+                &NO_STORE,
+            ))
+        }
+        Redeemed::InviteGone => Err(charged(&state, &parts, HumanProblem::InviteRefused)),
         Redeemed::CredentialTaken => Err(refuse("another principal holds this credential id")),
     }
 }

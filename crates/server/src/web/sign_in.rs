@@ -45,13 +45,13 @@ use landfall_core::protocol::AssertionText;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::ceremonies::{CHALLENGE_LIFETIME_SECS, Ceremony, Full};
+use super::ceremonies::{CHALLENGE_LIFETIME_SECS, FailureKind, Full};
 use super::registration::new_challenge;
-use super::{NO_STORE, admit, parsed};
+use super::{NO_STORE, admit, charge, charged, count_failure, parsed};
 use crate::agent_api::{ApiState, json as json_answer};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{
-    HumanProblem, Principal, SESSION_COOKIE, named_in_config, session_of, spend_budget,
+    HumanProblem, Leaving, SESSION_COOKIE, Spender, named_in_config, session_of, spend_budget,
 };
 use crate::store::SESSION_LIFETIME_SECS;
 
@@ -88,6 +88,7 @@ pub(super) async fn begin(
 ) -> Result<Response, HumanProblem> {
     let (parts, _) = request.into_parts();
     admit(&state, &parts)?;
+    charge(&state, &parts)?;
     let challenge = new_challenge()?;
     let opened = state
         .ceremonies()
@@ -190,15 +191,19 @@ fn cookie(value: &str, max_age: i64) -> Result<HeaderValue, HumanProblem> {
 /// A refusal nobody can be held to, for the capped log.
 fn refuse_stranger(state: &ApiState, parts: &Parts) -> HumanProblem {
     state.note_refusal(&parts.extensions, "a sign-in naming nobody known");
-    HumanProblem::SignInRefused
+    charged(state, parts, HumanProblem::SignInRefused)
 }
 
 /// A refusal against who was named, to count. The answer is the same.
-fn refuse_named(state: &ApiState, principal: &PrincipalId, reason: &'static str) -> HumanProblem {
-    state
-        .ceremonies()
-        .count_failure(principal, Ceremony::SignIn, reason);
-    HumanProblem::SignInRefused
+fn refuse_named(
+    state: &ApiState,
+    parts: &Parts,
+    principal: &PrincipalId,
+    kind: FailureKind,
+    reason: &'static str,
+) -> HumanProblem {
+    count_failure(state, parts, principal, kind, reason);
+    charged(state, parts, HumanProblem::SignInRefused)
 }
 
 /// `POST /sign-in/finish`.
@@ -208,7 +213,10 @@ pub(super) async fn finish(
 ) -> Result<Response, HumanProblem> {
     let (parts, body) = request.into_parts();
     let settings = admit(&state, &parts)?;
-    let sent: FinishBody = parsed(&state, body, MAX_FINISH_BODY_BYTES).await?;
+    let sent: FinishBody = match parsed(&state, body, MAX_FINISH_BODY_BYTES).await {
+        Ok(sent) => sent,
+        Err(problem) => return Err(charged(&state, &parts, problem)),
+    };
     let store = state.store();
 
     let challenge = URL_SAFE_NO_PAD.decode(&sent.challenge).unwrap_or_default();
@@ -226,34 +234,39 @@ pub(super) async fn finish(
     };
     if !verified {
         let reason = "the assertion did not verify";
-        return Err(refuse_named(&state, &claim.principal, reason));
+        let kind = FailureKind::SignIn;
+        return Err(refuse_named(&state, &parts, &claim.principal, kind, reason));
     }
     if let Some(reason) = claim.barred {
-        return Err(refuse_named(&state, &claim.principal, reason));
+        let kind = FailureKind::SignInBarred;
+        return Err(refuse_named(&state, &parts, &claim.principal, kind, reason));
     }
 
-    // They proved who they are, so only now may this cost them anything.
-    spend_budget(&state, &parts.extensions, &claim.principal, true).await?;
+    // They signed, so only now may this cost them anything, and from a budget nothing else
+    // spends: no session's, which nobody needs a passkey to use up.
+    let spender = Spender::SignIns(claim.principal.clone());
+    spend_budget(&state, &parts.extensions, &spender).await?;
     let came_with = session_of(&parts.headers);
-    let session = store
+    let begun = store
         .begin_session(&claim.principal, claim.how, came_with.as_ref())
         .await?;
+    state.forget_sessions(&begun.ended);
     let mut response = json_answer(&json!({ "principal": claim.principal }), &NO_STORE);
     response.headers_mut().insert(
         header::SET_COOKIE,
-        cookie(&session.reveal(), SESSION_LIFETIME_SECS)?,
+        cookie(&begun.session.reveal(), SESSION_LIFETIME_SECS)?,
     );
     Ok(response)
 }
 
 /// `POST /sign-out`: ends the session here, whatever the browser does with the cookie. The
-/// extractor has made the `Origin` check. A token has no session to end.
+/// extractor has made the `Origin` check, and charges a session nothing. A token has no session
+/// to end.
 pub(super) async fn sign_out(
     State(state): State<ApiState>,
-    principal: Principal,
-    request: Request<Body>,
+    Leaving { principal, session }: Leaving,
 ) -> Result<Response, HumanProblem> {
-    let Some(session) = session_of(request.headers()).filter(|_| principal.is_human()) else {
+    let Some(session) = session else {
         let event = AuditEvent {
             kind: EventKind::AccessRefused,
             deployment: None,
@@ -267,6 +280,7 @@ pub(super) async fn sign_out(
         return Err(HumanProblem::Forbidden);
     };
     state.store().end_session(principal.id(), &session).await?;
+    state.forget_sessions(&[session.hash()]);
     let mut response = StatusCode::NO_CONTENT.into_response();
     response
         .headers_mut()

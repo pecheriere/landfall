@@ -81,6 +81,36 @@ message from the TOML parser may include part of one.
   point of small order, or a key with any extra parameter.
 - Two approvers can't hold the same credential id or the same key.
 
+## `[server]`
+
+Settings only the controller reads. It can be left out.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `trusted_proxies` | list of addresses | `[]` | The reverse proxies in front of the controller, each one IP address: no ranges and no names. |
+
+The per-source rate limits, on agents' unauthenticated requests and on registering and signing in,
+go by the connection's peer. Behind a proxy that is the proxy, so everyone shares one allowance.
+List its address here and, only for a connection from a listed address, the source is the rightmost
+`X-Forwarded-For` entry that isn't listed. From anyone else the header is ignored. An entry that
+isn't an address, or a chain of only listed addresses, leaves the source as the proxy. The cap on
+connections per source is not affected: it counts connections, which are the proxy's.
+
+Your proxy must append to `X-Forwarded-For` (or replace it), not pass on what the client sent
+without adding to it. List every proxy between the internet and the controller, if there are
+several, and the address the controller sees for each.
+
+If it is wrong:
+
+- **Left empty behind a proxy:** everyone is one source, so anyone can keep everyone else from
+  beginning a sign-in, and any agent from getting a nonce, just by asking often enough.
+- **A listed proxy that doesn't append:** a client picks its own source each request, and so gets
+  round the limits. Sign-in challenges and failure counts still have their own bounds, but the logs
+  and audit rows name whoever the client said it was.
+- **Listing something that isn't your proxy,** an address clients can connect from directly, gives
+  them the same.
+- **A proxy that isn't listed:** the same as leaving it empty, for clients behind that one.
+
 ## `[approval]`
 
 The relying party that passkeys sign for and that hosts check approvals against.

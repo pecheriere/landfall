@@ -91,6 +91,11 @@ impl<K: Eq + Hash> RateLimiter<K> {
         true
     }
 
+    /// Forgets the buckets of the keys this says yes to.
+    pub(crate) fn forget_where(&mut self, forget: impl Fn(&K) -> bool) {
+        self.buckets.retain(|key, _| !forget(key));
+    }
+
     /// A full bucket says nothing a new one would not, so forgetting it costs
     /// its source nothing.
     fn forget_full_buckets(&mut self, now: i64) {

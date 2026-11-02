@@ -56,7 +56,9 @@ use serde::Serialize;
 use serde_json::json;
 use sqlx::{Sqlite, Transaction};
 
-use crate::agent_api::{ApiProblem, ApiState, deadline, json as json_answer, log, read_body};
+use crate::agent_api::{
+    ApiProblem, ApiState, deadline, json as json_answer, log, note_client_source, read_body,
+};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
 use crate::store::{RequestSnapshot, RequestState, StoreError, StoredRequest, WatchedRunning};
@@ -358,8 +360,9 @@ pub(crate) fn router(state: ApiState) -> Router {
         .route("/api/v1/", any(not_found))
         .route("/api/v1/{*rest}", any(not_found))
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state)
+        .with_state(state.clone())
         .layer(middleware::from_fn_with_state(limit, deadline))
+        .layer(middleware::from_fn_with_state(state, note_client_source))
 }
 
 #[cfg(test)]

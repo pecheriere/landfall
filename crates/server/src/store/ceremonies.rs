@@ -7,14 +7,25 @@ use sqlx::Row as _;
 
 use super::{Store, StoreError};
 use crate::audit::{AuditEvent, EventKind};
-use crate::auth::{PasskeyInvite, SessionToken};
+use crate::auth::{MAX_SESSIONS_PER_PRINCIPAL, PasskeyInvite, SessionToken};
 
 /// How long a session lasts, in seconds: twelve hours.
 pub const SESSION_LIFETIME_SECS: i64 = 12 * 60 * 60;
 
-/// How many sessions one principal keeps. Signing in anew past this ends the oldest, so a
-/// passkey signing in over and over can't grow the table.
-const MAX_SESSIONS_PER_PRINCIPAL: i64 = 16;
+/// The token hashes of a statement's `DELETE ... RETURNING token_hash`, for whoever keeps
+/// something per session.
+fn hashes(rows: Vec<Vec<u8>>) -> Vec<[u8; 32]> {
+    rows.into_iter()
+        .filter_map(|row| row.try_into().ok())
+        .collect()
+}
+
+/// A session just begun, and the ones that beginning it ended.
+#[derive(Debug)]
+pub(crate) struct Begun {
+    pub(crate) session: SessionToken,
+    pub(crate) ended: Vec<[u8; 32]>,
+}
 
 /// A key to keep, out of a checked registration.
 #[derive(Debug, Clone, Copy)]
@@ -30,6 +41,8 @@ pub(crate) enum Redeemed {
     Registered {
         /// Whose it is.
         principal: PrincipalId,
+        /// The sessions this ended.
+        ended: Vec<[u8; 32]>,
     },
     /// The code is wrong, used or expired.
     InviteGone,
@@ -111,10 +124,11 @@ impl Store {
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM sessions WHERE principal = ?")
-            .bind(&holder)
-            .execute(&mut *tx)
-            .await?;
+        let ended =
+            sqlx::query_scalar("DELETE FROM sessions WHERE principal = ? RETURNING token_hash")
+                .bind(&holder)
+                .fetch_all(&mut *tx)
+                .await?;
         let replaced = replaced
             .as_deref()
             .and_then(|bytes| CoseKey::parse(bytes).ok())
@@ -133,6 +147,7 @@ impl Store {
         tx.commit().await?;
         Ok(Redeemed::Registered {
             principal: principal_from(&holder)?,
+            ended: hashes(ended),
         })
     }
 
@@ -162,19 +177,21 @@ impl Store {
         principal: &PrincipalId,
         how: &'static str,
         came_with: Option<&SessionToken>,
-    ) -> Result<SessionToken, StoreError> {
+    ) -> Result<Begun, StoreError> {
         let session = SessionToken::random().map_err(StoreError::Random)?;
         let now = self.clock.now()?;
         let mut tx = self.begin().await?;
-        sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        let mut ended: Vec<Vec<u8>> =
+            sqlx::query_scalar("DELETE FROM sessions WHERE expires_at <= ? RETURNING token_hash")
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await?;
         if let Some(old) = came_with {
             sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
                 .bind(old.hash().as_slice())
                 .execute(&mut *tx)
                 .await?;
+            ended.push(old.hash().to_vec());
         }
         sqlx::query(
             "INSERT INTO sessions (token_hash, principal, created_at, expires_at)
@@ -186,16 +203,17 @@ impl Store {
         .bind(now.saturating_add(SESSION_LIFETIME_SECS))
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        let evicted: Vec<Vec<u8>> = sqlx::query_scalar(
             "DELETE FROM sessions WHERE principal = ?1 AND token_hash NOT IN (
                  SELECT token_hash FROM sessions WHERE principal = ?1
                  ORDER BY created_at DESC, rowid DESC LIMIT ?2
-             )",
+             ) RETURNING token_hash",
         )
         .bind(principal.as_ref())
         .bind(MAX_SESSIONS_PER_PRINCIPAL)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        ended.extend(evicted);
         let event = AuditEvent {
             kind: EventKind::SignedIn,
             deployment: None,
@@ -204,7 +222,10 @@ impl Store {
         };
         self.append(&mut tx, &event).await?;
         tx.commit().await?;
-        Ok(session)
+        Ok(Begun {
+            session,
+            ended: hashes(ended),
+        })
     }
 
     /// Ends a session server-side, with its audit row.
@@ -230,19 +251,21 @@ impl Store {
     }
 
     /// Clears out sessions and invites past their time, which nothing can use any more. They
-    /// end by the clock whether this runs or not, so there is nothing to audit.
-    pub(crate) async fn settle_ceremonies(&self) -> Result<(), StoreError> {
+    /// end by the clock whether this runs or not, so there is nothing to audit. Gives the
+    /// sessions it cleared out.
+    pub(crate) async fn settle_ceremonies(&self) -> Result<Vec<[u8; 32]>, StoreError> {
         let now = self.clock.now()?;
         let mut tx = self.begin().await?;
-        sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+        let ended =
+            sqlx::query_scalar("DELETE FROM sessions WHERE expires_at <= ? RETURNING token_hash")
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await?;
         sqlx::query("DELETE FROM passkey_invites WHERE expires_at <= ?")
             .bind(now)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(hashes(ended))
     }
 }

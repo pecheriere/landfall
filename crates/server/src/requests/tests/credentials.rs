@@ -145,7 +145,13 @@ async fn a_state_change_with_a_session_takes_the_exact_origin() {
         assert_eq!(answer.status, StatusCode::FORBIDDEN, "{origin:?}");
         assert_eq!(answer.code(), "bad_origin", "{origin:?}");
     }
-    assert_eq!(h.audited("access_refused").await.len(), 7);
+    // A bad origin writes nothing as it comes, and is one count afterwards.
+    assert_eq!(h.audited("access_refused").await.len(), 0);
+    crate::web::tend(&h.state).await;
+    let rows = h.audited("access_refused").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["attempts"], 7);
+    assert_eq!(rows[0]["by"]["principal"], "alice");
     assert_eq!(h.audited("deploy_requested").await.len(), 0);
 
     let answer = h

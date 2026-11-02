@@ -267,8 +267,12 @@ Behind a TLS-terminating proxy, the proxy is the one address all agents share. S
   `--max-connections` above it. Each agent holds one connection most of the time,
   and briefly another.
 - Know what that gives up: any client that can reach the proxy can use up that
-  whole allowance, and so keep the agents out, without having a key. The limits
-  cannot tell them apart, since a forwarding header is something anyone can send.
+  whole allowance of connections, and so keep the agents out, without having a key.
+  This cap goes by the connection's peer, which is the proxy, whatever you set.
+- Set `[server] trusted_proxies` in the configuration to the proxy's address, so
+  that the rate limits, for agents and for people signing in, tell clients apart
+  by `X-Forwarded-For`. See [its section](configuration.md#server) for what goes
+  wrong if it is wrong.
 
 ## Requirements
 
@@ -527,27 +531,33 @@ request is never queued twice either. If the host then refuses or defers its dep
 deployment is free again, and retrying takes a new request, a new assertion and a new deploy
 number.
 
-**Each principal has a budget for state changes,** so that a credential gone wrong can't fill
-the audit log or crowd out the agents' writes: 120 at once, refilling at one a second, with a
-principal's tokens and its person's session counted apart. Reads don't count, and neither use
+**Each credential has a budget for state changes,** so that one gone wrong can't fill the audit
+log or crowd out the agents' writes: 120 at once, refilling at one a second. Each session has its
+own, and a principal's tokens share one, so a stolen cookie can exhaust only itself: not the
+person's other sessions, their tokens, or signing in, and signing out is never refused by a budget.
+So if a session is being used up, the person can still end it. Reads don't count, and neither use
 comes near it in normal work. Over it, a call gets `429 rate_limited` with `Retry-After`, and
 writes nothing. The count of those goes in an `access_throttled` audit row, with how many were
 `dropped`, at the next call within the budget or within one watcher interval, whichever is
-first, and when the controller stops. It names the principal and whether by token or session,
-and no particular token, since it can be another of the principal's that comes next: to find
-which, look at the rows around it. The count is kept in memory, so a crash loses one not yet
+first, and when the controller stops. It names the principal and whether by `token`, `session` or
+`sign_in`, and no particular token, since it can be another of the principal's that comes next: to
+find which, look at the rows around it. The count is kept in memory, so a crash loses one not yet
 written.
 
 The budget is what bounds a credential gone wrong, not a promise of a small log: one write
 transaction a second, with rows of one to two KiB from a hostile caller and two rows a call for
 a rollback that supersedes a request. That is **some 80 to 170 MB of audit log a day for each
-credential** until it is revoked. `access_throttled` and a jump in `request_refused`,
-`approval_refused` or `request_cancelled` rows are worth an alert.
+credential** until it is revoked. A session takes a passkey to get and a principal keeps sixteen, so
+a person's sessions come to at most sixteen times that, and each session ends within 12 hours.
+`access_throttled` and a jump in `request_refused`, `approval_refused` or `request_cancelled` rows
+are worth an alert.
 
-A state change with a session and a bad `Origin` spends that session's budget too. It is the
-fair price of bounding those `access_refused` rows, and the session's alone: not the principal's
-tokens', and it is back within minutes. It takes the person's cookie to do, which a browser
-doesn't send from another site, as the cookie is `SameSite=Strict`.
+**A state change with a session and a bad `Origin`** is refused before it costs anything: it spends
+no budget, and writes no row of its own. `SameSite=Strict` doesn't stop a page on a sibling
+subdomain from sending the cookie, as that is the same site, so this must be free. They are counted,
+and written as one `access_refused` row each watcher interval, with how many `attempts`, when the
+first was and from where. A jump in those means someone is sending a person's cookie from another
+origin, and it may be their browser doing so at a page's bidding.
 
 **A request nothing can read** (`request_unreadable`, 500), from a hand-edited or damaged
 database, costs only itself. The controller's log names its row, it is left out of `GET
@@ -599,26 +609,51 @@ configuration's grants, and it stops working once the file no longer names the p
 at most are kept for a principal, the oldest ending first. `POST /sign-out` ends one on the server.
 **Approving always takes a fresh assertion,** so a stolen cookie can't approve anything.
 
+**What a session outlives.** Whether a key may sign in is decided when it signs in, so a session
+goes on after that changes. If someone with a stored key is added to `[approvers]` with another key,
+a session from the stored key lives up to 12 hours more. It can do what their grants say, and still
+can't approve, since `approve` takes the file's key. The stored key also wakes up by itself: if its
+owner is later named in the file with no `[approvers]` entry, or taken out of `[approvers]` but left
+with a grant, it signs in again. If that isn't what you want, end it by registering.
+
+**To end someone's sessions:** have them register again from a new invite, which replaces the stored
+key and ends every session of theirs. To do it without them, take them out of the file: their
+sessions stop working when the controller next loads it. There is no command for one session.
+
 Every failed sign-in gets the same `403 sign_in_refused`, whether the credential is unknown, the
 signature bad, or the key one that may not sign in, and nothing before that names anyone. Each
 challenge lasts five minutes and works once, and a sign-in's can't finish a registration.
 
 **Limits, for what anyone can send.** Every `POST` here wants the exact `Origin`, or
-`403 bad_origin`, and comes from a bucket per source: 30 at once, refilling at two a second, apart
-from the agents' so that a flood leaves them their nonces. Over it is `429 rate_limited`. Sign-in
-challenges are in memory, 65,536 at most: a full table answers `503 ceremonies_busy` and keeps
-every challenge it has, so nobody's can be pushed out. Beginning writes nothing to the database.
-Neither limit touches anyone's budget, a session already signed in, or an approval.
+`403 bad_origin`. Each `begin`, and each `finish` that turns out bad, comes from a bucket per source:
+30 at once, refilling at two a second, apart from the agents' so that a flood leaves them their
+nonces. Over it is `429 rate_limited`. A `finish` with a live challenge and a good answer costs
+nothing and can't be refused for this, so a tap once made isn't wasted by someone else's flood.
+Sign-in challenges are in memory, 65,536 at most, each holding its place for its five minutes: a
+full table answers `503 ceremonies_busy` and keeps every challenge it has, so nobody's can be pushed
+out. Beginning writes nothing to the database. Neither limit touches anyone's budget, a session
+already signed in, or an approval.
 
-The source is the connection's peer, so **behind a proxy all clients are one source**, and a
-flood through it can keep others from beginning a sign-in for as long as it lasts. Limit these
-paths at the proxy too if it faces the internet.
+**Behind a proxy, set `[server] trusted_proxies`** ([configuration](configuration.md#server)).
+Without it the source is the connection's peer, so all clients are one source, and anyone sending
+two `begin`s a second can keep everyone from beginning a sign-in for as long as they go on. When
+sessions have expired, nobody can then approve. With it, each client has its own bucket, and it
+takes many addresses to do that. Limit these paths at the proxy too if it faces the internet.
 
 **In the audit log:** `passkey_registered`, `signed_in` and `signed_out`, each with its change.
-Failures are counts, since anyone who knows a credential id could cause them: `sign_in_refused` and
-`registration_refused` name the principal, how many `attempts` and the last `reason`, one row per
-principal each watcher interval, and when the controller stops. A crash loses a count not yet
-written. A jump in either is worth an alert. A failure naming nobody goes to the capped log.
+Failures are counts, since anyone who knows a credential id could cause them. One row each watcher
+interval for each principal, kind and reason, and when the controller stops, each with how many
+`attempts`, the `reason`, `first_seen`, up to eight `sources` and how many attempts came `from_others`:
+
+- **`sign_in_barred_key`: treat this as an alert.** A signature verified by a key registered here
+  that may not sign in, so someone holds that key: a leaked invite, or an old device. Nothing a
+  sender does afterwards changes this row.
+- `sign_in_refused`: a signature that didn't verify on a known credential. A credential id may be
+  public, so this says little about who sent it.
+- `registration_refused`: a good invite's code with a ceremony that didn't check out.
+
+Each also goes to the capped log as it happens, with who it came from. A crash loses a count not yet
+written. A failure naming nobody goes only to the capped log.
 
 **A sign-in tap is `webauthn.get` too,** the same kind as an approval. So a compromised controller
 could put a request's intent hash in a sign-in ceremony, and a person signing in would have

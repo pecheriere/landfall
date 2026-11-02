@@ -133,6 +133,12 @@ try {
   // That was a test of the policy, and its refusal isn't a problem with the page.
   problems.length = 0;
 
+  let signInBody = null;
+  page.on("request", (request) => {
+    if (request.url().endsWith("/sign-in/finish")) {
+      signInBody = request.postData();
+    }
+  });
   await page.click("#sign-in");
   await page.waitForURL("**/approvals");
   const cookies = await context.cookies();
@@ -143,6 +149,84 @@ try {
     await page.evaluate(() => !document.cookie.includes("landfall")),
     "and the page's script can't read it",
   );
+  await page.waitForFunction(() =>
+    document.getElementById("status").textContent.includes("Nothing is waiting"),
+  );
+
+  // What goes to the server is exactly the four assertion fields.
+  const assertionFields = JSON.parse(signInBody).assertion;
+  check(
+    Object.keys(assertionFields).sort().join() ===
+      "authenticator_data,client_data_json,credential_id,signature",
+    "a sign-in sends exactly the four assertion fields",
+  );
+
+  // A lying or broken controller's text stays text: a tag, a name and a reason, on each page.
+  const hostile = '<img src=x onerror="window.injected = true">';
+  const noMarkup = () =>
+    page.evaluate(() => document.querySelector("img") === null && window.injected === undefined);
+  await page.route("**/api/v1/approvals", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        approvals: [
+          {
+            id: 1,
+            host: hostile,
+            intent: {
+              deployment: hostile,
+              tag: hostile,
+              commit: hostile,
+              digest: hostile,
+              expected_running: hostile,
+              nonce: hostile,
+            },
+            challenge: "AAAA",
+            state: "awaiting_approval",
+            requested_by: hostile,
+            created_at: 0,
+            expires_at: 0,
+            can_approve: true,
+          },
+        ],
+      }),
+    }),
+  );
+  await page.route("**/api/v1/approvals/1/cancel", (route) =>
+    route.fulfill({
+      status: 403,
+      contentType: "application/problem+json",
+      body: JSON.stringify({ code: "forbidden", title: hostile, status: 403 }),
+    }),
+  );
+  await page.reload();
+  await page.waitForSelector("section");
+  check((await page.textContent("#approvals")).includes(hostile), "a hostile tag is shown as text");
+  check(await noMarkup(), "and it made no element");
+  await page.getByRole("button", { name: "Cancel this request" }).click();
+  await page.waitForFunction(
+    (text) => document.getElementById("status").textContent === text,
+    hostile,
+  );
+  check(await noMarkup(), "a hostile reason is shown as text, and made no element");
+  await page.unroute("**/api/v1/approvals");
+  await page.unroute("**/api/v1/approvals/1/cancel");
+
+  await page.route("**/passkeys/register/begin", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ principal: hostile, publicKey: {} }),
+    }),
+  );
+  await page.goto(`${origin}/passkeys/register#code`);
+  await page.click("#register");
+  await page.waitForSelector("#who:not([hidden])");
+  check((await page.textContent("#who")).includes(hostile), "a hostile name is shown as text");
+  check(await noMarkup(), "and it made no element");
+  await page.unroute("**/passkeys/register/begin");
+  await page.goto(`${origin}/approvals`);
   await page.waitForFunction(() =>
     document.getElementById("status").textContent.includes("Nothing is waiting"),
   );

@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use serde::de::value::MapAccessDeserializer;
@@ -86,6 +87,13 @@ pub(super) fn build(text: &str, hash: String, check: KeyCheck) -> Result<Config,
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Config {
         signers,
+        // An IPv4 address on an IPv6 socket is the IPv4 address, whichever way it is written.
+        trusted_proxies: raw
+            .server
+            .trusted_proxies
+            .iter()
+            .map(IpAddr::to_canonical)
+            .collect(),
         approval,
         approvers,
         deployments,
@@ -106,6 +114,8 @@ pub(super) fn build(text: &str, hash: String, check: KeyCheck) -> Result<Config,
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     #[serde(default)]
+    server: RawServer,
+    #[serde(default)]
     signers: BTreeMap<PrincipalId, String>,
     #[serde(default)]
     approval: Option<RawApproval>,
@@ -115,6 +125,13 @@ struct RawConfig {
     deployments: Vec<RawDeployment>,
     #[serde(default, rename = "grant")]
     grants: Vec<RawGrant>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawServer {
+    #[serde(default)]
+    trusted_proxies: Vec<IpAddr>,
 }
 
 #[derive(Deserialize)]

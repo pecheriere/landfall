@@ -4,7 +4,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use serde_json::json;
 
-use super::{COOKIE_NAME, Harness, SIGN_IN_FINISH, SIGN_OUT, answer_of, sign_in_body};
+use super::{
+    COOKIE_NAME, Harness, SIGN_IN_FINISH, SIGN_OUT, answer_of, post_request, sign_in_body,
+};
 use crate::agent_api::Limits;
 use crate::store::SESSION_LIFETIME_SECS;
 
@@ -19,6 +21,82 @@ async fn list_status(app: &axum::Router, session: &str) -> StatusCode {
     )
     .await
     .status
+}
+
+/// A page on a sibling subdomain, or whoever stole the cookie, sends it with a bad `Origin`.
+#[tokio::test]
+async fn a_bad_origin_cannot_keep_a_person_from_signing_out_or_in() {
+    let h = Harness::new().await;
+    let session = h.signed_in(&h.alice).await;
+    let rows = h.count("audit_events").await;
+    for _ in 0..500 {
+        let request = post_request(
+            SIGN_OUT,
+            Some("https://sub.landfall.example"),
+            Some(&session),
+            &json!({}),
+        );
+        assert_eq!(h.send(request).await.code(), "bad_origin");
+    }
+    assert_eq!(h.count("audit_events").await, rows);
+
+    assert_eq!(h.signed_in(&h.alice).await.len(), 64);
+    let out = h.post(SIGN_OUT, Some(&session), &json!({})).await;
+    assert_eq!(out.status, StatusCode::NO_CONTENT, "{out:?}");
+    assert_eq!(
+        list_status(&h.app, &session).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Whoever stole the cookie uses it up properly, from the right `Origin`.
+#[tokio::test]
+async fn a_used_up_session_can_still_sign_out_and_its_owner_still_sign_in() {
+    let h = Harness::with_limits(Limits {
+        principal_burst: 3,
+        ..Limits::default()
+    })
+    .await;
+    let stolen = h.signed_in(&h.alice).await;
+    let mine = h.signed_in(&h.alice).await;
+    let state_change = "/api/v1/approvals/1/cancel";
+    for _ in 0..3 {
+        h.post(state_change, Some(&stolen), &json!({})).await;
+    }
+    let over = h.post(state_change, Some(&stolen), &json!({})).await;
+    assert_eq!(over.code(), "rate_limited");
+
+    // Their other session, and a new one.
+    let other = h.post(state_change, Some(&mine), &json!({})).await;
+    assert_ne!(other.status, StatusCode::TOO_MANY_REQUESTS, "{other:?}");
+    assert_eq!(h.signed_in(&h.alice).await.len(), 64);
+
+    let out = h.post(SIGN_OUT, Some(&stolen), &json!({})).await;
+    assert_eq!(out.status, StatusCode::NO_CONTENT, "{out:?}");
+    assert_eq!(list_status(&h.app, &stolen).await, StatusCode::UNAUTHORIZED);
+}
+
+/// A key signing in and out, or just in, never fills the table of budgets, which would leave the
+/// next session with none.
+#[tokio::test]
+async fn sessions_that_ended_leave_no_budget_behind() {
+    let h = Harness::with_limits(Limits {
+        ceremony_burst: 10_000,
+        principal_burst: 10_000,
+        ..Limits::default()
+    })
+    .await;
+    let state_change = "/api/v1/approvals/1/cancel";
+    // More than the table holds for this configuration's principals, with no time passing, so
+    // no bucket fills up again to be forgotten that way.
+    for round in 0..120 {
+        let session = h.signed_in(&h.alice).await;
+        let used = h.post(state_change, Some(&session), &json!({})).await;
+        assert_ne!(used.status, StatusCode::TOO_MANY_REQUESTS, "{round}");
+        if round % 2 == 0 {
+            h.post(SIGN_OUT, Some(&session), &json!({})).await;
+        }
+    }
 }
 
 #[tokio::test]

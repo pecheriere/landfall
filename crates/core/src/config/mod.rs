@@ -12,6 +12,7 @@
 //!
 //! // Struct literals are refused: the fields are private.
 //! let _ = Config {
+//!     trusted_proxies: vec![],
 //!     signers: BTreeMap::new(),
 //!     approval: None,
 //!     approvers: BTreeMap::new(),
@@ -31,6 +32,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::net::IpAddr;
 
 pub use approval::{Approval, Approver, KeyCheck, MAX_CREDENTIAL_ID_LEN};
 use serde::Deserialize;
@@ -314,6 +316,8 @@ impl fmt::Display for Chain<'_> {
 /// and has no mutators, so every value in it passed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Peers whose `X-Forwarded-For` the controller believes.
+    trusted_proxies: Vec<IpAddr>,
     /// Trusted tag-signing keys, by name.
     signers: BTreeMap<PrincipalId, SignerKey>,
     /// The relying party approvals are checked against.
@@ -551,6 +555,9 @@ macro_rules! getters {
 }
 
 getters!(Config, c {
+    /// `[server] trusted_proxies`: the peers whose `X-Forwarded-For` the controller believes,
+    /// each in its canonical form. Empty unless the file says otherwise.
+    trusted_proxies: &[IpAddr] => &c.trusted_proxies,
     /// Trusted tag-signing keys, by name.
     signers: &BTreeMap<PrincipalId, SignerKey> => &c.signers,
     /// The relying party approvals are checked against. `None` on a file with no
