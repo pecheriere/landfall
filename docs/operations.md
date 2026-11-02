@@ -635,17 +635,28 @@ gone and come back. What it can install is still only the one release it names, 
 
 #### Telling a crash from a replay
 
-Both are refused with `was already spent on this host, either by a replay or by a crash before
-that deploy started`, and name the nonce. The refusal itself changed nothing on the service.
-The host can't tell them apart, and you can, from its journal, by searching for that nonce:
+Every delivery of a spent approval is refused with `was already spent on this host, and this
+delivery changed nothing on the service`, naming the nonce. The host can't tell why it came
+again, and you can, from its journal, by searching for that nonce.
 
-- The journal says `approval_about_to_be_spent` for a nonce just before it is spent, naming
-  the approver, the deployment and the release.
-- **A crash:** after that line, this tag has no `deploy_step` lines and the agent restarted.
-  Honest: the controller redelivered work the host had claimed. Ask for a new approval.
-- **A replay:** after that line, the tag has `deploy_step` lines and a `deploy_finished`: the
-  approval did its work, and has been sent again. A controller doing that on a later number
-  is an alert. It gets nothing from it, as the approval is spent.
+The journal says `approval_about_to_be_spent` just before the host tries to spend a nonce,
+naming the approver, the deployment and the release. The line doesn't prove it was spent: it
+also appears with nothing spent, when the log turned out to be unusable or another writer got
+there first. So if a `nonce_log_unusable` line follows it, or the nonce isn't in the log, read
+it as an attempt. Otherwise, going by what follows it:
+
+- **A crash before the deploy started:** this tag has no `deploy_step` lines after it, and the
+  agent restarted. Honest: the controller redelivered work the host had claimed. It takes a new
+  approval.
+- **A deploy that ran and was then recovered or rolled back, redelivered:** the tag has
+  `deploy_step` lines, its `deploy_finished` isn't a success, or a `recover` ended it, and the
+  agent or the controller restarted around then. This can be honest too: a controller that
+  lost track of how the deploy ended delivers it again. Look at what the controller says about
+  that deploy, and if you still want the release, it takes a new approval.
+- **A replay:** the tag has `deploy_step` lines and its `deploy_finished` succeeded, the report
+  was delivered (`report_delivered`, by the deploy's number), and nothing restarted, yet the
+  approval has come again under a later number. Treat that as an alert. It gets nothing from it,
+  as the approval is spent.
 - **No such line at all, for a nonce in the log:** the log was changed by something other
   than the agent, or the journal has lost it. Treat it as an alert.
 
@@ -674,13 +685,15 @@ naming the file, and its `error` says which. Nothing repairs it for you:
 - **Any other line that isn't a nonce** means something other than the agent has written
   there. Find out what, and restore the file from a backup if you have one.
 
-**Taking a line out of the log reopens replay for that nonce.** The agent doesn't read an
-archive. What still bounds it: the approval has to have been kept by someone, and it only
-works while the digest it names as running is the one on record, so it can only ever take the
-deployment from that same running digest to the one signed release it names. The oldest
-lines name digests that are the least likely to be running again, which is why those are the
-ones to move. Removing the whole file forgets every approval this way. The agent reads the file
-afresh for each approval, so none of this needs a restart.
+**Taking a line out of the log reopens replay for that nonce, so only archive when you accept
+that.** The agent doesn't read an archive, and the controller that delivered every approval
+has seen them all, so assume a compromised one still holds each of them. What still bounds it:
+an approval only works while the digest it names as running is the one on record, so it can
+only ever take the deployment from that same running digest to the one signed release it names.
+Older lines are less likely to name a digest that is running, which is why they are the ones to
+move, but that is a likelihood and no more: a rollback to a long-lived digest, A to B and back
+to A, can reopen an old approval that named A. Removing the whole file forgets every approval
+this way. The agent reads the file afresh for each approval, so none of this needs a restart.
 
 ### A release that rolled back isn't retried
 

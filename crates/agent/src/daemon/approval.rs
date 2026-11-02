@@ -127,7 +127,7 @@ fn replayed(id: &DeploymentId, nonce: &[u8; 32]) -> Stop {
     refuse(
         Priority::Critical,
         format!(
-            "approval refused: {id}: nonce {} was already spent on this host, either by a replay or by a crash before that deploy started; this delivery changed nothing on the service, and it takes a new approval",
+            "approval refused: {id}: nonce {} was already spent on this host, and this delivery changed nothing on the service; it may be a replay, a redelivery after a crash, or a return to a digest it named earlier, and it takes a new approval",
             hex::encode(nonce),
         ),
     )
