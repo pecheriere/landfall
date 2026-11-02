@@ -231,6 +231,9 @@ pub async fn enrol(
     let state = StateDir::open(state_dir)?;
     let _lock = state.lock_daemon()?;
     let code = read_code(code_file)?;
+    // Before the key: a host that can't make a request, for want of CA certificates
+    // say, is told so with nothing left behind.
+    let http = client::http_client(url)?;
     let key = load_or_create_key(&state)?;
     let public_key = key.verifying_key();
     let request = EnrolRequest {
@@ -240,7 +243,7 @@ pub async fn enrol(
     };
     let body = serde_json::to_vec(&request)
         .map_err(|error| ControllerError::Serialise(error.to_string()))?;
-    let response = client::http_client(url)?
+    let response = http
         .post(url.enrol_url())
         .timeout(client::REQUEST_TIMEOUT)
         .header(CONTENT_TYPE, "application/json")
@@ -504,6 +507,29 @@ mod tests {
         let server = controller(200, "").await;
         f.enrol(&server).await.unwrap();
         assert_eq!(fs::read(f.key_path()).unwrap(), bytes, "the same key");
+    }
+
+    #[tokio::test]
+    async fn the_apis_refusal_is_told_by_its_code_and_title_not_as_raw_json() {
+        let f = fixture();
+        let server = MockServer::start().await;
+        let body = r#"{"code":"invalid_code","title":"the code\nis refused","status":403}"#;
+        Mock::given(method("POST"))
+            .and(path("/agent/v1/enrol"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("content-type", "application/problem+json")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let text = f.enrol(&server).await.unwrap_err().to_string();
+
+        assert!(text.contains("403"), "{text}");
+        assert!(text.contains("invalid_code: "), "{text}");
+        assert!(text.contains("the code"), "{text}");
+        assert!(!text.contains('{') && !text.contains('\n'), "{text}");
     }
 
     #[tokio::test]

@@ -216,15 +216,27 @@ fn host_is_private(url: &Url) -> bool {
 /// The HTTP client for a controller: no redirects, a connect timeout, and with
 /// an `https` URL nothing but `https`.
 pub(crate) fn http_client(url: &ControllerUrl) -> Result<Client, ControllerError> {
+    client_keeping_idle(url, IDLE_CONNECTION)
+}
+
+fn client_keeping_idle(url: &ControllerUrl, idle: Duration) -> Result<Client, ControllerError> {
     // No proxy from the environment: signed requests and enrolment codes go to
     // the controller the operator named, directly.
-    Client::builder()
+    let builder = Client::builder()
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
-        .pool_idle_timeout(IDLE_CONNECTION)
+        .pool_idle_timeout(idle)
         .https_only(url.is_https())
         .redirect(redirect::Policy::none())
-        .user_agent(concat!("landfall-agent/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("landfall-agent/", env!("CARGO_PKG_VERSION")));
+    // Plain HTTP makes no use of the system's CA certificates, and redirects aren't
+    // followed, so a host without them can still reach a controller over loopback.
+    let builder = if url.is_https() {
+        builder
+    } else {
+        builder.tls_certs_only([])
+    };
+    builder
         .build()
         .map_err(|error| ControllerError::Client(error_chain(&error)))
 }
@@ -256,9 +268,21 @@ pub(crate) async fn answer(response: reqwest::Response) -> Result<Vec<u8>, Contr
     }
     let detail = read_capped(response).await.map_or_else(
         |_| "its error could not be read".to_owned(),
-        |body| shown(&String::from_utf8_lossy(&body)),
+        |body| error_detail(&body),
     );
     Err(ControllerError::Status { status, detail })
+}
+
+/// What an error's body says: the code and title of the API's problem document, or
+/// else the body. Either way quoted and truncated, as it may not be the API's at all.
+fn error_detail(body: &[u8]) -> String {
+    serde_json::from_slice::<Problem>(body)
+        .ok()
+        .and_then(|problem| {
+            let code = ProblemCode::parse(&problem.code)?;
+            Some(format!("{}: {}", code.as_str(), shown(&problem.title)))
+        })
+        .unwrap_or_else(|| shown(&String::from_utf8_lossy(body)))
 }
 
 /// The API's own refusal for good, if `body` is one: a 4xx with its content type,
@@ -393,24 +417,79 @@ impl Controller for HttpController {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use landfall_core::protocol::{
         DeployId, DeployReportBody, Nonce, ReportedOutcome, RequestSignature, SigningKey,
         WorkRequest, verify,
     };
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{
-        Controller, ControllerError, ControllerUrl, HttpController, NonceResponse,
-        PROBLEM_CONTENT_TYPE, UrlError,
+        Controller, ControllerError, ControllerUrl, HttpController, IDLE_CONNECTION, NonceResponse,
+        PROBLEM_CONTENT_TYPE, UrlError, client_keeping_idle,
     };
 
     const NONCE: [u8; 32] = [0xab; 32];
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[3; 32])
+    }
+
+    /// A server that keeps connections open for as long as the client does, and counts
+    /// them: all that can show whether the client went back to an idle one.
+    async fn counting_server() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    while stream.read(&mut request).await.is_ok_and(|read| read > 0) {
+                        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                        stream.write_all(answer).await.unwrap();
+                    }
+                });
+            }
+        });
+        (url, connections)
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_is_used_again_only_within_its_time() {
+        let (url, connections) = counting_server().await;
+        let parsed = ControllerUrl::parse(&url, true).unwrap();
+        let idle = Duration::from_millis(200);
+        let client = client_keeping_idle(&parsed, idle).unwrap();
+        let get = async || {
+            let answer = client.get(url.as_str()).send().await.unwrap();
+            assert!(answer.status().is_success());
+        };
+
+        get().await;
+        get().await;
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "within its time");
+
+        tokio::time::sleep(idle * 2).await;
+        get().await;
+        assert_eq!(connections.load(Ordering::SeqCst), 2, "past its time");
+    }
+
+    /// Otherwise a request can go down a connection just as the controller closes it.
+    #[test]
+    fn an_idle_connection_is_let_go_before_the_controller_would() {
+        let controller = landfall_server::serve::ServeOptions::default();
+        assert!(IDLE_CONNECTION < controller.header_read_timeout);
     }
 
     fn client(server: &MockServer) -> HttpController {
