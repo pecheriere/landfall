@@ -112,7 +112,7 @@ cargo deny check
 - Keep files small: split a source file by responsibility before it passes
   about 800 lines of code, and move a large test module into its own file. When
   a change would push a file past that, split it in the same change, or track
-  the split as an issue (#18 lists the current ones). The parts of `foo.rs`
+  the split as an issue. The parts of `foo.rs`
   go in `foo/`, its tests in `foo/tests.rs` (shared fixtures) and
   `foo/tests/<scenario>.rs`, as `daemon` does. A test names what it imports
   rather than using `use super::*`.
