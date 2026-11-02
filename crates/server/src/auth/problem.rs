@@ -44,6 +44,8 @@ pub(crate) enum HumanProblem {
     AssertionRefused,
     /// The configuration has no `[approval]`.
     ApprovalsNotConfigured,
+    /// This principal has asked for too many state changes.
+    OverBudget,
     /// A problem both APIs have.
     Shared(ApiProblem),
 }
@@ -135,6 +137,11 @@ impl HumanProblem {
                 "approvals_not_configured",
                 "the configuration has no [approval] settings",
             ),
+            Self::OverBudget => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many state changes by this principal",
+            ),
             Self::Shared(_) => return None,
         })
     }
@@ -161,6 +168,11 @@ impl IntoResponse for HumanProblem {
             response
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if self == Self::OverBudget {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
         }
         response
     }

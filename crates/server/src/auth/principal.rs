@@ -13,6 +13,7 @@ use landfall_core::config::Config;
 use landfall_core::ids::PrincipalId;
 use serde_json::{Value, json};
 
+use super::budget::Spent;
 use super::grants::named_in_config;
 use super::problem::HumanProblem;
 use super::token::{ApiToken, SessionToken};
@@ -55,6 +56,34 @@ impl Principal {
         match self.via {
             Via::Session => json!({ "principal": self.id, "via": "session" }),
             Via::Token(token) => json!({ "principal": self.id, "via": "token", "token": token }),
+        }
+    }
+
+    /// Takes the cost of a state change from this principal's budget. Over it, the call is
+    /// refused before it can write anything. The first call back within it writes down how
+    /// many were, or is refused itself and keeps the count.
+    async fn spend_budget(&self, parts: &Parts, state: &ApiState) -> Result<(), HumanProblem> {
+        let store = state.store();
+        let human = self.is_human();
+        match state.spend_budget(&self.id, human, store.now()?) {
+            Spent::Over => {
+                state.note_refusal(&parts.extensions, "an API call over its principal's budget");
+                Err(HumanProblem::OverBudget)
+            }
+            Spent::Within { dropped: 0 } => Ok(()),
+            Spent::Within { dropped } => {
+                let event = AuditEvent {
+                    kind: EventKind::AccessThrottled,
+                    deployment: None,
+                    host: None,
+                    detail: json!({ "by": self.audited(), "dropped": dropped }),
+                };
+                if let Err(error) = store.record(&event).await {
+                    state.keep_dropped(&self.id, human, dropped);
+                    return Err(error.into());
+                }
+                Ok(())
+            }
         }
     }
 
@@ -160,10 +189,11 @@ impl FromRequestParts<ApiState> for Principal {
             return Err(HumanProblem::Unauthenticated);
         };
         let principal = Self { id, via };
-        if principal.is_human()
-            && !is_safe(&parts.method)
-            && !origin_matches(&parts.headers, state.config())
-        {
+        if is_safe(&parts.method) {
+            return Ok(principal);
+        }
+        principal.spend_budget(parts, state).await?;
+        if principal.is_human() && !origin_matches(&parts.headers, state.config()) {
             let event = AuditEvent {
                 kind: EventKind::AccessRefused,
                 deployment: None,

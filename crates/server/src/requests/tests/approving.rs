@@ -88,6 +88,22 @@ async fn assertion_for_another_intent_is_refused_by_the_controller_too() {
 }
 
 #[tokio::test]
+async fn a_request_has_one_path() {
+    let h = Harness::new().await;
+    let (id, intent) = h.opened().await;
+    let alice = h.session("alice").await;
+    let body = super::assertion_body(&h.keys.alice, &intent);
+    for alias in [format!("0{id}"), format!("%2B{id}"), format!("{id}%20")] {
+        let answer = h.post(&format!("{APPROVALS}/{alias}"), &alice, &body).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{alias}");
+        let cancel = format!("{APPROVALS}/{alias}/cancel");
+        let answer = h.post(&cancel, &alice, &json!({})).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{alias}");
+    }
+    assert_eq!(h.request_state(id).await, "awaiting_approval");
+}
+
+#[tokio::test]
 async fn the_queued_row_carries_what_the_host_verifies() {
     let h = Harness::new().await;
     let (id, intent) = h.opened().await;

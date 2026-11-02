@@ -39,15 +39,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use landfall_core::config::Config;
-use landfall_core::ids::HostId;
+use landfall_core::ids::{HostId, PrincipalId};
 use tokio::sync::{oneshot, watch};
 
 pub(crate) use self::handlers::json;
 pub(crate) use self::problem::{ApiProblem, log, problem_response};
-use self::rate_limit::RateLimiter;
-pub(crate) use self::rate_limit::source_key;
+pub(crate) use self::rate_limit::{RateLimiter, source_key};
 pub(crate) use self::refusal_log::RefusalLog;
 pub(crate) use self::signed::read_body;
+use crate::auth::{Budget, Spent};
 use crate::store::Store;
 
 /// The API's limits.
@@ -70,6 +70,16 @@ pub struct Limits {
     /// How many sources are remembered for rate limiting. When all of them are
     /// recently active, a new source is refused rather than the table growing.
     pub max_sources: usize,
+    /// State changes one principal may ask for each second, sustained, on the human API, its
+    /// tokens and its session apart. It is what a credential gone wrong can cost for as long
+    /// as it lasts: one write transaction a second beside the agents', and at a few hundred
+    /// bytes a row, some tens of MiB of audit log a day.
+    pub principal_rate_per_second: u32,
+    /// State changes one principal may ask for at once. A person signs a few approvals an
+    /// hour, and a script asks for at most one release per deployment and then waits, as a
+    /// deployment holds one open request: this leaves room for that across a large fleet, with
+    /// retries, and refills in two minutes.
+    pub principal_burst: u32,
 }
 
 impl Default for Limits {
@@ -83,6 +93,8 @@ impl Default for Limits {
             source_rate_per_second: 10,
             source_burst: 100,
             max_sources: 4096,
+            principal_rate_per_second: 1,
+            principal_burst: 120,
         }
     }
 }
@@ -94,6 +106,7 @@ pub struct ApiState {
     config: Arc<Config>,
     limits: Limits,
     limiter: Arc<Mutex<RateLimiter>>,
+    budget: Arc<Mutex<Budget>>,
     refusals: Arc<RefusalLog>,
     /// What ends each host's current long poll. One entry per host that ever
     /// signed a `work` request, so bounded by the enrolled hosts.
@@ -106,7 +119,14 @@ impl ApiState {
     /// once at start-up.
     #[must_use]
     pub fn new(store: Store, config: Config, limits: Limits) -> Self {
+        // Every principal the configuration can name, at most: it never changes while running.
+        let principals = config.grants().len().saturating_add(config.approvers().len());
         Self {
+            budget: Arc::new(Mutex::new(Budget::new(
+                limits.principal_rate_per_second,
+                limits.principal_burst,
+                principals,
+            ))),
             store,
             config: Arc::new(config),
             limits,
@@ -166,6 +186,23 @@ impl ApiState {
     /// The API's limits.
     pub(crate) fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// Takes the cost of one state change from a principal's budget.
+    pub(crate) fn spend_budget(&self, principal: &PrincipalId, human: bool, now: i64) -> Spent {
+        self.budget
+            .lock()
+            // Counts, valid at every step.
+            .unwrap_or_else(PoisonError::into_inner)
+            .spend(principal, human, now)
+    }
+
+    /// Puts back a count of dropped calls that couldn't be written down.
+    pub(crate) fn keep_dropped(&self, principal: &PrincipalId, human: bool, count: u64) {
+        self.budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keep_dropped(principal, human, count);
     }
 
     /// Ends every long poll now, with whatever it has, and makes later ones

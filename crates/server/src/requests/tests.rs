@@ -2,6 +2,7 @@
 
 mod approving;
 mod auditing;
+mod budget;
 mod cancelling;
 mod concurrent;
 mod credentials;
@@ -189,6 +190,7 @@ pub(super) struct Harness {
     pub(super) clock: Arc<ManualClock>,
     pub(super) keys: Keys,
     pub(super) config: Config,
+    pub(super) limits: Limits,
 }
 
 impl Harness {
@@ -202,13 +204,15 @@ impl Harness {
         let clock = ManualClock::at(1_800_000_000);
         let store = store.with_clock(clock.clone());
         let config = landfall_approval::parse_config(config_text(&keys, extra).as_bytes()).unwrap();
-        let state = ApiState::new(store.clone(), config.clone(), Limits::default());
+        let limits = Limits::default();
+        let state = ApiState::new(store.clone(), config.clone(), limits);
         Self {
             app: crate::router(state),
             store,
             clock,
             keys,
             config,
+            limits,
         }
     }
 

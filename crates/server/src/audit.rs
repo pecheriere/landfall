@@ -101,6 +101,8 @@ pub enum EventKind {
     RequestCancelled,
     /// A principal's cancelling of a request was refused.
     CancelRefused,
+    /// A principal came back within its budget: this many calls were refused without a row.
+    AccessThrottled,
 }
 
 impl EventKind {
@@ -135,6 +137,7 @@ impl EventKind {
             Self::RequestExpired => "request_expired",
             Self::RequestCancelled => "request_cancelled",
             Self::CancelRefused => "cancel_refused",
+            Self::AccessThrottled => "access_throttled",
         }
     }
 }

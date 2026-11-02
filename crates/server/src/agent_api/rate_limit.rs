@@ -1,6 +1,8 @@
-//! A token bucket per source for the unauthenticated endpoints.
+//! Token buckets: per source for the unauthenticated endpoints, and per principal for the
+//! human API's state changes ([`crate::auth`]).
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv6Addr};
 
 /// One source's allowance.
@@ -36,17 +38,24 @@ pub(crate) fn source_key(source: IpAddr) -> IpAddr {
     }
 }
 
-/// Token buckets, bounded in the number of sources they remember.
+/// Token buckets, bounded in the number of keys they remember.
 #[derive(Debug)]
-pub(super) struct RateLimiter {
+pub(crate) struct RateLimiter<K = IpAddr> {
     rate_per_second: u32,
     burst: u32,
     max_sources: usize,
-    buckets: HashMap<IpAddr, Bucket>,
+    buckets: HashMap<K, Bucket>,
 }
 
-impl RateLimiter {
-    pub(super) fn new(rate_per_second: u32, burst: u32, max_sources: usize) -> Self {
+impl RateLimiter<IpAddr> {
+    /// Whether `source` may make a request now, taking a token if it may.
+    pub(super) fn allow(&mut self, source: IpAddr, now: i64) -> bool {
+        self.allow_key(source_key(source), now)
+    }
+}
+
+impl<K: Eq + Hash> RateLimiter<K> {
+    pub(crate) fn new(rate_per_second: u32, burst: u32, max_sources: usize) -> Self {
         Self {
             rate_per_second,
             burst,
@@ -55,9 +64,8 @@ impl RateLimiter {
         }
     }
 
-    /// Whether `source` may make a request now, taking a token if it may.
-    pub(super) fn allow(&mut self, source: IpAddr, now: i64) -> bool {
-        let key = source_key(source);
+    /// Whether `key` may go ahead now, taking a token if it may.
+    pub(crate) fn allow_key(&mut self, key: K, now: i64) -> bool {
         let tokens = if let Some(bucket) = self.buckets.get(&key) {
             bucket.refilled(now, self.rate_per_second, self.burst)
         } else {

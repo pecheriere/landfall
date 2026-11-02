@@ -17,11 +17,13 @@
 //! doesn't exist, so that the API doesn't say which exist; with some other grant on it,
 //! they can see it anyway and get a 403.
 
+mod budget;
 mod grants;
 mod principal;
 mod problem;
 mod token;
 
+pub(crate) use self::budget::{Budget, Spent};
 pub(crate) use self::grants::{can, named_in_config, sees};
 pub(crate) use self::principal::Principal;
 #[cfg(test)]
