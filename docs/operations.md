@@ -1244,7 +1244,9 @@ naming the file, and its `error` says which. Nothing repairs it for you:
 process you ran as the agent's user or root. After a second of trying, nothing is spent, the
 journal says `work_waiting` naming the file, and the work is tried again at the next poll, so it
 goes on once the lock is let go. This has no bound, and meanwhile the claim holds up the host's
-other deployments, so find what holds it.
+other deployments, so find what holds it. While it is held to read, each poll verifies the release
+again and writes `approval_about_to_be_spent` again, at the backoff, so don't count those lines as
+taps when reading for a replay.
 
 **Taking a line out of the log reopens replay for that nonce, so only archive when you accept
 that.** The agent doesn't read an archive, and the controller that delivered every approval
