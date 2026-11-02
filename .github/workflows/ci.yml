@@ -99,6 +99,9 @@ jobs:
 
   docker-build:
     runs-on: ubuntu-latest
+    # Runs what a pull request built, so one that hangs mustn't hold this for 6 hours. About
+    # three times the slowest recent run, leaving room for a cold build of all three.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

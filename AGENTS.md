@@ -118,9 +118,14 @@ cargo deny check
   every PR (`docker buildx build --target binaries --platform
   linux/arm64,linux/amd64 --provenance=false --sbom=false --output
   type=local,dest=dist .`) and publishes nothing. `check_binaries.py` then wants
-  each to be an ELF for its directory's architecture, with no `PT_INTERP`, arm64
-  load segments that suit a kernel with 16 KiB pages, and a size within its
-  `MAX_BYTES` budget.
+  each to be a static PIE (`ET_DYN`, `DF_1_PIE`, no `PT_INTERP`, `DT_NEEDED` or text
+  relocations) for its directory's architecture, whole, with arm64 load segments
+  that suit a kernel with 16 KiB pages, mode 0755, and a size within its
+  `MAX_BYTES` budget. PIE comes from `RUSTFLAGS` in the Dockerfile's builder, as
+  `.cargo/` stays out of the build and a profile can't set it.
+- zig and the libraries that are its compiler and linker are pinned by version in
+  the Dockerfile. Alpine keeps only its newest, so a rebuild of one fails the build:
+  bump the version on purpose, and read what changed.
 - `macos.yml` tests and builds the CLI on an arm64 Mac, only when a change can
   reach it. It is filtered by path, so it can't be a required check, and isn't.
 - `crate-age` refuses `Cargo.lock` versions younger than 7 days (README,

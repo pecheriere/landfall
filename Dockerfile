@@ -8,11 +8,24 @@ FROM --platform=$BUILDPLATFORM rust:1.99.0-alpine3.23@sha256:42c2519fdf75d9e34cc
 
 ARG TARGETARCH
 
-# zig is pinned to the version in Alpine 3.23 community, so a repository update
-# cannot change the C compiler and linker under a digest-pinned base image.
-RUN apk add --no-cache musl-dev zig=0.15.2-r0 \
+# zig and the libraries that are its C compiler and linker are pinned to the
+# versions in Alpine 3.23, so a repository update cannot change them under a
+# digest-pinned base image. Alpine drops an old version when it publishes a new
+# one, so one of these can make this line fail, and that is the point: bump the
+# version on purpose. What stays free is in plan 06's "Left mutable" list: what
+# those libraries load (libffi, xz-libs, libxml2), musl-dev, and the targets,
+# which the digest-pinned toolchain's own channel manifest decides.
+RUN apk add --no-cache musl-dev zig=0.15.2-r0 llvm20-libs=20.1.8-r0 clang20-libs=20.1.8-r1 lld20-libs=20.1.8-r1 \
     && cargo install --locked --version 0.24.0 cargo-zigbuild \
     && rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+
+# Static and position-independent, so that where the agent, which is
+# root-equivalent, sits in memory differs on every run. rustc's own request for
+# that doesn't reach zig's linker, and this does. In the environment because
+# `.dockerignore` keeps a `.cargo/config.toml` out of the build, before both
+# builds below so the dependency layer and the real one agree, and with
+# `--target` it doesn't reach build scripts. check_binaries.py holds it.
+ENV RUSTFLAGS="-C link-arg=-pie"
 
 WORKDIR /src
 
