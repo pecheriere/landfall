@@ -375,6 +375,9 @@ impl Harness {
         let work = self.store.next_work(&host).await.unwrap().work.unwrap();
         let body = DeployReportBody {
             deploy_id: work.deploy_id,
+            deployment: work.deployment,
+            tag: work.tag,
+            digest: work.digest,
             outcome,
             steps: Vec::new(),
         };

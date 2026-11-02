@@ -522,6 +522,9 @@ mod tests {
     fn report() -> DeployReportBody {
         DeployReportBody {
             deploy_id: DeployId(7),
+            deployment: "app/prod".parse().unwrap(),
+            tag: "v1.2.5".parse().unwrap(),
+            digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             outcome: ReportedOutcome::Deployed {},
             steps: Vec::new(),
         }

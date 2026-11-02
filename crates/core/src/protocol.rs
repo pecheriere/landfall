@@ -704,6 +704,14 @@ pub struct ReportedStep {
 pub struct DeployReportBody {
     /// The deploy being reported.
     pub deploy_id: DeployId,
+    /// The deployment it was of. With `tag` and `digest` this says what ended: a
+    /// controller restored from a backup hands out numbers again, and a number alone
+    /// can't tell a late report from the deploy now under it.
+    pub deployment: DeploymentId,
+    /// The release it was of.
+    pub tag: ReleaseTag,
+    /// That release's image digest.
+    pub digest: ImageDigest,
     /// How it ended.
     pub outcome: ReportedOutcome,
     /// Every step, in order.
@@ -994,6 +1002,9 @@ mod tests {
     fn report() -> DeployReportBody {
         DeployReportBody {
             deploy_id: DeployId(7),
+            deployment: "app/prod".parse().unwrap(),
+            tag: "v1.2.5".parse().unwrap(),
+            digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             outcome: ReportedOutcome::RolledBack {
                 reason: "health check failed".to_owned(),
             },
@@ -1119,6 +1130,19 @@ mod tests {
             (Phase::RolledBack, "rolled_back"),
         ] {
             assert_eq!(serde_json::to_value(phase).unwrap(), want);
+        }
+        let wire = serde_json::to_value(report()).unwrap();
+        assert_eq!(wire["deploy_id"], 7);
+        assert_eq!(wire["deployment"], "app/prod");
+        assert_eq!(wire["tag"], "v1.2.5");
+        assert_eq!(wire["digest"], format!("sha256:{}", "c".repeat(64)));
+        for key in ["deployment", "tag", "digest"] {
+            let mut missing = wire.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<DeployReportBody>(missing).is_err(),
+                "{key} may not be left out"
+            );
         }
         let checks = ReportedDetail::Checks { checks: Vec::new() };
         assert_eq!(

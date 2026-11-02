@@ -282,6 +282,86 @@ fn backup(fleet: &Fleet, dest: &Path) -> (i32, String) {
     fleet.server_command(args.map(str::to_owned).to_vec())
 }
 
+/// A restore done with an agent still running, against what the guide says: its
+/// deploy in flight has a number the restored database hands out again, for another
+/// release. The late report says what it is of, so it can't finish that one.
+#[tokio::test]
+async fn a_late_report_does_not_finish_another_release_under_its_number() {
+    let (fleet, controller, mut agent) = running_fleet().await;
+    let mut controller = controller;
+    let before = fleet.db.with_extension("before");
+    assert_eq!(backup(&fleet, &before).0, 0);
+
+    // v1.2.4 is deploy 1, and is on its way.
+    fleet.world.hold_up();
+    fleet.world.publish("v1.2.4");
+    fleet.wait_at_up().await;
+    assert_eq!(fleet.deploys().await[0].tag, "v1.2.4");
+
+    // Restored meanwhile, the controller knows nothing of it, and gives v1.2.5 number 1.
+    fleet.world.publish("v1.2.5");
+    controller.stop().await;
+    remove_database(&fleet.db);
+    fs::copy(&before, &fleet.db).unwrap();
+    let mut controller = fleet.controller().await;
+    fleet
+        .wait_until("v1.2.5 claimed under the same number", async || {
+            fleet.deploys().await.first().is_some_and(|deploy| {
+                deploy.id == 1 && deploy.tag == "v1.2.5" && deploy.state == "claimed"
+            })
+        })
+        .await;
+
+    // v1.2.4's deploy ends, and its report for number 1 is refused for good.
+    fleet.world.release_up();
+    fleet
+        .wait_until("the late report refused", async || {
+            fleet.journalled("report_rejected") == 1
+        })
+        .await;
+    let refused = fleet.audit().await;
+    assert!(
+        refused.iter().any(|row| row.kind == "report_refused"
+            && row.detail["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("another release"))),
+        "{refused:#?}"
+    );
+    assert!(
+        !fleet.deployment_state().report_names().unwrap().is_empty(),
+        "the engine's copy stays on the host"
+    );
+
+    // And v1.2.5 is not lost: the host deploys it, and nothing says otherwise.
+    let deployed = wait_outcome(&fleet, "v1.2.5", "deployed").await;
+    assert_eq!(deployed.id, 1);
+    fleet.wait_running("v1.2.5").await;
+    assert!(
+        fleet
+            .world
+            .image()
+            .unwrap()
+            .ends_with(digest_of("v1.2.5").as_ref())
+    );
+    fleet
+        .wait_until("v1.2.5 said to be what runs", async || {
+            fleet
+                .audit()
+                .await
+                .iter()
+                .rfind(|row| row.kind == "rule_decision" && row.detail["tag"] == "v1.2.5")
+                .is_some_and(|row| {
+                    row.detail["reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("already running"))
+                })
+        })
+        .await;
+
+    agent.stop().await;
+    controller.stop().await;
+}
+
 #[tokio::test]
 async fn a_backup_taken_while_the_controller_writes_is_whole_and_a_true_prefix() {
     let (fleet, mut controller, mut agent) = running_fleet().await;

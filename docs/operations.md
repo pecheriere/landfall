@@ -204,7 +204,7 @@ is what can tell later that the backup is the one you took: a backup is as easy 
 the database. Until you overwrite it with a restore, `audit verify --at <head_seq>` on the
 live database must print the same hash, or the log has been changed since.
 
-To restore, with the controller stopped:
+To restore, stop the agents first, letting any deploy finish, then the controller:
 
 ```sh
 rm -f controller.db-wal controller.db-shm
@@ -212,7 +212,12 @@ cp /backups/controller-2026-11-01.db controller.db
 ```
 
 Removing the other two files first matters: `SQLite` would apply a log of the old database
-to the new. Then start it. Hosts stay enrolled as of the backup, and tell it what runs on
+to the new. Then start the controller, and then the agents. An agent left running reports
+deploys the backup has never heard of under numbers it hands out again. Each report says
+which release it is of, so one for another release can't finish the deploy under its
+number: it is refused for good (`report_refused` on the controller, `report_rejected` on
+the host), and the outcome then is only in the engine's copy under
+`<deployment>/reports/`. Hosts stay enrolled as of the backup, and tell it what runs on
 their next poll. Whatever happened since is gone from the log, so `audit verify --at`
 with a head kept since fails, as it should: keep a new head. Deploy numbers start over from
 the backup, which hosts cope with: [a number goes with its release](#a-release-that-rolled-back-isnt-retried).

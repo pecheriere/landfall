@@ -1176,6 +1176,9 @@ mod tests {
     fn body(id: u64) -> DeployReportBody {
         DeployReportBody {
             deploy_id: DeployId(id),
+            deployment: self::id("example/prod"),
+            tag: "v1.2.3".parse().unwrap(),
+            digest: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
             outcome: landfall_core::protocol::ReportedOutcome::Deployed {},
             steps: Vec::new(),
         }

@@ -20,8 +20,8 @@ use landfall_core::config;
 use landfall_core::ids::HostId;
 use landfall_core::protocol::{
     self, DeployId, DeployReportBody, EnrolRequest, HOST_HEADER, NONCE_HEADER, Nonce,
-    NonceResponse, PROBLEM_CONTENT_TYPE, Problem, ReportedOutcome, RunningState, SIGNATURE_HEADER,
-    SigningKey, WorkRequest, WorkResponse,
+    NonceResponse, PROBLEM_CONTENT_TYPE, Problem, ReportedOutcome, ReportedStep, RunningState,
+    SIGNATURE_HEADER, SigningKey, WorkRequest, WorkResponse,
 };
 use serde::Serialize;
 use sqlx::Row as _;
@@ -335,10 +335,22 @@ pub(super) fn signed_request(
         .unwrap()
 }
 
-pub(super) fn deployed_report(id: DeployId) -> DeployReportBody {
+/// A report of what [`Harness::queue`] queues for `app/prod` as `v1.0.1`.
+pub(super) fn report_of(
+    id: DeployId,
+    outcome: ReportedOutcome,
+    steps: Vec<ReportedStep>,
+) -> DeployReportBody {
     DeployReportBody {
         deploy_id: id,
-        outcome: ReportedOutcome::Deployed {},
-        steps: Vec::new(),
+        deployment: "app/prod".parse().unwrap(),
+        tag: "v1.0.1".parse().unwrap(),
+        digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
+        outcome,
+        steps,
     }
+}
+
+pub(super) fn deployed_report(id: DeployId) -> DeployReportBody {
+    report_of(id, ReportedOutcome::Deployed {}, Vec::new())
 }

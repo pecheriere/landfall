@@ -143,6 +143,9 @@ fn fit_to_the_wire(mut body: DeployReportBody) -> DeployReportBody {
 pub(super) fn reported(deploy_id: DeployId, report: &DeployReport) -> DeployReportBody {
     fit_to_the_wire(DeployReportBody {
         deploy_id,
+        deployment: report.deployment.clone(),
+        tag: report.tag.clone(),
+        digest: report.digest.clone(),
         outcome: reported_outcome(&report.outcome),
         steps: report
             .steps
@@ -326,6 +329,9 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<bool, 
             .filter(|deployed| deployed.tag == claim.tag && deployed.digest == claim.digest)
             .map(|_| DeployReportBody {
                 deploy_id: claim.deploy_id,
+                deployment: id.clone(),
+                tag: claim.tag.clone(),
+                digest: claim.digest.clone(),
                 outcome: ReportedOutcome::Deployed {},
                 steps: Vec::new(),
             })

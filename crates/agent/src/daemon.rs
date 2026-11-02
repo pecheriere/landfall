@@ -310,6 +310,9 @@ async fn deploy_approved<D: Docker, C: Controller>(
         }
         Err(error) => DeployReportBody {
             deploy_id: work.deploy_id,
+            deployment: work.deployment.clone(),
+            tag: work.tag.clone(),
+            digest: work.digest.clone(),
             outcome: ReportedOutcome::NothingChanged {
                 reason: outbox::bounded(&error.to_string()),
             },
@@ -406,6 +409,9 @@ async fn answer_work<C: Controller>(
     );
     let body = DeployReportBody {
         deploy_id: work.deploy_id,
+        deployment: work.deployment.clone(),
+        tag: work.tag.clone(),
+        digest: work.digest.clone(),
         outcome,
         steps: Vec::new(),
     };

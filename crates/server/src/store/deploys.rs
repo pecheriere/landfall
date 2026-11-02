@@ -222,11 +222,17 @@ impl Store {
     }
 
     /// Records `report` for `host`, finishing the deploy. Idempotent by deploy
-    /// id: a repeat changes nothing and records nothing, whatever it says. A
-    /// refusal is audited, with `host` as the signer it can be held to.
+    /// id: a repeat changes nothing and records nothing, whatever it says beyond what
+    /// it is of. A refusal is audited, with `host` as the signer it can be held to.
+    ///
+    /// A number alone doesn't say which deploy a report is of: a controller restored
+    /// from a backup hands numbers out again, and the deploy that ended can be another
+    /// than the one under its number now. A report of another deployment, tag or digest
+    /// is refused for good, so that the host drops it, keeping the engine's copy.
     ///
     /// # Errors
-    /// [`StoreError::UnknownDeploy`] if `host` has no such deploy;
+    /// [`StoreError::UnknownDeploy`] if `host` has no such deploy, or it is of another
+    /// release;
     /// [`StoreError::NotClaimed`] if it was never handed out; otherwise a
     /// clock, database or audit failure.
     pub async fn finish_deploy(
@@ -237,10 +243,12 @@ impl Store {
         let mut tx = self.begin().await?;
         let row = match stored_deploy_id(report.deploy_id) {
             Ok(id) => {
-                sqlx::query("SELECT id, deployment, host, tag, state FROM deploys WHERE id = ?")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                sqlx::query(
+                    "SELECT id, deployment, host, tag, digest, state FROM deploys WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
             }
             Err(_) => None,
         };
@@ -258,6 +266,20 @@ impl Store {
                 Some(deployment),
                 "another host's deploy",
             );
+            self.append(&mut tx, &refused).await?;
+            tx.commit().await?;
+            return Err(StoreError::UnknownDeploy);
+        }
+        if deployment != report.deployment
+            || row.try_get::<String, _>("tag")? != report.tag.as_ref()
+            || row.try_get::<String, _>("digest")? != report.digest.as_ref()
+        {
+            // All of these are validated identifiers.
+            let reason = format!(
+                "a report of another release under this number: {} {} {}",
+                report.deployment, report.tag, report.digest
+            );
+            let refused = refused_report(host, report.deploy_id, Some(deployment), &reason);
             self.append(&mut tx, &refused).await?;
             tx.commit().await?;
             return Err(StoreError::UnknownDeploy);

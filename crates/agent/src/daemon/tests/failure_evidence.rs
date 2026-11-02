@@ -12,8 +12,8 @@ use landfall_core::protocol::{DeployId, DeployReportBody, MAX_BODY_BYTES, Phase,
 use super::super::running::work_request;
 use super::super::{Backoff, Pacing, StepOutcome};
 use super::{
-    FakeController, FakeVerifier, Fixture, NEW, OLD, PATCH_RULE, answer, claim, container, fixture,
-    id, image, poll, state_of, work,
+    FakeController, FakeVerifier, Fixture, NEW, NEW_DIGEST, OLD, PATCH_RULE, answer, claim,
+    container, fixture, id, image, poll, state_of, work,
 };
 use crate::deploy;
 use crate::journal::{Priority, capture};
@@ -389,6 +389,9 @@ async fn a_two_mebibyte_reason_is_cut_to_fit() {
     for reason in ["x".repeat(2 << 20), "\u{1}".repeat(2 << 20)] {
         let oversized = DeployReportBody {
             deploy_id: DeployId(7),
+            deployment: id(),
+            tag: "v1.2.4".parse().unwrap(),
+            digest: NEW_DIGEST.parse().unwrap(),
             outcome: ReportedOutcome::NothingChanged { reason },
             steps: Vec::new(),
         };

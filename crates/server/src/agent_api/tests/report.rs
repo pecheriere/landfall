@@ -5,7 +5,7 @@ use landfall_core::protocol::{
 };
 use sqlx::Row as _;
 
-use super::{Harness, WORK, deployed_report};
+use super::{Harness, WORK, deployed_report, report_of};
 use crate::audit::MAX_DETAIL_BYTES;
 use crate::report::{MAX_STORED_CHECKS, MAX_STORED_STEPS};
 
@@ -34,12 +34,12 @@ async fn claimed(h: &Harness) -> (landfall_core::protocol::SigningKey, DeployId)
 async fn a_report_finishes_the_deploy_and_stores_its_steps() {
     let h = Harness::new().await;
     let (a, id) = claimed(&h).await;
-    let report = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::RolledBack {
+    let report = report_of(
+        id,
+        ReportedOutcome::RolledBack {
             reason: "health check failed".to_owned(),
         },
-        steps: vec![
+        vec![
             step("pull", None, None),
             step(
                 "checks",
@@ -53,7 +53,7 @@ async fn a_report_finishes_the_deploy_and_stores_its_steps() {
                 }),
             ),
         ],
-    };
+    );
     let answer = h.report(A, &a, &report).await;
     assert_eq!(answer.status, StatusCode::NO_CONTENT, "{answer:?}");
 
@@ -126,6 +126,65 @@ async fn report_for_another_hosts_deploy_is_refused() {
     assert_eq!(h.last_audit_detail().await["reason"], "no such deploy");
 }
 
+/// A late report, under a number handed out again: for whichever part differs, the
+/// deploy under the number stays as it was, the refusal is on the record, and the
+/// answer is one the host drops the report for. Finished or not.
+#[tokio::test]
+async fn a_report_of_another_release_under_the_number_is_refused_for_good() {
+    let h = Harness::new().await;
+    let (a, id) = claimed(&h).await;
+    let reports = [
+        DeployReportBody {
+            tag: "v1.0.0".parse().unwrap(),
+            ..deployed_report(id)
+        },
+        DeployReportBody {
+            digest: format!("sha256:{}", "d".repeat(64)).parse().unwrap(),
+            ..deployed_report(id)
+        },
+        // A `recover` of another deployment, of the very same release.
+        DeployReportBody {
+            deployment: "app/stage".parse().unwrap(),
+            ..deployed_report(id)
+        },
+    ];
+    for late in &reports {
+        let answer = h.report(A, &a, late).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{late:?}");
+        assert_eq!(answer.code(), "unknown_deploy", "{late:?}");
+        let row = sqlx::query("SELECT state, outcome FROM deploys")
+            .fetch_one(h.store.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "claimed", "{late:?}");
+        assert_eq!(row.get::<Option<String>, _>("outcome"), None, "{late:?}");
+        assert_eq!(h.audit_kinds().await.last().unwrap(), "report_refused");
+        let detail = h.last_audit_detail().await;
+        assert_eq!(detail["deploy_id"], id.0);
+        assert!(
+            detail["reason"]
+                .as_str()
+                .unwrap()
+                .contains("another release"),
+            "{detail}"
+        );
+    }
+
+    // What it is of goes on as if nothing had come.
+    let answer = h.report(A, &a, &deployed_report(id)).await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{answer:?}");
+
+    // And the same goes once that has finished: the record isn't anything else's.
+    let log = h.audit_kinds().await;
+    assert_eq!(h.report(A, &a, &reports[0]).await.code(), "unknown_deploy");
+    assert_eq!(h.audit_kinds().await.len(), log.len() + 1);
+    let outcome: String = sqlx::query_scalar("SELECT outcome FROM deploys")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(outcome, "deployed");
+}
+
 /// The configuration has no cap on checks, and a refused report leaves the
 /// deploy claimed, which blocks the host. So any number is accepted, and what is
 /// stored is bounded.
@@ -138,17 +197,17 @@ async fn a_step_with_many_checks_finishes_the_deploy() {
         attempts: 1,
         millis: 1,
     };
-    let report = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::Deployed {},
-        steps: vec![step(
+    let report = report_of(
+        id,
+        ReportedOutcome::Deployed {},
+        vec![step(
             "checks",
             None,
             Some(ReportedDetail::Checks {
                 checks: vec![check; MAX_STORED_CHECKS + 1],
             }),
         )],
-    };
+    );
     let answer = h.report(A, &a, &report).await;
     assert_eq!(answer.status, StatusCode::NO_CONTENT, "{answer:?}");
     let state: String = sqlx::query_scalar("SELECT state FROM deploys")
@@ -164,13 +223,13 @@ async fn a_long_reason_is_kept_in_the_tables_and_short_in_the_log() {
     let h = Harness::new().await;
     let (a, id) = claimed(&h).await;
     let long = format!("{}cause", "x".repeat(900));
-    let report = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::RolledBack {
+    let report = report_of(
+        id,
+        ReportedOutcome::RolledBack {
             reason: long.clone(),
         },
-        steps: vec![step("checks", Some(&long), None)],
-    };
+        vec![step("checks", Some(&long), None)],
+    );
     assert_eq!(
         h.report(A, &a, &report).await.status,
         StatusCode::NO_CONTENT
@@ -232,11 +291,11 @@ async fn a_deploy_never_handed_out_cannot_be_reported() {
 async fn report_is_idempotent() {
     let h = Harness::new().await;
     let (a, id) = claimed(&h).await;
-    let report = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::Deployed {},
-        steps: vec![step("pull", None, None)],
-    };
+    let report = report_of(
+        id,
+        ReportedOutcome::Deployed {},
+        vec![step("pull", None, None)],
+    );
     let first = h.report(A, &a, &report).await;
     assert_eq!(first.status, StatusCode::NO_CONTENT);
     let log = h.audit_kinds().await;
@@ -248,14 +307,14 @@ async fn report_is_idempotent() {
     assert_eq!(h.count("deploy_steps").await, 1);
 
     // A different one changes nothing: the first report stands.
-    let differing = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::RollbackFailed {
+    let differing = report_of(
+        id,
+        ReportedOutcome::RollbackFailed {
             reason: "x".to_owned(),
             rollback_reason: "y".to_owned(),
         },
-        steps: vec![step("a", None, None), step("b", None, None)],
-    };
+        vec![step("a", None, None), step("b", None, None)],
+    );
     assert_eq!(
         h.report(A, &a, &differing).await.status,
         StatusCode::NO_CONTENT
@@ -273,13 +332,13 @@ async fn report_is_idempotent() {
 async fn a_refusal_has_its_own_audit_kind_and_finishes_the_deploy() {
     let h = Harness::new().await;
     let (a, id) = claimed(&h).await;
-    let report = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::Refused {
+    let report = report_of(
+        id,
+        ReportedOutcome::Refused {
             reason: "minor release under a patch rule".to_owned(),
         },
-        steps: Vec::new(),
-    };
+        Vec::new(),
+    );
     assert_eq!(
         h.report(A, &a, &report).await.status,
         StatusCode::NO_CONTENT
@@ -323,14 +382,14 @@ async fn the_largest_hostile_report_is_accepted_and_stored_bounded() {
         failure: Some(text.clone()),
         detail: Some(ReportedDetail::Checks { checks }),
     };
-    let report = DeployReportBody {
-        deploy_id: id,
-        outcome: ReportedOutcome::RollbackFailed {
+    let report = report_of(
+        id,
+        ReportedOutcome::RollbackFailed {
             reason: text.clone(),
             rollback_reason: text.clone(),
         },
-        steps: vec![hostile; MAX_STORED_STEPS + 3],
-    };
+        vec![hostile; MAX_STORED_STEPS + 3],
+    );
     assert!(serde_json::to_vec(&report).unwrap().len() < MAX_BODY_BYTES);
     let answer = h.report(A, &a, &report).await;
     assert_eq!(answer.status, StatusCode::NO_CONTENT, "{answer:?}");
@@ -401,11 +460,14 @@ async fn every_change_is_audited() {
     let second = h.queue("app/prod", A, "v1.0.2").await;
     h.work(A, &a, vec![running(false, Phase::Idle)]).await;
     let refused = DeployReportBody {
-        deploy_id: second,
-        outcome: ReportedOutcome::Refused {
-            reason: "no".to_owned(),
-        },
-        steps: Vec::new(),
+        tag: "v1.0.2".parse().unwrap(),
+        ..report_of(
+            second,
+            ReportedOutcome::Refused {
+                reason: "no".to_owned(),
+            },
+            Vec::new(),
+        )
     };
     h.report(A, &a, &refused).await;
     h.work(A, &a, vec![running(true, Phase::Idle)]).await;

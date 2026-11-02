@@ -277,6 +277,9 @@ async fn nothing_over_the_limit_leaves_the_outbox_however_it_got_there() {
     let text = "\u{1}".repeat(4096);
     let oversized = DeployReportBody {
         deploy_id: DeployId(7),
+        deployment: "app/prod".parse().unwrap(),
+        tag: "v1.2.4".parse().unwrap(),
+        digest: NEW_DIGEST.parse().unwrap(),
         outcome: ReportedOutcome::Deployed {},
         steps: vec![
             ReportedStep {
@@ -516,6 +519,9 @@ async fn a_corrupt_report_or_claim_is_set_aside_and_the_host_goes_on_reporting()
     let root = StateDir::open(&f.state_dir).unwrap();
     let good = landfall_core::protocol::DeployReportBody {
         deploy_id: DeployId(2),
+        deployment: "app/prod".parse().unwrap(),
+        tag: "v1.2.4".parse().unwrap(),
+        digest: NEW_DIGEST.parse().unwrap(),
         outcome: ReportedOutcome::Deployed {},
         steps: Vec::new(),
     };

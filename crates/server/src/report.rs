@@ -11,6 +11,7 @@
 //! long one, up to [`MAX_STORED_TEXT_CHARS`], since a failure's cause is often
 //! past its first 64 characters.
 
+use landfall_core::ids::{DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, ReportedDetail, ReportedOutcome, ReportedStep,
 };
@@ -53,6 +54,12 @@ pub struct BoundedStep {
 pub struct BoundedReport {
     /// The deploy.
     pub deploy_id: DeployId,
+    /// The deployment it says it was of.
+    pub deployment: DeploymentId,
+    /// The release it says it was of.
+    pub tag: ReleaseTag,
+    /// That release's digest.
+    pub digest: ImageDigest,
     /// The outcome's stable name.
     pub outcome: &'static str,
     /// Whether the host refused the deploy.
@@ -173,6 +180,9 @@ impl BoundedReport {
             .collect();
         Self {
             deploy_id: report.deploy_id,
+            deployment: report.deployment.clone(),
+            tag: report.tag.clone(),
+            digest: report.digest.clone(),
             outcome,
             refused: matches!(report.outcome, ReportedOutcome::Refused { .. }),
             reason: reason.map(|text| stored_text(text)),
@@ -235,6 +245,9 @@ mod tests {
     fn report(outcome: ReportedOutcome, steps: Vec<ReportedStep>) -> DeployReportBody {
         DeployReportBody {
             deploy_id: DeployId(7),
+            deployment: "app/prod".parse().unwrap(),
+            tag: "v1.2.3".parse().unwrap(),
+            digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             outcome,
             steps,
         }

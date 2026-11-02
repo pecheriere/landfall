@@ -358,6 +358,49 @@ async fn a_report_after_a_crash_and_a_recover_names_the_controllers_deploy() {
     assert_eq!(controller.reports().len(), 1);
 }
 
+/// A report says what it is of, whichever way it was made, so that a late one can't
+/// pass for what is under its number now.
+#[tokio::test]
+async fn every_report_names_its_deployment_and_release() {
+    let f = fixture(PATCH_RULE);
+    let verifier = FakeVerifier::passes();
+    for (item, says) in [(work(7, "v1.2.4"), "ran"), (work(8, "v2.0.0"), "refused")] {
+        let expected = item.clone();
+        let controller = FakeController::with([answer(Some(item))]);
+        poll(&f, &controller, &verifier).await;
+        let reports = controller.reports();
+        assert_eq!(reports.len(), 1, "{says}");
+        assert_eq!(reports[0].deployment, expected.deployment, "{says}");
+        assert_eq!(reports[0].tag, expected.tag, "{says}");
+        assert_eq!(reports[0].digest, expected.digest, "{says}");
+    }
+
+    // A `recover` the daemon only finds out about: it goes by the claim.
+    let g = fixture(PATCH_RULE);
+    let taken = claim(9);
+    let state = state_of(&g);
+    state.set_claim(&taken).unwrap();
+    let report = deploy::DeployReport {
+        deployment: id(),
+        tag: taken.tag.clone(),
+        digest: taken.digest.clone(),
+        outcome: deploy::Outcome::NothingChanged {
+            reason: "recovered".to_owned(),
+        },
+        steps: Vec::new(),
+        started_at: Timestamp::UNIX_EPOCH,
+        finished_at: Timestamp::UNIX_EPOCH,
+    };
+    state.write_report("found", &report).unwrap();
+    let controller = FakeController::default();
+    poll(&g, &controller, &verifier).await;
+    let reports = controller.reports();
+    assert_eq!(reports[0].deploy_id, DeployId(9));
+    assert_eq!(reports[0].deployment, id());
+    assert_eq!(reports[0].tag, taken.tag);
+    assert_eq!(reports[0].digest, taken.digest);
+}
+
 /// What a `recover` by hand looks like to the engine, and what a child holding a copy
 /// of the lock for a moment does: the deploy never starts, and nothing is reported.
 #[tokio::test]
