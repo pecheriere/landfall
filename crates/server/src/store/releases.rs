@@ -1,16 +1,15 @@
 //! What the release watcher decided about each release, why anything is still
 //! undecided, and what it reads to decide.
 //!
-//! A reason is kept quoted and up to
-//! [`MAX_STORED_TEXT_CHARS`], and shown in the audit row in the short form,
-//! [`shown`]: it may hold text from GitHub or a registry. Both are done here, so
-//! that nothing the watcher writes can skip them.
+//! A reason is kept quoted and up to [`MAX_STORED_TEXT_CHARS`], and shown in the audit
+//! row and on stderr up to [`REASON_SHOWN_CHARS`]: it may hold text from GitHub or a
+//! registry. Both are done here, so that nothing the watcher writes can skip them.
 
 use std::collections::HashMap;
 
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::DeployId;
-use landfall_core::text::{quoted, shown};
+use landfall_core::text::quoted;
 use serde_json::{Value, json};
 use sqlx::Row as _;
 
@@ -24,6 +23,10 @@ use crate::report::MAX_STORED_TEXT_CHARS;
 /// seconds. Long against its polling, so that a restart or a brief outage does not
 /// hold a promotion back.
 pub const REPORT_FRESH_SECS: i64 = 15 * 60;
+
+/// The most characters of a hold's or a decision's reason in its audit row and its log
+/// line: what is useful in one is often at the end, and these are what an operator reads.
+const REASON_SHOWN_CHARS: usize = 256;
 
 /// The `tag` of a hold on a whole deployment; no release tag is empty.
 const WHOLE_DEPLOYMENT: &str = "";
@@ -69,6 +72,11 @@ impl ReleaseDecision {
 /// A reason as the tables keep it.
 fn stored_reason(reason: &str) -> String {
     quoted(reason, MAX_STORED_TEXT_CHARS)
+}
+
+/// A reason as the audit log and the log lines show it.
+fn shown_reason(reason: &str) -> String {
+    quoted(reason, REASON_SHOWN_CHARS)
 }
 
 /// A `releases` row.
@@ -317,7 +325,7 @@ impl Store {
             let detail = json!({
                 "tag": tag,
                 "decision": decision.as_str(),
-                "reason": shown(reason),
+                "reason": shown_reason(reason),
                 "digest": seen.and_then(|s| s.digest),
                 "previous": before.as_ref().map(|(d, _)| d),
             });
@@ -329,7 +337,7 @@ impl Store {
             log(&format!(
                 "decision: {deployment} {tag}: {}: {}",
                 decision.as_str(),
-                shown(reason)
+                shown_reason(reason)
             ));
         }
         Ok(())
@@ -420,14 +428,17 @@ impl Store {
                 kind: EventKind::ReleaseHeld,
                 deployment: Some(deployment.clone()),
                 host: Some(host.clone()),
-                detail: json!({ "tag": tag, "reason": shown(reason) }),
+                detail: json!({ "tag": tag, "reason": shown_reason(reason) }),
             };
             self.append(&mut tx, &event).await?;
         }
         tx.commit().await?;
         if !unchanged {
             let what = tag.map_or("everything", AsRef::as_ref);
-            log(&format!("hold: {deployment} {what}: {}", shown(reason)));
+            log(&format!(
+                "hold: {deployment} {what}: {}",
+                shown_reason(reason)
+            ));
         }
         Ok(())
     }

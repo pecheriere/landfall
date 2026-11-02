@@ -309,6 +309,80 @@ async fn audit_show_of_a_tampered_row_shows_what_is_there() {
 }
 
 #[tokio::test]
+async fn audit_show_escapes_what_a_terminal_would_act_on_and_it_reads_back_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("controller.db");
+    let store = Store::open(&path).await.unwrap();
+    let host: HostId = "host-a".parse().unwrap();
+    store.issue_enrol_code(&host, false).await.unwrap();
+    sqlx::query("DROP TRIGGER audit_events_no_update")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let hostile =
+        "del\u{7f} c1\u{80}\u{85}\u{9f} rlo\u{202e} lri\u{2066} alm\u{61c} ls\u{2028} ok é";
+    sqlx::query("UPDATE audit_events SET detail = ?")
+        .bind(serde_json::json!({ "reason": hostile }).to_string())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.close().await;
+
+    let mut out = Vec::new();
+    let show = parse(&[
+        "landfall-server",
+        "audit",
+        "show",
+        "--db",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(execute(show, &mut out).await.unwrap(), EXIT_OK);
+    let printed = String::from_utf8(out).unwrap();
+
+    for raw in [
+        '\u{7f}', '\u{80}', '\u{85}', '\u{9f}', '\u{202e}', '\u{2066}', '\u{61c}', '\u{2028}',
+    ] {
+        assert!(!printed.contains(raw), "{raw:?} in {printed}");
+    }
+    assert!(printed.contains("\\u202e"), "{printed}");
+    assert!(printed.contains('é'), "ordinary text stays as it is");
+    let read: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    assert_eq!(read["detail"]["reason"], hostile);
+}
+
+/// The useful part of a reason is often at the end: well past the short form, an audit
+/// row and what `audit show` prints still have it.
+#[tokio::test]
+async fn audit_show_prints_holds_and_decisions_up_to_their_longer_bound() {
+    use crate::store::ReleaseDecision;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("controller.db");
+    let store = Store::open(&path).await.unwrap();
+    let (id, host): (DeploymentId, HostId) =
+        ("app/prod".parse().unwrap(), "host-a".parse().unwrap());
+    let tag = "v1.2.3".parse().unwrap();
+    let kept = format!("{}the end", "x".repeat(249));
+    let reason = format!("{kept}; and past the bound");
+    store
+        .set_hold((&id, &host), Some(&tag), &reason, false)
+        .await
+        .unwrap();
+    store
+        .record_release((&id, &host, &tag), ReleaseDecision::Manual, &reason, None)
+        .await
+        .unwrap();
+    store.close().await;
+
+    let rows = shown_rows(path.to_str().unwrap(), &[]).await;
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let shown = row["detail"]["reason"].as_str().unwrap().to_owned();
+        assert_eq!(shown, format!("{kept:?}..."), "{}", row["kind"]);
+    }
+}
+
+#[tokio::test]
 async fn a_backup_refuses_what_is_there_and_leaves_nothing_of_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("controller.db");

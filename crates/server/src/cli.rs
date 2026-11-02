@@ -466,9 +466,37 @@ async fn audit_show(args: AuditShowArgs, out: &mut impl Write) -> Result<u8, Cli
             "host": row.host,
             "detail": detail,
         });
-        writeln!(out, "{line}").map_err(CliError::Output)?;
+        writeln!(out, "{}", safe_to_print(&line.to_string())).map_err(CliError::Output)?;
     }
     Ok(EXIT_OK)
+}
+
+/// A line of JSON with what JSON leaves as it is, and a terminal doesn't, escaped: the
+/// delete and C1 controls, and what reorders text or breaks a line unseen. They can
+/// only be inside strings, where the escape reads back as the same character.
+fn safe_to_print(line: &str) -> String {
+    let mut safe = String::with_capacity(line.len());
+    for character in line.chars() {
+        if matches!(
+            character,
+            '\u{7f}'..='\u{9f}'
+                | '\u{61c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        ) {
+            // Writing to a String cannot fail.
+            let _ = std::fmt::Write::write_fmt(
+                &mut safe,
+                format_args!("\\u{:04x}", u32::from(character)),
+            );
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
 }
 
 async fn audit_verify(args: AuditVerifyArgs, out: &mut impl Write) -> Result<u8, CliError> {
