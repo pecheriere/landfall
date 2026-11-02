@@ -5,7 +5,7 @@ use std::fs;
 use landfall_core::protocol::DeployId;
 
 use super::super::{CLAIM, ControllerClaim, StateDir, StateError};
-use super::{body, state};
+use super::{body, once_released, state};
 use crate::journal::{self, Priority};
 
 #[test]
@@ -52,7 +52,7 @@ fn a_second_daemon_is_busy() {
     let err = dir.lock_daemon().unwrap_err();
     assert!(matches!(err, StateError::DaemonBusy(_)), "{err}");
     drop(held);
-    dir.lock_daemon().unwrap();
+    once_released(|| dir.lock_daemon()).unwrap();
 }
 
 #[test]

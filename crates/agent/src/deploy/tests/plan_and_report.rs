@@ -9,8 +9,8 @@ use super::super::files::timestamp_id;
 use super::super::{DeployError, DeployPlan, Outcome, run};
 use super::{
     COMMIT, DIGEST, OLD, PINNED, PREVIOUS, STOP_FALSE, STOP_TRUE, backups, changes, container,
-    count_stops, deploy, deployment, failing_check, fixture, healthy_deploy, options,
-    override_text, reports, resolves,
+    count_stops, deploy, deploy_once, deployment, failing_check, fixture, healthy_deploy, options,
+    override_text, reports, resolves, retrying_while_busy,
 };
 
 #[tokio::test]
@@ -105,13 +105,25 @@ async fn report_is_written_on_every_outcome() {
 async fn concurrent_deploy_is_busy() {
     let f = fixture("");
     let held = f.state.lock().unwrap();
-    let err = deploy(&f).await.unwrap_err();
+    let err = deploy_once(&f).await.unwrap_err();
     assert!(matches!(err, DeployError::Busy(_)), "{err}");
     assert_eq!(f.docker.calls(), []);
     drop(held);
 
     healthy_deploy(&f);
-    let (first, second) = tokio::join!(deploy(&f), deploy(&f));
+    // Only one of the two takes the lock, but a lock that seems held for a
+    // moment after it was let go would make both busy: wait for it first.
+    retrying_while_busy(async || {
+        let lock = f
+            .state
+            .lock()
+            .map_err(|_| DeployError::Busy(f.deployment.id().clone()))?;
+        drop(lock);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let (first, second) = tokio::join!(deploy_once(&f), deploy_once(&f));
     let busy = [&first, &second]
         .iter()
         .filter(|r| matches!(r, Err(DeployError::Busy(_))))

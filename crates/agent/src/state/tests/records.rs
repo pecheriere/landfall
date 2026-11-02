@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use super::super::{
     DEPLOYED, IN_PROGRESS, InProgress, Phase, RecordedBackup, StateDir, StateError,
 };
-use super::{deployed, id, state};
+use super::{deployed, id, once_released, state};
 
 #[test]
 fn state_dir_must_not_be_group_writable() {
@@ -45,7 +45,7 @@ fn second_lock_is_busy() {
     assert!(matches!(&err, StateError::Busy(d) if *d == id("example/prod")));
     assert!(err.to_string().contains("example/prod"));
     drop(held);
-    second.lock().unwrap();
+    once_released(|| second.lock()).unwrap();
 }
 
 #[test]

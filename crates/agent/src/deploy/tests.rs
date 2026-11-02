@@ -210,7 +210,30 @@ fn new_version_migrates(f: &Fixture) {
     });
 }
 
-async fn deploy(f: &Fixture) -> Result<super::DeployReport, DeployError> {
+/// Runs `work`, again if the deployment's lock is taken. Nothing else in a test
+/// holds it once a run has returned, but tests run on threads of one process
+/// and others start children all the time: a child between `fork` and `exec`
+/// has a copy of every descriptor, the lock's included, and a `flock` lasts
+/// until the last copy closes. So the lock can seem taken for a moment after it
+/// was let go. A lock really held stays busy, and the last answer is returned
+/// after the bound. Tests of the busy answer itself use [`deploy_once`].
+async fn retrying_while_busy<T>(
+    mut work: impl AsyncFnMut() -> Result<T, DeployError>,
+) -> Result<T, DeployError> {
+    let mut tries = 1;
+    loop {
+        match work().await {
+            Err(DeployError::Busy(_)) if tries < 1000 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// One run, which is busy for as long as the lock is taken.
+async fn deploy_once(f: &Fixture) -> Result<super::DeployReport, DeployError> {
     run(
         &f.docker,
         &f.state,
@@ -222,15 +245,25 @@ async fn deploy(f: &Fixture) -> Result<super::DeployReport, DeployError> {
     .await
 }
 
+async fn deploy(f: &Fixture) -> Result<super::DeployReport, DeployError> {
+    retrying_while_busy(async || deploy_once(f).await).await
+}
+
 async fn deploy_with(
     f: &Fixture,
     options: &EngineOptions,
 ) -> Result<super::DeployReport, DeployError> {
-    run(&f.docker, &f.state, &f.deployment, &f.dir, &f.plan, options).await
+    retrying_while_busy(async || {
+        run(&f.docker, &f.state, &f.deployment, &f.dir, &f.plan, options).await
+    })
+    .await
 }
 
 async fn recovered(f: &Fixture) -> Result<super::DeployReport, DeployError> {
-    recover(&f.docker, &f.state, &f.deployment, &f.dir, &options()).await
+    retrying_while_busy(async || {
+        recover(&f.docker, &f.state, &f.deployment, &f.dir, &options()).await
+    })
+    .await
 }
 
 fn backups(f: &Fixture) -> Vec<String> {
