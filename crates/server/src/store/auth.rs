@@ -115,7 +115,7 @@ impl Store {
     /// A session row as sign-in would write it, for a test.
     #[cfg(test)]
     pub(crate) async fn begin_session_for_test(&self, principal: &str, lasts: i64) -> SessionToken {
-        let session = SessionToken::random_for_test();
+        let session = SessionToken::random().unwrap();
         let now = self.clock.now().unwrap();
         sqlx::query(
             "INSERT INTO sessions (token_hash, principal, created_at, expires_at)

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Register a passkey - landfall</title>
+<script src="/static/landfall.js" defer></script>
+</head>
+<body data-page="register">
+<main>
+<h1>Register a passkey</h1>
+<noscript><p>This page needs JavaScript to reach your passkey.</p></noscript>
+<p id="who" hidden></p>
+<p>This link works once. Your passkey stays on your device. This page shows its public key, for
+you to copy into the configuration.</p>
+<button id="register" type="button">Create a passkey</button>
+<p id="status" role="status"></p>
+<section id="result" hidden>
+<h2>Copy this into the configuration</h2>
+<p>Put this line under <code>[approvers]</code> in the configuration file, by pull request, and
+check the fingerprint when it is reviewed. Hosts trust a key only from that file.</p>
+<pre id="config-line"></pre>
+<dl>
+<dt>Principal</dt>
+<dd id="principal"></dd>
+<dt>Algorithm</dt>
+<dd id="algorithm"></dd>
+<dt>Credential id</dt>
+<dd><code id="credential-id"></code></dd>
+<dt>Public key</dt>
+<dd><code id="public-key"></code></dd>
+<dt>Fingerprint</dt>
+<dd><code id="fingerprint"></code></dd>
+</dl>
+<p>Someone with a key in the file signs in only with that key, so this one works once the
+controller has loaded it.</p>
+</section>
+</main>
+</body>
+</html>

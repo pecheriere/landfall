@@ -8,7 +8,7 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Method, header};
+use axum::http::{Extensions, HeaderMap, Method, header};
 use landfall_core::config::Config;
 use landfall_core::ids::PrincipalId;
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ use crate::audit::{AuditEvent, EventKind};
 
 /// The session cookie. `__Host-` makes a browser refuse it unless it is `Secure`, from
 /// this very host, with no `Domain` and `Path=/`.
-const SESSION_COOKIE: &str = "__Host-landfall-session";
+pub(crate) const SESSION_COOKIE: &str = "__Host-landfall-session";
 
 /// How a principal proved who it is. This is what tells the kinds apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,35 +59,40 @@ impl Principal {
         }
     }
 
-    /// Takes the cost of a state change from this principal's budget. Over it, the call is
-    /// refused before it can write anything. The first call back within it writes down how
-    /// many were, or is refused itself and keeps the count.
-    async fn spend_budget(&self, parts: &Parts, state: &ApiState) -> Result<(), HumanProblem> {
-        let store = state.store();
-        let human = self.is_human();
-        match state.spend_budget(&self.id, human, store.now()?) {
-            Spent::Over => {
-                state.note_refusal(&parts.extensions, "an API call over its principal's budget");
-                Err(HumanProblem::OverBudget)
-            }
-            Spent::Within { dropped: 0 } => Ok(()),
-            Spent::Within { dropped } => {
-                let event = throttled_event(&self.id, human, dropped);
-                if let Err(error) = store.record(&event).await {
-                    state.keep_dropped(&self.id, human, dropped);
-                    return Err(error.into());
-                }
-                Ok(())
-            }
-        }
-    }
-
     /// A principal with no request, for a test of grants.
     #[cfg(test)]
     pub(crate) fn for_test(name: &str, via: Via) -> Self {
         Self {
             id: name.parse().unwrap(),
             via,
+        }
+    }
+}
+
+/// Takes the cost of a state change from a budget. Over it, the call is refused before it can
+/// write anything. The first call back within it writes down how many were, or is refused
+/// itself and keeps the count. Call this only for someone who has proved who they are: anyone
+/// else could spend a person's budget by naming them.
+pub(crate) async fn spend_budget(
+    state: &ApiState,
+    extensions: &Extensions,
+    id: &PrincipalId,
+    human: bool,
+) -> Result<(), HumanProblem> {
+    let store = state.store();
+    match state.spend_budget(id, human, store.now()?) {
+        Spent::Over => {
+            state.note_refusal(extensions, "an API call over its principal's budget");
+            Err(HumanProblem::OverBudget)
+        }
+        Spent::Within { dropped: 0 } => Ok(()),
+        Spent::Within { dropped } => {
+            let event = throttled_event(id, human, dropped);
+            if let Err(error) = store.record(&event).await {
+                state.keep_dropped(id, human, dropped);
+                return Err(error.into());
+            }
+            Ok(())
         }
     }
 }
@@ -113,6 +118,11 @@ fn session_cookie(headers: &HeaderMap) -> Result<Option<&str>, ()> {
         }
     }
     Ok(found)
+}
+
+/// The session a request's cookie carries, if it carries one that can be read.
+pub(crate) fn session_of(headers: &HeaderMap) -> Option<SessionToken> {
+    SessionToken::parse(session_cookie(headers).ok()??)
 }
 
 /// The token in the value of an `Authorization` header.
@@ -146,7 +156,7 @@ fn is_safe(method: &Method) -> bool {
 
 /// Whether the request's one `Origin` is exactly the configured origin. A configuration
 /// with none has no page to be at, so nothing matches it.
-fn origin_matches(headers: &HeaderMap, config: &Config) -> bool {
+pub(crate) fn origin_matches(headers: &HeaderMap, config: &Config) -> bool {
     let Some(settings) = config.approval() else {
         return false;
     };
@@ -187,7 +197,13 @@ impl FromRequestParts<ApiState> for Principal {
         if is_safe(&parts.method) {
             return Ok(principal);
         }
-        principal.spend_budget(parts, state).await?;
+        spend_budget(
+            state,
+            &parts.extensions,
+            &principal.id,
+            principal.is_human(),
+        )
+        .await?;
         if principal.is_human() && !origin_matches(&parts.headers, state.config()) {
             let event = AuditEvent {
                 kind: EventKind::AccessRefused,

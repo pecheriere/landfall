@@ -6,6 +6,7 @@
 
 mod agent;
 mod auth;
+mod ceremonies;
 mod deploys;
 mod releases;
 mod requests;
@@ -29,6 +30,8 @@ use sqlx::{Row as _, SqlSafeStr as _, Sqlite, SqliteExecutor, SqlitePool, Transa
 use tokio::sync::watch;
 
 pub use self::agent::NONCE_LIFETIME_SECS;
+pub use self::ceremonies::SESSION_LIFETIME_SECS;
+pub(crate) use self::ceremonies::{NewPasskey, Redeemed};
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
     FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,
@@ -247,6 +250,11 @@ fn migrator() -> Migrator {
             3,
             "approvals",
             include_str!("../migrations/0003_approvals.sql"),
+        ),
+        migration(
+            4,
+            "passkeys",
+            include_str!("../migrations/0004_passkeys.sql"),
         ),
     ])
 }

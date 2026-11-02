@@ -481,7 +481,8 @@ landfall-server passkey-invite --principal operator --config fleet.toml --db /va
 `token create` prints the token once, as JSON, with its id. Only a hash is kept, and revoking
 works from the token's next use. A token whose principal has gone from the configuration
 stops working when the controller next loads it. `passkey-invite` prints a one-time link,
-valid for an hour; another for the same person replaces it.
+valid for an hour; another for the same person replaces it. [Passkeys and signing
+in](#passkeys-and-signing-in) says what happens next.
 
 Send a token as `Authorization: Bearer <token>`. No credentials, or a token that is malformed,
 unknown or revoked, all get the same `401 unauthenticated`. With credentials and no grant at
@@ -552,6 +553,79 @@ doesn't send from another site, as the cookie is `SameSite=Strict`.
 database, costs only itself. The controller's log names its row, it is left out of `GET
 /api/v1/approvals`, and it can't be approved or cancelled by id. It still ends by itself, and a
 rollback can still take its place, and reports from hosts are recorded whatever it holds.
+
+## Passkeys and signing in
+
+The pages are `/passkeys/register`, `/sign-in` and `/approvals`. They are served by the
+controller, and need the configuration's `[approval]`: with none, registering and signing in
+answer `503 approvals_not_configured`. The origin must be `https`, so the controller, which
+serves plain HTTP, sits behind a TLS-terminating proxy that leaves `Origin` as the browser sent it.
+
+**To register,** open the link `passkey-invite` printed and create a passkey. The code is after
+the `#`, so it reaches no access log, and the page takes it out of the address bar at once. A
+wrong, used or expired code all get the same `403 invite_refused`. Only a registration that
+succeeds spends the code, so a cancelled dialog costs nothing, and of any number at once one
+succeeds. The page shows the credential id, public key and fingerprint, and a line to copy under
+`[approvers]` by pull request. Hosts trust a key only from that file. The controller keeps its own
+copy, for signing in. No attestation is checked: what makes a key trusted is that someone reviews
+it. Compare the fingerprint in the pull request with the one the person saw. **Accepted residual
+risk (design 6.3):** a compromised controller could show its own key during registration.
+
+Registering again replaces the person's stored key and ends their sessions. The passkey must be
+discoverable, as signing in names nobody, so **a security key that can't hold a discoverable
+credential can't be used.** Registering again on the same authenticator replaces its credential
+for this controller: if the old one is in the configuration, update that too.
+
+**Whose key opens a session:**
+
+| The credential is | Signs in as | By |
+|---|---|---|
+| An `[approvers]` entry's | that approver, registered here or not | the file's key |
+| Stored here, for a principal with grants and no `[approvers]` entry | that principal | the stored key |
+| Stored here, for someone with a different `[approvers]` key | refused | |
+| Stored here, for a principal the file doesn't name | refused | |
+| Anything else | refused | |
+
+So a key that is registered and not yet reviewed can only be copied off the page, if its owner
+is or will be an approver. **An invite is only as trusted as its link:** a leaked one for someone
+with grants and no approver's key does open a session, with what those grants allow, which is why
+it lasts an hour and why every registration is in the audit log. It never gets `approve`, which
+takes a key in `[approvers]`.
+
+**A session** is 32 random bytes, kept only as a SHA-256, in a `__Host-landfall-session` cookie
+(`HttpOnly; Secure; SameSite=Strict; Path=/`, no `Domain`), for 12 hours. Each sign-in makes a new
+one, and any the browser came with ends. It has no power of its own: every use goes by the
+configuration's grants, and it stops working once the file no longer names the principal. Sixteen
+at most are kept for a principal, the oldest ending first. `POST /sign-out` ends one on the server.
+**Approving always takes a fresh assertion,** so a stolen cookie can't approve anything.
+
+Every failed sign-in gets the same `403 sign_in_refused`, whether the credential is unknown, the
+signature bad, or the key one that may not sign in, and nothing before that names anyone. Each
+challenge lasts five minutes and works once, and a sign-in's can't finish a registration.
+
+**Limits, for what anyone can send.** Every `POST` here wants the exact `Origin`, or
+`403 bad_origin`, and comes from a bucket per source: 30 at once, refilling at two a second, apart
+from the agents' so that a flood leaves them their nonces. Over it is `429 rate_limited`. Sign-in
+challenges are in memory, 65,536 at most: a full table answers `503 ceremonies_busy` and keeps
+every challenge it has, so nobody's can be pushed out. Beginning writes nothing to the database.
+Neither limit touches anyone's budget, a session already signed in, or an approval.
+
+The source is the connection's peer, so **behind a proxy all clients are one source**, and a
+flood through it can keep others from beginning a sign-in for as long as it lasts. Limit these
+paths at the proxy too if it faces the internet.
+
+**In the audit log:** `passkey_registered`, `signed_in` and `signed_out`, each with its change.
+Failures are counts, since anyone who knows a credential id could cause them: `sign_in_refused` and
+`registration_refused` name the principal, how many `attempts` and the last `reason`, one row per
+principal each watcher interval, and when the controller stops. A crash loses a count not yet
+written. A jump in either is worth an alert. A failure naming nobody goes to the capped log.
+
+**A sign-in tap is `webauthn.get` too,** the same kind as an approval. So a compromised controller
+could put a request's intent hash in a sign-in ceremony, and a person signing in would have
+approved it without knowing. It is within the residual risk of design 6.3: the ceremony runs on the
+controller's page, which can already show one thing and have another signed. The host still only
+runs a maintainer-signed release for that deployment, from the digest it is running. The page can't
+prove what it asks you to sign. `landfall approve`, computing the hash locally, is the stronger path.
 
 ## Running the agent
 

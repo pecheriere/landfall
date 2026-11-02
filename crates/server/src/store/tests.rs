@@ -478,6 +478,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
             "hosts",
             "nonces",
             "passkey_invites",
+            "passkeys",
             "release_holds",
             "releases",
             "replaced_releases",
@@ -489,7 +490,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(applied, 3);
+    assert_eq!(applied, 4);
     assert_eq!(chain(&store).await, (2, None));
 }
 

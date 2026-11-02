@@ -27,8 +27,10 @@ mod token;
 pub(crate) use self::budget::flush_dropped;
 pub(crate) use self::budget::{Budget, Spent, keep_flushing};
 pub(crate) use self::grants::{can, named_in_config, sees};
-pub(crate) use self::principal::Principal;
 #[cfg(test)]
 pub(crate) use self::principal::Via;
+pub(crate) use self::principal::{
+    Principal, SESSION_COOKIE, origin_matches, session_of, spend_budget,
+};
 pub(crate) use self::problem::HumanProblem;
 pub use self::token::{ApiToken, PasskeyInvite, SessionToken};

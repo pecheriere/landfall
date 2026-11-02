@@ -103,6 +103,16 @@ pub enum EventKind {
     CancelRefused,
     /// A principal came back within its budget: this many calls were refused without a row.
     AccessThrottled,
+    /// A passkey was registered with an invite's code.
+    PasskeyRegistered,
+    /// Registering with a good code failed, this many times since the last such row.
+    RegistrationRefused,
+    /// A person signed in, and a session began.
+    SignedIn,
+    /// Signing in as a principal failed, this many times since the last such row.
+    SignInRefused,
+    /// A person signed out, and their session ended.
+    SignedOut,
 }
 
 impl EventKind {
@@ -138,6 +148,11 @@ impl EventKind {
             Self::RequestCancelled => "request_cancelled",
             Self::CancelRefused => "cancel_refused",
             Self::AccessThrottled => "access_throttled",
+            Self::PasskeyRegistered => "passkey_registered",
+            Self::RegistrationRefused => "registration_refused",
+            Self::SignedIn => "signed_in",
+            Self::SignInRefused => "sign_in_refused",
+            Self::SignedOut => "signed_out",
         }
     }
 }

@@ -41,7 +41,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   the one place that says what a principal may do, each principal's budget for state
   changes, secrets that are only stored hashed, and the human API's problem answers),
   `requests` (the human API's routes: `asking` for a deploy, `approving` one and
-  `cancelling` one), `watcher` (release discovery, origin
+  `cancelling` one), `web` (the browser's side: the static pages and their one script, the
+  security headers on every answer, `registration`, `sign_in` and sign-out, and `ceremonies`,
+  the challenges and failure counts in memory), `watcher` (release discovery, origin
   verification, rule decisions and queueing, behind a `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `cli`
   (`serve`, `enrol-code`, `token`, `passkey-invite`, `backup`, `audit verify`, `audit
@@ -153,6 +155,12 @@ must not appear in the name of any other test.
 `crates/agent/tests/e2e/` runs the controller and the agent together as real
 processes, over loopback and a real SQLite file. The agent has `landfall-server` as a
 dev-dependency for it; the server depends on nothing of the agent's.
+
+`crates/server/tests/browser/` drives the web pages in a real browser with Chromium's virtual
+authenticator. It is `#[ignore]`d and named with a `browser_` prefix, and needs Node, `openssl`
+and Playwright, so CI doesn't run it: run it by hand after changing a page or the policy. Its
+`main.rs` says how. Playwright's version is pinned in its `package-lock.json`, by the same seven
+days as a crate.
 
 ### Linux tests on a Mac
 

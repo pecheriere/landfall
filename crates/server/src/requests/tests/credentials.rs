@@ -101,7 +101,7 @@ async fn every_bad_credential_gets_the_same_answer_as_none() {
         Caller::Token(gone.reveal()),
         Caller::Token(format!("lf_{}", "0".repeat(64))),
         Caller::Token("not-a-token".to_owned()),
-        Caller::Session(expired.reveal_for_test()),
+        Caller::Session(expired.reveal()),
         Caller::Session("0".repeat(64)),
         Caller::Session("not-a-session".to_owned()),
     ] {
@@ -122,7 +122,7 @@ async fn a_session_works_like_a_token_for_what_is_safe() {
     let h = Harness::new().await;
     let session = h.store.begin_session_for_test("alice", 3600).await;
     // A plain read carries no Origin in a browser, and needs none.
-    let caller = Caller::SessionFrom(session.reveal_for_test(), None);
+    let caller = Caller::SessionFrom(session.reveal(), None);
     assert_eq!(h.list(&caller).await.status, StatusCode::OK);
 }
 
@@ -130,11 +130,7 @@ async fn a_session_works_like_a_token_for_what_is_safe() {
 async fn a_state_change_with_a_session_takes_the_exact_origin() {
     let h = Harness::new().await;
     h.ready().await;
-    let session = h
-        .store
-        .begin_session_for_test("alice", 3600)
-        .await
-        .reveal_for_test();
+    let session = h.store.begin_session_for_test("alice", 3600).await.reveal();
     for origin in [
         None,
         Some("https://evil.example"),
@@ -195,11 +191,7 @@ async fn two_credentials_at_once_are_none() {
     let Caller::Token(token) = h.token("alice").await else {
         unreachable!()
     };
-    let session = h
-        .store
-        .begin_session_for_test("bob", 3600)
-        .await
-        .reveal_for_test();
+    let session = h.store.begin_session_for_test("bob", 3600).await.reveal();
     let both = Request::builder()
         .uri(APPROVALS)
         .header(header::AUTHORIZATION, format!("Bearer {token}"))

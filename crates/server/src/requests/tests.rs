@@ -294,7 +294,7 @@ impl Harness {
 
     pub(super) async fn session(&self, name: &str) -> Caller {
         let session = self.store.begin_session_for_test(name, 3600).await;
-        Caller::Session(session.reveal_for_test())
+        Caller::Session(session.reveal())
     }
 
     /// Records a release as the watcher does when it verified one.

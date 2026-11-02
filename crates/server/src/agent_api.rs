@@ -29,7 +29,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::Router;
@@ -49,6 +49,7 @@ pub(crate) use self::refusal_log::RefusalLog;
 pub(crate) use self::signed::read_body;
 use crate::auth::{Budget, Spent};
 use crate::store::Store;
+use crate::web::Ceremonies;
 
 /// The API's limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +82,16 @@ pub struct Limits {
     /// deployment holds one open request: this leaves room for that across a large fleet, with
     /// retries, and refills in two minutes.
     pub principal_burst: u32,
+    /// Registration and sign-in requests one source may make each second, sustained. They have
+    /// a bucket of their own, so that a flood of them leaves agents their nonces.
+    pub ceremony_rate_per_second: u32,
+    /// Registration and sign-in requests one source may make at once. A person makes two for a
+    /// tap, and everyone behind one reverse proxy counts as one source.
+    pub ceremony_burst: u32,
+    /// How many sign-in challenges may be outstanding, in memory. A full table refuses the new
+    /// and keeps those it has. Far more than the rate above lets one source hold for the five
+    /// minutes one lasts, so it takes many sources to fill, and 32-byte keys make it a few MiB.
+    pub max_sign_in_challenges: usize,
 }
 
 impl Default for Limits {
@@ -96,6 +107,9 @@ impl Default for Limits {
             max_sources: 4096,
             principal_rate_per_second: 1,
             principal_burst: 120,
+            ceremony_rate_per_second: 2,
+            ceremony_burst: 30,
+            max_sign_in_challenges: 65_536,
         }
     }
 }
@@ -108,6 +122,7 @@ pub struct ApiState {
     limits: Limits,
     limiter: Arc<Mutex<RateLimiter>>,
     budget: Arc<Mutex<Budget>>,
+    ceremonies: Arc<Mutex<Ceremonies>>,
     refusals: Arc<RefusalLog>,
     /// What ends each host's current long poll. One entry per host that ever
     /// signed a `work` request, so bounded by the enrolled hosts.
@@ -131,6 +146,7 @@ impl ApiState {
                 limits.principal_burst,
                 principals,
             ))),
+            ceremonies: Arc::new(Mutex::new(Ceremonies::new(&limits))),
             store,
             config: Arc::new(config),
             limits,
@@ -190,6 +206,14 @@ impl ApiState {
     /// The API's limits.
     pub(crate) fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// Registration's and sign-in's challenges and counts. Never held across an `await`.
+    pub(crate) fn ceremonies(&self) -> MutexGuard<'_, Ceremonies> {
+        self.ceremonies
+            .lock()
+            // Maps and counts, valid at every step.
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Takes the cost of one state change from a principal's budget.

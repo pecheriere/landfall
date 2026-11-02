@@ -1,0 +1,133 @@
+//! The browser's side: registering a passkey, signing in, and the approvals page.
+//!
+//! The pages are static files with one script, built into the binary, which fetch JSON and
+//! put what comes back in the page as text. So nothing a hostile tag or name holds can become
+//! markup, and the strict policy on every answer (see [`headers`]) has nothing to make an
+//! exception for. The design language comes later: these are the pages it restyles.
+//!
+//! These routes run before anyone has proved who they are, so everything here is hostile.
+//! Every `POST` that takes no [`Principal`](crate::auth::Principal) goes through [`admit`]
+//! first, for the three things that stop it before anything is read or written:
+//!
+//! - **The configuration has `[approval]`.** One that loads without it gets a clear refusal.
+//! - **The exact `Origin`.** The `Principal` extractor makes this check for a session's state
+//!   changes, and there is no session yet here. Without it a page on another site could sign
+//!   its visitor in as itself, or spend their allowance.
+//! - **The source's allowance:** its own bucket, as agents must not lose their nonces to this.
+//!
+//! Anyone can send these, so a refusal costs little. Over the allowance or with a full table it
+//! is a `429` or a `503` and writes nothing. A wrong invite or an unknown credential goes to the
+//! capped log. A failure that can be attributed to a principal is counted in memory and written
+//! as one row per principal by [`tend`], each watcher interval, so what anyone can make the
+//! audit log hold is bounded by the configuration and the clock. That also means a request that
+//! names a real principal does no more work than one that doesn't. A crash loses a count not
+//! yet written, as with [`Budget`](crate::auth::Budget).
+//!
+//! No `GET` changes anything here, which is what the extractor's check relies on.
+
+mod ceremonies;
+mod headers;
+mod pages;
+mod registration;
+mod sign_in;
+#[cfg(test)]
+mod tests;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::header;
+use axum::http::request::Parts;
+use axum::middleware;
+use axum::routing::{get, post};
+use landfall_core::config::Approval;
+use serde::de::DeserializeOwned;
+
+pub(crate) use self::ceremonies::Ceremonies;
+pub(crate) use self::headers::security_headers;
+use crate::agent_api::{ApiProblem, ApiState, deadline, log, read_body};
+use crate::auth::{HumanProblem, origin_matches};
+
+/// What a ceremony's answer says about being kept.
+const NO_STORE: [(header::HeaderName, &str); 1] = [(header::CACHE_CONTROL, "no-store")];
+
+/// Runs before everything else on a route with no principal yet. Gives the relying party.
+fn admit<'a>(state: &'a ApiState, parts: &Parts) -> Result<&'a Approval, HumanProblem> {
+    let Some(settings) = state.config().approval() else {
+        return Err(HumanProblem::ApprovalsNotConfigured);
+    };
+    if !origin_matches(&parts.headers, state.config()) {
+        state.note_refusal(&parts.extensions, "a ceremony from another origin");
+        return Err(HumanProblem::BadOrigin);
+    }
+    let source = parts.extensions.get::<ConnectInfo<SocketAddr>>().map_or(
+        // Only a test comes with no peer, and such requests share one allowance.
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        |peer| peer.0.ip(),
+    );
+    if !state.ceremonies().allow(source, state.store().now()?) {
+        state.note_refusal(&parts.extensions, "a ceremony over its source's allowance");
+        return Err(ApiProblem::RateLimited.into());
+    }
+    Ok(settings)
+}
+
+/// Reads and parses a body within `limit`.
+async fn parsed<T: DeserializeOwned>(
+    state: &ApiState,
+    body: Body,
+    limit: usize,
+) -> Result<T, HumanProblem> {
+    let bytes = read_body(body, limit, state.limits().body_timeout).await?;
+    serde_json::from_slice(&bytes).map_err(|_| ApiProblem::BadRequest.into())
+}
+
+/// The upkeep each watcher interval: writes down the failures counted since the last time,
+/// keeping any it can't, and clears out what's past its time.
+pub(crate) async fn tend(state: &ApiState) {
+    let store = state.store();
+    let now = match store.now() {
+        Ok(now) => now,
+        Err(error) => {
+            log(&format!("web: {error}"));
+            return;
+        }
+    };
+    state.ceremonies().forget_expired(now);
+    let counted = state.ceremonies().take_failures();
+    for failure in counted {
+        if let Err(error) = store.record(&failure.event()).await {
+            log(&format!("web: writing down failed ceremonies: {error}"));
+            state.ceremonies().keep_failure(failure);
+        }
+    }
+    if let Err(error) = store.settle_ceremonies().await {
+        log(&format!(
+            "web: clearing out sessions past their time: {error}"
+        ));
+    }
+}
+
+/// The routes.
+pub(crate) fn router(state: ApiState) -> Router {
+    let limit = state.limits().request_timeout;
+    Router::new()
+        .route("/passkeys/register", get(pages::register))
+        .route("/passkeys/register/begin", post(registration::begin))
+        .route("/passkeys/register/finish", post(registration::finish))
+        .route("/sign-in", get(pages::sign_in))
+        .route("/sign-in/begin", post(sign_in::begin))
+        .route("/sign-in/finish", post(sign_in::finish))
+        .route("/sign-out", post(sign_in::sign_out))
+        .route("/approvals", get(pages::approvals))
+        .route("/static/landfall.js", get(pages::script))
+        .method_not_allowed_fallback(method_not_allowed)
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(limit, deadline))
+}
+
+async fn method_not_allowed() -> HumanProblem {
+    HumanProblem::MethodNotAllowed
+}

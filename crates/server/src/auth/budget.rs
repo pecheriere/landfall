@@ -133,9 +133,13 @@ pub(crate) async fn keep_flushing(
 ) {
     loop {
         tokio::select! {
-            () = tokio::time::sleep(every) => flush_dropped(&state).await,
+            () = tokio::time::sleep(every) => {
+                flush_dropped(&state).await;
+                crate::web::tend(&state).await;
+            }
             () = until_stopped(&mut stop) => {
                 flush_dropped(&state).await;
+                crate::web::tend(&state).await;
                 return;
             }
         }

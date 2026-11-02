@@ -48,6 +48,15 @@ pub(crate) enum HumanProblem {
     ApprovalsNotConfigured,
     /// This principal has asked for too many state changes.
     OverBudget,
+    /// An invite's code that is wrong, used or expired: the same answer for every way of that.
+    InviteRefused,
+    /// A registration with a good code whose ceremony didn't check out.
+    RegistrationRefused,
+    /// A sign-in that didn't work: the same answer for every way of that, so that it says
+    /// nothing about who exists or which credentials are known.
+    SignInRefused,
+    /// Too many ceremonies are under way to begin another.
+    CeremoniesBusy,
     /// A problem both APIs have.
     Shared(ApiProblem),
 }
@@ -150,7 +159,38 @@ impl HumanProblem {
                 "rate_limited",
                 "too many state changes by this principal",
             ),
-            Self::Shared(_) => return None,
+            Self::InviteRefused
+            | Self::RegistrationRefused
+            | Self::SignInRefused
+            | Self::CeremoniesBusy
+            | Self::Shared(_) => return self.ceremony_parts(),
+        })
+    }
+
+    /// The same, for what registering and signing in refuse. `None` for anything else.
+    fn ceremony_parts(self) -> Option<(StatusCode, &'static str, &'static str)> {
+        Some(match self {
+            Self::InviteRefused => (
+                StatusCode::FORBIDDEN,
+                "invite_refused",
+                "this link is not valid; ask for a new one",
+            ),
+            Self::RegistrationRefused => (
+                StatusCode::BAD_REQUEST,
+                "registration_refused",
+                "this passkey could not be registered; try again from the link",
+            ),
+            Self::SignInRefused => (
+                StatusCode::FORBIDDEN,
+                "sign_in_refused",
+                "this passkey cannot sign in here, or the attempt took too long; try again",
+            ),
+            Self::CeremoniesBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ceremonies_busy",
+                "too many sign-ins are under way; try again shortly",
+            ),
+            _ => return None,
         })
     }
 
@@ -177,7 +217,7 @@ impl IntoResponse for HumanProblem {
                 .headers_mut()
                 .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
-        if self == Self::OverBudget {
+        if matches!(self, Self::OverBudget | Self::CeremoniesBusy) {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));

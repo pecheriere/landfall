@@ -290,7 +290,7 @@ async fn an_older_database_gets_told_to_run_serve() {
     for statement in [
         "DROP TABLE api_tokens",
         "DROP TABLE passkey_invites",
-        "DELETE FROM _sqlx_migrations WHERE version = 3",
+        "DELETE FROM _sqlx_migrations WHERE version >= 3",
     ] {
         sqlx::query(statement).execute(store.pool()).await.unwrap();
     }

@@ -65,7 +65,8 @@ unsupported.
 A table of `name = { credential_id, public_key }`: a WebAuthn credential id and
 its COSE public key. Names follow the same pattern as signers. Copy both from
 the page that registered the passkey. Host agents take an approver's key from
-this file and nowhere else.
+this file and nowhere else, and an approver signs in to the controller with this
+key and no other (`operations.md`, "Passkeys and signing in").
 
 Both values are unpadded base64url, and each is judged when the file is loaded,
 by every program that loads it. An error names the approver. Errors are escaped

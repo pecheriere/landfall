@@ -90,11 +90,7 @@ async fn a_session_cancels_only_from_the_exact_origin() {
     let h = Harness::new().await;
     h.ready().await;
     let id = h.asked_by_carol().await;
-    let session = h
-        .store
-        .begin_session_for_test("alice", 3600)
-        .await
-        .reveal_for_test();
+    let session = h.store.begin_session_for_test("alice", 3600).await.reveal();
     let evil = Caller::SessionFrom(session, Some("https://evil.example".to_owned()));
     assert_eq!(h.cancel(id, &evil).await.code(), "bad_origin");
     assert_eq!(h.request_state(id).await, "awaiting_approval");

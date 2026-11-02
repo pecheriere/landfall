@@ -249,6 +249,9 @@ deployment. The full key reference and validation rules are in `docs/configurati
   request; the agent only trusts keys from that file. Accepted residual risk: a compromised controller
   during registration could substitute its own key. Combined with signed tags, that still only allows
   maintainer-signed releases.
+- **Signing in:** a sign-in tap is `webauthn.get` too, so a compromised controller could put an
+  intent's hash in a sign-in ceremony. That is the same residual as "what the operator sees" above:
+  the page already chooses what is signed, and the same limit applies to what it can do.
 
 ### 6.4 Promotion
 `promote_to` makes the controller refuse to propose a version to the target until it has been healthy

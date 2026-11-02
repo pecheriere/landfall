@@ -172,11 +172,7 @@ async fn a_stolen_token_does_not_spend_the_persons_budget_or_anyone_elses() {
 #[tokio::test]
 async fn bad_origins_are_within_the_budget_too() {
     let h = Harness::new().await;
-    let session = h
-        .store
-        .begin_session_for_test("alice", 3600)
-        .await
-        .reveal_for_test();
+    let session = h.store.begin_session_for_test("alice", 3600).await.reveal();
     let caller = super::Caller::SessionFrom(session, None);
     let burst = usize::try_from(h.limits.principal_burst).unwrap();
     for _ in 0..burst + 5 {

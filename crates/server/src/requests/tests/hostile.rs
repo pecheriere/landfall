@@ -39,10 +39,7 @@ async fn a_long_or_binary_header_is_only_a_bad_credential() {
             header::COOKIE,
             format!(
                 "__Host-landfall-session={}",
-                h.store
-                    .begin_session_for_test("alice", 60)
-                    .await
-                    .reveal_for_test()
+                h.store.begin_session_for_test("alice", 60).await.reveal()
             ),
         )
         .header(header::ORIGIN, HeaderValue::from_bytes(&[0xff]).unwrap())

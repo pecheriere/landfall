@@ -76,20 +76,17 @@ impl SessionToken {
         Secret::parse(text).map(Self)
     }
 
+    pub(crate) fn random() -> Result<Self, getrandom::Error> {
+        Secret::random().map(Self)
+    }
+
+    /// The cookie's value. It goes in that one `Set-Cookie`, and nowhere else.
+    pub(crate) fn reveal(&self) -> String {
+        hex::encode(self.0.0)
+    }
+
     pub(crate) fn hash(&self) -> [u8; 32] {
         self.0.hash()
-    }
-
-    /// A session as sign-in would give one, for a test.
-    #[cfg(test)]
-    pub(crate) fn random_for_test() -> Self {
-        Self(Secret::random().unwrap())
-    }
-
-    /// The cookie's value, for a test.
-    #[cfg(test)]
-    pub(crate) fn reveal_for_test(&self) -> String {
-        hex::encode(self.0.0)
     }
 }
 
@@ -105,6 +102,12 @@ pub struct PasskeyInvite(Secret);
 impl PasskeyInvite {
     pub(crate) fn random() -> Result<Self, getrandom::Error> {
         Secret::random().map(Self)
+    }
+
+    /// The code as the page sends it: 64 lowercase hex digits, and `None` otherwise.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        Secret::parse(text).map(Self)
     }
 
     /// The code as the link carries it: 64 hex digits.
