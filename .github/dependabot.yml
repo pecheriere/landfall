@@ -73,3 +73,20 @@ updates:
         update-types: [minor, patch]
     commit-message:
       prefix: build
+
+  # The BuildKit that CI and the release build in. The file is only Dependabot's
+  # copy of the pin: its pull request fails test_buildkit_pin.py until the same
+  # reference goes in the workflows. On its own, so that this can't hold up a
+  # Rust base image update.
+  - package-ecosystem: docker
+    directory: /.github/buildkit
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      buildkit:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    commit-message:
+      prefix: ci

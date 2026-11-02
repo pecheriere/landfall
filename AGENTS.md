@@ -108,6 +108,21 @@ cargo deny check
 - The Dockerfile pins the Rust base image by digest (the version in
   `rust-toolchain.toml`) and its build tools by version, each a release at
   least 7 days old; Dependabot proposes base image updates.
+- BuildKit, which every binary is built inside, is pinned by digest in each
+  `docker/setup-buildx-action` step (`driver-opts`, with `cache-binary: false`).
+  Dependabot can't read that, so `.github/buildkit/Dockerfile` holds the same
+  reference and is never built. To bump it, take Dependabot's pull request and put
+  the same line in the workflows: `test_buildkit_pin.py` fails until they agree.
+- The Dockerfile's `binaries` stage holds static `landfall-agent`, `landfall` and
+  `landfall-server`, from the image's own builder. `docker-build` builds it on
+  every PR (`docker buildx build --target binaries --platform
+  linux/arm64,linux/amd64 --provenance=false --sbom=false --output
+  type=local,dest=dist .`) and publishes nothing. `check_binaries.py` then wants
+  each to be an ELF for its directory's architecture, with no `PT_INTERP`, arm64
+  load segments that suit a kernel with 16 KiB pages, and a size within its
+  `MAX_BYTES` budget.
+- `macos.yml` tests and builds the CLI on an arm64 Mac, only when a change can
+  reach it. It is filtered by path, so it can't be a required check, and isn't.
 - `crate-age` refuses `Cargo.lock` versions younger than 7 days (README,
   "Dependency age"). Pin an older version with
   `cargo update -p <crate> --precise <version>`; allow-list entries are only

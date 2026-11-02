@@ -1,0 +1,50 @@
+name: macos
+
+# The CLI is the one binary people run on a Mac, and it builds natively there rather than
+# with the Dockerfile's builder. Only changes that can reach it run this. A path-filtered
+# workflow can't be a required check, because one that doesn't run never reports, and this
+# one isn't.
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - crates/cli/**
+      - crates/origin/**
+      - crates/core/**
+      - crates/approval/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/macos.yml
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - crates/cli/**
+      - crates/origin/**
+      - crates/core/**
+      - crates/approval/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/macos.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cli:
+    # A version, not macos-latest: the label moves between OS releases. These are arm64.
+    runs-on: macos-26
+    # Plain `cargo test` has no time limit of its own.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test -p landfall-cli --locked
+      - run: cargo build --release --locked -p landfall-cli --target aarch64-apple-darwin
+      - run: target/aarch64-apple-darwin/release/landfall --version

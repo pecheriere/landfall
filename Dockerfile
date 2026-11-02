@@ -38,19 +38,30 @@ RUN case "$TARGETARCH" in \
     && for crate in core approval origin server agent; do \
         mkdir -p "crates/$crate/src" && : > "crates/$crate/src/lib.rs"; \
     done \
-    && cargo zigbuild --release --locked -p landfall-server --target "$(cat /target-triple)"
+    && cargo zigbuild --release --locked -p landfall-server -p landfall-agent -p landfall-cli --target "$(cat /target-triple)"
 
 COPY crates ./crates
 
-# The placeholder build of landfall-server is removed first, so the real
-# sources always compile, whatever their timestamps. The final image is empty
-# apart from what is installed here, and its HTTPS client refuses to start
-# without a CA bundle, so the base image's bundle (fixed by its digest) goes in.
+# The placeholder builds are removed first, so the real sources always compile,
+# whatever their timestamps. All three binaries come from one invocation, which
+# shares the dependency layer. The final image is empty apart from what is
+# installed in rootfs, and its HTTPS client refuses to start without a CA
+# bundle, so the base image's bundle (fixed by its digest) goes in.
 RUN target="$(cat /target-triple)" \
-    && cargo clean --release --target "$target" -p landfall-server -p landfall-core -p landfall-approval -p landfall-origin \
-    && cargo zigbuild --release --locked -p landfall-server --target "$target" \
+    && cargo clean --release --target "$target" -p landfall-server -p landfall-agent -p landfall-cli -p landfall-core -p landfall-approval -p landfall-origin \
+    && cargo zigbuild --release --locked -p landfall-server -p landfall-agent -p landfall-cli --target "$target" \
     && install -D -m 0755 "target/$target/release/landfall-server" /out/rootfs/landfall-server \
-    && install -D -m 0644 /etc/ssl/certs/ca-certificates.crt /out/rootfs/etc/ssl/certs/ca-certificates.crt
+    && install -D -m 0644 /etc/ssl/certs/ca-certificates.crt /out/rootfs/etc/ssl/certs/ca-certificates.crt \
+    && for binary in landfall-server landfall-agent landfall; do \
+        install -D -m 0755 "target/$target/release/$binary" "/out/binaries/$binary"; \
+    done
+
+# The static binaries, for `docker buildx build --target binaries --output
+# type=local,dest=dist`. check_binaries.py checks them. This stage is skipped
+# when the image is built, as the final stage doesn't need it.
+FROM scratch AS binaries
+
+COPY --from=build /out/binaries/ /
 
 # The image holds the controller only. The host agent runs outside Docker (it
 # must survive the deploys it performs) and the CLI runs wherever its user is.
