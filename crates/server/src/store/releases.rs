@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::DeployId;
 use landfall_core::text::quoted;
@@ -222,19 +223,6 @@ impl Store {
         rows.iter()
             .map(|row| Ok((row.try_get("tag")?, stored_release(row)?)))
             .collect()
-    }
-
-    /// What is recorded of this one release, outside any transaction.
-    ///
-    /// # Errors
-    /// A database failure, or [`StoreError::Corrupt`] for an unreadable row.
-    pub async fn release(
-        &self,
-        deployment: &DeploymentId,
-        tag: &ReleaseTag,
-    ) -> Result<Option<StoredRelease>, StoreError> {
-        let mut connection = self.pool.acquire().await?;
-        release_of(&mut connection, deployment, tag).await
     }
 
     /// Records what was decided about a release, with its audit rows, and ends any
@@ -559,14 +547,11 @@ impl Store {
     /// up to its last report before that. A host's word is all this is: silence holds
     /// it back, does not start the time again, and does not count, and the time goes on
     /// when the host is back.
-    ///
-    /// # Errors
-    /// A clock or database failure.
-    pub async fn healthy_for(
+    async fn healthy_for(
         &self,
+        connection: &mut sqlx::SqliteConnection,
         (source, host): (&DeploymentId, &HostId),
-        tag: &ReleaseTag,
-        digest: &ImageDigest,
+        (tag, digest): (&ReleaseTag, &ImageDigest),
         seconds: u64,
     ) -> Result<bool, StoreError> {
         let wanted = i64::try_from(seconds).unwrap_or(i64::MAX);
@@ -576,7 +561,7 @@ impl Store {
         )
         .bind(source.as_ref())
         .bind(host.as_ref())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await?;
         if let Some(row) = row {
             let current = row.try_get::<Option<String>, _>("tag")?.as_deref() == Some(tag.as_ref())
@@ -603,9 +588,58 @@ impl Store {
         .bind(host.as_ref())
         .bind(tag.as_ref())
         .bind(digest.as_ref())
-        .fetch_optional(&self.pool)
+        .fetch_optional(connection)
         .await?;
         Ok(observed.is_some_and(|secs| secs >= wanted))
+    }
+
+    /// The deployment the promotion of `tag` to `target` still waits for, if any: every
+    /// deployment that promotes to it must have had it healthy for long enough. Enforced by
+    /// the controller only.
+    ///
+    /// # Errors
+    /// A clock or database failure.
+    pub async fn promotion_waits_for<'a>(
+        &self,
+        config: &'a Config,
+        target: &DeploymentId,
+        release: (&ReleaseTag, &ImageDigest),
+    ) -> Result<Option<&'a DeploymentId>, StoreError> {
+        let mut connection = self.pool.acquire().await?;
+        self.promotion_waits_for_on(&mut connection, config, target, release)
+            .await
+    }
+
+    /// [`promotion_waits_for`](Self::promotion_waits_for), on `connection`, which can be a
+    /// transaction's, so that it holds until that commits.
+    ///
+    /// # Errors
+    /// A clock or database failure.
+    pub async fn promotion_waits_for_on<'a>(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        config: &'a Config,
+        target: &DeploymentId,
+        release: (&ReleaseTag, &ImageDigest),
+    ) -> Result<Option<&'a DeploymentId>, StoreError> {
+        for source in config.deployments() {
+            let Some(promotion) = source.promote_to() else {
+                continue;
+            };
+            if promotion.deployment() == target
+                && !self
+                    .healthy_for(
+                        connection,
+                        (source.id(), source.host()),
+                        release,
+                        promotion.healthy_for_secs(),
+                    )
+                    .await?
+            {
+                return Ok(Some(source.id()));
+            }
+        }
+        Ok(None)
     }
 }
 

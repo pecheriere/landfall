@@ -325,7 +325,7 @@ checks = ["container-healthy"]
 promote_to = { deployment = "app/prod", healthy_for = "1h" }
 "#;
 
-async fn on_promotion() -> Harness {
+pub(super) async fn on_promotion() -> Harness {
     let store = crate::store::Store::open_in_memory().await.unwrap();
     Harness::on(store, PROMOTION)
 }

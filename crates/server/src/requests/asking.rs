@@ -21,7 +21,6 @@ use crate::agent_api::{ApiState, json as json_answer};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};
 use crate::store::{NewRequest, StoreError};
-use crate::watcher::promotion_waits_for;
 
 /// A request is one tag, at most 128 bytes.
 const MAX_REQUEST_BODY_BYTES: usize = 1024;
@@ -33,35 +32,6 @@ const NO_GRANT_TO_ASK: &str = "no grant lets this principal ask for this deploym
 #[serde(deny_unknown_fields)]
 struct AskBody {
     tag: ReleaseTag,
-}
-
-/// Whether promotion holds this release back: not for a downgrade, the manual rollback.
-async fn promotion_holds(
-    state: &ApiState,
-    d: &Deployment,
-    tag: &ReleaseTag,
-    version: &Version,
-) -> Result<bool, StoreError> {
-    let store = state.store();
-    let running = store.watch_view(d.id(), d.host()).await?.running;
-    let running_version = running
-        .and_then(|running| running.tag)
-        .and_then(|running| d.origin().tags().parse_tag(&running).ok());
-    if running_version.is_some_and(|running| *version < running) {
-        return Ok(false);
-    }
-    let Some(digest) = store
-        .release(d.id(), tag)
-        .await?
-        .and_then(|release| release.digest)
-    else {
-        return Ok(false);
-    };
-    Ok(
-        promotion_waits_for(store, state.config(), d.id(), tag, &digest)
-            .await?
-            .is_some(),
-    )
 }
 
 /// Everything about a request but its nonce, judged in `tx`: the intent to record. A
@@ -134,6 +104,17 @@ async fn judge_request(
             HumanProblem::Forbidden,
             "no grant lets this principal ask for this: a lower version takes rollback, and \
              any other takes request",
+        ));
+    }
+    if !downgrade
+        && store
+            .promotion_waits_for_on(tx, state.config(), d.id(), (tag, digest))
+            .await?
+            .is_some()
+    {
+        return Err(refused(
+            HumanProblem::PromotionPending,
+            "not yet reported healthy for long enough where it is promoted from",
         ));
     }
     if snapshot.open_request {
@@ -210,16 +191,6 @@ pub(super) async fn ask(
         )
         .await);
     };
-    if promotion_holds(&state, d, tag, &version).await? {
-        return Err(refuse_alone(
-            &state,
-            &principal,
-            subject,
-            HumanProblem::PromotionPending,
-            "not yet reported healthy for long enough where it is promoted from",
-        )
-        .await);
-    }
     let mut nonce = [0; 32];
     getrandom::fill(&mut nonce).map_err(StoreError::Random)?;
     let store = state.store();

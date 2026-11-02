@@ -174,6 +174,68 @@ async fn a_release_whose_record_changed_can_not_be_approved() {
 }
 
 #[tokio::test]
+async fn a_hold_placed_after_the_request_keeps_it_from_being_approved_for_now() {
+    let h = Harness::new().await;
+    let (id, intent) = h.opened().await;
+    let deployment = PROD.parse().unwrap();
+    let host = HOST.parse().unwrap();
+    h.store
+        .set_hold(
+            (&deployment, &host),
+            Some(&intent.tag),
+            "two runs for this tag",
+            false,
+        )
+        .await
+        .unwrap();
+    let alice = h.session("alice").await;
+    let answer = h.approve(id, &alice, &h.keys.alice, &intent).await;
+    assert_eq!(answer.status, StatusCode::CONFLICT, "{answer:?}");
+    assert_eq!(answer.code(), "release_not_verified");
+    assert_eq!(h.request_state(id).await, "awaiting_approval");
+    assert_eq!(h.count_deploys().await, 0);
+
+    h.store
+        .clear_hold(&deployment, Some(&intent.tag))
+        .await
+        .unwrap();
+    let answer = h.approve(id, &alice, &h.keys.alice, &intent).await;
+    assert_eq!(answer.status, StatusCode::OK, "{answer:?}");
+}
+
+#[tokio::test]
+async fn a_record_from_another_configuration_keeps_it_from_being_approved_for_now() {
+    let h = Harness::new().await;
+    let (id, intent) = h.opened().await;
+    let commit = "1".repeat(40).parse().unwrap();
+    let same = digest('1');
+    let seen = Seen {
+        tag_object: "object",
+        config_hash: "another",
+        commit: Some(&commit),
+        digest: Some(&same),
+        refused: false,
+        detail: json!({}),
+        origin: json!({}),
+    };
+    h.store
+        .record_release(
+            (&PROD.parse().unwrap(), &HOST.parse().unwrap(), &intent.tag),
+            ReleaseDecision::NeedsApproval,
+            "a higher version that needs an approver",
+            Some(&seen),
+        )
+        .await
+        .unwrap();
+    let answer = h
+        .approve(id, &h.session("alice").await, &h.keys.alice, &intent)
+        .await;
+    assert_eq!(answer.code(), "release_not_verified");
+    assert_eq!(h.request_state(id).await, "awaiting_approval");
+    assert_eq!(h.count_deploys().await, 0);
+}
+
+#[tokio::test]
 async fn the_watchers_record_of_a_waiting_release_does_not_conflict_with_a_request() {
     let h = Harness::new().await;
     let (id, intent) = h.opened().await;

@@ -553,8 +553,10 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         if let Some((no, why)) = self.history_says_no(tag, digest, self.store.now()?) {
             return Ok((no, why.to_owned()));
         }
-        if let Some(source) =
-            promotion_waits_for(self.store, self.config, self.d.id(), tag, digest).await?
+        if let Some(source) = self
+            .store
+            .promotion_waits_for(self.config, self.d.id(), (tag, digest))
+            .await?
         {
             let reason = format!(
                 "waits for promotion: not yet reported healthy for long enough on {source}, or \
@@ -733,36 +735,6 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         }
         Ok((None, None))
     }
-}
-
-/// The deployment the promotion of `tag` to `target` still waits for, if any: every
-/// deployment that promotes to it must have had it healthy for long enough. Enforced by
-/// the controller only.
-pub(crate) async fn promotion_waits_for<'a>(
-    store: &Store,
-    config: &'a Config,
-    target: &DeploymentId,
-    tag: &ReleaseTag,
-    digest: &ImageDigest,
-) -> Result<Option<&'a DeploymentId>, StoreError> {
-    for source in config.deployments() {
-        let Some(promotion) = source.promote_to() else {
-            continue;
-        };
-        if promotion.deployment() == target
-            && !store
-                .healthy_for(
-                    (source.id(), source.host()),
-                    tag,
-                    digest,
-                    promotion.healthy_for_secs(),
-                )
-                .await?
-        {
-            return Ok(Some(source.id()));
-        }
-    }
-    Ok(None)
 }
 
 /// The reason for a refusal by the rule.

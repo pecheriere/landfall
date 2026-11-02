@@ -24,8 +24,8 @@
 //!   watcher recorded of it from its history doesn't count, since retrying a release that
 //!   failed is what an approval is for.
 //! - promotion, as the watcher goes by it, but for a rollback, which must not have to wait.
-//!   Promotion is the controller's alone to enforce. It is read just before the
-//!   transaction, as a store on one connection could not read it during one.
+//!   Promotion is the controller's alone to enforce, so it is looked at when asking and
+//!   again when approving, each time in the transaction.
 //! - no other request open, no deploy active, and a host that can take it. A rollback by
 //!   someone with the `rollback` grant takes an open request's place, cancelling it in the
 //!   same transaction: nobody's forgotten or stolen request gets to stand in its way.

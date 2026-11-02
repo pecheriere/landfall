@@ -140,6 +140,19 @@ async fn judge_approval(
         )
         .await;
     }
+    // Both pass by themselves, or become a changed record, so the request stays open. The
+    // host would refuse what they say at critical priority, so it isn't to be asked.
+    let verified_now = snapshot
+        .release
+        .as_ref()
+        .is_some_and(|release| release.verified_under(state.config().hash()));
+    if !verified_now || store.release_held(tx, d.id(), &intent.tag).await? {
+        return Err(refused(
+            HumanProblem::ReleaseNotVerified,
+            "the watcher has this release on hold, or hasn't looked at it under this \
+             configuration",
+        ));
+    }
     if let Some(running) = &snapshot.running
         && running.digest != intent.expected_running
     {
@@ -157,7 +170,33 @@ async fn judge_approval(
             "the deployment has a deploy queued or running",
         ));
     }
-    ready_host(&snapshot)?;
+    let running = ready_host(&snapshot)?;
+    // Promotion is the controller's alone, so nothing after this would catch it. It stays
+    // open when this refuses: the source's report may come back, or its time may yet run,
+    // and whether it never will isn't known here. Time or a cancel ends it if so.
+    let tags = d.origin().tags();
+    let downgrade = match (tags.parse_tag(&intent.tag), &running.tag) {
+        (Ok(version), Some(running)) => tags
+            .parse_tag(running)
+            .is_ok_and(|running| version < running),
+        _ => false,
+    };
+    if !downgrade
+        && store
+            .promotion_waits_for_on(
+                tx,
+                state.config(),
+                d.id(),
+                (&intent.tag, &intent.digest),
+            )
+            .await?
+            .is_some()
+    {
+        return Err(refused(
+            HumanProblem::PromotionPending,
+            "no longer reported healthy for long enough where it is promoted from",
+        ));
+    }
     Ok(())
 }
 

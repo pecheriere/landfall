@@ -8,6 +8,7 @@ mod concurrent;
 mod credentials;
 mod grants;
 mod hostile;
+mod promotion;
 mod requesting;
 mod staleness;
 
