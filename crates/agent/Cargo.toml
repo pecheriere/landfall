@@ -33,6 +33,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
+# The end-to-end tests run the controller too. Only in this direction: the server
+# depends on nothing of the agent's.
+landfall-server.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 wiremock.workspace = true

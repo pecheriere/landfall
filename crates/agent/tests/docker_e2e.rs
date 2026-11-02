@@ -980,7 +980,7 @@ async fn docker_failed_deploys_keep_only_the_newest_backups() {
 /// it stays even when others sort ahead of it, as a clock that went back leaves.
 #[tokio::test]
 #[ignore = "docker: runs in ci.yml"]
-async fn docker_prune_spares_the_backup_a_live_marker_names() {
+async fn docker_prune_spares_the_backup_an_unfinished_marker_names() {
     const AHEAD: [&str; 3] = [
         "2999-01-01T00-00-00-000000000Z",
         "2999-01-02T00-00-00-000000000Z",
