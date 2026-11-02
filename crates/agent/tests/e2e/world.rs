@@ -208,6 +208,7 @@ impl ReleaseSource for FileSource {
         deployment: &DeploymentId,
         tag: &ReleaseTag,
         _: &CommitSha,
+        _: &ImageDigest,
     ) -> impl Future<Output = Result<Vec<RunCandidate>, ReleaseError>> + Send {
         ready(self.origin(deployment, tag).map(|origin| {
             vec![RunCandidate {
