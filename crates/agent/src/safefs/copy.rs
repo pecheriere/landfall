@@ -7,6 +7,8 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use rustix::fs::OFlags;
 use rustix::fs::{
     AtFlags, FileType, Gid, Mode, Stat, Timespec, Timestamps, Uid, chownat, fchmod, fchown, fstat,
     fsync, futimens, mkdirat, openat, readlinkat, statat, symlinkat, utimensat,

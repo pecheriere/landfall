@@ -1,13 +1,19 @@
 //! What a copy keeps: times, owners, names and limits.
 
-use std::fs::{self};
+use std::fs;
+#[cfg(target_os = "linux")]
+use std::fs::Permissions;
 use std::os::unix::fs::symlink;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
 
 use super::super::{MAX_DEPTH, SafeFsError, restore, seam, snapshot};
 use super::{assert_sentinel_untouched, mkfifo, mtime, rel, root, sentinel};
+#[cfg(target_os = "linux")]
+use super::{mode, write};
 
 #[test]
 fn symlink_times_survive_the_round_trip() {
