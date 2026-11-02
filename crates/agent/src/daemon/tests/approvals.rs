@@ -20,7 +20,7 @@ use super::{
 };
 use crate::journal::{Priority, capture};
 use crate::state::{NonceSpend, StateDir};
-use crate::testing::Call;
+use crate::testing::{Call, test_nonce};
 
 pub(super) const RP_ID: &str = "landfall.example";
 pub(super) const ORIGIN: &str = "https://landfall.example";
@@ -88,14 +88,14 @@ pub(super) fn bare_keyed(rule: &str) -> (Fixture, Keys) {
 }
 
 /// What an honest controller asks a person to approve.
-pub(super) fn intent(tag: &str, expected_running: Option<&str>, nonce: u8) -> DeployIntent {
+pub(super) fn intent(tag: &str, expected_running: Option<&str>, label: &str) -> DeployIntent {
     DeployIntent {
         deployment: id(),
         tag: tag.parse().unwrap(),
         commit: COMMIT.parse().unwrap(),
         digest: NEW_DIGEST.parse().unwrap(),
         expected_running: expected_running.map(|digest| digest.parse().unwrap()),
-        nonce: [nonce; 32],
+        nonce: test_nonce(label),
     }
 }
 
@@ -132,10 +132,10 @@ pub(super) fn carrying(deploy_id: u64, approval: Approval) -> DeployWork {
     }
 }
 
-pub(super) fn spent(f: &Fixture, nonce: u8) -> bool {
+pub(super) fn spent(f: &Fixture, label: &str) -> bool {
     StateDir::open(&f.state_dir)
         .unwrap()
-        .nonce_used(&[nonce; 32])
+        .nonce_used(&test_nonce(label))
         .unwrap()
 }
 
@@ -186,13 +186,13 @@ pub(super) fn assert_deployed(outcome: &StepOutcome) {
 #[tokio::test]
 async fn first_deploy_with_an_approval_runs() {
     let (f, keys) = bare_keyed(PATCH_RULE);
-    let approval = signed(&keys.operator, &intent("v1.2.3", None, 1));
+    let approval = signed(&keys.operator, &intent("v1.2.3", None, "first"));
     let outcome = asked(&f, &FakeVerifier::passes(), carrying(7, approval)).await;
     assert_deployed(&outcome);
     let deployed = state_of(&f).deployed().unwrap().unwrap();
     assert_eq!(deployed.tag.as_ref(), "v1.2.3");
     assert_eq!(deployed.digest.as_ref(), NEW_DIGEST);
-    assert!(spent(&f, 1));
+    assert!(spent(&f, "first"));
     let events = capture::events("approval_about_to_be_spent");
     let (_, event) = events.last().unwrap();
     assert_eq!(event["approver"], "operator", "whose approval it was");
@@ -201,7 +201,7 @@ async fn first_deploy_with_an_approval_runs() {
 #[tokio::test]
 async fn minor_under_an_approve_rule_runs() {
     let (f, keys) = keyed(PATCH_RULE);
-    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), 1));
+    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), "first"));
     let outcome = asked(&f, &FakeVerifier::passes(), carrying(7, approval)).await;
     assert_deployed(&outcome);
     assert_eq!(
@@ -215,7 +215,7 @@ async fn downgrade_with_an_approval_runs() {
     for tag in ["v1.2.2", "v2.0.0"] {
         // A downgrade is the manual rollback, and a major is plain manual.
         let (f, keys) = keyed(PATCH_RULE);
-        let approval = signed(&keys.operator, &intent(tag, Some(OLD_DIGEST), 1));
+        let approval = signed(&keys.operator, &intent(tag, Some(OLD_DIGEST), "first"));
         let outcome = asked(&f, &FakeVerifier::passes(), carrying(7, approval)).await;
         assert_deployed(&outcome);
         assert_eq!(state_of(&f).deployed().unwrap().unwrap().tag.as_ref(), tag);
@@ -262,13 +262,13 @@ async fn failed_release_retried_with_an_approval_runs_and_clears_the_record() {
     let (reason, priority) = refused_later(&f, work(7, "v1.2.4")).await;
     assert!(reason.contains("failed on this host"), "{reason}");
     assert_eq!(priority, Priority::Error);
-    let forged = signed(&keys.stranger, &intent("v1.2.4", Some(OLD_DIGEST), 1));
+    let forged = signed(&keys.stranger, &intent("v1.2.4", Some(OLD_DIGEST), "first"));
     let (_, priority) = refused_later(&f, carrying(8, forged)).await;
     assert_eq!(priority, Priority::Critical);
 
     // The manual retry: automatic by its rule, and it takes an approval anyway.
     script_a_good_deploy(&f, 2);
-    let approval = signed(&keys.operator, &intent("v1.2.4", Some(OLD_DIGEST), 1));
+    let approval = signed(&keys.operator, &intent("v1.2.4", Some(OLD_DIGEST), "first"));
     let outcome = asked(&f, &verifier, carrying(9, approval)).await;
     assert_deployed(&outcome);
     assert_eq!(
@@ -294,7 +294,7 @@ async fn a_retry_that_fails_again_stays_on_the_record() {
         .script_inspect_after_up(3, [Ok(container(NEW, false))]);
     f.docker
         .script_inspect_after_up(4, [Ok(container(OLD, true))]);
-    let approval = signed(&keys.operator, &intent("v1.2.4", Some(OLD_DIGEST), 1));
+    let approval = signed(&keys.operator, &intent("v1.2.4", Some(OLD_DIGEST), "first"));
     let _ = asked(&f, &FakeVerifier::passes(), carrying(9, approval)).await;
     assert_eq!(state_of(&f).failed_releases().unwrap().len(), 1);
     let evidence = failure_evidence(
@@ -368,7 +368,7 @@ fn forgeries(keys: &Keys, honest: &DeployIntent) -> Vec<(String, DeployWork, &'s
             DeployWork {
                 approval: Some(Approval {
                     intent: DeployIntent {
-                        nonce: [9; 32],
+                        nonce: test_nonce("changed"),
                         ..honest.clone()
                     },
                     assertion: real.assertion.clone(),
@@ -379,7 +379,10 @@ fn forgeries(keys: &Keys, honest: &DeployIntent) -> Vec<(String, DeployWork, &'s
         ),
         (
             "a nonce this host has used, properly signed".to_owned(),
-            carrying(0, signed(&keys.operator, &intent(tag, Some(OLD_DIGEST), 2))),
+            carrying(
+                0,
+                signed(&keys.operator, &intent(tag, Some(OLD_DIGEST), "used")),
+            ),
             "already",
         ),
     ];
@@ -421,12 +424,15 @@ fn forgeries(keys: &Keys, honest: &DeployIntent) -> Vec<(String, DeployWork, &'s
 /// approval is still good at the end: the nonce it carries wasn't spent by any of them.
 #[tokio::test]
 async fn controller_cannot_forge_an_approval() {
-    const NONCE: u8 = 1;
+    const LABEL: &str = "first";
     let (f, keys) = keyed(PATCH_RULE);
     let verifier = FakeVerifier::passes();
-    let honest = intent("v1.3.0", Some(OLD_DIGEST), NONCE);
+    let honest = intent("v1.3.0", Some(OLD_DIGEST), LABEL);
     let root = StateDir::open(&f.state_dir).unwrap();
-    assert_eq!(root.spend_nonce(&[2; 32]).unwrap(), NonceSpend::Recorded);
+    assert_eq!(
+        root.spend_nonce(&test_nonce("used")).unwrap(),
+        NonceSpend::Recorded
+    );
 
     let mut number = 100;
     for (name, mut item, says) in forgeries(&keys, &honest) {
@@ -435,7 +441,7 @@ async fn controller_cannot_forge_an_approval() {
         let (reason, priority) = assert_refused(&f, &verifier, item).await;
         assert!(reason.contains(says), "{name}: {reason}");
         assert_eq!(priority, Priority::Critical, "{name}");
-        assert!(!spent(&f, NONCE), "{name}");
+        assert!(!spent(&f, LABEL), "{name}");
         assert_eq!(verifier.calls(), 0, "{name}: a refusal costs no fetch");
     }
 
@@ -456,14 +462,14 @@ async fn controller_cannot_forge_an_approval() {
         let (reason, priority) = assert_refused(&f, &verifier, item).await;
         assert!(reason.contains(says), "{field}: {reason}");
         assert_eq!(priority, Priority::Critical, "{field}");
-        assert!(!spent(&f, NONCE), "{field}");
+        assert!(!spent(&f, LABEL), "{field}");
     }
 
     // After all of that, the real one works.
     number += 1;
     let real = signed(&keys.operator, &honest);
     assert_deployed(&asked(&f, &verifier, carrying(number, real)).await);
-    assert!(spent(&f, NONCE));
+    assert!(spent(&f, LABEL));
 }
 
 #[tokio::test]
@@ -473,21 +479,21 @@ async fn approval_for_another_running_digest_is_refused() {
     // On record is one digest, and it signed for another, or for a first deploy.
     for expected in [Some(OTHER_DIGEST), None] {
         let (f, keys) = keyed(PATCH_RULE);
-        let approval = signed(&keys.operator, &intent("v1.3.0", expected, 1));
+        let approval = signed(&keys.operator, &intent("v1.3.0", expected, "first"));
         let (reason, priority) = assert_refused(&f, &verifier, carrying(7, approval)).await;
         assert!(reason.contains("running"), "{reason}");
         assert!(reason.contains(OLD_DIGEST), "{reason}");
         assert_eq!(priority, Priority::Critical);
-        assert!(!spent(&f, 1));
+        assert!(!spent(&f, "first"));
     }
 
     // Nothing on record, and it signed for something running: `None` matches only `None`.
     let (f, keys) = bare_keyed(PATCH_RULE);
-    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), 1));
+    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), "first"));
     let (reason, priority) = assert_refused(&f, &verifier, carrying(7, approval)).await;
     assert!(reason.contains("nothing"), "{reason}");
     assert_eq!(priority, Priority::Critical);
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
     assert_eq!(state_of(&f).deployed().unwrap(), None);
 }
 
@@ -498,7 +504,7 @@ async fn approved_and_rolled_back(f: &Fixture, keys: &Keys) -> Approval {
         .script_inspect_after_up(1, [Ok(container(NEW, false))]);
     f.docker
         .script_inspect_after_up(2, [Ok(container(OLD, true))]);
-    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), 1));
+    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), "first"));
     let outcome = asked(f, &FakeVerifier::passes(), carrying(7, approval.clone())).await;
     assert!(
         matches!(
@@ -547,7 +553,7 @@ async fn replayed_nonce_is_refused_after_a_restart() {
 async fn crash_after_recording_the_nonce_spends_the_approval() {
     let (f, keys) = keyed(PATCH_RULE);
     let override_before = fs::read(f.compose.join(crate::compose::OVERRIDE_FILE)).unwrap();
-    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), 1));
+    let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), "first"));
 
     let reached = std::sync::Arc::new(tokio::sync::Notify::new());
     let signal = std::sync::Arc::clone(&reached);
@@ -567,10 +573,10 @@ async fn crash_after_recording_the_nonce_spends_the_approval() {
 
     // The future is gone, as the process would be. Docker answers the next one.
     f.docker.hang_when(|_| false);
-    assert!(spent(&f, 1), "the approval is spent");
+    assert!(spent(&f, "first"), "the approval is spent");
     let events = capture::events("approval_about_to_be_spent");
     let (_, line) = events.last().expect("the journal has a line for the crash");
-    assert_eq!(line["nonce"], hex::encode([1_u8; 32]));
+    assert_eq!(line["nonce"], hex::encode(test_nonce("first")));
     assert_eq!(
         f.docker.count(|c| matches!(
             c,
@@ -622,7 +628,7 @@ async fn crash_after_recording_the_nonce_spends_the_approval() {
 
 #[tokio::test]
 async fn auto_ignores_an_attached_assertion() {
-    let honest = intent("v1.2.4", Some(OLD_DIGEST), 1);
+    let honest = intent("v1.2.4", Some(OLD_DIGEST), "first");
     let garbage = Approval {
         intent: DeployIntent {
             tag: "v9.9.9".parse().unwrap(),
@@ -678,12 +684,12 @@ async fn prerelease_and_same_version_stay_refused() {
     ] {
         let (f, keys) = keyed(PATCH_RULE);
         let verifier = FakeVerifier::passes();
-        let approval = signed(&keys.operator, &intent(tag, Some(OLD_DIGEST), 1));
+        let approval = signed(&keys.operator, &intent(tag, Some(OLD_DIGEST), "first"));
         let (reason, priority) = assert_refused(&f, &verifier, carrying(7, approval)).await;
         assert!(reason.contains(says), "{reason}");
         assert_eq!(priority, Priority::Critical);
         assert_eq!(verifier.calls(), 0);
-        assert!(!spent(&f, 1), "{tag}");
+        assert!(!spent(&f, "first"), "{tag}");
     }
 }
 
@@ -699,7 +705,7 @@ async fn corrupt_nonce_log_refuses_approvals() {
         fs::write(&log, &bad).unwrap();
         let seen = capture::events("nonce_log_unusable").len();
         let verifier = FakeVerifier::passes();
-        let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), 1));
+        let approval = signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), "first"));
 
         let (reason, priority) = assert_refused(&f, &verifier, carrying(7, approval)).await;
 
@@ -731,7 +737,7 @@ async fn corrupt_nonce_log_refuses_approvals() {
 async fn refused_approval_is_critical_in_the_journal() {
     let (f, keys) = keyed(PATCH_RULE);
     let verifier = FakeVerifier::passes();
-    let honest = intent("v1.3.0", Some(OLD_DIGEST), 1);
+    let honest = intent("v1.3.0", Some(OLD_DIGEST), "first");
     let long = "a".repeat(120);
     let mut reasons = Vec::new();
     for (number, ending) in [(7, "one"), (8, "two")] {

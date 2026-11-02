@@ -10,8 +10,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::nonces::append_line;
 use super::super::{MAX_NONCE_LOG_BYTES, NONCE_LOG, NonceSpend, StateDir, StateError};
+use crate::testing::test_nonce;
 
-const NONCE: [u8; 32] = [7; 32];
+/// The nonce most of these spend. It is also writer 7's own: see the test with the writers.
+fn shared() -> [u8; 32] {
+    test_nonce("writer 7")
+}
 
 fn dir(tmp: &tempfile::TempDir) -> StateDir {
     StateDir::open(tmp.path()).unwrap()
@@ -27,18 +31,21 @@ fn until_free(root: &StateDir, nonce: &[u8; 32]) -> NonceSpend {
     }
 }
 
-fn line(byte: u8) -> String {
-    format!("{}\n", hex::encode([byte; 32]))
+fn line(label: &str) -> String {
+    format!("{}\n", hex::encode(test_nonce(label)))
 }
 
 fn assert_refused(root: &StateDir) {
     assert!(
-        matches!(root.nonce_used(&NONCE), Err(StateError::NonceLog { .. })),
+        matches!(root.nonce_used(&shared()), Err(StateError::NonceLog { .. })),
         "{:?}",
-        root.nonce_used(&NONCE)
+        root.nonce_used(&shared())
     );
     assert!(
-        matches!(root.spend_nonce(&NONCE), Err(StateError::NonceLog { .. })),
+        matches!(
+            root.spend_nonce(&shared()),
+            Err(StateError::NonceLog { .. })
+        ),
         "a log that can't be read is not added to"
     );
     assert!(matches!(
@@ -51,33 +58,36 @@ fn assert_refused(root: &StateDir) {
 fn a_nonce_is_spent_once_and_the_log_survives_a_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
-    assert!(!root.nonce_used(&NONCE).unwrap());
+    assert!(!root.nonce_used(&shared()).unwrap());
     assert!(
         !tmp.path().join(NONCE_LOG).exists(),
         "reading makes no file"
     );
     root.check_nonce_log().unwrap();
 
-    assert_eq!(root.spend_nonce(&NONCE).unwrap(), NonceSpend::Recorded);
+    assert_eq!(root.spend_nonce(&shared()).unwrap(), NonceSpend::Recorded);
 
-    assert!(root.nonce_used(&NONCE).unwrap());
-    assert!(!root.nonce_used(&[8; 32]).unwrap());
-    assert_eq!(root.spend_nonce(&NONCE).unwrap(), NonceSpend::AlreadyUsed);
-    let reopened = dir(&tmp);
-    assert!(reopened.nonce_used(&NONCE).unwrap());
+    assert!(root.nonce_used(&shared()).unwrap());
+    assert!(!root.nonce_used(&test_nonce("other")).unwrap());
     assert_eq!(
-        reopened.spend_nonce(&NONCE).unwrap(),
+        root.spend_nonce(&shared()).unwrap(),
+        NonceSpend::AlreadyUsed
+    );
+    let reopened = dir(&tmp);
+    assert!(reopened.nonce_used(&shared()).unwrap());
+    assert_eq!(
+        reopened.spend_nonce(&shared()).unwrap(),
         NonceSpend::AlreadyUsed
     );
     assert_eq!(
-        reopened.spend_nonce(&[8; 32]).unwrap(),
+        reopened.spend_nonce(&test_nonce("other")).unwrap(),
         NonceSpend::Recorded
     );
 
     let log = reopened.nonce_log_path();
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
-        format!("{}{}", line(7), line(8)),
+        format!("{}{}", line("writer 7"), line("other")),
         "one line per nonce"
     );
     let mode = fs::metadata(&log).unwrap().permissions().mode() & 0o777;
@@ -86,17 +96,17 @@ fn a_nonce_is_spent_once_and_the_log_survives_a_restart() {
 
 #[test]
 fn a_torn_or_corrupt_log_refuses_and_is_left_as_it_is() {
-    let good = line(1);
-    let long = format!("{}0\n", hex::encode([1_u8; 32]));
+    let good = line("first");
+    let long = format!("{}0\n", hex::encode(test_nonce("first")));
     for bad in [
         // A crash in the middle of the last line.
-        format!("{good}{}", &line(2)[..20]),
+        format!("{good}{}", &line("second")[..20]),
         // A whole line's length without the end of a line.
-        format!("{good}{}0", hex::encode([2_u8; 32])),
+        format!("{good}{}0", hex::encode(test_nonce("second"))),
         "\n".to_owned(),
         format!("{}\n", "x".repeat(64)),
         format!("{}\n", "AB".repeat(32)),
-        format!("{}\r\n", hex::encode([1_u8; 32])),
+        format!("{}\r\n", hex::encode(test_nonce("first"))),
         long,
         // Whole lines' worth of bytes, with the damage early on.
         format!("{}\n{good}", "!".repeat(64)),
@@ -116,7 +126,7 @@ fn a_log_past_its_bound_refuses_without_being_read() {
     let file = fs::File::create(root.nonce_log_path()).unwrap();
     // Sparse: whole lines' worth of zeros. Read, line 1 would refuse it for what it holds,
     // so what is refused for its length wasn't read.
-    let says = |root: &StateDir| match root.nonce_used(&NONCE) {
+    let says = |root: &StateDir| match root.nonce_used(&shared()) {
         Err(StateError::NonceLog { reason, .. }) => reason,
         other => panic!("{other:?}"),
     };
@@ -162,9 +172,12 @@ fn appender(path: &Path) -> fs::File {
 fn a_failed_write_takes_back_what_it_wrote() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
-    assert_eq!(root.spend_nonce(&[1; 32]).unwrap(), NonceSpend::Recorded);
+    assert_eq!(
+        root.spend_nonce(&test_nonce("first")).unwrap(),
+        NonceSpend::Recorded
+    );
     let log = root.nonce_log_path();
-    let line = self::line(2);
+    let line = self::line("second");
 
     let error = append_line(
         &appender(&log),
@@ -178,19 +191,25 @@ fn a_failed_write_takes_back_what_it_wrote() {
         matches!(error, StateError::Io { op: "write", .. }),
         "{error}"
     );
-    assert_eq!(fs::read_to_string(&log).unwrap(), self::line(1));
+    assert_eq!(fs::read_to_string(&log).unwrap(), self::line("first"));
     // So the next one, with room on the disk, goes through.
-    assert!(!root.nonce_used(&[2; 32]).unwrap());
-    assert_eq!(root.spend_nonce(&[2; 32]).unwrap(), NonceSpend::Recorded);
+    assert!(!root.nonce_used(&test_nonce("second")).unwrap());
+    assert_eq!(
+        root.spend_nonce(&test_nonce("second")).unwrap(),
+        NonceSpend::Recorded
+    );
 }
 
 #[test]
 fn a_failed_write_that_cannot_be_taken_back_stays_closed() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
-    assert_eq!(root.spend_nonce(&[1; 32]).unwrap(), NonceSpend::Recorded);
+    assert_eq!(
+        root.spend_nonce(&test_nonce("first")).unwrap(),
+        NonceSpend::Recorded
+    );
     let log = root.nonce_log_path();
-    let line = self::line(2);
+    let line = self::line("second");
     // Not open for writing, so it can't be truncated.
     let read_only = fs::File::open(&log).unwrap();
 
@@ -211,19 +230,22 @@ fn a_symlink_in_the_logs_place_is_not_followed() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
     let elsewhere = tmp.path().join("elsewhere");
-    fs::write(&elsewhere, line(7)).unwrap();
+    fs::write(&elsewhere, line("writer 7")).unwrap();
     symlink(&elsewhere, root.nonce_log_path()).unwrap();
 
-    assert!(root.nonce_used(&NONCE).is_err(), "not read through");
-    assert!(root.spend_nonce(&[9; 32]).is_err(), "not written through");
+    assert!(root.nonce_used(&shared()).is_err(), "not read through");
+    assert!(
+        root.spend_nonce(&test_nonce("elsewhere")).is_err(),
+        "not written through"
+    );
     assert!(root.check_nonce_log().is_err());
-    assert_eq!(fs::read_to_string(&elsewhere).unwrap(), line(7));
+    assert_eq!(fs::read_to_string(&elsewhere).unwrap(), line("writer 7"));
 
     // Nor one that points nowhere, which a plain create would make the target of.
     fs::remove_file(root.nonce_log_path()).unwrap();
     let nowhere = tmp.path().join("nowhere");
     symlink(&nowhere, root.nonce_log_path()).unwrap();
-    assert!(root.spend_nonce(&NONCE).is_err());
+    assert!(root.spend_nonce(&shared()).is_err());
     assert!(!nowhere.exists());
 }
 
@@ -232,8 +254,8 @@ fn something_other_than_a_private_file_refuses() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
     fs::create_dir(root.nonce_log_path()).unwrap();
-    assert!(root.nonce_used(&NONCE).is_err());
-    assert!(root.spend_nonce(&NONCE).is_err());
+    assert!(root.nonce_used(&shared()).is_err());
+    assert!(root.spend_nonce(&shared()).is_err());
     fs::remove_dir(root.nonce_log_path()).unwrap();
 
     // A FIFO would hold a plain open for reading until a writer came along.
@@ -243,20 +265,20 @@ fn something_other_than_a_private_file_refuses() {
         .unwrap();
     assert!(made.success());
     assert!(matches!(
-        root.nonce_used(&NONCE),
+        root.nonce_used(&shared()),
         Err(StateError::NonceLog { .. })
     ));
-    assert!(root.spend_nonce(&NONCE).is_err());
+    assert!(root.spend_nonce(&shared()).is_err());
     fs::remove_file(root.nonce_log_path()).unwrap();
 
-    fs::write(root.nonce_log_path(), line(1)).unwrap();
+    fs::write(root.nonce_log_path(), line("first")).unwrap();
     fs::set_permissions(root.nonce_log_path(), fs::Permissions::from_mode(0o620)).unwrap();
     assert!(
-        matches!(root.nonce_used(&NONCE), Err(StateError::Writable { .. })),
+        matches!(root.nonce_used(&shared()), Err(StateError::Writable { .. })),
         "someone else could forge or erase what it says"
     );
     assert!(matches!(
-        root.spend_nonce(&NONCE),
+        root.spend_nonce(&shared()),
         Err(StateError::Writable { .. })
     ));
 }
@@ -271,10 +293,10 @@ fn of_writers_at_once_exactly_one_spends_a_nonce() {
             std::thread::spawn(move || {
                 // Each has its own descriptor, as another process would.
                 let root = StateDir::open(&path).unwrap();
-                if until_free(&root, &NONCE) == NonceSpend::Recorded {
+                if until_free(&root, &shared()) == NonceSpend::Recorded {
                     recorded.fetch_add(1, Ordering::SeqCst);
                 }
-                let _ = until_free(&root, &[writer; 32]);
+                let _ = until_free(&root, &test_nonce(&format!("writer {writer}")));
             })
         })
         .collect();
@@ -300,7 +322,7 @@ fn of_writers_at_once_exactly_one_spends_a_nonce() {
 fn a_lock_let_go_in_a_moment_is_gone_through() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
-    assert_eq!(root.spend_nonce(&NONCE).unwrap(), NonceSpend::Recorded);
+    assert_eq!(root.spend_nonce(&shared()).unwrap(), NonceSpend::Recorded);
     let holder = fs::File::open(root.nonce_log_path()).unwrap();
     holder.lock().unwrap();
     let letting_go = std::thread::spawn(move || {
@@ -308,7 +330,10 @@ fn a_lock_let_go_in_a_moment_is_gone_through() {
         drop(holder);
     });
 
-    assert_eq!(root.spend_nonce(&[8; 32]).unwrap(), NonceSpend::Recorded);
+    assert_eq!(
+        root.spend_nonce(&test_nonce("other")).unwrap(),
+        NonceSpend::Recorded
+    );
     letting_go.join().unwrap();
 }
 
@@ -316,7 +341,7 @@ fn a_lock_let_go_in_a_moment_is_gone_through() {
 fn a_lock_held_on_the_log_is_said_and_changes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let root = dir(&tmp);
-    assert_eq!(root.spend_nonce(&NONCE).unwrap(), NonceSpend::Recorded);
+    assert_eq!(root.spend_nonce(&shared()).unwrap(), NonceSpend::Recorded);
     let before = fs::read(root.nonce_log_path()).unwrap();
     let holder = fs::File::open(root.nonce_log_path()).unwrap();
     let busy = |result: Result<NonceSpend, StateError>| {
@@ -328,19 +353,22 @@ fn a_lock_held_on_the_log_is_said_and_changes_nothing() {
 
     // Held to read: it can still be read, and can't be written.
     holder.lock_shared().unwrap();
-    assert!(root.nonce_used(&NONCE).unwrap());
-    busy(root.spend_nonce(&[8; 32]));
+    assert!(root.nonce_used(&shared()).unwrap());
+    busy(root.spend_nonce(&test_nonce("other")));
 
     // Held to write: neither.
     holder.unlock().unwrap();
     holder.lock().unwrap();
     assert!(matches!(
-        root.nonce_used(&NONCE),
+        root.nonce_used(&shared()),
         Err(StateError::NonceLogBusy(_))
     ));
-    busy(root.spend_nonce(&[8; 32]));
+    busy(root.spend_nonce(&test_nonce("other")));
     assert_eq!(fs::read(root.nonce_log_path()).unwrap(), before);
 
     drop(holder);
-    assert_eq!(root.spend_nonce(&[8; 32]).unwrap(), NonceSpend::Recorded);
+    assert_eq!(
+        root.spend_nonce(&test_nonce("other")).unwrap(),
+        NonceSpend::Recorded
+    );
 }

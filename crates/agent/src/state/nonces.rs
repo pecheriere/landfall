@@ -115,8 +115,8 @@ fn locked(attempt: impl Fn() -> Result<(), TryLockError>, path: &Path) -> Result
 }
 
 /// Reads the whole log from its start, refusing it if any of it isn't what the log
-/// holds, and says whether `nonce` is in it.
-fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> {
+/// holds, and hands `each` the digits of every line.
+fn read_lines(file: &File, path: &Path, mut each: impl FnMut(&[u8])) -> Result<(), StateError> {
     let len = file.metadata().map_err(io_err("inspect", path))?.len();
     if len >= MAX_NONCE_LOG_BYTES {
         return Err(unusable(
@@ -130,8 +130,6 @@ fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> 
             format!("it is {len} bytes, which isn't whole lines: its last line is torn"),
         ));
     }
-    let wanted = hex::encode(nonce);
-    let mut found = false;
     let mut reader = BufReader::new(file);
     let mut line = [0_u8; LINE_BYTES];
     for number in 1..=len / LINE_BYTES as u64 {
@@ -143,9 +141,26 @@ fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> 
         if !is_hex || end != b"\n" {
             return Err(unusable(path, format!("line {number} isn't a nonce")));
         }
-        found |= digits == wanted.as_bytes();
+        each(digits);
     }
+    Ok(())
+}
+
+/// Reads the whole log as [`read_lines`] does, and says whether `nonce` is in it.
+fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> {
+    let wanted = hex::encode(nonce);
+    let mut found = false;
+    read_lines(file, path, |digits| found |= digits == wanted.as_bytes())?;
     Ok(found)
+}
+
+/// The log, with a lock on it to read. `None` if it isn't there.
+fn open_to_read(path: &Path) -> Result<Option<File>, StateError> {
+    let Some(file) = open(path, OFlags::RDONLY)? else {
+        return Ok(None);
+    };
+    locked(|| file.try_lock_shared(), path)?;
+    Ok(Some(file))
 }
 
 /// Writes `line` through `out`, which ends up in `file`. Called under the file's lock. A
@@ -189,20 +204,24 @@ impl StateDir {
     /// [`StateError::NonceLogBusy`] if something holds its lock to write.
     pub fn nonce_used(&self, nonce: &[u8; 32]) -> Result<bool, StateError> {
         let path = self.nonce_log_path();
-        let Some(file) = open(&path, OFlags::RDONLY)? else {
+        let Some(file) = open_to_read(&path)? else {
             return Ok(false);
         };
-        locked(|| file.try_lock_shared(), &path)?;
         scan(&file, &path, nonce)
     }
 
-    /// Reads the log and says if it can be trusted.
+    /// Reads the log and says if it can be trusted. No log can be.
     ///
     /// # Errors
     ///
-    /// [`StateError`] if it can't.
+    /// [`StateError`] if it can't, and [`StateError::NonceLogBusy`] if something holds its lock
+    /// to write.
     pub fn check_nonce_log(&self) -> Result<(), StateError> {
-        self.nonce_used(&[0; 32]).map(|_| ())
+        let path = self.nonce_log_path();
+        match open_to_read(&path)? {
+            Some(file) => read_lines(&file, &path, |_| {}),
+            None => Ok(()),
+        }
     }
 
     /// Spends `nonce`: refuses it if it was spent, and otherwise appends it, and it is

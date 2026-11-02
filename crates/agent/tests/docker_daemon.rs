@@ -36,6 +36,11 @@ mod compose_project;
 
 use compose_project::ComposeProject;
 
+#[path = "support/test_nonce.rs"]
+mod test_nonce;
+
+use test_nonce::test_nonce;
+
 const REPO: &str = "containerd/busybox";
 /// Tag 1.36: what runs before the poll.
 const DIGEST_A: &str = "sha256:7b3ccabffc97de872a30dfd234fd972a66d247c8cfc69b0550f276481852627c";
@@ -245,7 +250,7 @@ async fn docker_daemon_step_runs_a_first_deploy_on_an_approval_verified_here() {
         commit: COMMIT.parse().unwrap(),
         digest: DIGEST_B.parse().unwrap(),
         expected_running: None,
-        nonce: [3; 32],
+        nonce: test_nonce("the approval"),
     };
 
     // The same intent, signed by a passkey this host has never heard of: nothing starts.
@@ -287,7 +292,7 @@ async fn docker_daemon_step_runs_a_first_deploy_on_an_approval_verified_here() {
     let deployed = stack.state.deployed().unwrap().unwrap();
     assert_eq!(deployed.digest.as_ref(), DIGEST_B);
     let root = StateDir::open(stack.state_root.path()).unwrap();
-    assert!(root.nonce_used(&[3; 32]).unwrap());
+    assert!(root.nonce_used(&test_nonce("the approval")).unwrap());
 }
 
 #[tokio::test]

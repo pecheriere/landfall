@@ -22,12 +22,12 @@ use crate::compose::OVERRIDE_FILE;
 use crate::deploy::{self, DeployError, DeployPlan};
 use crate::journal::{Priority, capture};
 use crate::state::{DeployLock, Deployed, FailedRelease, NonceSpend, Phase, StateDir, StateError};
-use crate::testing::Call;
+use crate::testing::{Call, test_nonce};
 
 fn approved_minor(keys: &Keys, number: u64) -> DeployWork {
     carrying(
         number,
-        signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), 1)),
+        signed(&keys.operator, &intent("v1.3.0", Some(OLD_DIGEST), "first")),
     )
 }
 
@@ -48,12 +48,12 @@ async fn the_nonce_is_on_disk_before_anything_changes_and_the_lock_is_held_from_
                 | Call::ComposeUp { .. }
                 | Call::ComposeStop { .. }
         ) {
-            let spent = log.nonce_used(&[1; 32]).unwrap();
+            let spent = log.nonce_used(&test_nonce("first")).unwrap();
             let locked = state.lock().is_err();
             copy.lock().unwrap().push((spent, locked));
         }
     });
-    let approval = signed(&keys.operator, &intent("v1.2.3", None, 1));
+    let approval = signed(&keys.operator, &intent("v1.2.3", None, "first"));
 
     let outcome = asked(&f, &FakeVerifier::passes(), carrying(7, approval)).await;
 
@@ -76,7 +76,7 @@ async fn the_lock_the_nonce_was_spent_under_is_the_one_the_engine_starts_with() 
     let copy = Arc::clone(&seen);
     when_the_engine_starts(move || {
         copy.lock().unwrap().push((
-            log.nonce_used(&[1; 32]).unwrap(),
+            log.nonce_used(&test_nonce("first")).unwrap(),
             matches!(state.lock(), Err(StateError::Busy(_))),
         ));
     });
@@ -133,7 +133,7 @@ async fn a_nonce_that_cannot_be_recorded_changes_nothing() {
     }));
     let seen = capture::events("nonce_log_unusable").len();
     let spending = capture::events("approval_about_to_be_spent").len();
-    let approval = signed(&keys.operator, &intent("v1.2.3", None, 1));
+    let approval = signed(&keys.operator, &intent("v1.2.3", None, "first"));
 
     let (reason, priority) = assert_refused(&f, &verifier, carrying(7, approval)).await;
 
@@ -160,7 +160,7 @@ async fn verification_that_refuses_or_cannot_run_spends_nothing() {
     let (reason, priority) = assert_refused(&f, &refusing, approved_minor(&keys, 7)).await;
     assert!(reason.contains("tag signature"), "{reason}");
     assert_eq!(priority, Priority::Critical);
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 
     let away = FakeVerifier::answering(Err(VerifyFailure::Unavailable("registry".to_owned())));
     let outcome = asked(&f, &away, approved_minor(&keys, 8)).await;
@@ -168,12 +168,12 @@ async fn verification_that_refuses_or_cannot_run_spends_nothing() {
         matches!(outcome, StepOutcome::Waiting { .. }),
         "{outcome:?}"
     );
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 
     // So the same approval goes through once the registry is back.
     let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 8)).await;
     assert_deployed(&outcome);
-    assert!(spent(&f, 1));
+    assert!(spent(&f, "first"));
 }
 
 #[tokio::test]
@@ -184,14 +184,14 @@ async fn what_holds_a_deploy_up_spends_nothing() {
         .script_inspect_after_up(0, [Ok(container("ghcr.io/example/app@sha256:ff", true))]);
     let (reason, _) = assert_deferred(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     assert!(reason.contains("drifted"), "{reason}");
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 
     // Evidence of a failure that can't be read: it could be anything, approval or none.
     let (f, keys) = keyed(PATCH_RULE);
     fs::write(state_of(&f).failed_releases_path(), "{").unwrap();
     let (reason, _) = assert_deferred(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     assert!(reason.contains("can't tell"), "{reason}");
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 
     // An interrupted deploy, whose record says nothing about what runs.
     let (f, keys) = keyed(PATCH_RULE);
@@ -200,17 +200,17 @@ async fn what_holds_a_deploy_up_spends_nothing() {
         .unwrap();
     let (reason, _) = assert_deferred(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     assert!(reason.contains("recover"), "{reason}");
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 
     // The same, on a first deploy: `None` on record means nothing while a marker's there.
     let (f, keys) = bare_keyed(PATCH_RULE);
     state_of(&f)
         .set_in_progress(&marker(Phase::Deploying))
         .unwrap();
-    let approval = signed(&keys.operator, &intent("v1.2.4", None, 1));
+    let approval = signed(&keys.operator, &intent("v1.2.4", None, "first"));
     let (reason, _) = assert_deferred(&f, &FakeVerifier::passes(), carrying(7, approval)).await;
     assert!(reason.contains("recover"), "{reason}");
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 }
 
 #[tokio::test]
@@ -230,7 +230,7 @@ async fn the_record_is_compared_again_under_the_lock() {
     let (reason, priority) = assert_refused(&f, &verifier, approved_minor(&keys, 7)).await;
     assert!(reason.contains(OTHER_DIGEST), "{reason}");
     assert_eq!(priority, Priority::Critical);
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 
     // Or a marker came meanwhile: not now, and the approval stays good.
     let (f, keys) = keyed(PATCH_RULE);
@@ -245,7 +245,7 @@ async fn the_record_is_compared_again_under_the_lock() {
             if reason.contains("recover")),
         "{outcome:?}"
     );
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
     assert_eq!(touched(&f.docker), []);
 
     // Or the rule's answer changed with the record: same digest, now the version asked for.
@@ -258,7 +258,7 @@ async fn the_record_is_compared_again_under_the_lock() {
     let (reason, priority) = assert_refused(&f, &verifier, approved_minor(&keys, 7)).await;
     assert!(reason.contains("already running"), "{reason}");
     assert_eq!(priority, Priority::Critical);
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
 }
 
 #[tokio::test]
@@ -267,7 +267,10 @@ async fn a_nonce_spent_after_the_first_look_is_refused_at_the_last() {
     let verifier = FakeVerifier::passes();
     let root = StateDir::open(&f.state_dir).unwrap();
     *verifier.during.lock().unwrap() = Some(Box::new(move || {
-        assert_eq!(root.spend_nonce(&[1; 32]).unwrap(), NonceSpend::Recorded);
+        assert_eq!(
+            root.spend_nonce(&test_nonce("first")).unwrap(),
+            NonceSpend::Recorded
+        );
     }));
     let (reason, priority) = assert_refused(&f, &verifier, approved_minor(&keys, 7)).await;
     assert!(reason.contains("already"), "{reason}");
@@ -291,7 +294,7 @@ async fn a_recover_holding_the_lock_leaves_the_approval_good() {
         matches!(&outcome, StepOutcome::Waiting { reason, .. } if reason.contains("busy")),
         "{outcome:?}"
     );
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
     assert_eq!(touched(&f.docker), []);
     assert_eq!(state_of(&f).claim().unwrap(), None);
 
@@ -306,7 +309,7 @@ async fn a_recover_holding_the_lock_leaves_the_approval_good() {
         outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     }
     assert_deployed(&outcome);
-    assert!(spent(&f, 1));
+    assert!(spent(&f, "first"));
 }
 
 /// Something run by hand holds the nonce log's lock, past any deadline. Nothing may wait for it,
@@ -314,7 +317,10 @@ async fn a_recover_holding_the_lock_leaves_the_approval_good() {
 async fn a_held_log_makes_the_work_wait(hold: impl Fn(&fs::File)) {
     let (f, keys) = keyed(PATCH_RULE);
     let root = StateDir::open(&f.state_dir).unwrap();
-    assert_eq!(root.spend_nonce(&[9; 32]).unwrap(), NonceSpend::Recorded);
+    assert_eq!(
+        root.spend_nonce(&test_nonce("unrelated")).unwrap(),
+        NonceSpend::Recorded
+    );
     let holder = fs::File::open(root.nonce_log_path()).unwrap();
     hold(&holder);
     let log_before = fs::read(root.nonce_log_path()).unwrap();
@@ -353,7 +359,7 @@ async fn a_held_log_makes_the_work_wait(hold: impl Fn(&fs::File)) {
     drop(holder);
     let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     assert_deployed(&outcome);
-    assert!(spent(&f, 1));
+    assert!(spent(&f, "first"));
 }
 
 /// Held to write, it stops the first look.
@@ -379,7 +385,7 @@ async fn a_stop_during_verification_spends_nothing() {
     let outcome = asked(&f, &verifier, approved_minor(&keys, 7)).await;
 
     assert_eq!(outcome, StepOutcome::ShuttingDown);
-    assert!(!spent(&f, 1));
+    assert!(!spent(&f, "first"));
     assert_eq!(touched(&f.docker), []);
 }
 
@@ -389,7 +395,7 @@ async fn a_nonce_spent_for_one_deployment_is_spent_for_the_others() {
     // The log is the host's: this nonce went on another deployment here.
     let _: NonceSpend = StateDir::open(&f.state_dir)
         .unwrap()
-        .spend_nonce(&[1; 32])
+        .spend_nonce(&test_nonce("first"))
         .unwrap();
     let stage: landfall_core::ids::DeploymentId = "app/stage".parse().unwrap();
     f.options = super::options_for(BTreeMap::from([
@@ -400,7 +406,7 @@ async fn a_nonce_spent_for_one_deployment_is_spent_for_the_others() {
         &keys.backup,
         &DeployIntent {
             deployment: stage.clone(),
-            ..intent("v1.2.4", None, 1)
+            ..intent("v1.2.4", None, "first")
         },
     );
     let item = DeployWork {
