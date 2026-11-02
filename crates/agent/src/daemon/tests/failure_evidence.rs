@@ -52,26 +52,39 @@ fn report_file(f: &Fixture) -> PathBuf {
     state.report_path(&names[0])
 }
 
+/// The ledger's one record of this number.
 fn ledger_file(f: &Fixture, deploy_id: u64) -> PathBuf {
-    f.state_dir.join(format!("finished/{deploy_id}.json"))
+    let prefix = format!("{deploy_id}-");
+    let found: Vec<PathBuf> = fs::read_dir(f.state_dir.join("finished"))
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_str().unwrap().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.into_iter().next().unwrap()
 }
 
-/// Asks for `item` and returns why it was refused. Nothing may run.
-async fn refused(f: &Fixture, item: landfall_core::protocol::DeployWork) -> String {
+/// Asks for `item` and returns how it was answered. Nothing may run.
+async fn answered(f: &Fixture, item: landfall_core::protocol::DeployWork) -> ReportedOutcome {
     let before = ups(f);
     let controller = FakeController::with([answer(Some(item))]);
     let verifier = FakeVerifier::passes();
     let outcome = poll(f, &controller, &verifier).await;
     assert_eq!(ups(f), before, "{outcome:?}");
     assert_eq!(verifier.calls(), 0, "{outcome:?}");
-    let StepOutcome::Finished {
-        outcome: ReportedOutcome::Refused { reason },
-        ..
-    } = outcome
-    else {
-        panic!("not refused: {outcome:?}");
+    let StepOutcome::Finished { outcome, .. } = outcome else {
+        panic!("not answered: {outcome:?}");
     };
-    reason
+    outcome
+}
+
+/// Asks for `item` and returns why it was refused. Nothing may run.
+async fn refused(f: &Fixture, item: landfall_core::protocol::DeployWork) -> String {
+    match answered(f, item).await {
+        ReportedOutcome::Refused { reason } => reason,
+        outcome => panic!("not refused: {outcome:?}"),
+    }
 }
 
 const FAILED_HERE: &str = "failed on this host";
@@ -130,11 +143,14 @@ async fn a_report_never_written_does_not_let_a_failed_release_run_again() {
     assert!(reason.contains(FAILED_HERE), "{reason}");
 }
 
-/// Refuses `tag` as unknowable, naming `file`, with the journal saying how to
-/// clear it.
+/// Puts `tag` off as unknowable, naming `file`, with the journal saying how to clear
+/// it.
 async fn assert_fails_closed(f: &Fixture, deploy_id: u64, tag: &str, file: &std::path::Path) {
     let seen = capture::events("failure_evidence_unreadable").len();
-    let reason = refused(f, work(deploy_id, tag)).await;
+    let outcome = answered(f, work(deploy_id, tag)).await;
+    let ReportedOutcome::Deferred { reason } = outcome else {
+        panic!("not deferred: {outcome:?}");
+    };
     assert!(reason.contains("can't tell"), "{reason}");
     assert!(reason.contains(file.to_str().unwrap()), "{reason}");
     let events = capture::events("failure_evidence_unreadable");
@@ -146,7 +162,7 @@ async fn assert_fails_closed(f: &Fixture, deploy_id: u64, tag: &str, file: &std:
 }
 
 #[tokio::test]
-async fn an_unreadable_report_refuses_what_it_could_be_about_and_can_be_cleared() {
+async fn an_unreadable_report_puts_off_what_it_could_be_about_and_can_be_cleared() {
     let f = fixture(PATCH_RULE);
     failed_deploy(&f).await;
     let (report, record) = (report_file(&f), state_of(&f).failed_releases_path());
@@ -178,7 +194,7 @@ async fn an_unreadable_report_refuses_what_it_could_be_about_and_can_be_cleared(
 }
 
 #[tokio::test]
-async fn an_unreadable_record_refuses_rather_than_counting_as_no_failure() {
+async fn an_unreadable_record_puts_off_rather_than_counting_as_no_failure() {
     let f = fixture(PATCH_RULE);
     failed_deploy(&f).await;
     let record = state_of(&f).failed_releases_path();
@@ -227,27 +243,70 @@ async fn a_release_that_deployed_is_not_on_the_record() {
 }
 
 #[tokio::test]
-async fn a_number_on_record_naming_another_release_is_refused_not_answered_with_the_old_report() {
+async fn a_number_on_record_naming_another_release_is_judged_like_any_other() {
     let f = fixture(PATCH_RULE);
     let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
     poll(&f, &controller, &FakeVerifier::passes()).await;
     assert_eq!(ups(&f), 1);
     let on_record = fs::read(ledger_file(&f, 7)).unwrap();
 
+    // What this host would refuse from any number, it refuses from this one.
     let other_digest = format!("sha256:{}", "e".repeat(64));
     let mut other_deployment = work(7, "v1.2.4");
     other_deployment.deployment = "app/stage".parse().unwrap();
-    let mut other_release = work(7, "v1.2.4");
+    let mut other_release = work(7, "v1.2.5");
     other_release.digest = other_digest.parse().unwrap();
-    for item in [work(7, "v1.2.5"), other_release, other_deployment] {
-        let reason = refused(&f, item).await;
-        assert!(reason.contains("already finished"), "{reason}");
+    let verifier = FakeVerifier::passes();
+    for (item, says) in [
+        (other_deployment, "not a deployment of this host"),
+        (other_release, "verifies to digest"),
+        (work(7, "v2.0.0"), "manual"),
+    ] {
+        let controller = FakeController::with([answer(Some(item))]);
+        let outcome = poll(&f, &controller, &verifier).await;
+        let StepOutcome::Finished {
+            outcome: ReportedOutcome::Refused { reason },
+            ..
+        } = &outcome
+        else {
+            panic!("not refused: {outcome:?}");
+        };
+        assert!(reason.contains(says), "{reason}");
+        assert_eq!(ups(&f), 1);
     }
-    assert_eq!(fs::read(ledger_file(&f, 7)).unwrap(), on_record);
 
-    // The release it was for still gets its report.
+    // What it would run from any number, it runs from this one.
+    f.docker
+        .script_compose_service([Ok(image(NEW)), Ok(image(NEW)), Ok(image(NEW))]);
+    f.docker
+        .script_inspect_after_up(2, [Ok(container(NEW, true))]);
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.5")))]);
+    let outcome = poll(&f, &controller, &verifier).await;
+    assert!(
+        matches!(
+            &outcome,
+            StepOutcome::Finished {
+                outcome: ReportedOutcome::Deployed {},
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(ups(&f), 2);
+    assert_eq!(
+        state_of(&f).deployed().unwrap().unwrap().tag.as_ref(),
+        "v1.2.5"
+    );
+
+    // The release it was for still gets its report, and runs no more than it did.
+    let kept: Vec<_> = fs::read_dir(f.state_dir.join("finished"))
+        .unwrap()
+        .map(|entry| fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    assert!(kept.contains(&on_record), "the old record stays as it was");
     let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
-    let outcome = poll(&f, &controller, &FakeVerifier::passes()).await;
+    let outcome = poll(&f, &controller, &verifier).await;
+    assert_eq!(ups(&f), 2);
     assert!(
         matches!(
             &outcome,

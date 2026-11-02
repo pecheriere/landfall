@@ -6,7 +6,7 @@ use std::path::Path;
 
 use landfall_core::config::{Config, Deployment};
 use landfall_core::ids::DeploymentId;
-use landfall_core::protocol::{DeployId, DeployWork};
+use landfall_core::protocol::DeployWork;
 use landfall_core::rule::{Decision, Refusal, decide};
 use landfall_origin::release::ReleaseOrigin;
 use serde::Serialize;
@@ -27,14 +27,22 @@ pub(super) enum Verdict<'a> {
         deployment: &'a Deployment,
         dir: &'a Path,
     },
-    /// It may not, and that is the answer.
+    /// It may not, and that is the answer for good: its rule, a failed verification
+    /// result, or the record of failures on this host.
     Refuse { priority: Priority, reason: String },
-    /// Not now, and nothing is reported.
+    /// Not now, and the controller is told: the claim ends, so that the host's other
+    /// deployments can go, and the controller may ask again later.
+    Defer { priority: Priority, reason: String },
+    /// Not yet, and nothing is reported: the controller delivers it again.
     Wait { reason: String },
 }
 
 fn refuse<'a>(priority: Priority, reason: String) -> Verdict<'a> {
     Verdict::Refuse { priority, reason }
+}
+
+fn defer<'a>(priority: Priority, reason: String) -> Verdict<'a> {
+    Verdict::Defer { priority, reason }
 }
 
 /// Why this rule's answer is not `Auto`, if it isn't. Matching every decision
@@ -75,7 +83,11 @@ fn held_up<'a>(
     claim: Option<&ControllerClaim>,
 ) -> Option<Verdict<'a>> {
     let id = &work.deployment;
-    let ours = claim.is_some_and(|claim| claim.deploy_id == work.deploy_id);
+    // The number alone isn't enough: a controller whose database was rebuilt uses
+    // numbers again.
+    let ours = claim.is_some_and(|claim| {
+        claim.deploy_id == work.deploy_id && claim.tag == work.tag && claim.digest == work.digest
+    });
     match marker {
         // The controller delivers claimed work again: this is the deploy that
         // was interrupted, and `recover` will end it.
@@ -85,7 +97,7 @@ fn held_up<'a>(
                 marker.tag
             ),
         }),
-        Some(marker) => Some(refuse(
+        Some(marker) => Some(defer(
             Priority::Error,
             format!(
                 "the deploy of {} did not finish; run `landfall-agent recover --deployment {id}`",
@@ -117,22 +129,14 @@ fn differs_from_asked(work: &DeployWork, origin: &ReleaseOrigin) -> Option<Strin
 }
 
 /// Adds the time since the last look to how long this work item's verification
-/// has been unable to run, says so each period, and returns the total. The sum
-/// goes by the monotonic clock and is kept on disk, so it survives a restart and
-/// the wall clock has no say in it.
+/// has been unable to run, and returns the total. The sum goes by the monotonic
+/// clock and is kept on disk, so it survives a restart and the wall clock has no say
+/// in it.
 async fn note_wait(
     state_dir: &Path,
     options: &DaemonOptions,
     work: &DeployWork,
-    error: &str,
 ) -> Result<u64, String> {
-    #[derive(Serialize)]
-    struct StillWaiting<'a> {
-        event: &'static str,
-        deploy_id: DeployId,
-        waited_millis: u64,
-        error: &'a str,
-    }
     let now = std::time::Instant::now();
     let since_last = locked(&options.memory.verification_seen)
         .replace((work.deploy_id, now))
@@ -140,15 +144,12 @@ async fn note_wait(
         .map_or(0, |(_, last)| {
             u64::try_from(now.duration_since(last).as_millis()).unwrap_or(u64::MAX)
         });
-    let period = u64::try_from(options.verification_bound.as_millis())
-        .unwrap_or(u64::MAX)
-        .max(1);
     let (root, id, deploy_id) = (
         state_dir.to_owned(),
         work.deployment.clone(),
         work.deploy_id,
     );
-    let (waited_millis, warn) = on_thread("record the wait", move || {
+    on_thread("record the wait", move || {
         let state = deployment_state(&root, &id)?;
         let mut wait = state
             .verification_wait()?
@@ -156,28 +157,12 @@ async fn note_wait(
             .unwrap_or(VerificationWait {
                 deploy_id,
                 waited_millis: 0,
-                warned_periods: 0,
             });
         wait.waited_millis = wait.waited_millis.saturating_add(since_last);
-        let periods = wait.waited_millis / period;
-        let warn = periods > wait.warned_periods;
-        wait.warned_periods = periods;
         state.set_verification_wait(&wait)?;
-        Ok((wait.waited_millis, warn))
+        Ok(wait.waited_millis)
     })
-    .await?;
-    if warn {
-        journal::emit(
-            Priority::Warning,
-            &StillWaiting {
-                event: "verification_still_waiting",
-                deploy_id,
-                waited_millis,
-                error,
-            },
-        );
-    }
-    Ok(waited_millis)
+    .await
 }
 
 /// Verification has come to an answer, so the wait is over.
@@ -191,45 +176,48 @@ async fn forget_wait(state_dir: &Path, options: &DaemonOptions, id: &DeploymentI
     .await;
 }
 
-/// What verification that could not run comes to. A registry or GitHub that is
-/// away may be back: this waits as long as it takes. A tag or an image that isn't
-/// there may be a release still being published, but only for so long: a yanked
-/// release would otherwise hold the host's queue for ever without a word.
+/// What verification that could not run comes to. It may yet: a registry that is
+/// away may be back, a release may still be publishing, and a wrong answer may be
+/// put right. While this waits the claim blocks every deployment of the host, so it
+/// waits only for so long, and then the controller is told not now, which frees the
+/// host. The controller's next tries are paced by its own growing wait. A wait that
+/// can't be recorded has no bound to go by, so it ends at once.
 async fn waiting_verdict<'a>(
     state_dir: &Path,
     options: &DaemonOptions,
     work: &DeployWork,
-    error: String,
-    missing: bool,
+    error: &str,
+    what: &str,
 ) -> Verdict<'a> {
-    let waited = match note_wait(state_dir, options, work, &error).await {
+    let waited = match note_wait(state_dir, options, work).await {
         Ok(waited) => waited,
         Err(record) => {
-            return Verdict::Wait {
-                reason: format!("verification could not run: {error}; {record}"),
-            };
+            return defer(
+                Priority::Error,
+                format!("{what}: {error}; the wait can't be recorded: {record}"),
+            );
         }
     };
     let bound = u64::try_from(options.verification_bound.as_millis()).unwrap_or(u64::MAX);
-    if missing && waited >= bound {
+    if waited >= bound {
         forget_wait(state_dir, options, &work.deployment).await;
-        return refuse(
-            Priority::Error,
+        return defer(
+            Priority::Warning,
             format!(
-                "the release is still not to be found after waiting {:?}: {error}",
+                "{what} after waiting {:?}: {error}",
                 options.verification_bound
             ),
         );
     }
     Verdict::Wait {
-        reason: format!("verification could not run: {error}"),
+        reason: format!("{what}: {error}"),
     }
 }
 
-/// What this host knows of the release having failed here says no. What runs is
-/// the digest asked for or nothing, as verification sees to later, so a name of
-/// the controller's choosing can't get around this.
-fn refused_by_evidence<'a>(evidence: FailureEvidence, work: &DeployWork) -> Option<Verdict<'a>> {
+/// What this host knows of the release having failed here says no, or that it can't
+/// tell yet. What runs is the digest asked for or nothing, as verification sees to
+/// later, so a name of the controller's choosing can't get around this.
+fn held_by_evidence<'a>(evidence: FailureEvidence, work: &DeployWork) -> Option<Verdict<'a>> {
     #[derive(Serialize)]
     struct Unreadable<'a> {
         event: &'static str,
@@ -257,7 +245,7 @@ fn refused_by_evidence<'a>(evidence: FailureEvidence, work: &DeployWork) -> Opti
                     clear: CLEAR,
                 },
             );
-            Some(refuse(
+            Some(defer(
                 Priority::Error,
                 format!(
                     "can't tell whether {} failed on this host: {} can't be read: {error}; {CLEAR}",
@@ -305,7 +293,7 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
     .await;
     let (deployed, marker, claim, evidence) = match read {
         Ok(read) => read,
-        Err(error) => return refuse(Priority::Error, error),
+        Err(error) => return defer(Priority::Error, error),
     };
     if let Some(verdict) = held_up(work, marker.as_ref(), claim.as_ref()) {
         return verdict;
@@ -319,13 +307,13 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
     if let Some(reason) = not_auto(decision, running, &version) {
         return refuse(Priority::Critical, reason);
     }
-    if let Some(verdict) = refused_by_evidence(evidence, work) {
+    if let Some(verdict) = held_by_evidence(evidence, work) {
         return verdict;
     }
     match fresh_drift(docker, deployment, dir, deployed.is_some(), options).await {
         Ok(false) => {}
         Ok(true) => {
-            return refuse(
+            return defer(
                 Priority::Error,
                 format!(
                     "{id} has drifted: what runs is not what the agent deployed, so it gets no automatic deploys until that clears"
@@ -333,7 +321,7 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
             );
         }
         Err(error) => {
-            return refuse(
+            return defer(
                 Priority::Error,
                 format!("{id}: what runs could not be read: {error}"),
             );
@@ -346,10 +334,21 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
             return refuse(Priority::Critical, format!("verification: {error}"));
         }
         Err(VerifyFailure::Missing(error)) => {
-            return waiting_verdict(state_dir, options, work, error, true).await;
+            let what = "the release is not to be found";
+            return waiting_verdict(state_dir, options, work, &error, what).await;
         }
         Err(VerifyFailure::Unavailable(error)) => {
-            return waiting_verdict(state_dir, options, work, error, false).await;
+            let what = "verification could not run";
+            return waiting_verdict(state_dir, options, work, &error, what).await;
+        }
+        Err(VerifyFailure::ClockBehind(error)) => {
+            forget_wait(state_dir, options, id).await;
+            return defer(
+                Priority::Warning,
+                format!(
+                    "this host's clock is behind the release; it deploys once the clock is synchronised: {error}"
+                ),
+            );
         }
     };
     forget_wait(state_dir, options, id).await;

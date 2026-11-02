@@ -51,11 +51,14 @@ const KILL_WAIT: Duration = Duration::from_secs(5);
 /// Environment variables that would make a compose command read something
 /// other than the stack's own files, or, for `PWD`, label a container with
 /// another spelling of its directory: Go takes the path from it when it leads
-/// to the working directory, a symlink included.
-const SCRUBBED_ENV: [&str; 4] = [
+/// to the working directory, a symlink included. And the agent's token for GitHub,
+/// which goes to GitHub only: compose would hand it to any stack that names it in
+/// its file.
+const SCRUBBED_ENV: [&str; 5] = [
     "COMPOSE_FILE",
     "COMPOSE_PROJECT_NAME",
     "COMPOSE_PROFILES",
+    "GITHUB_TOKEN",
     "PWD",
 ];
 

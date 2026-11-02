@@ -8,8 +8,9 @@ use landfall_core::protocol::{DeployId, Phase, ReportedOutcome};
 
 use super::super::{StepOutcome, VerifyFailure};
 use super::{
-    COMMIT, FakeController, FakeVerifier, NEW_DIGEST, OLD, PATCH_RULE, answer, assert_refused,
-    bare_fixture, claim, container, fixture, marker, origin, poll, state_of, touched, work,
+    COMMIT, FakeController, FakeVerifier, NEW_DIGEST, OLD, PATCH_RULE, answer, assert_deferred,
+    assert_refused, bare_fixture, claim, container, fixture, marker, origin, poll, state_of,
+    touched, work,
 };
 use crate::journal::{Priority, capture};
 
@@ -124,10 +125,43 @@ async fn in_progress_marker_blocks_work() {
         .set_in_progress(&marker(crate::state::Phase::Deploying))
         .unwrap();
     let verifier = FakeVerifier::passes();
-    let (reason, priority) = assert_refused(&f, &verifier, work(8, "v1.2.5")).await;
+    let (reason, priority) = assert_deferred(&f, &verifier, work(8, "v1.2.5")).await;
     assert!(reason.contains("recover"), "{reason}");
     assert_eq!(priority, Priority::Error);
     assert_eq!(verifier.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_clock_behind_the_release_defers_it_without_a_wait() {
+    let f = fixture(PATCH_RULE);
+    let verifier =
+        FakeVerifier::answering(Err(VerifyFailure::ClockBehind("in the future".to_owned())));
+    let (reason, priority) = assert_deferred(&f, &verifier, work(7, "v1.2.4")).await;
+    assert!(reason.contains("clock"), "{reason}");
+    assert_eq!(priority, Priority::Warning);
+    assert_eq!(state_of(&f).verification_wait().unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_controllers_number_for_another_release_is_not_the_interrupted_deploy() {
+    let f = fixture(PATCH_RULE);
+    let mut taken = claim(7);
+    taken.tag = "v1.2.9".parse().unwrap();
+    state_of(&f).set_claim(&taken).unwrap();
+    state_of(&f)
+        .set_in_progress(&marker(crate::state::Phase::Deploying))
+        .unwrap();
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
+
+    let outcome = poll(&f, &controller, &FakeVerifier::passes()).await;
+
+    assert!(
+        matches!(&outcome, StepOutcome::Finished { outcome: ReportedOutcome::Deferred { reason }, .. }
+            if reason.contains("recover")),
+        "{outcome:?}"
+    );
+    assert_eq!(touched(&f.docker), []);
+    assert_eq!(state_of(&f).claim().unwrap(), Some(taken), "it stays");
 }
 
 #[tokio::test]
@@ -159,7 +193,7 @@ async fn drift_blocks_work() {
     f.docker
         .script_inspect_after_up(0, [Ok(container("ghcr.io/example/app@sha256:ff", true))]);
     let verifier = FakeVerifier::passes();
-    let (reason, priority) = assert_refused(&f, &verifier, work(7, "v1.2.4")).await;
+    let (reason, priority) = assert_deferred(&f, &verifier, work(7, "v1.2.4")).await;
     assert!(reason.contains("drifted"), "{reason}");
     assert_eq!(priority, Priority::Error);
     assert_eq!(verifier.calls(), 0);
@@ -200,7 +234,7 @@ async fn drift_that_cleared_is_seen_at_once_by_a_deploy() {
 async fn drift_that_cannot_be_read_blocks_work() {
     let f = fixture(PATCH_RULE);
     f.docker.script_container([Err("daemon gone")]);
-    let (reason, _) = assert_refused(&f, &FakeVerifier::passes(), work(7, "v1.2.4")).await;
+    let (reason, _) = assert_deferred(&f, &FakeVerifier::passes(), work(7, "v1.2.4")).await;
     assert!(reason.contains("daemon gone"), "{reason}");
 }
 
@@ -219,7 +253,7 @@ async fn state_that_cannot_be_read_is_listed_as_not_fit_to_deploy_to() {
     assert!(!sent.busy);
     assert_eq!(capture::events("state_unreadable")[0].0, Priority::Critical);
     assert!(
-        matches!(&outcome, StepOutcome::Finished { outcome: ReportedOutcome::Refused { reason }, .. }
+        matches!(&outcome, StepOutcome::Finished { outcome: ReportedOutcome::Deferred { reason }, .. }
             if reason.contains("corrupt")),
         "{outcome:?}"
     );

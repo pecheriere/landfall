@@ -6,7 +6,8 @@
 //! deployment's rule must make the move from what
 //! [`Deployed`](crate::state::Deployed) says to the tag `Auto`; and the release
 //! must verify, with this host's trust root, to the digest and commit asked for.
-//! Anything else is refused, journalled and reported, and nothing runs.
+//! Anything else is journalled and reported, and nothing runs: as refused when that
+//! is final, and as deferred when its cause may pass.
 //!
 //! The report of a deploy goes in the outbox in the state directory before it is
 //! sent, and leaves when the controller has acknowledged it. The
@@ -85,8 +86,8 @@ pub struct DaemonOptions {
     pub heartbeat: Duration,
     /// How often a deployment's drift is looked at.
     pub drift_every: Duration,
-    /// How long a release that isn't to be found is waited for before it is
-    /// refused, and how often the journal hears of any wait for verification.
+    /// How long verification that can't run, for any reason, is waited for before
+    /// the work item is answered with not now, which frees the host.
     pub verification_bound: Duration,
     /// What stops the daemon.
     pub shutdown: Shutdown,
@@ -356,18 +357,24 @@ fn finished_record(work: &DeployWork, body: &DeployReportBody) -> FinishedDeploy
     }
 }
 
-/// Journals and reports a refusal. Nothing has run. `ends_it` says the work item
-/// has its answer for good; otherwise it is another release's number.
-async fn refuse_work<C: Controller>(
+/// How a work item that didn't run is answered.
+enum Answer {
+    /// For good: on record, so that the same number gets this answer again.
+    Refused,
+    /// Not now, and nothing to remember: it is judged afresh if it comes again.
+    Deferred,
+}
+
+/// Journals and reports that a work item won't run. Nothing has run.
+async fn answer_work<C: Controller>(
     controller: &C,
     state_dir: &Path,
     work: &DeployWork,
-    priority: Priority,
-    reason: &str,
-    ends_it: bool,
+    answer: Answer,
+    (priority, reason): (Priority, &str),
 ) -> StepOutcome {
     #[derive(Serialize)]
-    struct Refused<'a> {
+    struct Answered<'a> {
         event: &'static str,
         deploy_id: DeployId,
         deployment: &'a DeploymentId,
@@ -375,10 +382,21 @@ async fn refuse_work<C: Controller>(
         digest: &'a ImageDigest,
         reason: &'a str,
     }
+    let reported = outbox::bounded(reason);
+    let (event, outcome) = match answer {
+        Answer::Refused => (
+            "controller_work_refused",
+            ReportedOutcome::Refused { reason: reported },
+        ),
+        Answer::Deferred => (
+            "controller_work_deferred",
+            ReportedOutcome::Deferred { reason: reported },
+        ),
+    };
     journal::emit(
         priority,
-        &Refused {
-            event: "controller_work_refused",
+        &Answered {
+            event,
             deploy_id: work.deploy_id,
             deployment: &work.deployment,
             tag: &work.tag,
@@ -388,18 +406,15 @@ async fn refuse_work<C: Controller>(
     );
     let body = DeployReportBody {
         deploy_id: work.deploy_id,
-        outcome: ReportedOutcome::Refused {
-            reason: outbox::bounded(reason),
-        },
+        outcome,
         steps: Vec::new(),
     };
-    let keep = if ends_it {
-        Keep::Finished {
+    let keep = match answer {
+        Answer::Refused => Keep::Finished {
             record: finished_record(work, &body),
             claimed: None,
-        }
-    } else {
-        Keep::SendOnly
+        },
+        Answer::Deferred => Keep::SendOnly,
     };
     outbox::finish(controller, state_dir, body, keep).await
 }
@@ -434,9 +449,10 @@ async fn settle_claims(state_dir: &Path, options: &DaemonOptions) {
 }
 
 /// A deploy that has finished never runs again: if the controller delivers it
-/// again, it gets its original report. The same number naming another release,
-/// as from a controller whose database was rebuilt, is refused, with the record
-/// left as it is.
+/// again, it gets its original report. The ledger goes by number and release, so the
+/// same number naming another release, as from a controller whose database was
+/// rebuilt, is new, and is judged like any other: a controller could as well pick a
+/// number it has not used.
 async fn answer_finished<C: Controller>(
     controller: &C,
     state_dir: &Path,
@@ -447,24 +463,13 @@ async fn answer_finished<C: Controller>(
         event: &'static str,
         deploy_id: DeployId,
     }
-    let (root, deploy_id) = (state_dir.to_owned(), work.deploy_id);
+    let (root, deploy_id, asked) = (state_dir.to_owned(), work.deploy_id, work.clone());
     let found = on_thread("read finished", move || {
-        StateDir::open(&root)?.finished(deploy_id)
+        StateDir::open(&root)?.finished(&asked)
     })
     .await;
     match found {
         Ok(None) => None,
-        Ok(Some(entry))
-            if entry.deployment != work.deployment
-                || entry.tag != work.tag
-                || entry.digest != work.digest =>
-        {
-            let reason = format!(
-                "deploy {deploy_id} already finished on this host as {} {} {}, and this asks for another release under its number",
-                entry.deployment, entry.tag, entry.digest
-            );
-            Some(refuse_work(controller, state_dir, work, Priority::Error, &reason, false).await)
-        }
         Ok(Some(entry)) => {
             journal::emit(
                 Priority::Warning,
@@ -560,7 +565,12 @@ pub async fn step<D: Docker, C: Controller, V: Verifier>(
             reason,
         },
         Verdict::Refuse { priority, reason } => {
-            refuse_work(controller, state_dir, &work, priority, &reason, true).await
+            let said = (priority, reason.as_str());
+            answer_work(controller, state_dir, &work, Answer::Refused, said).await
+        }
+        Verdict::Defer { priority, reason } => {
+            let said = (priority, reason.as_str());
+            answer_work(controller, state_dir, &work, Answer::Deferred, said).await
         }
     }
 }
@@ -660,6 +670,9 @@ pub enum DaemonError {
     /// The release fetcher could not be built.
     #[error("cannot build the release fetcher: {0}")]
     Fetcher(#[source] FetchError),
+    /// `GITHUB_TOKEN` is set but cannot be used. The value is never shown.
+    #[error("GITHUB_TOKEN is set but is not valid UTF-8 text or not a valid HTTP header value")]
+    GitHubToken,
     /// Releases have no image for this host.
     #[error("no image platform for {os}/{arch}: the agent runs on Linux, on arm64 or amd64")]
     Platform {

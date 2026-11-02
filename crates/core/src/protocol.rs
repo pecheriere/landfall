@@ -624,12 +624,20 @@ pub enum ReportedOutcome {
         /// Why the rollback failed.
         rollback_reason: String,
     },
-    /// The host refused the controller's request without starting it, because
-    /// its own configuration or state does not allow it. This is the signal
-    /// of a controller asking for something the host doesn't allow (a release
-    /// its rule does not make automatic, a downgrade): treat it as an alert.
+    /// The host refused the controller's request for good, without starting it:
+    /// its rule does not allow it, verification failed on it, or it is on the
+    /// host's record of failures. This is the signal of a controller asking for
+    /// something the host doesn't allow: treat it as an alert.
     Refused {
         /// Why the host refused.
+        reason: String,
+    },
+    /// Not now: the host did not start it, for a cause that may pass (a deploy
+    /// that did not finish, drift, what it could not read, its clock behind the
+    /// release, a wait for verification past its bound). The controller may ask
+    /// again later, and the host judges it again then.
+    Deferred {
+        /// Why not now.
         reason: String,
     },
 }
@@ -1047,6 +1055,10 @@ mod tests {
             (
                 ReportedOutcome::Refused { reason: r() },
                 json!({"kind": "refused", "reason": "why"}),
+            ),
+            (
+                ReportedOutcome::Deferred { reason: r() },
+                json!({"kind": "deferred", "reason": "why"}),
             ),
         ]
     }

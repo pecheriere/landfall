@@ -358,6 +358,45 @@ async fn a_report_after_a_crash_and_a_recover_names_the_controllers_deploy() {
     assert_eq!(controller.reports().len(), 1);
 }
 
+/// What a `recover` by hand looks like to the engine, and what a child holding a copy
+/// of the lock for a moment does: the deploy never starts, and nothing is reported.
+#[tokio::test]
+async fn a_deploy_that_finds_the_lock_taken_waits_and_goes_when_it_is_free() {
+    let f = fixture(PATCH_RULE);
+    let held = state_of(&f).lock().unwrap();
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
+    let verifier = FakeVerifier::passes();
+
+    let outcome = poll(&f, &controller, &verifier).await;
+
+    assert!(
+        matches!(&outcome, StepOutcome::Waiting { deploy_id: DeployId(7), reason }
+            if reason.contains("busy")),
+        "{outcome:?}"
+    );
+    assert_eq!(controller.reports(), []);
+    assert_eq!(state_of(&f).claim().unwrap(), None);
+    assert_eq!(
+        f.docker.count(|c| matches!(c, Call::ComposeUp { .. })),
+        0,
+        "nothing ran"
+    );
+
+    drop(held);
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
+    let outcome = poll(&f, &controller, &verifier).await;
+    assert!(
+        matches!(
+            &outcome,
+            StepOutcome::Finished {
+                outcome: ReportedOutcome::Deployed {},
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_claim_is_left_alone_while_recover_holds_the_lock() {
     let f = fixture(PATCH_RULE);

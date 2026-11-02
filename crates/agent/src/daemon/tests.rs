@@ -398,15 +398,54 @@ fn touched(docker: &FakeDocker) -> Vec<Call> {
         .collect()
 }
 
-/// Runs a work item that must be refused, checks that nothing ran and returns
-/// why it was refused and at what priority the journal said so.
+/// Runs a work item that must be refused for good, checks that nothing ran and
+/// returns why it was refused and at what priority the journal said so.
 async fn assert_refused(
     f: &Fixture,
     verifier: &FakeVerifier,
     item: DeployWork,
 ) -> (String, Priority) {
+    assert_answered(
+        f,
+        verifier,
+        item,
+        "controller_work_refused",
+        |outcome| match outcome {
+            ReportedOutcome::Refused { reason } => Some(reason.clone()),
+            _ => None,
+        },
+    )
+    .await
+}
+
+/// [`assert_refused`] for a work item that must be put off, and be free to come back.
+async fn assert_deferred(
+    f: &Fixture,
+    verifier: &FakeVerifier,
+    item: DeployWork,
+) -> (String, Priority) {
+    assert_answered(
+        f,
+        verifier,
+        item,
+        "controller_work_deferred",
+        |outcome| match outcome {
+            ReportedOutcome::Deferred { reason } => Some(reason.clone()),
+            _ => None,
+        },
+    )
+    .await
+}
+
+async fn assert_answered(
+    f: &Fixture,
+    verifier: &FakeVerifier,
+    item: DeployWork,
+    journalled: &str,
+    reason_of: fn(&ReportedOutcome) -> Option<String>,
+) -> (String, Priority) {
     let controller = FakeController::with([answer(Some(item.clone()))]);
-    let seen_before = capture::events("controller_work_refused").len();
+    let seen_before = capture::events(journalled).len();
     let marker_before = state_of(f).in_progress().unwrap();
 
     let outcome = poll(f, &controller, verifier).await;
@@ -415,8 +454,8 @@ async fn assert_refused(
     assert_eq!(reports.len(), 1, "{outcome:?}");
     assert_eq!(reports[0].deploy_id, item.deploy_id);
     assert!(reports[0].steps.is_empty(), "no step ran");
-    let ReportedOutcome::Refused { reason } = &reports[0].outcome else {
-        panic!("not refused: {:?}", reports[0].outcome);
+    let Some(reason) = reason_of(&reports[0].outcome) else {
+        panic!("not {journalled}: {:?}", reports[0].outcome);
     };
     assert_eq!(
         outcome,
@@ -431,10 +470,10 @@ async fn assert_refused(
     assert_eq!(state_of(f).claim().unwrap(), None);
     assert_eq!(outbox(f), [], "acknowledged");
 
-    let events = capture::events("controller_work_refused");
+    let events = capture::events(journalled);
     assert_eq!(events.len(), seen_before + 1);
     let (priority, event) = events.last().unwrap();
     assert_eq!(event["reason"], reason.as_str(), "the journal says why too");
     assert_eq!(event["deploy_id"], item.deploy_id.0);
-    (reason.clone(), *priority)
+    (reason, *priority)
 }

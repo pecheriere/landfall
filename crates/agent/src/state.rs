@@ -17,9 +17,10 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
-use landfall_core::protocol::{DeployId, DeployReportBody};
+use landfall_core::protocol::{DeployId, DeployReportBody, DeployWork};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::journal::{self, Priority};
 
@@ -214,8 +215,8 @@ pub struct ControllerClaim {
     pub reports_before: Vec<String>,
 }
 
-/// How a controller's deploy ended, and what it was of, so that the same number
-/// naming another release can be told apart.
+/// How a controller's deploy ended, and what it was of: a record goes by number and
+/// release, as a controller whose database was rebuilt uses numbers again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinishedDeploy {
@@ -249,8 +250,6 @@ pub struct VerificationWait {
     pub deploy_id: DeployId,
     /// How long so far.
     pub waited_millis: u64,
-    /// How many periods of waiting the journal has been told about.
-    pub warned_periods: u64,
 }
 
 /// The agent's state directory.
@@ -386,12 +385,13 @@ impl StateDir {
     }
 
     /// Records for good how the controller's deploy ended, so that it is answered
-    /// with this report if it is ever delivered again, and never runs again. The
-    /// [`FINISHED_KEPT`] most recently added are kept, by the order they were
-    /// added in and whatever their numbers: a controller can ask for as many
-    /// numbers as it likes, and one that comes back after that is judged afresh,
-    /// by a rule that refuses what ran or failed. An id already on record keeps
-    /// its report and its place.
+    /// with this report if it is ever delivered again, and never runs again. A
+    /// record goes by number and release: the same number naming another release
+    /// has a record of its own, or none. The [`FINISHED_KEPT`] most recently added
+    /// are kept, by the order they were added in and whatever their numbers: a
+    /// controller can ask for as many numbers as it likes, and one that comes back
+    /// after that is judged afresh, by a rule that refuses what ran or failed. A
+    /// record already there keeps its report and its place.
     ///
     /// # Errors
     ///
@@ -399,36 +399,47 @@ impl StateDir {
     pub fn finished_put(&self, entry: &FinishedDeploy) -> Result<(), StateError> {
         let dir = self.path.join(FINISHED);
         create_private(&self.path, &dir)?;
-        let id = entry.report.deploy_id.0;
-        let mut order: Vec<u64> = read_or_set_aside(&dir.join(FINISHED_ORDER))?.unwrap_or_default();
+        let key = ledger_key(
+            entry.report.deploy_id,
+            &entry.deployment,
+            &entry.tag,
+            &entry.digest,
+        );
+        let mut order: Vec<String> =
+            read_or_set_aside(&dir.join(FINISHED_ORDER))?.unwrap_or_default();
         // Records the order doesn't name, after a crash or with the order lost,
         // count as older than what it does, lowest number first.
         let mut unlisted = Vec::new();
         for file in fs::read_dir(&dir).map_err(io_err("list", &dir))? {
             let path = file.map_err(io_err("list", &dir))?.path();
-            if let Some(found) = path
+            if let Some((found, number)) = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.parse::<u64>().ok())
-                && !order.contains(&found)
+                .filter(|_| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .and_then(|stem| Some((stem, ledger_number(stem)?)))
+                && !order.iter().any(|known| known == found)
             {
-                unlisted.push(found);
+                unlisted.push((number, found.to_owned()));
             }
         }
         unlisted.sort_unstable();
-        unlisted.append(&mut order);
-        let mut order = unlisted;
-        if order.contains(&id) {
+        let mut listed: Vec<String> = unlisted.into_iter().map(|(_, key)| key).collect();
+        listed.append(&mut order);
+        let mut order = listed;
+        if order.contains(&key) {
             return write_order(&dir, &order);
         }
-        order.push(id);
+        order.push(key.clone());
         let evicted = order.len().saturating_sub(FINISHED_KEPT);
-        let gone: Vec<u64> = order.drain(..evicted).collect();
+        let gone: Vec<String> = order.drain(..evicted).collect();
         write_order(&dir, &order)?;
         for old in gone {
             remove_in(&dir, &format!("{old}.json"))?;
         }
-        let name = format!("{id}.json");
+        let name = format!("{key}.json");
         let bytes = serde_json::to_vec_pretty(entry).map_err(|source| StateError::Serialise {
             path: dir.join(&name),
             source,
@@ -436,14 +447,15 @@ impl StateDir {
         write_atomic(&dir, &name, &bytes)
     }
 
-    /// How the controller's deploy ended, if it is on record. A record that
-    /// cannot be read is set aside and counts as none.
+    /// How this work item ended, if it is on record: the same number and the same
+    /// release. A record that cannot be read is set aside and counts as none.
     ///
     /// # Errors
     ///
     /// [`StateError`] if the file cannot be read.
-    pub fn finished(&self, deploy_id: DeployId) -> Result<Option<FinishedDeploy>, StateError> {
-        read_or_set_aside(&self.path.join(FINISHED).join(format!("{deploy_id}.json")))
+    pub fn finished(&self, work: &DeployWork) -> Result<Option<FinishedDeploy>, StateError> {
+        let key = ledger_key(work.deploy_id, &work.deployment, &work.tag, &work.digest);
+        read_or_set_aside(&self.path.join(FINISHED).join(format!("{key}.json")))
     }
 
     /// Removes an acknowledged report; absent is fine.
@@ -474,7 +486,28 @@ fn lock_file(path: &Path, busy: impl FnOnce() -> StateError) -> Result<DeployLoc
     }
 }
 
-fn write_order(dir: &Path, order: &[u64]) -> Result<(), StateError> {
+/// The name of a ledger record: the number, then a hash of the release, which keeps
+/// what a controller named out of the file name.
+fn ledger_key(
+    deploy_id: DeployId,
+    deployment: &DeploymentId,
+    tag: &ReleaseTag,
+    digest: &ImageDigest,
+) -> String {
+    let mut release = Sha256::new();
+    for part in [deployment.as_ref(), tag.as_ref(), digest.as_ref()] {
+        release.update(part.as_bytes());
+        release.update([0]);
+    }
+    format!("{deploy_id}-{}", hex::encode(&release.finalize()[..16]))
+}
+
+/// The number in a ledger record's name, if it is the name of one.
+fn ledger_number(key: &str) -> Option<u64> {
+    key.split_once('-')?.0.parse().ok()
+}
+
+fn write_order(dir: &Path, order: &[String]) -> Result<(), StateError> {
     let bytes = serde_json::to_vec(order).map_err(|source| StateError::Serialise {
         path: dir.join(FINISHED_ORDER),
         source,
@@ -1238,30 +1271,47 @@ mod tests {
         }
     }
 
+    /// The work item that [`finished_entry`] is the end of.
+    fn asked(id: u64) -> DeployWork {
+        let entry = finished_entry(id);
+        DeployWork {
+            deploy_id: DeployId(id),
+            deployment: entry.deployment,
+            tag: entry.tag,
+            digest: entry.digest,
+            commit: "b".repeat(40).parse().unwrap(),
+        }
+    }
+
+    fn key_of(id: u64) -> String {
+        let entry = finished_entry(id);
+        ledger_key(DeployId(id), &entry.deployment, &entry.tag, &entry.digest)
+    }
+
     #[test]
     fn the_ledger_evicts_the_longest_on_record_whatever_the_numbers() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = StateDir::open(tmp.path()).unwrap();
-        assert_eq!(dir.finished(DeployId(1)).unwrap(), None);
+        assert_eq!(dir.finished(&asked(1)).unwrap(), None);
         // A full ledger, written directly as a thousand synced writes are slow. A
         // very high number came first: by number it would be the last to go.
         dir.finished_put(&finished_entry(u64::MAX)).unwrap();
         dir.finished_put(&finished_entry(u64::MAX - 1)).unwrap();
         let ledger = tmp.path().join(FINISHED);
-        let mut order = vec![u64::MAX, u64::MAX - 1];
+        let mut order = vec![key_of(u64::MAX), key_of(u64::MAX - 1)];
         for id in 1..=u64::try_from(FINISHED_KEPT - 2).unwrap() {
             let entry = serde_json::to_vec(&finished_entry(id)).unwrap();
-            fs::write(ledger.join(format!("{id}.json")), entry).unwrap();
-            order.push(id);
+            fs::write(ledger.join(format!("{}.json", key_of(id))), entry).unwrap();
+            order.push(key_of(id));
         }
         write_order(&ledger, &order).unwrap();
 
         dir.finished_put(&finished_entry(5000)).unwrap();
 
-        assert_eq!(dir.finished(DeployId(u64::MAX)).unwrap(), None);
-        assert!(dir.finished(DeployId(u64::MAX - 1)).unwrap().is_some());
-        assert!(dir.finished(DeployId(1)).unwrap().is_some());
-        assert!(dir.finished(DeployId(5000)).unwrap().is_some());
+        assert_eq!(dir.finished(&asked(u64::MAX)).unwrap(), None);
+        assert!(dir.finished(&asked(u64::MAX - 1)).unwrap().is_some());
+        assert!(dir.finished(&asked(1)).unwrap().is_some());
+        assert!(dir.finished(&asked(5000)).unwrap().is_some());
         let kept = fs::read_dir(&ledger).unwrap().count();
         assert_eq!(kept, FINISHED_KEPT + 1, "with the order file");
     }
@@ -1273,9 +1323,49 @@ mod tests {
         let first = finished_entry(1);
         dir.finished_put(&first).unwrap();
         let mut again = finished_entry(1);
-        again.tag = "v9.9.9".parse().unwrap();
+        again.report.steps.clear();
+        again.report.outcome = landfall_core::protocol::ReportedOutcome::Refused {
+            reason: "no".to_owned(),
+        };
         dir.finished_put(&again).unwrap();
-        assert_eq!(dir.finished(DeployId(1)).unwrap(), Some(first));
+        assert_eq!(dir.finished(&asked(1)).unwrap(), Some(first));
+    }
+
+    #[test]
+    fn the_ledger_goes_by_number_and_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = StateDir::open(tmp.path()).unwrap();
+        let first = finished_entry(1);
+        dir.finished_put(&first).unwrap();
+
+        for other in [
+            DeployWork {
+                tag: "v9.9.9".parse().unwrap(),
+                ..asked(1)
+            },
+            DeployWork {
+                digest: format!("sha256:{}", "e".repeat(64)).parse().unwrap(),
+                ..asked(1)
+            },
+            DeployWork {
+                deployment: id("example/other"),
+                ..asked(1)
+            },
+            asked(2),
+        ] {
+            assert_eq!(dir.finished(&other).unwrap(), None, "{other:?}");
+        }
+
+        // The same number, for another release, has a record of its own.
+        let mut second = finished_entry(1);
+        second.tag = "v9.9.9".parse().unwrap();
+        dir.finished_put(&second).unwrap();
+        assert_eq!(dir.finished(&asked(1)).unwrap(), Some(first));
+        let ask = DeployWork {
+            tag: "v9.9.9".parse().unwrap(),
+            ..asked(1)
+        };
+        assert_eq!(dir.finished(&ask).unwrap(), Some(second));
     }
 
     #[test]
@@ -1285,12 +1375,12 @@ mod tests {
         dir.finished_put(&finished_entry(5)).unwrap();
         fs::write(tmp.path().join(FINISHED).join(FINISHED_ORDER), "{").unwrap();
         dir.finished_put(&finished_entry(6)).unwrap();
-        let order: Vec<u64> = serde_json::from_slice(
+        let order: Vec<String> = serde_json::from_slice(
             &fs::read(tmp.path().join(FINISHED).join(FINISHED_ORDER)).unwrap(),
         )
         .unwrap();
-        assert_eq!(order, [5, 6]);
-        assert!(dir.finished(DeployId(5)).unwrap().is_some());
+        assert_eq!(order, [key_of(5), key_of(6)]);
+        assert!(dir.finished(&asked(5)).unwrap().is_some());
     }
 
     #[test]

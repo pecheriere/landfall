@@ -1,11 +1,13 @@
 //! Verifying a release on this host, with this host's own trust root.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::release::Platform;
+use landfall_origin::attestation::AttestationError;
 use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin, verify_release};
 use landfall_origin::trust::{Refresh, TrustRoot, load_trusted_root};
@@ -28,13 +30,23 @@ pub enum VerifyFailure {
     /// still being published, or one that was yanked. Waited for, but not for
     /// ever.
     Missing(String),
-    /// The material could not be obtained, as in a network failure or a rate
-    /// limit, which may work on a later try.
+    /// The material could not be obtained, or was not what it should be, as in a
+    /// network failure, a rate limit or a wrong answer, which may work on a later
+    /// try. Waited for, but not for ever.
     Unavailable(String),
+    /// This host's clock is behind the transparency log's time for the release. A
+    /// host may have no battery for its clock, and this says nothing of the release.
+    ClockBehind(String),
 }
 
 impl From<ReleaseError> for VerifyFailure {
     fn from(error: ReleaseError) -> Self {
+        if matches!(
+            &error,
+            ReleaseError::Attestation(AttestationError::ClockBehind(_))
+        ) {
+            return Self::ClockBehind(error_chain(&error));
+        }
         let missing = matches!(
             &error,
             ReleaseError::TagObject(fetch)
@@ -64,6 +76,24 @@ pub trait Verifier: Send + Sync {
     ) -> impl Future<Output = Result<ReleaseOrigin, VerifyFailure>> + Send;
 }
 
+/// The fetcher for GitHub and the registry, with `token`, the value of
+/// `GITHUB_TOKEN`, for GitHub only: hosts behind one address share the limit on
+/// anonymous requests. Unset or empty is no token. A value that can't be used is an
+/// error, which doesn't repeat it.
+fn release_fetcher(token: Option<OsString>) -> Result<Fetcher, DaemonError> {
+    let fetcher = Fetcher::new(Endpoints::public().map_err(DaemonError::Fetcher)?)
+        .map_err(DaemonError::Fetcher)?;
+    match token {
+        Some(token) if !token.is_empty() => {
+            let token = token.into_string().map_err(|_| DaemonError::GitHubToken)?;
+            fetcher
+                .with_github_token(&token)
+                .map_err(|_| DaemonError::GitHubToken)
+        }
+        _ => Ok(fetcher),
+    }
+}
+
 /// [`verify_release`] with the trust root in the state directory.
 pub struct OriginVerifier {
     fetcher: Fetcher,
@@ -86,8 +116,7 @@ impl OriginVerifier {
 
     fn for_platform(cache_dir: PathBuf, platform: Platform) -> Result<Self, DaemonError> {
         Ok(Self {
-            fetcher: Fetcher::new(Endpoints::public().map_err(DaemonError::Fetcher)?)
-                .map_err(DaemonError::Fetcher)?,
+            fetcher: release_fetcher(std::env::var_os("GITHUB_TOKEN"))?,
             platform,
             cache_dir,
             root: tokio::sync::Mutex::new(None),
@@ -172,10 +201,15 @@ fn host_platform(os: &'static str, arch: &'static str) -> Result<Platform, Daemo
 #[cfg(test)]
 mod tests {
     use landfall_core::config;
+    use landfall_origin::attestation::AttestationError;
     use landfall_origin::fetch::FetchError;
     use landfall_origin::release::ReleaseError;
 
-    use super::{OriginVerifier, Verifier, VerifyFailure, host_platform};
+    use std::ffi::OsString;
+
+    use super::{
+        DaemonError, OriginVerifier, Verifier, VerifyFailure, host_platform, release_fetcher,
+    };
 
     #[test]
     fn what_is_not_there_is_told_from_what_cant_be_reached() {
@@ -236,6 +270,38 @@ checks = ["container-healthy"]
             origin.attestation.digest.as_ref(),
             "sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055"
         );
+    }
+
+    #[test]
+    fn the_github_token_is_optional_but_must_be_usable_and_is_not_repeated() {
+        assert!(release_fetcher(None).is_ok());
+        assert!(release_fetcher(Some(OsString::new())).is_ok());
+        assert!(release_fetcher(Some("a-token".into())).is_ok());
+        let not_utf8 = std::os::unix::ffi::OsStringExt::from_vec(vec![0xff]);
+        for bad in [not_utf8, OsString::from("secret\ntoken")] {
+            let Err(error) = release_fetcher(Some(bad)) else {
+                panic!("a token that can't be sent is an error");
+            };
+            assert!(matches!(error, DaemonError::GitHubToken), "{error}");
+            assert!(!error.to_string().contains("secret"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_clock_behind_the_log_is_its_own_class_and_no_refusal() {
+        let error = ReleaseError::Attestation(AttestationError::ClockBehind(
+            "integrated time is in the future".to_owned(),
+        ));
+        let VerifyFailure::ClockBehind(text) = VerifyFailure::from(error) else {
+            panic!("a clock is not a verdict on a release");
+        };
+        assert!(text.contains("in the future"), "{text}");
+        // A bundle that doesn't verify stays what it is.
+        let refused = ReleaseError::Attestation(AttestationError::Signature("no".to_owned()));
+        assert!(matches!(
+            VerifyFailure::from(refused),
+            VerifyFailure::Refused(_)
+        ));
     }
 
     #[test]

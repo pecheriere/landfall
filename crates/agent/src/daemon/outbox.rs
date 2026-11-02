@@ -96,7 +96,8 @@ fn bound_the_outcome(outcome: &mut ReportedOutcome) {
         ReportedOutcome::RolledBack { reason }
         | ReportedOutcome::NothingChanged { reason }
         | ReportedOutcome::FailedNoPrevious { reason }
-        | ReportedOutcome::Refused { reason } => *reason = bounded(reason),
+        | ReportedOutcome::Refused { reason }
+        | ReportedOutcome::Deferred { reason } => *reason = bounded(reason),
         ReportedOutcome::RollbackFailed {
             reason,
             rollback_reason,

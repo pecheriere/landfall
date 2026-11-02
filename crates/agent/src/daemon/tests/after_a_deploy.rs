@@ -314,15 +314,15 @@ fn missing() -> FakeVerifier {
     )))
 }
 
-#[tokio::test]
-async fn a_release_that_stays_missing_is_refused_after_the_bound() {
+/// Whatever the wait is for, past its bound the claim ends with not now and the
+/// reason, nothing has run, and the host is free.
+async fn a_wait_ends_with_not_now_after_the_bound(verifier: FakeVerifier, says: &str) {
     let mut f = fixture(PATCH_RULE);
     f.options.verification_bound = Duration::from_millis(50);
     let controller = FakeController::with([
         answer(Some(work(7, "v1.2.4"))),
         answer(Some(work(7, "v1.2.4"))),
     ]);
-    let verifier = missing();
 
     let outcome = poll(&f, &controller, &verifier).await;
     assert!(
@@ -334,10 +334,10 @@ async fn a_release_that_stays_missing_is_refused_after_the_bound() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     let outcome = poll(&f, &controller, &verifier).await;
 
-    let ReportedOutcome::Refused { reason } = finished(&outcome) else {
-        panic!("not refused: {outcome:?}");
+    let ReportedOutcome::Deferred { reason } = finished(&outcome) else {
+        panic!("not deferred: {outcome:?}");
     };
-    assert!(reason.contains("404"), "{reason}");
+    assert!(reason.contains(says), "{reason}");
     assert_eq!(controller.reports().len(), 1);
     assert_eq!(touched(&f.docker), []);
     assert_eq!(
@@ -345,10 +345,65 @@ async fn a_release_that_stays_missing_is_refused_after_the_bound() {
         None,
         "the wait is over"
     );
-    assert!(
-        !capture::events("verification_still_waiting").is_empty(),
+    assert_eq!(
+        capture::events("controller_work_deferred")
+            .last()
+            .unwrap()
+            .0,
+        Priority::Warning,
         "and the journal heard"
     );
+    assert_eq!(capture::events("controller_work_refused").len(), 0);
+}
+
+#[tokio::test]
+async fn a_release_that_stays_missing_is_deferred_after_the_bound() {
+    a_wait_ends_with_not_now_after_the_bound(missing(), "404").await;
+}
+
+#[tokio::test]
+async fn an_answer_of_the_wrong_shape_is_deferred_after_the_bound() {
+    let verifier = FakeVerifier::answering(Err(VerifyFailure::Unavailable(
+        "expected exactly one bundle, found 2".to_owned(),
+    )));
+    a_wait_ends_with_not_now_after_the_bound(verifier, "exactly one bundle").await;
+}
+
+#[tokio::test]
+async fn a_number_that_was_deferred_is_judged_afresh_if_it_comes_again() {
+    let mut f = fixture(PATCH_RULE);
+    f.options.verification_bound = Duration::ZERO;
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
+    let outcome = poll(&f, &controller, &missing()).await;
+    assert!(
+        matches!(finished(&outcome), ReportedOutcome::Deferred { .. }),
+        "{outcome:?}"
+    );
+
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
+    let outcome = poll(&f, &controller, &FakeVerifier::passes()).await;
+    assert_eq!(finished(&outcome), &ReportedOutcome::Deployed {});
+    assert!(
+        matches!(outcome, StepOutcome::Finished { .. }),
+        "not a replay: {outcome:?}"
+    );
+}
+
+#[test]
+fn not_now_cannot_repeat_every_second() {
+    let mut pacing = pacing();
+    let now = Instant::now();
+    let deferred = StepOutcome::Finished {
+        deploy_id: DeployId(7),
+        outcome: ReportedOutcome::Deferred {
+            reason: "not now".to_owned(),
+        },
+        delivered: true,
+    };
+    for full in [1, 2, 4, 8].map(Duration::from_secs) {
+        let delay = pacing.after(&deferred, now);
+        assert!(delay >= full / 2 && delay <= full, "{delay:?} for {full:?}");
+    }
 }
 
 #[tokio::test]
@@ -367,33 +422,6 @@ async fn a_release_missing_within_the_bound_goes_on_waiting() {
         );
     }
     assert_eq!(controller.reports(), []);
-}
-
-#[tokio::test]
-async fn an_unreachable_registry_is_waited_for_past_the_bound_and_said_each_period() {
-    let mut f = fixture(PATCH_RULE);
-    f.options.verification_bound = Duration::from_millis(20);
-    let controller = FakeController::with([
-        answer(Some(work(7, "v1.2.4"))),
-        answer(Some(work(7, "v1.2.4"))),
-        answer(Some(work(7, "v1.2.4"))),
-    ]);
-    let verifier =
-        FakeVerifier::answering(Err(VerifyFailure::Unavailable("rate limit".to_owned())));
-
-    for _ in 0..3 {
-        let outcome = poll(&f, &controller, &verifier).await;
-        assert!(
-            matches!(outcome, StepOutcome::Waiting { .. }),
-            "{outcome:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
-
-    assert_eq!(controller.reports(), []);
-    let events = capture::events("verification_still_waiting");
-    assert_eq!(events.len(), 2, "{events:?}");
-    assert_eq!(events[0].0, Priority::Warning);
 }
 
 #[tokio::test]
@@ -433,7 +461,7 @@ async fn the_wait_survives_a_restart_and_goes_by_no_wall_clock() {
     tokio::time::sleep(Duration::from_millis(30)).await;
     let outcome = step(&restarted).await;
     assert!(
-        matches!(finished(&outcome), ReportedOutcome::Refused { .. }),
+        matches!(finished(&outcome), ReportedOutcome::Deferred { .. }),
         "{outcome:?}"
     );
 }

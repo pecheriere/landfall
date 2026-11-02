@@ -107,7 +107,8 @@ impl ReleaseError {
     /// attestation, platform). `false` for anything one bad answer from a server can
     /// cause, which may be otherwise on a later try: material that could not be
     /// fetched, was the wrong shape or did not match what named it; a version tag's
-    /// digest not listed; a bundle that does not parse; an unknown deployment.
+    /// digest not listed; a bundle that does not parse; an unknown deployment. And for
+    /// a clock behind the transparency log, which says nothing of the release.
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         match self {
@@ -120,7 +121,9 @@ impl ReleaseError {
             | Self::Index(_)
             | Self::Bundle(_)
             | Self::Runs(RunRuleError::VersionDigestOutside { .. })
-            | Self::Attestation(AttestationError::Bundle(_)) => false,
+            | Self::Attestation(AttestationError::Bundle(_) | AttestationError::ClockBehind(_)) => {
+                false
+            }
             Self::TagPattern(_)
             | Self::TagSignature(_)
             | Self::Digest(_)
@@ -934,6 +937,10 @@ checks = ["container-healthy"]
         assert!(!ReleaseError::Bundle(bundles(2)).is_refusal());
         assert!(
             !ReleaseError::Attestation(AttestationError::Bundle("junk".to_owned())).is_refusal()
+        );
+        assert!(
+            !ReleaseError::Attestation(AttestationError::ClockBehind("late".to_owned()))
+                .is_refusal()
         );
         let outside = ReleaseError::Runs(RunRuleError::VersionDigestOutside {
             digest: VW_DIGEST.parse().unwrap(),
