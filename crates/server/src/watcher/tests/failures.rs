@@ -129,6 +129,21 @@ async fn a_rate_limit_during_verification_stops_the_repository_for_this_tick() {
     assert_eq!(h.deploys(PROD).await, []);
 }
 
+#[tokio::test]
+async fn a_rate_limit_among_old_tags_does_not_hold_up_a_new_release() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.2", "v1.2.4"]);
+    h.fake.locked().verify_fails.insert(
+        "v1.2.2".to_owned(),
+        rate_limited(RateLimitReset::After(1000)),
+    );
+
+    assert_eq!(h.tick().await.queued.len(), 1);
+    assert_eq!(h.deploys(PROD).await[0].0, "v1.2.4");
+    // Its repository waits all the same.
+    assert_eq!(h.tick().await.backed_off, 1);
+}
+
 #[test]
 fn a_servers_word_on_a_rate_limit_is_bounded() {
     let state = WatcherState::default();

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use landfall_core::config::{self, Config};
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
+use landfall_core::release::{ReleaseRun, RunCandidate, select_release_run};
 use serde_json::json;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -49,6 +50,32 @@ fn deployment() -> DeploymentId {
 
 fn real_digest() -> ImageDigest {
     DIGEST.parse().unwrap()
+}
+
+/// The real digest with the run the real bundle's certificate names, as read from
+/// the fixture by verifying it.
+fn real_candidate() -> RunCandidate {
+    let tag: ReleaseTag = TAG.parse().unwrap();
+    let commit: CommitSha = COMMIT.parse().unwrap();
+    let repo = REPO.parse().unwrap();
+    let attestation = crate::attestation::verify_bundle(
+        BUNDLE,
+        &real_digest(),
+        &TrustRoot::from_json(TRUSTED_ROOT),
+        &crate::attestation::Expected {
+            repo: &repo,
+            repo_id: 121_898_717,
+            owner_id: 725_423,
+            workflow: ".github/workflows/release.yml",
+            tag: &tag,
+            commit: &commit,
+        },
+    )
+    .unwrap();
+    RunCandidate {
+        digest: real_digest(),
+        run_url: attestation.run_url,
+    }
 }
 
 fn other_digest(c: char) -> ImageDigest {
@@ -128,7 +155,7 @@ impl Mocks {
 async fn a_candidate_that_verifies_counts() {
     let mocks = Mocks::listing(&[&real_digest()]).await;
     let answer = mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
-    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.verified, [real_candidate()]);
     assert_eq!(answer.ignored, []);
 }
 
@@ -137,8 +164,9 @@ async fn a_verified_result_is_kept_and_not_verified_again() {
     let mocks = Mocks::listing(&[&real_digest()]).await;
     let cache = CandidateCache::default();
     for _ in 0..3 {
+        // The cached result keeps the run it came from.
         let answer = mocks.ask(&cache, TAG).await.unwrap();
-        assert_eq!(answer.verified, [real_digest()]);
+        assert_eq!(answer.verified, [real_candidate()]);
     }
     assert_eq!(mocks.bundle_fetches().await, 1);
 }
@@ -151,7 +179,7 @@ async fn a_candidate_that_does_not_verify_is_ignored_and_says_why() {
     mount_bundles(&mocks.registry, REPO, &wrong, &[(BUNDLE, SLSA_PROVENANCE)]).await;
 
     let answer = mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
-    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.verified, [real_candidate()]);
     assert_eq!(answer.ignored.len(), 1, "{answer:?}");
     assert_eq!(answer.ignored[0].digest, wrong);
     assert!(answer.ignored[0].reason.contains("attests"), "{answer:?}");
@@ -163,7 +191,7 @@ async fn a_candidate_with_nothing_attached_is_ignored() {
     let empty = other_digest('b');
     let mocks = Mocks::listing(&[&real_digest(), &empty]).await;
     let answer = mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
-    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.verified, [real_candidate()]);
     assert_eq!(answer.ignored.len(), 1, "{answer:?}");
 }
 
@@ -248,7 +276,7 @@ async fn a_bundle_for_another_release_is_fetched_once_across_releases() {
 
     // It is still looked at for the release it names.
     let answer = mocks.ask(&cache, TAG).await.unwrap();
-    assert_eq!(answer.verified, [real_digest()]);
+    assert_eq!(answer.verified, [real_candidate()]);
     assert_eq!(mocks.bundle_fetches().await, 2);
 }
 
@@ -267,10 +295,11 @@ async fn a_bundle_of_another_repository_is_ruled_out_for_every_release() {
 /// The attestation fixture's release on the real registry: every referrer tag of
 /// the image is looked at, and two digests verify, since the project's one
 /// workflow attests two image variants per tag: `1.37.4`, the digest the fixture
-/// holds, and `1.37.4-alpine`. The exactly-one rule therefore refuses this release.
+/// holds, and `1.37.4-alpine`. They come from one run and attempt, so the rule
+/// passes the release.
 #[tokio::test]
 #[ignore = "network: runs nightly in advisories.yml"]
-async fn live_the_fixture_release_has_its_two_variants_attested() {
+async fn live_the_fixture_release_has_two_variants_from_one_run() {
     let cache_dir = tempfile::tempdir().unwrap();
     let root = crate::trust::load_trusted_root(cache_dir.path(), crate::trust::Refresh::Online)
         .await
@@ -289,7 +318,18 @@ async fn live_the_fixture_release_has_its_two_variants_attested() {
         "sha256:19ea2b669945d842dadc3d500f2d6a795866a003330f59a47b9634658bae98bb"
             .parse()
             .unwrap();
-    assert_eq!(answer.verified, [alpine, real_digest()]);
+    let found: Vec<&ImageDigest> = answer.verified.iter().map(|c| &c.digest).collect();
+    assert_eq!(found, [&alpine, &real_digest()]);
+    let repo = REPO.parse().unwrap();
+    let run = select_release_run(&repo, &answer.verified, &real_digest()).unwrap();
+    assert_eq!(
+        run,
+        ReleaseRun {
+            run: 37_388_798_451,
+            attempt: 1
+        }
+    );
+    assert_eq!(answer.verified[0].run_url, answer.verified[1].run_url);
 
     // What verified is known now, and what named another release is ruled out.
     let started = std::time::Instant::now();

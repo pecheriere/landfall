@@ -147,8 +147,14 @@ All must pass:
    reusable-workflow pinning: the Build Config URI must equal the SAN.
    The bundle must be in format v0.3 with exactly one Rekor v1 transparency log entry carrying an
    inclusion proof and an inclusion promise; Rekor v2 entries are refused until supported (#12).
-4. **Exactly one digest per release.** If several validly attested digests exist for one (repo, tag)
-   (a re-run release workflow), the release is refused with that reason.
+4. **Exactly one run per release.** Every validly attested digest for one (repo, tag) must come from
+   one run and attempt of the workflow, as the certificate's Run Invocation URI
+   (`.../actions/runs/<id>/attempts/<n>`) names it, and the digest the version tag resolves to must
+   be among them. Several digests from one run are image variants of the release, and only the
+   version tag's is pinned. Two runs, or two attempts of one run, are a re-run release workflow, and
+   the release is refused, naming both; so is one whose version tag's digest is outside the set, or
+   whose run URI does not read strictly as that shape. A project building its variants in separate
+   workflow runs for one tag is refused too.
 5. **Platform present.** The digest is a multi-arch index containing the host's platform. The index
    digest is what is pinned and recorded.
 

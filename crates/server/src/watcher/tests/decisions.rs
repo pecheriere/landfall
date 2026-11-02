@@ -192,15 +192,18 @@ async fn several_attested_digests_refuse_the_release() {
     h.fake.tags(PROD, &["v1.2.4"]);
     h.fake
         .locked()
-        .more_digests
-        .insert("v1.2.4".to_owned(), vec![digest("rerun")]);
+        .more_candidates
+        .insert("v1.2.4".to_owned(), vec![candidate("rerun", RUN_2)]);
 
     h.tick().await;
     h.tick().await;
 
     let (decision, reason) = h.decision(PROD, "v1.2.4").await;
     assert_eq!(decision, "refused");
-    assert!(reason.contains("2 attested image digests"), "{reason}");
+    assert!(
+        reason.contains("run 1 attempt 1, run 2 attempt 1"),
+        "{reason}"
+    );
     assert_eq!(h.deploys(PROD).await, []);
     assert_eq!(h.fake.verify_count(), 1);
     assert_eq!(h.audit("rule_decision").await.len(), 1);
@@ -216,13 +219,93 @@ async fn several_attested_digests_refuse_the_release() {
 }
 
 #[tokio::test]
-async fn a_lower_release_can_still_go_when_a_higher_one_has_two_digests() {
+async fn a_second_attempt_of_the_same_run_refuses_the_release() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.fake.locked().more_candidates.insert(
+        "v1.2.4".to_owned(),
+        vec![candidate("rerun", RUN_1_ATTEMPT_2)],
+    );
+
+    h.tick().await;
+
+    let (decision, reason) = h.decision(PROD, "v1.2.4").await;
+    assert_eq!(decision, "refused");
+    assert!(
+        reason.contains("run 1 attempt 1, run 1 attempt 2"),
+        "{reason}"
+    );
+    assert_eq!(h.deploys(PROD).await, []);
+}
+
+#[tokio::test]
+async fn image_variants_from_one_run_pass_and_the_version_tags_digest_is_pinned() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.fake
+        .locked()
+        .more_candidates
+        .insert("v1.2.4".to_owned(), vec![candidate("alpine", RUN_1)]);
+
+    h.tick().await;
+
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+    let deployed: String = sqlx::query_scalar("SELECT digest FROM deploys")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(deployed, digest("v1.2.4").as_ref());
+}
+
+#[tokio::test]
+async fn a_version_tags_digest_outside_the_attested_ones_refuses_the_release() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.fake
+        .locked()
+        .own_digest_unlisted
+        .insert("v1.2.4".to_owned());
+    h.fake
+        .locked()
+        .more_candidates
+        .insert("v1.2.4".to_owned(), vec![candidate("alpine", RUN_1)]);
+
+    h.tick().await;
+
+    let (decision, reason) = h.decision(PROD, "v1.2.4").await;
+    assert_eq!(decision, "refused");
+    assert!(reason.contains("version tag's digest"), "{reason}");
+    assert_eq!(h.deploys(PROD).await, []);
+}
+
+#[tokio::test]
+async fn a_run_uri_that_does_not_parse_refuses_the_release() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.fake.locked().more_candidates.insert(
+        "v1.2.4".to_owned(),
+        vec![candidate(
+            "odd",
+            "https://github.com/example/app/actions/runs/1",
+        )],
+    );
+
+    h.tick().await;
+
+    let (decision, reason) = h.decision(PROD, "v1.2.4").await;
+    assert_eq!(decision, "refused");
+    assert!(reason.contains("not a run and attempt"), "{reason}");
+    assert_eq!(h.deploys(PROD).await, []);
+}
+
+#[tokio::test]
+async fn a_lower_release_can_still_go_when_a_higher_one_was_re_run() {
     let h = Harness::running("v1.2.3").await;
     h.fake.tags(PROD, &["v1.2.4", "v1.2.5"]);
     h.fake
         .locked()
-        .more_digests
-        .insert("v1.2.5".to_owned(), vec![digest("rerun")]);
+        .more_candidates
+        .insert("v1.2.5".to_owned(), vec![candidate("rerun", RUN_2)]);
 
     h.tick().await;
 
@@ -234,7 +317,7 @@ async fn a_lower_release_can_still_go_when_a_higher_one_has_two_digests() {
 }
 
 #[tokio::test]
-async fn a_second_digest_that_comes_after_verification_stops_the_deploy() {
+async fn a_second_run_that_comes_after_verification_stops_the_deploy() {
     let h = Harness::running("v1.2.3").await;
     h.report_busy(PROD, HOST, "v1.2.3").await;
     h.fake.tags(PROD, &["v1.2.4"]);
@@ -245,14 +328,14 @@ async fn a_second_digest_that_comes_after_verification_stops_the_deploy() {
     // A re-run workflow attests another digest while the host is busy.
     h.fake
         .locked()
-        .more_digests
-        .insert("v1.2.4".to_owned(), vec![digest("rerun")]);
+        .more_candidates
+        .insert("v1.2.4".to_owned(), vec![candidate("rerun", RUN_2)]);
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.tick().await;
 
     let (decision, reason) = h.decision(PROD, "v1.2.4").await;
     assert_eq!(decision, "refused");
-    assert!(reason.contains("attested image digests"), "{reason}");
+    assert!(reason.contains("workflow runs"), "{reason}");
     assert_eq!(h.deploys(PROD).await, []);
 }
 

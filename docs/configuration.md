@@ -102,6 +102,13 @@ prefix: release tag `v1.2.3` is looked up as `ghcr.io/example/app:1.2.3`, what
 registry tag is only a lookup hint: the attestation binds the digest to the
 release.
 
+One release comes from one run. Every digest attested for a tag must come from
+the same run and attempt of `origin.workflow`, and the digest the version tag
+resolves to must be among them; that one is what is deployed. Image variants
+built by one run, such as `1.2.3` and `1.2.3-alpine`, pass. A re-run release
+workflow, or a second attempt of one run, is refused, and so is a project that
+builds its variants in separate workflow runs for one tag.
+
 The release workflow (`origin.workflow`) must meet every one of these rules,
 which are checked against the Fulcio certificate of the attestation, not
 against anything the workflow writes itself:

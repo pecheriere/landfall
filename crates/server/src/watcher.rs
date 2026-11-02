@@ -25,9 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use landfall_core::config::{Config, Deployment};
-use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
+use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag, RepoName};
 use landfall_core::protocol::DeployId;
-use landfall_core::release::select_release_digest;
+use landfall_core::release::{RunCandidate, select_release_run};
 use landfall_core::rule::{Decision, Refusal, decide};
 use landfall_core::text::{quoted, shown};
 use landfall_origin::fetch::{FetchError, ListedTag, RateLimitReset};
@@ -103,7 +103,7 @@ pub trait ReleaseSource: Send + Sync + 'static {
         deployment: &DeploymentId,
         tag: &ReleaseTag,
         commit: &CommitSha,
-    ) -> impl Future<Output = Result<Vec<ImageDigest>, ReleaseError>> + Send;
+    ) -> impl Future<Output = Result<Vec<RunCandidate>, ReleaseError>> + Send;
 }
 
 /// What one tick did.
@@ -235,17 +235,16 @@ enum Looked {
     Stopped(Stop),
 }
 
-/// The release's digest given what enumerating found: the one verified digest
-/// and the candidates must name a single one between them.
-fn one_digest(
-    verified: &ImageDigest,
-    mut candidates: Vec<ImageDigest>,
+/// Whether what enumerating found makes one release: one run and attempt, with the
+/// version tag's digest among its digests.
+fn one_run(
+    repo: &RepoName,
+    version_digest: &ImageDigest,
+    candidates: &[RunCandidate],
 ) -> Result<(), ReleaseError> {
-    candidates.push(verified.clone());
-    candidates.sort();
-    select_release_digest(&candidates)
+    select_release_run(repo, candidates, version_digest)
         .map(drop)
-        .map_err(ReleaseError::Digest)
+        .map_err(ReleaseError::Runs)
 }
 
 /// Watching one deployment for one tick.
@@ -393,7 +392,7 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             Ok(candidates) => candidates,
             Err(error) => return self.failed(listed, Some(&origin.commit), &error).await,
         };
-        if let Err(error) = one_digest(digest, candidates) {
+        if let Err(error) = one_run(self.d.repo().name(), digest, &candidates) {
             return self.failed(listed, Some(&origin.commit), &error).await;
         }
         Ok(Looked::Settled(Settled {
@@ -519,17 +518,19 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
     }
 
     /// Goes through the deployment's releases, newest first. Gives the ones its
-    /// rule makes automatic, or what stopped the look.
+    /// rule makes automatic, and what stopped the look, if anything. What was
+    /// settled before a stop still counts: everything not looked at is older, so
+    /// a rate limit met among old tags does not hold up a new release.
     async fn go_through(
         &mut self,
         releases: &[(Version, ListedTag)],
-    ) -> Result<Result<Vec<AutoRelease>, Stop>, StoreError> {
+    ) -> Result<(Vec<AutoRelease>, Option<Stop>), StoreError> {
         let mut autos = Vec::new();
         for (version, listed) in releases {
             let settled = match self.look_at_origin(version, listed).await? {
                 Looked::Settled(settled) => settled,
                 Looked::Refused | Looked::Held => continue,
-                Looked::Stopped(stop) => return Ok(Err(stop)),
+                Looked::Stopped(stop) => return Ok((autos, Some(stop))),
             };
             let (decision, reason) = self.decision(version, &listed.tag, &settled.digest).await?;
             let config = self.config;
@@ -550,7 +551,7 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
                 });
             }
         }
-        Ok(Ok(autos))
+        Ok((autos, None))
     }
 
     /// Whether the host can take a deploy now.
@@ -589,7 +590,9 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
                     .source
                     .attested_digests(self.d.id(), &listed.tag, &settled.commit)
                     .await
-                    .and_then(|candidates| one_digest(&settled.digest, candidates));
+                    .and_then(|candidates| {
+                        one_run(self.d.repo().name(), &settled.digest, &candidates)
+                    });
                 if let Err(error) = enumerated {
                     match self.failed(&listed, Some(&settled.commit), &error).await? {
                         Looked::Refused => continue,
@@ -708,10 +711,9 @@ async fn watch_deployment<S: ReleaseSource>(
         budget: VERIFICATIONS_PER_TICK,
         summary,
     };
-    let (hold, stop) = match watch.go_through(&releases).await? {
-        Ok(autos) => watch.queue_highest(autos).await?,
-        Err(stop) => (None, Some(stop)),
-    };
+    let (autos, stopped) = watch.go_through(&releases).await?;
+    let (hold, stop) = watch.queue_highest(autos).await?;
+    let stop = stopped.or(stop);
     let mut summary = watch.summary;
     // A stop that came with a reason left it on the tag it was looking at. The
     // deployment's own hold is about the deployment.

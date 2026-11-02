@@ -25,6 +25,10 @@ use crate::store::ManualClock;
 const PROD: &str = "app/prod";
 const OTHER: &str = "other/prod";
 const HOST: &str = "host-a";
+/// The run every release of the fake comes from, unless a test says otherwise.
+const RUN_1: &str = "https://github.com/example/app/actions/runs/1/attempts/1";
+const RUN_1_ATTEMPT_2: &str = "https://github.com/example/app/actions/runs/1/attempts/2";
+const RUN_2: &str = "https://github.com/example/app/actions/runs/2/attempts/1";
 
 /// `app/prod` with `rule`, and `other/prod` of another repository on auto `any`.
 fn config_text(rule: &str) -> String {
@@ -64,6 +68,14 @@ fn digest(tag: &str) -> ImageDigest {
     format!("sha256:{}", hashed(tag)).parse().unwrap()
 }
 
+/// The digest named by `name`, attested by the run at `run_url`.
+fn candidate(name: &str, run_url: &str) -> RunCandidate {
+    RunCandidate {
+        digest: digest(name),
+        run_url: run_url.to_owned(),
+    }
+}
+
 fn commit(tag: &str) -> CommitSha {
     hashed(&format!("commit {tag}"))[..40].parse().unwrap()
 }
@@ -89,7 +101,7 @@ fn origin(text: &str) -> ReleaseOrigin {
             git_ref: format!("refs/tags/{text}"),
             repo_id: 1,
             owner_id: 2,
-            run_url: "https://github.com/example/app/actions/runs/1".to_owned(),
+            run_url: RUN_1.to_owned(),
             rekor_log_index: 7,
             integrated_time: 1_800_000_000,
         },
@@ -110,7 +122,10 @@ struct FakeState {
     tags_hang: HashSet<String>,
     verify_fails: HashMap<String, MakeError>,
     attested_fails: HashMap<String, MakeError>,
-    more_digests: HashMap<String, Vec<ImageDigest>>,
+    /// What else verified for a tag, beside its own digest.
+    more_candidates: HashMap<String, Vec<RunCandidate>>,
+    /// Tags whose own digest the enumeration does not find.
+    own_digest_unlisted: HashSet<String>,
     /// Asked in the middle of each call, to see that nothing is holding it up.
     store: Option<Store>,
 }
@@ -196,25 +211,33 @@ impl ReleaseSource for Fake {
 
     async fn attested_digests(
         &self,
-        _deployment: &DeploymentId,
+        deployment: &DeploymentId,
         tag: &ReleaseTag,
         _commit: &CommitSha,
-    ) -> Result<Vec<ImageDigest>, ReleaseError> {
+    ) -> Result<Vec<RunCandidate>, ReleaseError> {
         self.nothing_in_the_way().await;
         self.enumerations.fetch_add(1, Ordering::SeqCst);
         let state = self.locked();
         if let Some(fail) = state.attested_fails.get(tag.as_ref()) {
             return Err(fail());
         }
-        let mut digests = vec![digest(tag.as_ref())];
-        digests.extend(
+        let mut candidates = Vec::new();
+        if !state.own_digest_unlisted.contains(tag.as_ref()) {
+            let run = if deployment.as_ref() == OTHER {
+                "https://github.com/example/other/actions/runs/1/attempts/1"
+            } else {
+                RUN_1
+            };
+            candidates.push(candidate(tag.as_ref(), run));
+        }
+        candidates.extend(
             state
-                .more_digests
+                .more_candidates
                 .get(tag.as_ref())
                 .cloned()
                 .unwrap_or_default(),
         );
-        Ok(digests)
+        Ok(candidates)
     }
 }
 

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use landfall_core::config::Config;
-use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
+use landfall_core::ids::{CommitSha, DeploymentId, ReleaseTag};
+use landfall_core::release::RunCandidate;
 use landfall_core::text::shown;
 use landfall_origin::candidates::{CandidateCache, attested_digests};
 use landfall_origin::fetch::{Fetcher, ListedTag};
@@ -153,7 +154,7 @@ impl ReleaseSource for LiveSource {
         deployment: &DeploymentId,
         tag: &ReleaseTag,
         commit: &CommitSha,
-    ) -> Result<Vec<ImageDigest>, ReleaseError> {
+    ) -> Result<Vec<RunCandidate>, ReleaseError> {
         let root = self.root().await?;
         let answer = attested_digests(
             &self.fetcher,
@@ -227,6 +228,90 @@ operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
         fs::write(dir.path().join(REFRESH_STAMP), "x").unwrap();
         let reason = source(dir.path().to_owned()).prepare().await.unwrap_err();
         assert!(reason.contains("TUF cache"), "{reason}");
+    }
+
+    /// One deployment of the attestation fixture's project, unsigned, with its real
+    /// ids and a patch rule.
+    const LIVE_CONFIG: &str = r#"
+[approvers]
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+
+[[deployment]]
+id = "app/prod"
+repo = { name = "dani-garcia/vaultwarden", id = 121898717, owner_id = 725423 }
+host = "host-a"
+compose = { dir = "/srv/app", service = "app" }
+origin = { workflow = ".github/workflows/release.yml", tags = "*", signed_tags = false }
+rule = { auto = "patch", approvers = ["operator"] }
+checks = ["container-healthy"]
+"#;
+
+    /// Real GitHub, GHCR and Sigstore: a real release with two image variants from
+    /// one run gets decided, and a deploy of the highest patch of its line queued.
+    /// It may take more than a tick, so that newer releases than this one, each
+    /// verified first, do not fail it as they appear.
+    #[tokio::test]
+    #[ignore = "network: GitHub, GHCR and the Sigstore TUF repository"]
+    async fn live_a_tick_decides_a_real_release() {
+        use landfall_core::protocol::{DeployedRelease, Phase, RunningState};
+
+        use crate::store::{ReleaseDecision, Store};
+        use crate::watcher::{WatcherState, tick};
+
+        const DIGEST: &str =
+            "sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055";
+        let dir = tempfile::tempdir().unwrap();
+        let config = Arc::new(landfall_core::config::parse(LIVE_CONFIG.as_bytes()).unwrap());
+        let mut fetcher = Fetcher::new(Endpoints::public().unwrap()).unwrap();
+        if let Some(token) = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()) {
+            fetcher = fetcher.with_github_token(&token).unwrap();
+        }
+        let live = Arc::new(LiveSource::new(
+            fetcher,
+            Arc::clone(&config),
+            dir.path().to_owned(),
+        ));
+        let store = Store::open_in_memory().await.unwrap();
+        let deployment: DeploymentId = "app/prod".parse().unwrap();
+        let running = RunningState {
+            deployment: deployment.clone(),
+            deployed: Some(DeployedRelease {
+                tag: "1.37.3".parse().unwrap(),
+                digest: format!("sha256:{}", "a".repeat(64)).parse().unwrap(),
+            }),
+            drift: false,
+            phase: Phase::Idle,
+            busy: false,
+        };
+        let host = "host-a".parse().unwrap();
+        store
+            .record_host_state(&host, None, &[&running])
+            .await
+            .unwrap();
+        let state = Arc::new(WatcherState::default());
+
+        let mut queued = Vec::new();
+        for _ in 0..10 {
+            let summary = tick(&store, &config, &live, &state).await;
+            assert_eq!(summary.failed, 0, "{summary:?}");
+            assert_eq!(summary.backed_off, 0, "{summary:?}");
+            queued.extend(summary.queued);
+            if store
+                .releases_of(&deployment)
+                .await
+                .unwrap()
+                .contains_key("1.37.4")
+            {
+                break;
+            }
+        }
+
+        let releases = store.releases_of(&deployment).await.unwrap();
+        let release = &releases["1.37.4"];
+        assert_eq!(release.decision, ReleaseDecision::Auto, "{release:?}");
+        assert_eq!(release.digest.as_ref().unwrap().as_ref(), DIGEST);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(store.verify_audit().await.unwrap().first_bad, None);
     }
 
     #[tokio::test]

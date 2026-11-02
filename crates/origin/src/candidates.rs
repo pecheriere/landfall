@@ -1,4 +1,6 @@
-//! Every digest validly attested for one release (design section 5.2, step 4).
+//! Every digest validly attested for one release, and the run that attested it
+//! (design section 5.2, step 4, whose rule is
+//! [`landfall_core::release::select_release_run`]).
 //!
 //! The registry lists a referrer tag for every digest with something attached,
 //! whichever release it belongs to. Each is checked against this release's
@@ -14,13 +16,14 @@
 //! certificate names the one ref it was issued for, so a bundle already seen to
 //! name another release's ref need not be fetched again for each release.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt as _, stream};
 use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
+use landfall_core::release::RunCandidate;
 
 use crate::attestation::{AttestationError, Expected, verify_bundle};
 use crate::fetch::{FetchError, Fetcher};
@@ -61,7 +64,8 @@ struct RuledOut {
 
 #[derive(Debug, Default)]
 struct CacheEntries {
-    verified: HashSet<VerifiedKey>,
+    /// With the run its certificate names.
+    verified: HashMap<VerifiedKey, String>,
     ruled_out: HashMap<(DeploymentId, ImageDigest), RuledOut>,
 }
 
@@ -91,8 +95,8 @@ impl CandidateCache {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn is_verified(&self, key: &VerifiedKey) -> bool {
-        self.locked().verified.contains(key)
+    fn verified_run(&self, key: &VerifiedKey) -> Option<String> {
+        self.locked().verified.get(key).cloned()
     }
 
     fn is_ruled_out(&self, key: &(DeploymentId, ImageDigest), git_ref: &str) -> bool {
@@ -102,12 +106,12 @@ impl CandidateCache {
         })
     }
 
-    fn keep_verified(&self, key: VerifiedKey) {
+    fn keep_verified(&self, key: VerifiedKey, run_url: String) {
         let mut entries = self.locked();
         if entries.verified.len() >= MAX_CACHE_ENTRIES {
             entries.verified.clear();
         }
-        entries.verified.insert(key);
+        entries.verified.insert(key, run_url);
     }
 
     fn keep_ruled_out(&self, key: (DeploymentId, ImageDigest), except_ref: Option<String>) {
@@ -138,8 +142,9 @@ pub struct IgnoredCandidate {
 /// The answer for one release.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AttestedDigests {
-    /// Every digest validly attested for the release, sorted.
-    pub verified: Vec<ImageDigest>,
+    /// Every digest validly attested for the release, with the run that attested
+    /// it, sorted by digest.
+    pub verified: Vec<RunCandidate>,
     /// The candidates looked at this time that do not count. One already known
     /// not to count is not looked at, so it is not repeated here.
     pub ignored: Vec<IgnoredCandidate>,
@@ -188,8 +193,8 @@ pub async fn attested_digests(
     let mut answer = AttestedDigests::default();
     let mut unknown = Vec::new();
     for digest in candidates {
-        if cache.is_verified(&verified_key(&digest)) {
-            answer.verified.push(digest);
+        if let Some(run_url) = cache.verified_run(&verified_key(&digest)) {
+            answer.verified.push(RunCandidate { digest, run_url });
         } else if !cache.is_ruled_out(&(deployment.clone(), digest.clone()), &git_ref) {
             unknown.push(digest);
         }
@@ -205,9 +210,9 @@ pub async fn attested_digests(
         .buffer_unordered(CANDIDATES_AT_ONCE);
     while let Some((digest, checked)) = checks.next().await {
         match checked? {
-            Candidate::Verified => {
-                cache.keep_verified(verified_key(&digest));
-                answer.verified.push(digest);
+            Candidate::Verified(run_url) => {
+                cache.keep_verified(verified_key(&digest), run_url.clone());
+                answer.verified.push(RunCandidate { digest, run_url });
             }
             Candidate::Unattested(reason) => {
                 answer.ignored.push(IgnoredCandidate { digest, reason });
@@ -223,13 +228,14 @@ pub async fn attested_digests(
             }
         }
     }
-    answer.verified.sort();
+    answer.verified.sort_by(|a, b| a.digest.cmp(&b.digest));
     Ok(answer)
 }
 
 /// What one candidate turned out to be.
 enum Candidate {
-    Verified,
+    /// With the Run Invocation URI of its certificate.
+    Verified(String),
     /// Nothing is attached yet, and something may be soon.
     Unattested(String),
     RuledOut {
@@ -259,7 +265,7 @@ async fn check_candidate(
         }
     };
     match verify_bundle(&bundle, digest, root, expected) {
-        Ok(_) => Ok(Candidate::Verified),
+        Ok(attestation) => Ok(Candidate::Verified(attestation.run_url)),
         Err(error) => {
             let except_ref = match &error {
                 AttestationError::Identity { field, found, .. } if *field == REF_CLAIM => {

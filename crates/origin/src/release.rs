@@ -20,7 +20,7 @@
 use landfall_core::config::{Config, SignerKey};
 use landfall_core::ids::{CommitSha, DeploymentId, PrincipalId, ReleaseTag, RepoName, TagError};
 use landfall_core::release::{
-    DigestRuleError, Platform, PlatformError, require_platform, select_release_digest,
+    DigestRuleError, Platform, PlatformError, RunRuleError, require_platform, select_release_digest,
 };
 use landfall_core::tag::{SignedTag, TagVerifyError, verify_tag};
 use serde::Serialize;
@@ -73,6 +73,10 @@ pub enum ReleaseError {
     /// The release does not have exactly one digest.
     #[error("release digest")]
     Digest(#[source] DigestRuleError),
+    /// The release's attested digests do not come from one run and attempt, or
+    /// the version tag's digest is not among them.
+    #[error("release run")]
+    Runs(#[source] RunRuleError),
     /// The build-provenance bundle for the digest could not be fetched.
     #[error("attestation bundle")]
     Bundle(#[source] FetchError),
@@ -108,6 +112,7 @@ impl ReleaseError {
             Self::TagPattern(_)
             | Self::TagSignature(_)
             | Self::Digest(_)
+            | Self::Runs(_)
             | Self::Attestation(_)
             | Self::Platform(_) => true,
         }
@@ -127,6 +132,7 @@ impl ReleaseError {
             | Self::TagPattern(_)
             | Self::TagSignature(_)
             | Self::Digest(_)
+            | Self::Runs(_)
             | Self::Attestation(_)
             | Self::Platform(_)
             | Self::NoTrustRoot => None,
