@@ -15,11 +15,22 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-origin` (`crates/origin`): release origin verification that needs
   the Sigstore stack or the network: build-provenance bundles and their
   Fulcio certificate identity, the TUF trust root, and the fetchers for
-  signed tag objects (GitHub API), image indexes and bundles (GHCR), and
-  `verify_release`, which composes them for one release.
+  signed tag objects, a repository's tags (GitHub API), image indexes, bundles
+  and referrer tags (GHCR), `verify_release`, which composes them for one
+  release, and `candidates`, which finds every digest attested for it.
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
-  the audit log, serves the API and the web UI.
+  the audit log, serves the API and the web UI. A library plus a thin binary;
+  modules: `store` (the only code that touches SQLite: migrations, transactions,
+  appending to and verifying the audit log, enrolment codes, hosts, nonces,
+  deploys, running state, release decisions and holds), `audit` (audit events and
+  the hash-chain encoding), `report` (bounding a deploy report before it is
+  stored), `agent_api` (the routes agents call: signed-request extractor,
+  handlers, problem answers, rate limit), `watcher` (release discovery, origin
+  verification, rule decisions and queueing, behind a `ReleaseSource` trait),
+  `serve` (the accept loop, with header timeouts and a connection cap), `cli`
+  (`serve`, `enrol-code`, `backup`, `audit verify`, `audit show`, behind the thin
+  `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:
@@ -31,8 +42,14 @@ passkey approvals. Agents drive it through a typed API. Design:
   (the override file the agent owns, compose directory resolution), `checks`
   (post-deploy checks: health, HTTP probe, command, log window), `deploy` (the
   sequence, rollback and recovery, recording every step in a report), `journal`
-  (the only code that writes to stderr: syslog-prefixed JSON lines), `cli`
-  (`status` and `recover`, behind the thin `main.rs`).
+  (the only code that writes to stderr: syslog-prefixed JSON lines), `client`
+  (the `Controller` trait and the signing HTTP client), `enrol` (the host's key
+  and the enrolment request), `daemon` (`run`: one poll is `daemon::step`, which
+  judges each work item by the host's own rule and records, deploys, and keeps
+  reports in an outbox until acknowledged), `cli` (`status`, `recover`, `enrol`
+  and `run`, behind the thin `main.rs`). `daemon::run_with` and the server's
+  `cli::run_watching` take a fake verifier and source, for the end-to-end tests;
+  nothing on a command line leads to them.
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents.
 
@@ -86,6 +103,10 @@ cargo deny check
   or other details of anyone's infrastructure in code, docs, tests or
   commit messages.
 - Commits: conventional-commit subject, no AI attribution trailers.
+- Keep files small: split a source file by responsibility before it passes
+  about 800 lines of code, and move a large test module into its own file. When
+  a change would push a file past that, split it in the same change, or track
+  the split as an issue (#18 lists the current ones).
 
 ## Testing rules
 
@@ -98,6 +119,14 @@ which is how CI selects them:
 `docker_e2e.rs` lists what each needs. The `foreign_owner` tests need root and
 skip without it, unless `LANDFALL_TEST_REQUIRE_ROOT` is set, as it is in CI, which
 makes that a failure.
+
+Tests against the real GitHub, GHCR and Sigstore are `#[ignore]`d and named with a
+`live_` prefix, which is how the nightly job in `advisories.yml` selects them: `live_`
+must not appear in the name of any other test.
+
+`crates/agent/tests/e2e/` runs the controller and the agent together as real
+processes, over loopback and a real SQLite file. The agent has `landfall-server` as a
+dev-dependency for it; the server depends on nothing of the agent's.
 
 ### Linux tests on a Mac
 

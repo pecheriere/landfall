@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+futures-util.workspace = true
 jiff.workspace = true
 landfall-core.workspace = true
 reqwest.workspace = true
@@ -18,6 +19,7 @@ sha1-checked.workspace = true
 sha2.workspace = true
 sigstore-verify.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 base64.workspace = true

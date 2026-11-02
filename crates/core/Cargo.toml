@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+ed25519-dalek.workspace = true
 semver.workspace = true
 serde.workspace = true
 sha2.workspace = true

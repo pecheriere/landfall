@@ -30,6 +30,10 @@ use thiserror::Error;
 
 use crate::attestation::{MAX_BUNDLE_BYTES, SLSA_PROVENANCE};
 
+mod listing;
+
+pub use self::listing::{ListedTag, MAX_LISTED_TAGS};
+
 /// Cap on a GitHub API response for a tag ref or tag object.
 pub const TAG_OBJECT_LIMIT: usize = 64 * 1024;
 /// Cap on an image index or manifest, and on a registry token response.
@@ -278,6 +282,17 @@ pub enum FetchError {
         digest: ImageDigest,
         /// How many bundles refer to it.
         count: usize,
+    },
+    /// A paginated list goes on past what is read of it, so whatever it holds
+    /// further on is unknown.
+    #[error("{url}: the list goes on past {limit} {what}")]
+    ListCap {
+        /// The first page's URL.
+        url: String,
+        /// The cap.
+        limit: usize,
+        /// What is counted: `tags` or `pages`.
+        what: &'static str,
     },
 }
 
@@ -592,8 +607,18 @@ impl Fetcher {
     /// the digest, [`FetchError::Digest`] when a manifest or the bundle does
     /// not match its descriptor, and the transport and parsing errors.
     pub async fn bundle(&self, image: &str, digest: &ImageDigest) -> Result<Vec<u8>, FetchError> {
-        check_image(image)?;
-        let token = self.registry_token(image).await?;
+        let token = self.pull_token(image).await?;
+        self.bundle_with(image, digest, &token).await
+    }
+
+    /// [`Fetcher::bundle`] with a token from [`Fetcher::pull_token`], for looking at
+    /// many digests of one image.
+    pub(crate) async fn bundle_with(
+        &self,
+        image: &str,
+        digest: &ImageDigest,
+        token: &HeaderValue,
+    ) -> Result<Vec<u8>, FetchError> {
         let referrers_tag = digest.as_ref().replacen(':', "-", 1);
         let url = self.manifest_url(image, &referrers_tag)?;
         let accept = format!("{OCI_INDEX}, {OCI_MANIFEST}");
@@ -602,7 +627,7 @@ impl Fetcher {
             count: 0,
         };
         let response = match self
-            .registry_get(&url, &accept, Some(&token), MANIFEST_LIMIT)
+            .registry_get(&url, &accept, Some(token), MANIFEST_LIMIT)
             .await
         {
             Err(FetchError::NotFound { .. }) => return Err(no_bundle()),
@@ -631,7 +656,7 @@ impl Fetcher {
                 };
                 let manifest_url = self.manifest_url(image, descriptor.digest.as_ref())?;
                 let response = self
-                    .registry_get(&manifest_url, OCI_MANIFEST, Some(&token), MANIFEST_LIMIT)
+                    .registry_get(&manifest_url, OCI_MANIFEST, Some(token), MANIFEST_LIMIT)
                     .await?;
                 let found = media_type(&response.headers);
                 if found != OCI_MANIFEST {
@@ -685,7 +710,7 @@ impl Fetcher {
         segments.extend(["blobs", layer.digest.as_ref()]);
         let blob_url = join(&self.endpoints.registry, &segments)?;
         let response = self
-            .registry_get(&blob_url, BUNDLE_TYPE, Some(&token), MAX_BUNDLE_BYTES)
+            .registry_get(&blob_url, BUNDLE_TYPE, Some(token), MAX_BUNDLE_BYTES)
             .await?;
         layer.check_content(&blob_url, &response.body)?;
         Ok(response.body)
@@ -728,6 +753,12 @@ impl Fetcher {
         Ok(object)
     }
 
+    /// A pull token for `image`, whose name is checked first.
+    pub(crate) async fn pull_token(&self, image: &str) -> Result<HeaderValue, FetchError> {
+        check_image(image)?;
+        self.registry_token(image).await
+    }
+
     /// An anonymous pull token for `image`, as an `Authorization` value.
     async fn registry_token(&self, image: &str) -> Result<HeaderValue, FetchError> {
         let mut url = join(&self.endpoints.registry, &["token"])?;
@@ -757,6 +788,11 @@ impl Fetcher {
 
     /// A GET to the GitHub API, with the token when there is one.
     async fn github_get(&self, url: &Url) -> Result<Vec<u8>, FetchError> {
+        Ok(self.github_fetch(url, TAG_OBJECT_LIMIT).await?.body)
+    }
+
+    /// [`github_get`](Self::github_get) with its headers, and a cap of `limit`.
+    async fn github_fetch(&self, url: &Url, limit: usize) -> Result<Fetched, FetchError> {
         let mut request = self
             .client
             .get(url.clone())
@@ -765,9 +801,7 @@ impl Fetcher {
         if let Some(token) = &self.github_token {
             request = request.header(AUTHORIZATION, token.clone());
         }
-        Ok(send(request, Service::GitHubApi, url, TAG_OBJECT_LIMIT)
-            .await?
-            .body)
+        send(request, Service::GitHubApi, url, limit).await
     }
 
     /// A GET to the registry, with its pull token when there is one; never

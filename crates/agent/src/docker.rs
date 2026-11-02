@@ -51,11 +51,14 @@ const KILL_WAIT: Duration = Duration::from_secs(5);
 /// Environment variables that would make a compose command read something
 /// other than the stack's own files, or, for `PWD`, label a container with
 /// another spelling of its directory: Go takes the path from it when it leads
-/// to the working directory, a symlink included.
-const SCRUBBED_ENV: [&str; 4] = [
+/// to the working directory, a symlink included. And the agent's token for GitHub,
+/// which goes to GitHub only: compose would hand it to any stack that names it in
+/// its file.
+const SCRUBBED_ENV: [&str; 5] = [
     "COMPOSE_FILE",
     "COMPOSE_PROJECT_NAME",
     "COMPOSE_PROFILES",
+    "GITHUB_TOKEN",
     "PWD",
 ];
 
@@ -1195,37 +1198,35 @@ impl Docker for DockerCli {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::{Mutex, MutexGuard, PoisonError};
+    use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
 
-    /// Running a freshly written script races with forks in other threads
-    /// (`ETXTBSY`), so the tests that run stubs take turns.
-    static STUBS: Mutex<()> = Mutex::new(());
-
-    /// A fake `docker` in a temp directory; the guard keeps tests that run
-    /// stubs from overlapping.
+    /// A fake `docker` in a temp directory.
     struct Stub {
         dir: tempfile::TempDir,
-        _turn: MutexGuard<'static, ()>,
     }
 
     impl Stub {
+        /// Executing a file fails with `ETXTBSY` while any process holds it open
+        /// for writing. A file this process writes is open in every child some
+        /// other test's thread forks in that moment, from the fork until its
+        /// `exec` closes it, whichever thread does the writing, and renaming the
+        /// file changes nothing. So the script itself is made by `cp`, a process
+        /// of its own, gone by the time it is run: no descriptor for writing to
+        /// it ever exists in this one.
         fn new(body: &str) -> Self {
-            let turn = STUBS.lock().unwrap_or_else(PoisonError::into_inner);
             let dir = tempfile::tempdir().unwrap();
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o755)
-                .open(dir.path().join("docker"))
+            let script = dir.path().join("script");
+            fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let copied = std::process::Command::new("cp")
+                .arg(&script)
+                .arg(dir.path().join("docker"))
+                .status()
                 .unwrap();
-            writeln!(file, "#!/bin/sh\n{body}").unwrap();
-            file.sync_all().unwrap();
-            drop(file);
-            Self { dir, _turn: turn }
+            assert!(copied.success());
+            Self { dir }
         }
 
         fn cli(&self) -> DockerCli {

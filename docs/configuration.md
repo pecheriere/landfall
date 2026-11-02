@@ -85,6 +85,16 @@ pattern as signers.
 | `promote_to.deployment` | string | required if `promote_to` | Deployment to promote to; it must have the same `repo.id`. |
 | `promote_to.healthy_for` | string | required if `promote_to` | How long this deployment must stay healthy: `<n>m`, `<n>h` or `<n>d`, `n` above zero. |
 
+Healthy here is the source host's word, as the controller hears it: the host says
+the release is running, idle and without drift, and has said so within the last 15
+minutes. Only such time counts, whether the release still runs or has since been
+replaced, in which case it counts up to the last report before that. Time a host was
+unheard of for longer than those 15 minutes, or a deploy was under way, doesn't count: a
+host gone quiet holds the promotion back, and its time goes on from where it was when it
+is back. Drift clearing and a rollback start the time again for what then runs. The
+promotion is enforced by the controller only, and trusts that host: a compromised source
+host can say what it likes.
+
 Anything outside `auto` and `approve` (major releases by default) is manual: a
 grant holder requests it and an approver approves it.
 
@@ -101,6 +111,17 @@ prefix: release tag `v1.2.3` is looked up as `ghcr.io/example/app:1.2.3`, what
 `docker/metadata-action` produces with `type=semver,pattern={{version}}`. The
 registry tag is only a lookup hint: the attestation binds the digest to the
 release.
+
+One release comes from one run. Every digest attested for a tag must come from
+the same run and attempt of `origin.workflow`, and the digest the version tag
+resolves to must be among them; that one is what is deployed. Image variants
+built by one run, such as `1.2.3` and `1.2.3-alpine`, pass. A re-run release
+workflow, or a second attempt of one run, is refused, and so is a project that
+builds its variants in separate workflow runs for one tag. Re-running one failed
+job of a matrix makes attempt 2 of the run, so if that job attests, the release is
+refused, and the way out is a new tag. If the version tag's digest is not among the
+attested ones, the release waits and is tried again hourly, since the registry's
+list may be behind.
 
 The release workflow (`origin.workflow`) must meet every one of these rules,
 which are checked against the Fulcio certificate of the attestation, not
@@ -128,8 +149,9 @@ against anything the workflow writes itself:
 
 To check a deployment's `repo` and `origin` against a real release, run
 [`landfall verify`](../README.md#verifying-a-release). Hosts need a
-synchronised clock (NTP): a clock running behind refuses a fresh release with
-"integrated time … in the future".
+synchronised clock (NTP): with a clock running behind a fresh release can't be
+verified until it is right ("the transparency log's time is ahead of this
+machine's clock").
 
 ### `origin.signed_tags = false`
 

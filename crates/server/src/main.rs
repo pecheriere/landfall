@@ -1,11 +1,10 @@
 //! `landfall-server`: Watches releases, verifies their origin and coordinates deploys.
 
+use std::process::ExitCode;
+
 use clap::Parser;
+use landfall_server::cli::{self, Cli};
 
-#[derive(Parser)]
-#[command(version, about)]
-struct Cli {}
-
-fn main() {
-    Cli::parse();
+fn main() -> ExitCode {
+    ExitCode::from(cli::run(Cli::parse()))
 }

@@ -18,7 +18,8 @@ WORKDIR /src
 
 # Dependencies build in their own layer, from the manifests and Cargo.lock
 # only, so the build cache reuses it until Cargo.lock changes. Each crate gets
-# an empty main.rs (lib.rs for the library crates; the agent has both) for this step.
+# an empty main.rs (lib.rs for the library crates; the server and the agent
+# have both) for this step.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/
 COPY crates/origin/Cargo.toml crates/origin/
@@ -33,7 +34,7 @@ RUN case "$TARGETARCH" in \
     && for crate in server agent cli; do \
         mkdir -p "crates/$crate/src" && echo 'fn main() {}' > "crates/$crate/src/main.rs"; \
     done \
-    && for crate in core origin agent; do \
+    && for crate in core origin server agent; do \
         mkdir -p "crates/$crate/src" && : > "crates/$crate/src/lib.rs"; \
     done \
     && cargo zigbuild --release --locked -p landfall-server --target "$(cat /target-triple)"
@@ -41,11 +42,14 @@ RUN case "$TARGETARCH" in \
 COPY crates ./crates
 
 # The placeholder build of landfall-server is removed first, so the real
-# sources always compile, whatever their timestamps.
+# sources always compile, whatever their timestamps. The final image is empty
+# apart from what is installed here, and its HTTPS client refuses to start
+# without a CA bundle, so the base image's bundle (fixed by its digest) goes in.
 RUN target="$(cat /target-triple)" \
     && cargo clean --release --target "$target" -p landfall-server -p landfall-core -p landfall-origin \
     && cargo zigbuild --release --locked -p landfall-server --target "$target" \
-    && install -D -m 0755 "target/$target/release/landfall-server" /out/rootfs/landfall-server
+    && install -D -m 0755 "target/$target/release/landfall-server" /out/rootfs/landfall-server \
+    && install -D -m 0644 /etc/ssl/certs/ca-certificates.crt /out/rootfs/etc/ssl/certs/ca-certificates.crt
 
 # The image holds the controller only. The host agent runs outside Docker (it
 # must survive the deploys it performs) and the CLI runs wherever its user is.

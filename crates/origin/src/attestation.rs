@@ -6,7 +6,7 @@ use sigstore_verify::crypto::CertificateInfo;
 use sigstore_verify::types::{
     Artifact, Bundle, MediaType, Sha256Hash, SignatureContent, Statement,
 };
-use sigstore_verify::{SubjectAltName, VerificationPolicy, Verifier};
+use sigstore_verify::{SubjectAltName, TransparencyLogError, VerificationPolicy, Verifier};
 use thiserror::Error;
 
 use crate::trust::TrustRoot;
@@ -95,6 +95,11 @@ pub enum AttestationError {
     /// Not a parseable build-provenance bundle.
     #[error("malformed bundle: {0}")]
     Bundle(String),
+    /// The log says the release was signed later than this machine's clock says
+    /// it is now. That says nothing of the release: a machine with no battery for
+    /// its clock can be behind any release, until it has synchronised.
+    #[error("the transparency log's time is ahead of this machine's clock: {0}")]
+    ClockBehind(String),
     /// The Sigstore verification failed.
     #[error("bundle does not verify: {0}")]
     Signature(String),
@@ -196,9 +201,12 @@ pub fn verify_bundle(
     // The identity is matched below, claim by claim, so a refusal can name
     // the claim; the policy here only requires the cryptographic checks.
     let verifier = Verifier::new(root.inner()).map_err(|e| signature(&e))?;
+    // Before the verifier reads the clock, so that a time it found in the future is
+    // past this one too.
+    let before = jiff::Timestamp::now();
     let result = verifier
         .verify(artifact, &bundle, &VerificationPolicy::any_identity())
-        .map_err(|e| signature(&e))?;
+        .map_err(|e| refused_verification(&e, &bundle, before))?;
     if !(result.certificate_verified() && result.sct_verified() && result.tlog_verified()) {
         return Err(AttestationError::Signature(
             "certificate chain, certificate timestamp or transparency log not verified".to_owned(),
@@ -367,6 +375,32 @@ fn mismatch(field: &'static str, expected: String, found: Option<&str>) -> Attes
 
 fn signature(error: &sigstore_verify::Error) -> AttestationError {
     AttestationError::Signature(error.to_string())
+}
+
+/// What a failed verification says. The verifier raises this one error for an
+/// integrated time in the future and for one outside the certificate's validity, and
+/// checks the entry's log signature before either, so the entry's time can be trusted
+/// here to tell them apart. The other way to be wrong about it, a time outside the
+/// validity that has only just passed `before`, is not final and is looked at again.
+fn refused_verification(
+    error: &sigstore_verify::Error,
+    bundle: &Bundle,
+    before: jiff::Timestamp,
+) -> AttestationError {
+    let ahead = matches!(
+        error,
+        sigstore_verify::Error::TransparencyLog(TransparencyLogError::IntegratedTime(_))
+    ) && bundle
+        .verification_material
+        .tlog_entries
+        .iter()
+        .filter_map(|entry| entry.integrated_time)
+        .any(|time| time > before);
+    if ahead {
+        AttestationError::ClockBehind(error.to_string())
+    } else {
+        signature(error)
+    }
 }
 
 fn parse_bundle(bundle_json: &[u8]) -> Result<Bundle, AttestationError> {
@@ -587,6 +621,34 @@ mod tests {
         assert_eq!(verified.run_url, RUN_URL);
         assert_eq!(verified.rekor_log_index, REKOR_LOG_INDEX);
         assert_eq!(verified.integrated_time, INTEGRATED_TIME);
+    }
+
+    #[test]
+    fn a_time_the_log_vouches_for_ahead_of_the_clock_is_the_clock_and_nothing_else_is() {
+        let bundle = super::parse_bundle(BUNDLE).unwrap();
+        let time = jiff::Timestamp::from_second(INTEGRATED_TIME).unwrap();
+        let earlier = time - jiff::SignedDuration::from_secs(1);
+        let integrated = || {
+            sigstore_verify::Error::from(super::TransparencyLogError::IntegratedTime("no".into()))
+        };
+
+        // Behind the release, the error can only be about the clock.
+        assert!(matches!(
+            super::refused_verification(&integrated(), &bundle, earlier),
+            AttestationError::ClockBehind(_)
+        ));
+        // Past it, this is a time outside the certificate's validity: final.
+        assert!(matches!(
+            super::refused_verification(&integrated(), &bundle, time),
+            AttestationError::Signature(_)
+        ));
+        // And no other failure is the clock's, whatever the clock says.
+        let other =
+            sigstore_verify::Error::from(super::TransparencyLogError::InclusionProof("no".into()));
+        assert!(matches!(
+            super::refused_verification(&other, &bundle, earlier),
+            AttestationError::Signature(_)
+        ));
     }
 
     #[test]

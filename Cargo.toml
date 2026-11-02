@@ -31,9 +31,14 @@ print_stderr = "deny"
 [workspace.dependencies]
 landfall-core = { path = "crates/core", version = "0.0.0" }
 landfall-origin = { path = "crates/origin", version = "0.0.0" }
+landfall-server = { path = "crates/server", version = "0.0.0" }
 clap = { version = "4.6.7", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
 semver = { version = "1.0.28", features = ["serde"] }
 sha2 = "0.11.1"
+# Agent request signatures: sign and verify only. Keys are supplied by the
+# caller, so no randomness feature is enabled here.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize"] }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 toml = "0.9.8"
@@ -57,3 +62,20 @@ sha1-checked = { version = "0.10.0", default-features = false }
 wiremock = "0.6.5"
 # Process identity (uid) and no-follow directory-fd walking without unsafe code.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "fs"] }
+# The controller's store. Queries are plain SQL with bound parameters: no
+# `macros` feature, so nothing about the schema is checked or embedded at build
+# time beyond the migration text itself.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+tower = { version = "0.5.3", default-features = false }
+# The controller's own accept loop: `axum::serve` has no way to set a timeout on
+# reading a request's headers, so a client could hold a connection forever. Both
+# are already in the tree through axum.
+hyper = { version = "1.12.0", default-features = false }
+hyper-util = { version = "0.1.21", default-features = false }
+http-body-util = "0.1.5"
+# Test bodies that stream or stall. Already in the tree through tokio and axum.
+futures-core = { version = "0.3.34", default-features = false }
+# Enrolment codes. The operating system's generator, nothing seeded.
+getrandom = "0.4.3"
+hex = "0.4.3"

@@ -17,6 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 jiff.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
@@ -26,12 +28,18 @@ rustix.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
+# The end-to-end tests run the controller too. Only in this direction: the server
+# depends on nothing of the agent's.
+landfall-server.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true

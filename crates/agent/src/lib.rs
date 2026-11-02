@@ -3,9 +3,12 @@
 
 pub mod checks;
 pub mod cli;
+pub mod client;
 pub mod compose;
+pub mod daemon;
 pub mod deploy;
 pub mod docker;
+pub mod enrol;
 pub mod journal;
 pub mod safefs;
 pub mod state;

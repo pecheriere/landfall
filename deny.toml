@@ -17,6 +17,7 @@ allow = [
     "ISC",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
+    "Zlib",
 ]
 
 [bans]
