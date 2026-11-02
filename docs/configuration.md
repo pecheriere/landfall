@@ -83,7 +83,9 @@ message from the TOML parser may include part of one.
 
 ## `[server]`
 
-Settings only the controller reads. It can be left out.
+Settings only the controller acts on. It can be left out. It is part of the file like the rest, so
+the hash covers it: changing it on the controller alone looks like drift to every host, which then
+refuses work until it has the same file.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

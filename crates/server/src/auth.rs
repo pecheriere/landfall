@@ -23,9 +23,9 @@ mod principal;
 mod problem;
 mod token;
 
-#[cfg(test)]
-pub(crate) use self::budget::flush_dropped;
-pub(crate) use self::budget::{Budget, MAX_SESSIONS_PER_PRINCIPAL, Spender, Spent, keep_flushing};
+pub(crate) use self::budget::{
+    Budget, MAX_SESSIONS_PER_PRINCIPAL, Spender, Spent, flush_dropped, keep_flushing,
+};
 pub(crate) use self::grants::{can, named_in_config, sees};
 #[cfg(test)]
 pub(crate) use self::principal::Via;

@@ -109,12 +109,14 @@ impl Controller {
             .env(CHILD_ARGS, args.to_string())
             .spawn()
             .unwrap();
+        // Made before the wait, so that a panic in it still kills the child.
+        let controller = Self(child);
         let started = Instant::now();
         while TcpStream::connect(files.backend).is_err() {
             assert!(started.elapsed() < PATIENCE, "the controller did not start");
             std::thread::sleep(Duration::from_millis(50));
         }
-        Self(child)
+        controller
     }
 }
 

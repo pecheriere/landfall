@@ -8,7 +8,6 @@ use super::{
     Answer, Harness, ORIGIN, RP_ID, SIGN_IN_BEGIN, SIGN_IN_FINISH, answer_of, assertion_text, b64,
     config_text, post_request, sign_in_body, sign_in_ceremony_body,
 };
-use crate::agent_api::Limits;
 
 const CHALLENGE_LIFETIME: i64 = 5 * 60;
 
@@ -135,18 +134,18 @@ async fn a_stored_row_cannot_take_a_credential_id_the_file_gives_to_someone() {
 /// Signing in over and over takes a passkey each time, and is bounded for whoever holds one.
 #[tokio::test]
 async fn a_passkey_signing_in_over_and_over_is_held_to_a_budget() {
-    let h = Harness::with_limits(Limits {
-        principal_burst: 2,
-        ..Limits::default()
-    })
-    .await;
+    let h = Harness::new().await;
+    // The ruling: ten at once, and one more every five minutes.
+    let refill = 300;
     let session = h.signed_in(&h.alice).await;
-    h.signed_in(&h.alice).await;
+    for _ in 1..10 {
+        h.signed_in(&h.alice).await;
+    }
     let over = h.try_sign_in(&h.alice).await;
     assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS, "{over:?}");
     assert_eq!(over.code(), "rate_limited");
-    assert_eq!(h.count("sessions").await, 2);
-    assert_eq!(h.audited("signed_in").await.len(), 2);
+    assert_eq!(h.count("sessions").await, 10);
+    assert_eq!(h.audited("signed_in").await.len(), 10);
 
     // Sessions have budgets of their own: this one is whole.
     let used = h
@@ -161,6 +160,19 @@ async fn a_passkey_signing_in_over_and_over_is_held_to_a_budget() {
         json!({ "principal": "alice", "via": "sign_in" })
     );
     assert_eq!(rows[0]["dropped"], 1);
+
+    // Not a moment before the refill, and then one.
+    h.clock.advance(refill - 1);
+    assert_eq!(
+        h.try_sign_in(&h.alice).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    h.clock.advance(1);
+    assert_eq!(h.try_sign_in(&h.alice).await.status, StatusCode::OK);
+    assert_eq!(
+        h.try_sign_in(&h.alice).await.status,
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }
 
 /// The strongest signal there is: it can't be washed out by what the sender does next.

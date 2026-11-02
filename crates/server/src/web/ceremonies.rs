@@ -60,7 +60,9 @@ pub(crate) struct Failure {
     first_seen: i64,
     /// Who from, as far as [`MAX_SOURCES_NAMED`].
     sources: BTreeSet<IpAddr>,
-    /// How many attempts came from a source there was no room to name.
+    /// How many attempts came from a source there was no room to name. A count put back after it
+    /// couldn't be written has lost how many came from each of its sources, so what doesn't fit
+    /// then counts as one each: this can be low in that case, never high.
     from_others: u64,
 }
 
@@ -199,6 +201,13 @@ impl Ceremonies {
                 expires_at: now.saturating_add(CHALLENGE_LIFETIME_SECS),
             },
         );
+    }
+
+    /// Whether this invite has a challenge in time, leaving it there.
+    pub(super) fn has_registration(&self, invite: &[u8; 32], now: i64) -> bool {
+        self.registrations
+            .get(invite)
+            .is_some_and(|registering| registering.expires_at > now)
     }
 
     /// This invite's challenge, if it has one in time. It doesn't have it any more.

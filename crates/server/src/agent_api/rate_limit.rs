@@ -96,6 +96,12 @@ impl<K: Eq + Hash> RateLimiter<K> {
         self.buckets.retain(|key, _| !forget(key));
     }
 
+    /// How many keys this says yes to have a bucket, for a test.
+    #[cfg(test)]
+    pub(crate) fn count_where(&self, counted: impl Fn(&K) -> bool) -> usize {
+        self.buckets.keys().filter(|key| counted(key)).count()
+    }
+
     /// A full bucket says nothing a new one would not, so forgetting it costs
     /// its source nothing.
     fn forget_full_buckets(&mut self, now: i64) {

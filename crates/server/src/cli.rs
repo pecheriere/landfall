@@ -25,7 +25,7 @@ use tokio::sync::watch;
 use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
 use crate::audit::AuditReport;
-use crate::auth::keep_flushing;
+use crate::auth::{flush_dropped, keep_flushing};
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 use crate::watcher::{self, LiveSource, ReleaseSource};
@@ -381,6 +381,7 @@ async fn serve_watching<S: ReleaseSource>(
 
     let closing = store.clone();
     let state = ApiState::new(store, config, Limits::default());
+    let draining = state.clone();
     let app = crate::router(state.clone());
     let flushing = tokio::spawn(keep_flushing(state.clone(), interval, stop_flushing));
     let shutdown = async move {
@@ -396,6 +397,10 @@ async fn serve_watching<S: ReleaseSource>(
     // had already stopped, that was a panic and it was logged by the runtime.
     drop(watching.await);
     drop(flushing.await);
+    // It stopped as the draining began, and a request finishing since may have counted something.
+    // A request still running past the drain can count one too late even for this.
+    flush_dropped(&draining).await;
+    crate::web::tend(&draining).await;
     // So that the main file holds everything. A request still running past the
     // drain has its connection for a while yet, and stopping does not wait for that:
     // the next start reads what is left in the write-ahead log.

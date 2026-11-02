@@ -83,6 +83,7 @@ async fn sessions_that_ended_leave_no_budget_behind() {
     let h = Harness::with_limits(Limits {
         ceremony_burst: 10_000,
         principal_burst: 10_000,
+        sign_in_burst: 10_000,
         ..Limits::default()
     })
     .await;
@@ -204,6 +205,64 @@ async fn signed_out_session_is_refused() {
     assert_eq!(rows[0]["principal"], "alice");
 }
 
+/// One session in the budget table, used once, by someone registered.
+async fn a_session_with_a_budget(h: &Harness) {
+    let gina = h.registered("gina").await;
+    let session = h.signed_in(&gina).await;
+    let used = h
+        .post("/api/v1/approvals/1/cancel", Some(&session), &json!({}))
+        .await;
+    assert_ne!(used.status, StatusCode::TOO_MANY_REQUESTS, "{used:?}");
+    assert_eq!(h.state.session_budgets(), 1);
+}
+
+#[tokio::test]
+async fn registering_again_lets_go_of_the_budgets_of_the_sessions_it_ended() {
+    let h = Harness::new().await;
+    a_session_with_a_budget(&h).await;
+    h.registered("gina").await;
+    assert_eq!(h.state.session_budgets(), 0);
+}
+
+#[tokio::test]
+async fn upkeep_lets_go_of_the_budgets_of_expired_sessions() {
+    let h = Harness::new().await;
+    a_session_with_a_budget(&h).await;
+    crate::web::tend(&h.state).await;
+    assert_eq!(h.state.session_budgets(), 1);
+    h.clock.advance(SESSION_LIFETIME_SECS);
+    crate::web::tend(&h.state).await;
+    assert_eq!(h.state.session_budgets(), 0);
+}
+
+/// Each would be a row per request otherwise, from a stolen token, as sign-out spares only sessions.
+#[tokio::test]
+async fn a_token_at_sign_out_pays_for_its_refusal() {
+    let h = Harness::with_limits(Limits {
+        principal_burst: 2,
+        ..Limits::default()
+    })
+    .await;
+    let (_, token) = h
+        .store
+        .create_token(&"alice".parse().unwrap())
+        .await
+        .unwrap();
+    let send = || {
+        Request::builder()
+            .method("POST")
+            .uri(SIGN_OUT)
+            .header(header::AUTHORIZATION, format!("Bearer {}", token.reveal()))
+            .body(Body::empty())
+            .unwrap()
+    };
+    for _ in 0..2 {
+        assert_eq!(h.send(send()).await.code(), "forbidden");
+    }
+    assert_eq!(h.send(send()).await.code(), "rate_limited");
+    assert_eq!(h.audited("access_refused").await.len(), 2);
+}
+
 #[tokio::test]
 async fn a_token_has_no_session_to_end() {
     let h = Harness::new().await;
@@ -258,6 +317,7 @@ async fn expired_invites_are_settled_too() {
 async fn signing_in_again_and_again_keeps_a_bounded_number_of_sessions() {
     let h = Harness::with_limits(Limits {
         ceremony_burst: 1000,
+        sign_in_burst: 1000,
         ..Limits::default()
     })
     .await;

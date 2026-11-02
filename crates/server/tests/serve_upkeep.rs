@@ -28,7 +28,8 @@ use sqlx::SqlitePool;
 
 const CHILD_ARGS: &str = "LANDFALL_UPKEEP_CHILD";
 const CHILD_INTERVAL_MS: &str = "LANDFALL_UPKEEP_INTERVAL_MS";
-const PATIENCE: Duration = Duration::from_secs(30);
+/// Shorter than nextest's limit, so that a failure says what it was waiting for.
+const PATIENCE: Duration = Duration::from_secs(20);
 const RP_ID: &str = "landfall.example";
 const ORIGIN: &str = "https://landfall.example";
 
@@ -115,12 +116,23 @@ impl Controller {
             .env(CHILD_INTERVAL_MS, every_ms.to_string())
             .spawn()
             .unwrap();
+        // Made before the wait, so that a panic in it still kills the child.
+        let controller = Self { child, address };
         let started = Instant::now();
         while TcpStream::connect(address).is_err() {
             assert!(started.elapsed() < PATIENCE, "the controller did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
-        Self { child, address }
+        controller
+    }
+
+    /// SIGTERM.
+    fn stop(&self) {
+        let stopped = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(stopped.success());
     }
 
     /// A POST from the configured origin. Gives the status and the body.
@@ -143,6 +155,13 @@ impl Controller {
 
     /// One signature that doesn't verify, on `key`'s credential.
     fn fail_a_sign_in(&self, key: &SoftwareAuthenticator) {
+        let body = self.forged_finish(key);
+        let (status, answer) = self.post("/sign-in/finish", &body);
+        assert_eq!(status, 403, "{answer}");
+    }
+
+    /// The body of a finish, for a new challenge, with a signature that doesn't verify.
+    fn forged_finish(&self, key: &SoftwareAuthenticator) -> Value {
         let (status, begun) = self.post("/sign-in/begin", &json!({}));
         assert_eq!(status, 200, "{begun}");
         let text = begun["publicKey"]["challenge"].as_str().unwrap();
@@ -154,19 +173,15 @@ impl Controller {
             .assertion(&forged)
             .unwrap();
         let encode = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
-        let (status, answer) = self.post(
-            "/sign-in/finish",
-            &json!({
-                "challenge": text,
-                "assertion": {
-                    "credential_id": encode(&assertion.credential_id),
-                    "authenticator_data": encode(&assertion.authenticator_data),
-                    "client_data_json": encode(&assertion.client_data_json),
-                    "signature": encode(&assertion.signature),
-                },
-            }),
-        );
-        assert_eq!(status, 403, "{answer}");
+        json!({
+            "challenge": text,
+            "assertion": {
+                "credential_id": encode(&assertion.credential_id),
+                "authenticator_data": encode(&assertion.authenticator_data),
+                "client_data_json": encode(&assertion.client_data_json),
+                "signature": encode(&assertion.signature),
+            },
+        })
     }
 }
 
@@ -220,12 +235,43 @@ async fn serve_writes_failures_down_when_it_stops() {
     controller.fail_a_sign_in(&key);
     assert_eq!(attempts(&dir.path().join("c.db")).await, [] as [i64; 0]);
 
-    let stopped = Command::new("kill")
-        .args(["-TERM", &controller.child.id().to_string()])
-        .status()
-        .unwrap();
-    assert!(stopped.success());
+    controller.stop();
     let status = controller.child.wait().unwrap();
     assert!(status.success(), "{status}");
     assert_eq!(attempts(&dir.path().join("c.db")).await, [2]);
+}
+
+/// A request still running as stopping begins finishes in the drain, after the upkeep task has
+/// had its last look. What it counts mustn't be lost, as it could be a barred key's.
+#[tokio::test]
+async fn serve_writes_down_a_failure_counted_in_the_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SoftwareAuthenticator::es256().unwrap();
+    let mut controller = Controller::start(dir.path(), &key, 3_600_000);
+    let body = controller.forged_finish(&key).to_string();
+    let (first, rest) = body.split_at(body.len() / 2);
+
+    let mut stream = TcpStream::connect(controller.address).unwrap();
+    write!(
+        stream,
+        "POST /sign-in/finish HTTP/1.1\r\nHost: {RP_ID}\r\nOrigin: {ORIGIN}\r\n\
+         Connection: close\r\nContent-Length: {}\r\n\r\n{first}",
+        body.len(),
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    // Long enough for the request to be under way and, once stopped, for the task to finish.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    controller.stop();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(attempts(&dir.path().join("c.db")).await, [] as [i64; 0]);
+
+    stream.write_all(rest.as_bytes()).unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+
+    let status = controller.child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    assert_eq!(attempts(&dir.path().join("c.db")).await, [1]);
 }

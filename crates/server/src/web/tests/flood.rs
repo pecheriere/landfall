@@ -113,6 +113,114 @@ async fn a_bad_finish_pays_for_itself() {
     }
 }
 
+/// A live challenge spares a good answer, not a bad one.
+#[tokio::test]
+async fn a_bad_signature_on_a_live_challenge_pays_for_itself() {
+    let h = Harness::with_limits(Limits {
+        ceremony_rate_per_second: 1,
+        ceremony_burst: 3,
+        ..Limits::default()
+    })
+    .await;
+    let stranger = SoftwareAuthenticator::es256().unwrap();
+    let challenge = h.begin_sign_in().await;
+    let mut forged = landfall_approval::Ceremony::new(super::RP_ID, ORIGIN, &challenge);
+    forged.credential_id = Some(h.alice.credential_id().to_vec());
+    let answer = h
+        .post(
+            SIGN_IN_FINISH,
+            None,
+            &super::sign_in_ceremony_body(&stranger, &challenge, &forged),
+        )
+        .await;
+    assert_eq!(answer.code(), "sign_in_refused");
+    // The begin and the bad answer took two of three.
+    h.begin_sign_in().await;
+    let over = h.post(SIGN_IN_BEGIN, None, &json!({})).await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_refused_registration_with_a_good_invite_pays_for_itself() {
+    let h = Harness::with_limits(Limits {
+        ceremony_rate_per_second: 1,
+        ceremony_burst: 3,
+        ..Limits::default()
+    })
+    .await;
+    let code = h.invite("gina").await;
+    let key = SoftwareAuthenticator::es256().unwrap();
+    let challenge = h.begin_registration(&code).await;
+    let wrong =
+        landfall_approval::Ceremony::new(super::RP_ID, "https://elsewhere.example", &challenge);
+    let answer = h
+        .post(
+            super::REGISTER_FINISH,
+            None,
+            &super::attestation_body(&code, &key, &wrong),
+        )
+        .await;
+    assert_eq!(answer.code(), "registration_refused");
+    h.begin_registration(&code).await;
+    let over = h
+        .post(super::REGISTER_BEGIN, None, &json!({ "code": code }))
+        .await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// With no challenge waiting, a source over its allowance is told so before the database is asked.
+#[tokio::test]
+async fn a_code_with_no_challenge_costs_no_read_over_the_allowance() {
+    let h = Harness::with_limits(Limits {
+        ceremony_rate_per_second: 1,
+        ceremony_burst: 1,
+        ..Limits::default()
+    })
+    .await;
+    let body = json!({
+        "code": "0".repeat(64),
+        "attestation_object": "",
+        "client_data_json": "",
+    });
+    assert_eq!(
+        h.post(super::REGISTER_FINISH, None, &body).await.code(),
+        "invite_refused"
+    );
+    // Every connection is taken, so a read would wait, and this would run out of time. A closed
+    // database wouldn't show it, as the answer over the allowance is `429` whatever a read gave.
+    let pool = h.store.pool();
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let over = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.post(super::REGISTER_FINISH, None, &body),
+    )
+    .await
+    .expect("it asked the database");
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS, "{over:?}");
+}
+
+/// Paying before the read, it still pays only once.
+#[tokio::test]
+async fn a_good_code_with_no_challenge_pays_once() {
+    let h = Harness::with_limits(Limits {
+        ceremony_rate_per_second: 1,
+        ceremony_burst: 2,
+        ..Limits::default()
+    })
+    .await;
+    let code = h.invite("gina").await;
+    let body = json!({ "code": code, "attestation_object": "", "client_data_json": "" });
+    for _ in 0..2 {
+        let answer = h.post(super::REGISTER_FINISH, None, &body).await;
+        assert_eq!(answer.code(), "registration_refused", "{answer:?}");
+    }
+    let over = h.post(super::REGISTER_FINISH, None, &body).await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
 #[tokio::test]
 async fn a_full_table_answers_at_once_and_time_alone_empties_it() {
     let h = Harness::with_limits(Limits {

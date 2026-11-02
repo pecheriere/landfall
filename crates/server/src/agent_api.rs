@@ -79,15 +79,21 @@ pub struct Limits {
     /// can cost for as long as it lasts: one write transaction a second beside the agents'. A
     /// hostile caller's worst rows are one to two KiB, and superseding a request writes two a
     /// call, so that is some 80 to 170 MB of audit log a day, for each credential, until it is
-    /// revoked. A session takes a passkey to get and a principal keeps sixteen, which is the bound
-    /// on how many of those there can be. A principal's sign-ins, each with a verified assertion,
-    /// are charged at this rate too, on a budget of their own.
+    /// revoked. A principal keeps sixteen sessions, so sixteen times that, plus the burst of each
+    /// new one: a sign-in is a whole new bucket, which [`sign_in_burst`](Self::sign_in_burst) and
+    /// [`sign_in_refill_secs`](Self::sign_in_refill_secs) bound.
     pub principal_rate_per_second: u32,
     /// State changes one credential may ask for at once. A person signs a few approvals an
     /// hour, and a script asks for at most one release per deployment and then waits, as a
     /// deployment holds one open request: this leaves room for that across a large fleet, with
     /// retries, and refills in two minutes.
     pub principal_burst: u32,
+    /// Sign-ins one principal may make at once, each after a signature verified. A person signs
+    /// in a few times a day. Each one makes a new session with a whole burst above, so this and
+    /// the next are what a passkey in the wrong hands can buy with: 120 state changes for each.
+    pub sign_in_burst: u32,
+    /// How long, in seconds, a principal waits for one more sign-in once those are spent.
+    pub sign_in_refill_secs: u32,
     /// Beginnings of registration and sign-in, and failed finishes, one source may make each
     /// second, sustained. They have a bucket of their own, so that a flood of them leaves agents
     /// their nonces. A finish with a live challenge isn't charged. Behind a proxy, one source is
@@ -115,6 +121,8 @@ impl Default for Limits {
             max_sources: 4096,
             principal_rate_per_second: 1,
             principal_burst: 120,
+            sign_in_burst: 10,
+            sign_in_refill_secs: 300,
             ceremony_rate_per_second: 2,
             ceremony_burst: 30,
             max_sign_in_challenges: 65_536,
@@ -149,11 +157,7 @@ impl ApiState {
             .len()
             .saturating_add(config.approvers().len());
         Self {
-            budget: Arc::new(Mutex::new(Budget::new(
-                limits.principal_rate_per_second,
-                limits.principal_burst,
-                principals,
-            ))),
+            budget: Arc::new(Mutex::new(Budget::new(&limits, principals))),
             ceremonies: Arc::new(Mutex::new(Ceremonies::new(&limits))),
             store,
             config: Arc::new(config),
@@ -239,6 +243,15 @@ impl ApiState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .forget_sessions(ended);
+    }
+
+    /// How many sessions have a budget, for a test.
+    #[cfg(test)]
+    pub(crate) fn session_budgets(&self) -> usize {
+        self.budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .session_budgets()
     }
 
     /// Takes every count of dropped calls there is, to write down.

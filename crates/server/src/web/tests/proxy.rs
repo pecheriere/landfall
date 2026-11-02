@@ -21,12 +21,7 @@ async fn behind_a_proxy(limits: Limits) -> Harness {
         "{}\n[server]\ntrusted_proxies = [\"{PROXY}\"]\n",
         config_text(&alice)
     );
-    Harness::on(
-        Store::open_in_memory().await.unwrap(),
-        &text,
-        limits,
-        alice,
-    )
+    Harness::on(Store::open_in_memory().await.unwrap(), &text, limits, alice)
 }
 
 fn at(mut request: Request<Body>, peer: &str, forwarded: Option<&str>) -> Request<Body> {
@@ -116,18 +111,12 @@ async fn the_agent_apis_limit_goes_by_the_same_source() {
             Some(forwarded),
         )
     };
-    assert_eq!(
-        h.send(nonce("198.51.100.1")).await.status,
-        StatusCode::OK
-    );
+    assert_eq!(h.send(nonce("198.51.100.1")).await.status, StatusCode::OK);
     assert_eq!(
         h.send(nonce("198.51.100.1")).await.status,
         StatusCode::TOO_MANY_REQUESTS
     );
-    assert_eq!(
-        h.send(nonce("198.51.100.2")).await.status,
-        StatusCode::OK
-    );
+    assert_eq!(h.send(nonce("198.51.100.2")).await.status, StatusCode::OK);
 }
 
 /// What a failure's row names is the client, not the proxy.

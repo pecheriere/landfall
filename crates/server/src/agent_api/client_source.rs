@@ -35,20 +35,24 @@ fn client_source(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAddr]) -> IpAdd
     // Several headers are one list, in order, so the last is the nearest.
     let values: Vec<_> = headers.get_all(FORWARDED_FOR).iter().collect();
     for value in values.into_iter().rev() {
-        let Ok(text) = value.to_str() else {
-            return peer;
-        };
-        for entry in text.rsplit(',') {
-            let Ok(address) = entry.trim().parse::<IpAddr>() else {
+        // As bytes, entry by entry: what a client put left of the client's own entry is never
+        // reached, whatever it holds.
+        for entry in value.as_bytes().rsplit(|byte| *byte == b',') {
+            let Some(address) = forwarded_address(entry) else {
                 return peer;
             };
-            let address = address.to_canonical();
             if !trusted.contains(&address) {
                 return address;
             }
         }
     }
     peer
+}
+
+/// One entry of the header, as an address in its canonical form.
+fn forwarded_address(entry: &[u8]) -> Option<IpAddr> {
+    let address: IpAddr = std::str::from_utf8(entry).ok()?.trim().parse().ok()?;
+    Some(address.to_canonical())
 }
 
 /// Works out who a request is from. A request with no peer can only come from a test; such
@@ -154,9 +158,15 @@ mod tests {
         }
         // Left of the client it does no harm: anyone can send that.
         assert_eq!(source(PROXY, &["unknown, 198.51.100.7"]), ip(CLIENT));
-        let mut binary = HeaderMap::new();
-        binary.append(FORWARDED_FOR, HeaderValue::from_bytes(b"\xff").unwrap());
-        assert_eq!(client_source(ip(PROXY), &binary, &[ip(PROXY)]), ip(PROXY));
+        let binary = |bytes: &[u8]| {
+            let mut headers = HeaderMap::new();
+            headers.append(FORWARDED_FOR, HeaderValue::from_bytes(bytes).unwrap());
+            client_source(ip(PROXY), &headers, &[ip(PROXY)])
+        };
+        assert_eq!(binary(b"\xff"), ip(PROXY));
+        assert_eq!(binary(b"198.51.100.7, \xff"), ip(PROXY));
+        // A high byte left of the client is the same as any other text left of the client.
+        assert_eq!(binary(b"\xff, 198.51.100.7"), ip(CLIENT));
     }
 
     #[test]

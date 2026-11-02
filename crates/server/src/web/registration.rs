@@ -206,11 +206,27 @@ pub(super) async fn finish(
         Ok(sent) => sent,
         Err(problem) => return Err(charged(&state, &parts, problem)),
     };
+    let store = state.store();
+    let now = store.now()?;
+    // A code with no challenge waiting pays before the database is asked about it, so that going
+    // over the allowance costs no read. Each answer stays what it would be: `429` over it, and
+    // within it what the code and the table say below. Paying twice would be the only difference.
+    let live = PasskeyInvite::parse(&sent.code.0)
+        .is_some_and(|invite| state.ceremonies().has_registration(&invite.hash(), now));
+    if !live {
+        charge(&state, &parts)?;
+    }
+    let bill = |problem: HumanProblem| {
+        if live {
+            charged(&state, &parts, problem)
+        } else {
+            problem
+        }
+    };
     let (invite, principal) = match invite_of(&state, &parts, &sent.code.0).await {
         Ok(found) => found,
-        Err(problem) => return Err(charged(&state, &parts, problem)),
+        Err(problem) => return Err(bill(problem)),
     };
-    let store = state.store();
 
     let refuse = |reason: &'static str| {
         count_failure(
@@ -220,9 +236,8 @@ pub(super) async fn finish(
             FailureKind::Registration,
             reason,
         );
-        charged(&state, &parts, HumanProblem::RegistrationRefused)
+        bill(HumanProblem::RegistrationRefused)
     };
-    let now = store.now()?;
     let waiting = state.ceremonies().take_registration(&invite.hash(), now);
     let challenge = waiting
         .ok_or_else(|| refuse("no challenge is waiting for this invite: too late, or used"))?;
@@ -263,7 +278,7 @@ pub(super) async fn finish(
                 &NO_STORE,
             ))
         }
-        Redeemed::InviteGone => Err(charged(&state, &parts, HumanProblem::InviteRefused)),
+        Redeemed::InviteGone => Err(bill(HumanProblem::InviteRefused)),
         Redeemed::CredentialTaken => Err(refuse("another principal holds this credential id")),
     }
 }

@@ -56,13 +56,14 @@ use crate::auth::{
 use crate::store::SESSION_LIFETIME_SECS;
 
 /// An assertion at its limits, as an approval's body allows, and a challenge.
-const MAX_FINISH_BODY_BYTES: usize = 32 * 1024;
+pub(super) const MAX_FINISH_BODY_BYTES: usize = 32 * 1024;
 
 const _: () = assert!(MAX_CREDENTIAL_ID_LEN < MAX_FINISH_BODY_BYTES);
 
 /// A P-256 key checked against for a credential nobody knows, so that one takes the time of a
 /// real check. It is the curve's generator, whose private key is 1, so a signature by it proves
-/// nothing, and the result is never accepted: see [`check`].
+/// nothing, and the result is never accepted: see [`check`]. An Ed25519 credential's check takes
+/// a little less time than this, which only confirms an id the sender already has.
 pub(super) const NOBODYS_KEY: [u8; 77] = [
     0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20, 0x6b, 0x17, 0xd1, 0xf2, 0xe1, 0x2c,
     0x42, 0x47, 0xf8, 0xbc, 0xe6, 0xe5, 0x63, 0xa4, 0x40, 0xf2, 0x77, 0x03, 0x7d, 0x81, 0x2d, 0xeb,

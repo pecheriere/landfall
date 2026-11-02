@@ -547,9 +547,11 @@ written.
 The budget is what bounds a credential gone wrong, not a promise of a small log: one write
 transaction a second, with rows of one to two KiB from a hostile caller and two rows a call for
 a rollback that supersedes a request. That is **some 80 to 170 MB of audit log a day for each
-credential** until it is revoked. A session takes a passkey to get and a principal keeps sixteen, so
-a person's sessions come to at most sixteen times that, and each session ends within 12 hours.
-`access_throttled` and a jump in `request_refused`, `approval_refused` or `request_cancelled` rows
+credential** until it is revoked. A person's sessions come to at most sixteen times that, as a
+principal keeps sixteen, **plus 120 state changes for each sign-in spent,** since each new session
+starts with a whole budget. Sign-ins take a verified passkey, so nobody else can spend them, and a
+principal has ten at once, with one more every five minutes: some 288 a day, or about 35,000 more
+state changes, in the hands of someone holding that key. `access_throttled` and a jump in `request_refused`, `approval_refused` or `request_cancelled` rows
 are worth an alert.
 
 **A state change with a session and a bad `Origin`** is refused before it costs anything: it spends
