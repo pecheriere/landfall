@@ -48,7 +48,8 @@ async fn watch_repository<S: ReleaseSource>(
     let work = async {
         for index in rotated {
             let d = &config.deployments()[index];
-            match watch_deployment(&store, &config, source.as_ref(), d).await {
+            match watch_deployment(&store, &config, source.as_ref(), d, state.cooldown_start).await
+            {
                 Ok((done, stop)) => {
                     summary.add(done);
                     if let Some(stop) = stop {
@@ -167,7 +168,7 @@ pub async fn run<S: ReleaseSource>(
     interval: Duration,
     mut stop: watch::Receiver<bool>,
 ) {
-    let state = Arc::new(WatcherState::default());
+    let state = Arc::new(WatcherState::looking_every(interval));
     loop {
         let job = tokio::spawn({
             let (store, config, source, state) = (

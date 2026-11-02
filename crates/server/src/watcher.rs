@@ -14,7 +14,9 @@
 //! The controller only asks. The host verifies everything again and makes its own
 //! decision, so nothing here is what stops a bad release from running. It is what
 //! keeps the host from being asked: a claimed deploy blocks its host until it is
-//! reported, so only what the host can take is queued.
+//! reported, so only what the host can take is queued. A host that answers not now
+//! is asked again after a wait that grows with each answer; one that refuses is not
+//! asked again.
 
 mod backoff;
 mod source;
@@ -72,6 +74,13 @@ const BELOW_RUNNING_RETRY_SECS: i64 = 24 * 60 * 60;
 /// tries for one release.
 const NOTHING_CHANGED_TRIES: i64 = 3;
 
+/// The longest wait before asking a host again after it said not now, seconds. Long
+/// against the hour a host can take over one try, for which its other deployments
+/// wait: a release that will never verify takes a small part of the host's time.
+const DEFERRED_COOLDOWN_MAX_SECS: i64 = 6 * 60 * 60;
+
+const HOST_DEFERRED: &str =
+    "its host said not now, for the reason in its last deploy_finished; asked again after a wait";
 const NOT_REPORTED: &str = "its host has not reported this deployment yet";
 const RUNNING_TAG_UNREADABLE: &str = "the running tag does not match the deployment's tag pattern";
 const RATE_LIMITED: &str = "rate limited: waiting for the limit to lift";
@@ -184,6 +193,19 @@ fn classify(error: &ReleaseError) -> Failure {
     }
 }
 
+/// How long after the `count`th time a host said not now to ask it again, seconds:
+/// `start`, doubling each time, up to [`DEFERRED_COOLDOWN_MAX_SECS`]. There is no last
+/// try: the cause may pass at any time, and only the host can tell.
+fn deferred_cooldown(start: i64, count: i64) -> i64 {
+    let doublings = u32::try_from(count.saturating_sub(1)).unwrap_or(u32::MAX);
+    2_i64
+        .checked_pow(doublings)
+        .and_then(|factor| factor.checked_mul(start))
+        .map_or(DEFERRED_COOLDOWN_MAX_SECS, |wait| {
+            wait.min(DEFERRED_COOLDOWN_MAX_SECS)
+        })
+}
+
 /// Where a verified release came from, its text put through `bound`.
 fn origin_value(listed: &ListedTag, origin: &ReleaseOrigin, bound: fn(&str) -> String) -> Value {
     let attestation = &origin.attestation;
@@ -264,6 +286,8 @@ struct DeploymentWatch<'a, S> {
     holds: HashMap<String, Hold>,
     stored: HashMap<String, StoredRelease>,
     budget: usize,
+    /// The wait after a host's first "not now", seconds.
+    cooldown_start: i64,
     summary: TickSummary,
 }
 
@@ -457,24 +481,38 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
     }
 
     /// Why a release this deployment's rule would allow is not to be queued, from
-    /// what became of it here before.
-    fn history_says_no(&self, tag: &ReleaseTag, digest: &ImageDigest) -> Option<&'static str> {
+    /// what became of it here before. What is final comes first: a host's "not now"
+    /// only ever makes it wait, and never ends it.
+    fn history_says_no(
+        &self,
+        tag: &ReleaseTag,
+        digest: &ImageDigest,
+        now: i64,
+    ) -> Option<(ReleaseDecision, &'static str)> {
         let finished = self
             .view
             .finished
             .iter()
             .filter(|f| f.tag == tag.as_ref() && f.digest == digest.as_ref());
+        let refused = |reason| Some((ReleaseDecision::Refused, reason));
+        let mut deferred = None;
         for deploy in finished {
             match deploy.outcome.as_str() {
                 "nothing_changed" if deploy.count < NOTHING_CHANGED_TRIES => {}
-                "nothing_changed" => return Some("its deploys kept stopping before they began"),
-                "rolled_back" => return Some("it already rolled back on its host"),
-                "refused" => return Some("its host refused it"),
-                "deployed" => return Some("it was deployed before and is not running now"),
-                _ => return Some("its deploy failed on its host"),
+                "nothing_changed" => return refused("its deploys kept stopping before they began"),
+                "deferred" => deferred = Some(deploy),
+                "rolled_back" => return refused("it already rolled back on its host"),
+                "refused" => return refused("its host refused it"),
+                "deployed" => return refused("it was deployed before and is not running now"),
+                _ => return refused("its deploy failed on its host"),
             }
         }
-        None
+        deferred
+            .filter(|deploy| {
+                now.saturating_sub(deploy.last_finished_at)
+                    < deferred_cooldown(self.cooldown_start, deploy.count)
+            })
+            .map(|_| (ReleaseDecision::Deferred, HOST_DEFERRED))
     }
 
     /// The deployment the promotion of `tag` still waits for, if any: every
@@ -537,8 +575,8 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
                 return Ok((ReleaseDecision::Refused, refusal_reason(refusal).to_owned()));
             }
         };
-        if let Some(no) = self.history_says_no(tag, digest) {
-            return Ok((ReleaseDecision::Refused, no.to_owned()));
+        if let Some((no, why)) = self.history_says_no(tag, digest, self.store.now()?) {
+            return Ok((no, why.to_owned()));
         }
         if let Some(source) = self.promotion_waits_for(tag, digest).await? {
             let reason = format!(
@@ -744,6 +782,7 @@ async fn watch_deployment<S: ReleaseSource>(
     config: &Config,
     source: &S,
     d: &Deployment,
+    cooldown_start: i64,
 ) -> Result<(TickSummary, Option<Stop>), StoreError> {
     let mut summary = TickSummary::default();
     let id = d.id();
@@ -797,6 +836,7 @@ async fn watch_deployment<S: ReleaseSource>(
         holds,
         stored: store.releases_of(id).await?,
         budget: VERIFICATIONS_PER_TICK,
+        cooldown_start,
         summary,
     };
     let (autos, stopped) = watch.go_through(&releases).await?;

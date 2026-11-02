@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use landfall_core::ids::HostId;
+use landfall_core::ids::{DeploymentId, HostId};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::migrate::{MigrateError, Migration, MigrationType, Migrator};
@@ -256,6 +256,23 @@ fn prepare_private_file(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// A row of the audit log, as it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRow {
+    /// Its place in the log.
+    pub seq: i64,
+    /// When it was written, in unix seconds.
+    pub ts: i64,
+    /// What it records.
+    pub kind: String,
+    /// The deployment it is about, if any.
+    pub deployment: Option<String>,
+    /// The host it is about, if any.
+    pub host: Option<String>,
+    /// Its detail, which should be JSON.
+    pub detail: String,
+}
+
 /// The controller's database. Cloning shares the connections.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -412,10 +429,62 @@ impl Store {
         &self.pool
     }
 
-    /// Closes every connection; later use fails.
-    #[cfg(test)]
-    pub(crate) async fn close(&self) {
+    /// Closes every connection; later use fails. Closing the last one moves what is
+    /// in the write-ahead log into the main file. Waits for connections in use.
+    pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Writes a copy of the whole database to `dest`, a file that is empty or new, in
+    /// one read snapshot: a writer goes on meanwhile, and what it writes is not in
+    /// the copy.
+    ///
+    /// # Errors
+    /// [`StoreError::Database`] if the copy fails.
+    pub async fn vacuum_into(&self, dest: &str) -> Result<(), StoreError> {
+        sqlx::query("VACUUM INTO ?")
+            .bind(dest)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The newest `limit` rows of the audit log, of `deployment` if given, oldest of
+    /// them first, as they are: for looking at, not for trusting, which is what
+    /// [`verify_audit`](Self::verify_audit) is for. Text that isn't valid UTF-8 in a
+    /// tampered row comes out replaced.
+    ///
+    /// # Errors
+    /// [`StoreError::Database`] if the log cannot be read.
+    pub async fn audit_rows(
+        &self,
+        deployment: Option<&DeploymentId>,
+        limit: u32,
+    ) -> Result<Vec<AuditRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT seq, ts, CAST(kind AS BLOB), CAST(deployment AS BLOB), CAST(host AS BLOB),
+                    CAST(detail AS BLOB)
+             FROM audit_events
+             WHERE ?1 IS NULL OR deployment = ?1
+             ORDER BY seq DESC LIMIT ?2",
+        )
+        .bind(deployment.map(AsRef::<str>::as_ref))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
+        let mut read = Vec::with_capacity(rows.len());
+        for row in rows.iter().rev() {
+            read.push(AuditRow {
+                seq: row.try_get(0)?,
+                ts: row.try_get(1)?,
+                kind: text(row.try_get(2)?),
+                deployment: row.try_get::<Option<Vec<u8>>, _>(3)?.map(text),
+                host: row.try_get::<Option<Vec<u8>>, _>(4)?.map(text),
+                detail: text(row.try_get(5)?),
+            });
+        }
+        Ok(read)
     }
 
     /// Moves everything from the WAL into the main file, so copying that file

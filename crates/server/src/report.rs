@@ -157,6 +157,7 @@ impl BoundedReport {
                 rollback_reason,
             } => ("rollback_failed", Some(reason), Some(rollback_reason)),
             ReportedOutcome::Refused { reason } => ("refused", Some(reason), None),
+            ReportedOutcome::Deferred { reason } => ("deferred", Some(reason), None),
             // Only for `ReportedOutcome` being non-exhaustive: an outcome this
             // build does not know gets `bad_request` at parse. Agent and
             // controller are upgraded together.

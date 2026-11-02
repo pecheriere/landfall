@@ -300,6 +300,22 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        if matches!(
+            report.outcome,
+            "rolled_back" | "rollback_failed" | "failed_no_previous"
+        ) {
+            // The previous version has just been put back, and a poll may never have
+            // said so while it was happening. Time starts again; if it has drifted
+            // it stays unknown.
+            sqlx::query(
+                "UPDATE running_states SET healthy_since = ?
+                 WHERE deployment = ? AND healthy_since IS NOT NULL",
+            )
+            .bind(self.clock.now()?)
+            .bind(deployment.as_ref())
+            .execute(&mut *tx)
+            .await?;
+        }
         let tag: String = row.try_get("tag")?;
         let event = AuditEvent {
             kind: if report.refused {
@@ -416,13 +432,22 @@ impl Store {
         }
         let release_changed = old_tag != tag || old_digest != digest;
         let drift_changed = old_drift != state.drift;
-        let healthy_since = if tag.is_none() || state.drift {
+        // A rollback puts the previous version back: what it was seen to do before
+        // that doesn't speak for it now.
+        let rolling_back = matches!(
+            state.phase,
+            Phase::RollingBack | Phase::Restored | Phase::RolledBack
+        );
+        let healthy_since = if tag.is_none() || state.drift || rolling_back {
             None
         } else if release_changed || old_drift {
             Some(now)
         } else {
-            stored.as_ref().and_then(|s| s.healthy_since)
+            stored.as_ref().and_then(|s| s.healthy_since).or(Some(now))
         };
+        if release_changed && let Some(stored) = &stored {
+            keep_observed_health(tx, &state.deployment, stored).await?;
+        }
         let event = |kind, detail| AuditEvent {
             kind,
             deployment: Some(state.deployment.clone()),
@@ -484,6 +509,38 @@ struct StoredRunning {
     inconsistent: bool,
     healthy_since: Option<i64>,
     last_report: Option<i64>,
+}
+
+/// Keeps how long the release `stored` names was observed healthy, up to its last
+/// report, as another takes its place: the longest it ever was, should it have run
+/// more than once.
+async fn keep_observed_health(
+    connection: &mut SqliteConnection,
+    deployment: &DeploymentId,
+    stored: &StoredRunning,
+) -> Result<(), StoreError> {
+    let (Some(tag), Some(digest), Some(since), Some(last_report)) = (
+        stored.tag.as_deref(),
+        stored.digest.as_deref(),
+        stored.healthy_since,
+        stored.last_report,
+    ) else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO replaced_releases (deployment, host, tag, digest, healthy_secs)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (deployment, host, tag, digest) DO UPDATE SET
+             healthy_secs = max(healthy_secs, excluded.healthy_secs)",
+    )
+    .bind(deployment.as_ref())
+    .bind(&stored.host)
+    .bind(tag)
+    .bind(digest)
+    .bind(last_report.saturating_sub(since).max(0))
+    .execute(connection)
+    .await?;
+    Ok(())
 }
 
 /// The audit row for a signed report that was refused. `reason` is the

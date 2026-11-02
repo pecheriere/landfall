@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_idle_keep_alive_connection_is_dropped() {
+    async fn an_idle_connection_kept_open_is_dropped() {
         let server = start(options()).await;
         let mut stream = TcpStream::connect(server.addr).await.unwrap();
         stream

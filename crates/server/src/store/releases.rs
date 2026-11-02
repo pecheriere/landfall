@@ -16,6 +16,7 @@ use sqlx::Row as _;
 
 use super::deploys::{NewDeploy, parsed};
 use super::{Store, StoreError};
+use crate::agent_api::log;
 use crate::audit::{AuditEvent, EventKind};
 use crate::report::MAX_STORED_TEXT_CHARS;
 
@@ -38,6 +39,8 @@ pub enum ReleaseDecision {
     Manual,
     /// No deploy.
     Refused,
+    /// Its host said not now: asked again after a wait.
+    Deferred,
 }
 
 impl ReleaseDecision {
@@ -47,6 +50,7 @@ impl ReleaseDecision {
             Self::NeedsApproval => "needs_approval",
             Self::Manual => "manual",
             Self::Refused => "refused",
+            Self::Deferred => "deferred",
         }
     }
 
@@ -56,6 +60,7 @@ impl ReleaseDecision {
             "needs_approval" => Ok(Self::NeedsApproval),
             "manual" => Ok(Self::Manual),
             "refused" => Ok(Self::Refused),
+            "deferred" => Ok(Self::Deferred),
             _ => Err(StoreError::Corrupt("decision")),
         }
     }
@@ -164,6 +169,8 @@ pub struct FinishedDeploy {
     pub outcome: String,
     /// How many.
     pub count: i64,
+    /// When the last of them finished.
+    pub last_finished_at: i64,
 }
 
 /// What the store knows that bears on queueing a deployment's next release.
@@ -318,6 +325,13 @@ impl Store {
                 .await?;
         }
         tx.commit().await?;
+        if !unchanged {
+            log(&format!(
+                "decision: {deployment} {tag}: {}: {}",
+                decision.as_str(),
+                shown(reason)
+            ));
+        }
         Ok(())
     }
 
@@ -378,7 +392,8 @@ impl Store {
                 .bind(key)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if before.as_deref() == Some(stored.as_str()) {
+        let unchanged = before.as_deref() == Some(stored.as_str());
+        if unchanged {
             sqlx::query("UPDATE release_holds SET last_try = ? WHERE deployment = ? AND tag = ?")
                 .bind(now)
                 .bind(deployment.as_ref())
@@ -410,6 +425,10 @@ impl Store {
             self.append(&mut tx, &event).await?;
         }
         tx.commit().await?;
+        if !unchanged {
+            let what = tag.map_or("everything", AsRef::as_ref);
+            log(&format!("hold: {deployment} {what}: {}", shown(reason)));
+        }
         Ok(())
     }
 
@@ -454,7 +473,9 @@ impl Store {
         .fetch_optional(&mut *connection)
         .await?;
         let rows = sqlx::query(
-            "SELECT tag, digest, outcome, count(*) AS count FROM deploys
+            "SELECT tag, digest, outcome, count(*) AS count,
+                    COALESCE(max(finished_at), 0) AS last_finished_at
+             FROM deploys
              WHERE deployment = ? AND state = 'finished'
              GROUP BY tag, digest, outcome",
         )
@@ -469,6 +490,7 @@ impl Store {
                     digest: row.try_get("digest")?,
                     outcome: row.try_get("outcome")?,
                     count: row.try_get("count")?,
+                    last_finished_at: row.try_get("last_finished_at")?,
                 })
             })
             .collect::<Result<_, sqlx::Error>>()?;
@@ -518,8 +540,9 @@ impl Store {
     /// least `seconds`, by this controller's clock from what `host`, whose it is,
     /// reported: since it was first reported running, if it still is and its host
     /// has reported within [`REPORT_FRESH_SECS`]; or, if a later release has
-    /// replaced it, from its deploy finishing until that one's did. A host's word
-    /// is all this is: silence holds it back, and does not start the time again.
+    /// replaced it, for as long as it was observed healthy up to its last report
+    /// before that. A host's word is all this is: silence holds it back, does not
+    /// start the time again, and does not count.
     ///
     /// # Errors
     /// A clock or database failure.
@@ -554,11 +577,9 @@ impl Store {
                     && since.is_some_and(|since| now.saturating_sub(since) >= wanted));
             }
         }
-        let deployed = sqlx::query(
-            "SELECT id, finished_at FROM deploys
-             WHERE deployment = ? AND host = ? AND tag = ? AND digest = ?
-                 AND outcome = 'deployed'
-             ORDER BY id DESC LIMIT 1",
+        let observed: Option<i64> = sqlx::query_scalar(
+            "SELECT healthy_secs FROM replaced_releases
+             WHERE deployment = ? AND host = ? AND tag = ? AND digest = ?",
         )
         .bind(source.as_ref())
         .bind(host.as_ref())
@@ -566,21 +587,7 @@ impl Store {
         .bind(digest.as_ref())
         .fetch_optional(&self.pool)
         .await?;
-        let Some(deployed) = deployed else {
-            return Ok(false);
-        };
-        let id: i64 = deployed.try_get("id")?;
-        let started: i64 = deployed.try_get("finished_at")?;
-        let replaced: Option<i64> = sqlx::query_scalar(
-            "SELECT min(finished_at) FROM deploys
-             WHERE deployment = ? AND host = ? AND id > ? AND outcome = 'deployed'",
-        )
-        .bind(source.as_ref())
-        .bind(host.as_ref())
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(replaced.is_some_and(|ended| ended.saturating_sub(started) >= wanted))
+        Ok(observed.is_some_and(|secs| secs >= wanted))
     }
 }
 

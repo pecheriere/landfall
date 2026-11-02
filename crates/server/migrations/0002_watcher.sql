@@ -19,6 +19,18 @@ ALTER TABLE releases ADD COLUMN origin_refused INTEGER NOT NULL DEFAULT 0
 ALTER TABLE running_states ADD COLUMN healthy_since INTEGER;
 ALTER TABLE running_states ADD COLUMN last_report INTEGER;
 
+-- How long a release was observed healthy, from `healthy_since` up to its last
+-- report, the longest it ever was, kept when another release replaces it: what
+-- promotion goes by once it no longer runs.
+CREATE TABLE replaced_releases (
+    deployment   TEXT NOT NULL,
+    host         TEXT NOT NULL,
+    tag          TEXT NOT NULL,
+    digest       TEXT NOT NULL,
+    healthy_secs INTEGER NOT NULL,
+    PRIMARY KEY (deployment, host, tag, digest)
+) STRICT;
+
 -- Why something could not be decided yet, recorded once for as long as the reason
 -- stands: a tag whose material cannot be read, or, with `tag` empty, a whole
 -- deployment. `reason` is quoted and bounded. `slow` says it is retried on the

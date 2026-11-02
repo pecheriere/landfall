@@ -144,6 +144,90 @@ async fn a_deploy_that_never_started_is_tried_a_few_times() {
     assert_eq!(h.decision(PROD, "v1.2.4").await.0, "refused");
 }
 
+async fn deferred(h: &Harness) {
+    h.finish(
+        HOST,
+        ReportedOutcome::Deferred {
+            reason: "its clock is behind".to_owned(),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn not_now_is_asked_again_after_a_wait_that_grows_and_never_ends_it() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    assert_eq!(h.tick().await.queued.len(), 1);
+    let start = i64::try_from(TICK_INTERVAL.as_secs()).unwrap();
+
+    // Well past the tries a deploy that stopped short gets, and past the longest wait.
+    for count in 1..=8 {
+        deferred(&h).await;
+        let wait = (start << (count - 1)).min(DEFERRED_COOLDOWN_MAX_SECS);
+        assert_eq!(wait, deferred_cooldown(start, count));
+        assert_eq!(h.tick().await.queued, [], "just answered: try {count}");
+        let (decision, reason) = h.decision(PROD, "v1.2.4").await;
+        assert_eq!(decision, "deferred", "try {count}");
+        assert!(reason.contains("not now"), "{reason}");
+
+        h.clock.advance(wait - 1);
+        assert_eq!(h.tick().await.queued, [], "a second early: try {count}");
+        h.clock.advance(1);
+        assert_eq!(h.tick().await.queued.len(), 1, "due: try {count}");
+        assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+    }
+
+    // And when it goes, it is done.
+    h.finish(HOST, ReportedOutcome::Deployed {}).await;
+    h.report(PROD, HOST, Some("v1.2.4")).await;
+    assert_eq!(h.tick().await.queued, []);
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "refused");
+}
+
+#[tokio::test]
+async fn not_now_is_recorded_once_for_each_time_and_leaves_a_newer_release_free() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.tick().await;
+    deferred(&h).await;
+    h.tick().await;
+    h.tick().await;
+    let said: Vec<_> = h
+        .audit("rule_decision")
+        .await
+        .into_iter()
+        .filter(|row| row["decision"] == "deferred")
+        .collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(h.audit("deploy_refused").await.len(), 0, "this is no alert");
+
+    h.fake.tags(PROD, &["v1.2.4", "v1.2.5"]);
+    assert_eq!(h.tick().await.queued.len(), 1);
+    assert_eq!(h.deploys(PROD).await[1].0, "v1.2.5");
+}
+
+#[tokio::test]
+async fn a_refusal_after_not_now_is_final_whatever_came_before() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.tick().await;
+    deferred(&h).await;
+    h.clock.advance(DEFERRED_COOLDOWN_MAX_SECS);
+    h.tick().await;
+    h.finish(
+        HOST,
+        ReportedOutcome::Refused {
+            reason: "a failed signature".to_owned(),
+        },
+    )
+    .await;
+
+    h.clock.advance(DEFERRED_COOLDOWN_MAX_SECS);
+    assert_eq!(h.tick().await.queued, []);
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "refused");
+}
+
 #[tokio::test]
 async fn a_release_already_deployed_is_not_queued_again_before_the_host_says_so() {
     let h = Harness::running("v1.2.3").await;

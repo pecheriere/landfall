@@ -37,7 +37,7 @@ CREATE TABLE releases (
     tag        TEXT NOT NULL,
     commit_sha TEXT,
     digest     TEXT,
-    decision   TEXT NOT NULL CHECK (decision IN ('auto', 'needs_approval', 'manual', 'refused')),
+    decision   TEXT NOT NULL CHECK (decision IN ('auto', 'needs_approval', 'manual', 'refused', 'deferred')),
     reason     TEXT NOT NULL,
     seen_at    INTEGER NOT NULL,
     PRIMARY KEY (deployment, tag)

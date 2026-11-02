@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use landfall_origin::fetch::RateLimitReset;
 
-use super::REPO_DEADLINE;
+use super::{REPO_DEADLINE, TICK_INTERVAL};
 
 /// The first wait after a failure, seconds; it doubles with each one after.
 pub(super) const BACKOFF_START_SECS: i64 = 5 * 60;
@@ -30,20 +30,33 @@ pub struct WatcherState {
     /// Whose turn it is to go first in each repository, as a count of looks.
     turns: Mutex<HashMap<u64, usize>>,
     pub(super) repo_deadline: Duration,
+    /// The wait after a host's first "not now", seconds: one look's worth.
+    pub(super) cooldown_start: i64,
 }
 
 impl Default for WatcherState {
     fn default() -> Self {
-        Self::with_deadline(REPO_DEADLINE)
+        Self::looking_every(TICK_INTERVAL)
     }
 }
 
 impl WatcherState {
+    /// The default state but for how long a repository may take, for a test.
+    #[cfg(test)]
     pub(super) fn with_deadline(repo_deadline: Duration) -> Self {
+        Self {
+            repo_deadline,
+            ..Self::default()
+        }
+    }
+
+    /// The state of a watcher that looks every `interval`.
+    pub(super) fn looking_every(interval: Duration) -> Self {
         Self {
             backoffs: Mutex::default(),
             turns: Mutex::default(),
-            repo_deadline,
+            repo_deadline: REPO_DEADLINE,
+            cooldown_start: i64::try_from(interval.as_secs()).unwrap_or(i64::MAX),
         }
     }
 

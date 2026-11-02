@@ -468,6 +468,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
             "nonces",
             "release_holds",
             "releases",
+            "replaced_releases",
             "running_states"
         ]
     );

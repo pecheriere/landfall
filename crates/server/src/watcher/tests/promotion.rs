@@ -203,6 +203,7 @@ async fn promotion_counts_a_release_the_source_has_since_replaced() {
     h.finish(HOST, ReportedOutcome::Deployed {}).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.clock.advance(25 * 60 * 60);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.fake.tags(STAGING, &["v1.2.4", "v1.2.5"]);
     h.tick().await;
     h.finish(HOST, ReportedOutcome::Deployed {}).await;
@@ -215,4 +216,125 @@ async fn promotion_counts_a_release_the_source_has_since_replaced() {
     assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
     assert_eq!(h.decision(PROD, "v1.2.5").await.0, "manual");
     assert_eq!(h.deploys(PROD).await[0].0, "v1.2.4");
+}
+
+/// `v1.2.4` is deployed on staging, then replaced by `v1.2.5`; prod is asked about
+/// `v1.2.4` after `between` has run, between them.
+async fn replaced_after(between: impl AsyncFnOnce(&Harness)) -> Harness {
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.3")).await;
+    h.fake.tags(STAGING, &["v1.2.4"]);
+    h.tick().await;
+    h.finish(HOST, ReportedOutcome::Deployed {}).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    between(&h).await;
+    h.fake.tags(STAGING, &["v1.2.4", "v1.2.5"]);
+    h.tick().await;
+    h.finish(HOST, ReportedOutcome::Deployed {}).await;
+    h.report(STAGING, HOST, Some("v1.2.5")).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.tick().await;
+    h
+}
+
+#[tokio::test]
+async fn elapsed_time_is_no_promotion_for_a_release_replaced_after_going_quiet() {
+    let h = replaced_after(async |h| h.clock.advance(25 * 60 * 60)).await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "manual");
+    assert_eq!(h.deploys(PROD).await, []);
+}
+
+#[tokio::test]
+async fn elapsed_time_is_no_promotion_for_a_release_replaced_while_drifted() {
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.clock.advance(60 * 60);
+    let mut drifted = Harness::state_of(STAGING, Some("v1.2.4"));
+    drifted.drift = true;
+    h.report_state(HOST, drifted.clone()).await;
+    h.clock.advance(24 * 60 * 60);
+    h.report_state(HOST, drifted).await;
+    // Put right by a release that a deploy by hand brought, as far as this can tell.
+    h.report(STAGING, HOST, Some("v1.2.5")).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.tick().await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "manual");
+    assert_eq!(h.deploys(PROD).await, []);
+}
+
+#[tokio::test]
+async fn a_replaced_release_counts_what_it_was_seen_to_do_and_no_more() {
+    let h = replaced_after(async |h| {
+        h.clock.advance(24 * 60 * 60 - 1);
+        h.report(STAGING, HOST, Some("v1.2.4")).await;
+        h.clock.advance(60 * 60);
+    })
+    .await;
+    assert_eq!(
+        h.decision(PROD, "v1.2.4").await.0,
+        "manual",
+        "a second short"
+    );
+
+    let h = replaced_after(async |h| {
+        h.clock.advance(24 * 60 * 60);
+        h.report(STAGING, HOST, Some("v1.2.4")).await;
+    })
+    .await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_rollback_starts_the_time_again_for_what_it_put_back() {
+    // Heard of as it happens...
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.clock.advance(23 * 60 * 60);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    let mut rolling = Harness::state_of(STAGING, Some("v1.2.4"));
+    rolling.phase = Phase::RollingBack;
+    rolling.busy = true;
+    h.report_state(HOST, rolling).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.clock.advance(23 * 60 * 60);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await, [], "23 hours since it came back");
+    h.clock.advance(60 * 60);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+
+    // ...and known only by the report, the poll having missed it.
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.3")).await;
+    h.fake.tags(STAGING, &["v1.2.4"]);
+    h.clock.advance(24 * 60 * 60);
+    h.report(STAGING, HOST, Some("v1.2.3")).await;
+    h.tick().await;
+    h.finish(
+        HOST,
+        ReportedOutcome::RolledBack {
+            reason: "checks failed".to_owned(),
+        },
+    )
+    .await;
+    h.report(STAGING, HOST, Some("v1.2.3")).await;
+    let at: Option<i64> =
+        sqlx::query_scalar("SELECT healthy_since FROM running_states WHERE deployment = ?")
+            .bind(STAGING)
+            .fetch_one(h.store.pool())
+            .await
+            .unwrap();
+    assert_eq!(at, Some(h.store.now().unwrap()));
 }

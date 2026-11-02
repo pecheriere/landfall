@@ -4,18 +4,18 @@
 //! clap's own status).
 
 use std::ffi::OsString;
-use std::fs::DirBuilder;
+use std::fs::{DirBuilder, OpenOptions};
 use std::future::Future;
 use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use landfall_core::config::{self, Config, ConfigError};
-use landfall_core::ids::HostId;
+use landfall_core::ids::{DeploymentId, HostId};
 use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -23,9 +23,13 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
 use crate::agent_api::{ApiState, Limits};
+use crate::audit::AuditReport;
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 use crate::watcher::{self, LiveSource, ReleaseSource};
+
+/// How long stopping waits for the database's last connection to close.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -60,6 +64,11 @@ enum Command {
         #[command(subcommand)]
         command: AuditCommand,
     },
+    /// Write a whole copy of the database to a new file, private to this user, while
+    /// `serve` runs or not, verify the copy's audit log, and print the same JSON as
+    /// `audit verify` does for it. A copy of the database file alone is no backup: a
+    /// running controller's latest changes are in the file beside it.
+    Backup(BackupArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -70,6 +79,10 @@ enum AuditCommand {
     /// backup restored: keep the printed head elsewhere, and check later with
     /// `--at` that the log still holds that row with that hash.
     Verify(AuditVerifyArgs),
+    /// Print the newest rows of the audit log as JSON lines, oldest first, without
+    /// writing to the database: what was decided and held, and why. This reads the
+    /// log and does not check it, which is what `verify` is for.
+    Show(AuditShowArgs),
 }
 
 #[derive(Debug, Args)]
@@ -146,6 +159,34 @@ struct AuditVerifyArgs {
     at: Option<i64>,
 }
 
+#[derive(Debug, Args)]
+struct AuditShowArgs {
+    /// The database file, which must exist.
+    #[arg(long, value_name = "FILE")]
+    db: PathBuf,
+    /// Only the rows about this deployment.
+    #[arg(long, value_name = "ID")]
+    deployment: Option<DeploymentId>,
+    /// How many rows, the newest.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = 100,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct BackupArgs {
+    /// The database file, which must exist.
+    #[arg(long, value_name = "FILE")]
+    db: PathBuf,
+    /// The file to write, which must not exist.
+    #[arg(value_name = "DEST")]
+    dest: PathBuf,
+}
+
 /// Why a command could not run.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -208,6 +249,15 @@ pub enum CliError {
     /// The result could not be written to stdout.
     #[error("cannot write the result: {0}")]
     Output(#[source] io::Error),
+    /// The backup's file could not be created or completed. An existing one is
+    /// refused, and left as it is.
+    #[error("backup {}: {source}", .path.display())]
+    BackupFile {
+        /// The file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
 }
 
 fn load_config(path: &Path) -> Result<Config, CliError> {
@@ -302,6 +352,7 @@ async fn serve_watching<S: ReleaseSource>(
         stop_watching,
     ));
 
+    let closing = store.clone();
     let state = ApiState::new(store, config, Limits::default());
     let app = crate::router(state.clone());
     let shutdown = async move {
@@ -316,6 +367,15 @@ async fn serve_watching<S: ReleaseSource>(
     // Told to stop as the serving began to, it lets go at once. If the watcher
     // had already stopped, that was a panic and it was logged by the runtime.
     drop(watching.await);
+    // So that the main file holds everything. A request still running past the
+    // drain has its connection for a while yet, and stopping does not wait for that:
+    // the next start reads what is left in the write-ahead log.
+    if tokio::time::timeout(CLOSE_TIMEOUT, closing.close())
+        .await
+        .is_err()
+    {
+        crate::agent_api::log("the database did not close in time; it stays whole, with its -wal");
+    }
     Ok(EXIT_OK)
 }
 
@@ -327,20 +387,94 @@ async fn enrol_code(args: EnrolCodeArgs, out: &mut impl Write) -> Result<u8, Cli
             source,
         })?;
     let code = store.issue_enrol_code(&args.host, args.replace).await?;
+    store.close().await;
     writeln!(out, "{}", code.reveal()).map_err(CliError::Output)?;
+    Ok(EXIT_OK)
+}
+
+/// The JSON of `audit verify`, for the log `store` holds.
+fn verified_line(report: &AuditReport) -> serde_json::Value {
+    json!({
+        "rows": report.rows,
+        "empty": report.rows == 0,
+        "first_bad": report.first_bad,
+        "head_seq": report.head_seq,
+        "head_hash": report.head_hash,
+    })
+}
+
+async fn backup(args: BackupArgs, out: &mut impl Write) -> Result<u8, CliError> {
+    let dest_error = |source| CliError::BackupFile {
+        path: args.dest.clone(),
+        source,
+    };
+    // Read-only, so that it asks nothing of a controller that is running. First, so
+    // that a mistyped source leaves no file behind.
+    let source = Store::open_read_only(&args.db).await?;
+    let dest = args.dest.to_str().ok_or_else(|| {
+        dest_error(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path is not valid UTF-8",
+        ))
+    })?;
+    // Made here rather than by `SQLite`, to refuse what is there, whatever it holds
+    // and without following a link, and to be private from the start.
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&args.dest)
+        .map_err(dest_error)?;
+    let copied = source.vacuum_into(dest).await;
+    source.close().await;
+    if let Err(error) = copied {
+        // What was left is unfinished, and is this command's own.
+        drop(std::fs::remove_file(&args.dest));
+        return Err(error.into());
+    }
+    file.sync_all().map_err(dest_error)?;
+    let dir = args.dest.parent().filter(|dir| !dir.as_os_str().is_empty());
+    std::fs::File::open(dir.unwrap_or_else(|| Path::new(".")))
+        .and_then(|dir| dir.sync_all())
+        .map_err(dest_error)?;
+    let copy = Store::open_read_only(&args.dest).await?;
+    let report = copy.verify_audit().await;
+    copy.close().await;
+    let report = report?;
+    writeln!(out, "{}", verified_line(&report)).map_err(CliError::Output)?;
+    Ok(if report.first_bad.is_some() {
+        EXIT_TAMPERED
+    } else {
+        EXIT_OK
+    })
+}
+
+async fn audit_show(args: AuditShowArgs, out: &mut impl Write) -> Result<u8, CliError> {
+    let store = Store::open_read_only(&args.db).await?;
+    let rows = store
+        .audit_rows(args.deployment.as_ref(), args.limit)
+        .await?;
+    for row in rows {
+        // A detail that isn't JSON is a tampered row: shown as the text it is.
+        let detail = serde_json::from_str::<serde_json::Value>(&row.detail)
+            .unwrap_or(serde_json::Value::String(row.detail));
+        let line = json!({
+            "seq": row.seq,
+            "ts": row.ts,
+            "kind": row.kind,
+            "deployment": row.deployment,
+            "host": row.host,
+            "detail": detail,
+        });
+        writeln!(out, "{line}").map_err(CliError::Output)?;
+    }
     Ok(EXIT_OK)
 }
 
 async fn audit_verify(args: AuditVerifyArgs, out: &mut impl Write) -> Result<u8, CliError> {
     let store = Store::open_read_only(&args.db).await?;
     let report = store.verify_audit().await?;
-    let mut line = json!({
-        "rows": report.rows,
-        "empty": report.rows == 0,
-        "first_bad": report.first_bad,
-        "head_seq": report.head_seq,
-        "head_hash": report.head_hash,
-    });
+    let mut line = verified_line(&report);
     let mut row_missing = false;
     if let Some(seq) = args.at {
         let hash = store.audit_hash_at(seq).await?;
@@ -363,6 +497,10 @@ async fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
         Command::Audit {
             command: AuditCommand::Verify(args),
         } => audit_verify(args, out).await,
+        Command::Audit {
+            command: AuditCommand::Show(args),
+        } => audit_show(args, out).await,
+        Command::Backup(args) => backup(args, out).await,
     }
 }
 
@@ -615,6 +753,177 @@ mod tests {
         assert_eq!(execute(verify, &mut out).await.unwrap(), EXIT_TAMPERED);
         let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(printed["rows"], 1);
+        assert_eq!(printed["first_bad"], 1);
+    }
+
+    /// Runs `audit show` with `extra` and gives what it printed, row by row.
+    async fn shown_rows(db: &str, extra: &[&str]) -> Vec<serde_json::Value> {
+        let mut args = vec!["landfall-server", "audit", "show", "--db", db];
+        args.extend_from_slice(extra);
+        let mut out = Vec::new();
+        assert_eq!(execute(parse(&args), &mut out).await.unwrap(), EXIT_OK);
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn audit_show_prints_the_newest_rows_as_json_lines_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        let db = path.to_str().unwrap();
+        let store = Store::open(&path).await.unwrap();
+        for host in ["host-a", "host-b", "host-c"] {
+            let host: HostId = host.parse().unwrap();
+            store.issue_enrol_code(&host, false).await.unwrap();
+        }
+        let id: DeploymentId = "app/prod".parse().unwrap();
+        let host: HostId = "host-a".parse().unwrap();
+        store
+            .set_hold((&id, &host), None, "held\nfor a reason", false)
+            .await
+            .unwrap();
+        store.close().await;
+        let before = std::fs::read(&path).unwrap();
+
+        let all = shown_rows(db, &[]).await;
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0]["seq"], 1);
+        assert_eq!(all[0]["kind"], "enrol_code_issued");
+        assert_eq!(all[0]["host"], "host-a");
+        assert_eq!(all[3]["kind"], "release_held");
+        assert_eq!(all[3]["deployment"], "app/prod");
+        assert!(
+            all[3]["detail"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("for a reason")
+        );
+
+        let newest = shown_rows(db, &["--limit", "2"]).await;
+        assert_eq!(
+            newest.iter().map(|row| &row["seq"]).collect::<Vec<_>>(),
+            [3, 4],
+            "the newest, oldest first"
+        );
+        let held = shown_rows(db, &["--deployment", "app/prod"]).await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0]["seq"], 4);
+        assert!(
+            shown_rows(db, &["--deployment", "app/none"])
+                .await
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "read only");
+
+        assert!(
+            Cli::try_parse_from([
+                "landfall-server",
+                "audit",
+                "show",
+                "--db",
+                db,
+                "--limit",
+                "0"
+            ])
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_show_of_a_tampered_row_shows_what_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        let store = Store::open(&path).await.unwrap();
+        let host: HostId = "host-a".parse().unwrap();
+        store.issue_enrol_code(&host, false).await.unwrap();
+        sqlx::query("DROP TRIGGER audit_events_no_update")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE audit_events SET detail = CAST(x'6e6f7420ff6a736f6e' AS TEXT)")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.close().await;
+        let rows = shown_rows(path.to_str().unwrap(), &[]).await;
+        assert_eq!(rows[0]["detail"], "not \u{fffd}json");
+    }
+
+    #[tokio::test]
+    async fn a_backup_refuses_what_is_there_and_leaves_nothing_of_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        let store = Store::open(&path).await.unwrap();
+        let host: HostId = "host-a".parse().unwrap();
+        store.issue_enrol_code(&host, false).await.unwrap();
+
+        let dest = dir.path().join("backup.db");
+        let args = |dest: &Path| {
+            parse(&[
+                "landfall-server",
+                "backup",
+                "--db",
+                path.to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ])
+        };
+        let mut out = Vec::new();
+        assert_eq!(execute(args(&dest), &mut out).await.unwrap(), EXIT_OK);
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed["rows"], 1);
+        assert_eq!(printed["first_bad"], serde_json::Value::Null);
+
+        // Whatever is there, a backup, a file, an empty file or a link to one.
+        let before = std::fs::read(&dest).unwrap();
+        let error = execute(args(&dest), &mut Vec::new()).await.unwrap_err();
+        assert!(matches!(error, CliError::BackupFile { .. }), "{error}");
+        assert_eq!(std::fs::read(&dest).unwrap(), before);
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "").unwrap();
+        assert!(execute(args(&empty), &mut Vec::new()).await.is_err());
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+        let link = dir.path().join("link");
+        let aimed = dir.path().join("aimed");
+        std::os::unix::fs::symlink(&aimed, &link).unwrap();
+        assert!(execute(args(&link), &mut Vec::new()).await.is_err());
+        assert!(!aimed.exists());
+
+        // No source, and nothing is made.
+        let nothing = dir.path().join("nothing.db");
+        let missing = parse(&[
+            "landfall-server",
+            "backup",
+            "--db",
+            dir.path().join("typo.db").to_str().unwrap(),
+            nothing.to_str().unwrap(),
+        ]);
+        assert!(execute(missing, &mut Vec::new()).await.is_err());
+        assert!(!nothing.exists());
+        assert!(!dir.path().join("typo.db").exists());
+    }
+
+    #[tokio::test]
+    async fn a_backup_of_a_tampered_log_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller.db");
+        let store = Store::open(&path).await.unwrap();
+        let host: HostId = "host-a".parse().unwrap();
+        store.issue_enrol_code(&host, false).await.unwrap();
+        store.tamper_for_test().await;
+        let dest = dir.path().join("backup.db");
+        let args = parse(&[
+            "landfall-server",
+            "backup",
+            "--db",
+            path.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ]);
+        let mut out = Vec::new();
+        assert_eq!(execute(args, &mut out).await.unwrap(), EXIT_TAMPERED);
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(printed["first_bad"], 1);
     }
 
