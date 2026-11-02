@@ -223,8 +223,9 @@ To restore:
      | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
    ```
 
-3. **Put the backup in place.** Removing the other two files first matters: `SQLite` would apply a log
-   of the old database to the new.
+3. **Put the backup in place,** as the user the controller runs as, which must be able to open it.
+   Removing the other two files first matters: `SQLite` would apply a log of the old database to the
+   new.
 
    ```sh
    rm -f controller.db-wal controller.db-shm
@@ -259,6 +260,64 @@ To restore:
    in `[approvers]`.
 7. **Keep a new head.** Whatever happened since is gone from the log, so `audit verify --at` with a head
    kept since fails, as it should.
+
+**In its container,** these are the same steps with other commands. The image holds the one program and
+no shell, so `grep`, `rm` and the rest run on the host, on the directory mounted at `/data`. With `serve`
+stopped `docker exec` has nothing to run in, so each `landfall-server` command is a one-off container. The
+names here are those of [the run command above](#running-the-controller), and the backup is one made
+on the volume with `docker exec`:
+
+```sh
+# 1. Stop the agents, then the controller.
+docker stop landfall
+
+# 2. What was revoked since the backup.
+docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+  audit show --db /data/controller.db --limit 4294967295 \
+  | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
+
+# 3. The backup in place. `install`, as the container runs as uid 65532: a root-owned copy
+#    can't be opened, and every command says `unable to open database file`.
+sudo rm -f /srv/landfall/controller.db-wal /srv/landfall/controller.db-shm
+sudo install -o 65532 -g 65532 -m 0600 /srv/landfall/controller-2026-11-01.db /srv/landfall/controller.db
+
+# 4. Revoke those tokens again.
+grep '"kind":"token_revoked"' changed-since-backup.txt | sed -E 's/.*"token":([0-9]+).*/\1/' \
+  | while read -r id; do
+      docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+        token revoke --id "$id" --db /data/controller.db
+    done
+
+# 5. Start it, and then the agents.
+docker start landfall
+```
+
+If the old database is lost or you don't trust it, step 4 goes by the restored log, and new tokens need
+the file as well:
+
+```sh
+docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+  audit show --db /data/controller.db --limit 4294967295 \
+  | grep '"kind":"token_created"' | sed -E 's/.*"token":([0-9]+).*/\1/' \
+  | while read -r id; do
+      docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+        token revoke --id "$id" --db /data/controller.db
+    done
+docker run --rm -v /srv/landfall:/data -v /etc/landfall/fleet.toml:/fleet.toml:ro \
+  ghcr.io/pecheriere/landfall token create --principal ci --config /fleet.toml --db /data/controller.db
+```
+
+A backup from before an upgrade needs `serve` once before step 4. With no network and no published port,
+nothing can reach it meanwhile. It is ready when its log says `listening on`:
+
+```sh
+docker run -d --name landfall-upgrade --network none -v /srv/landfall:/data \
+  -v /etc/landfall/fleet.toml:/fleet.toml:ro ghcr.io/pecheriere/landfall \
+  serve --config /fleet.toml --db /data/controller.db --listen 127.0.0.1:8080
+docker logs landfall-upgrade
+docker stop landfall-upgrade
+docker rm landfall-upgrade
+```
 
 Deploy numbers start over from the backup, which hosts cope with:
 [a number goes with its release](#a-release-that-rolled-back-isnt-retried). Invites, requests and
