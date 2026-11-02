@@ -18,7 +18,8 @@
 //!   hasn't been refused or put on hold since. A tag the controller doesn't know, or
 //!   several runs for one tag, which the watcher records as a refusal, are all refused
 //!   alike. Only the watcher goes to the network: it enumerates a non-automatic release's
-//!   runs once, so a second run that came since is left for the host to refuse.
+//!   runs once, so a second run that came since is left for the host to refuse. Issue #30
+//!   tracks that, and cancelling a queued approved row, which nothing here can do.
 //! - what the rule says, with what runs now. `Refused` stays refused. A downgrade, the
 //!   manual rollback, takes the `rollback` grant; all else takes `request`. Whatever the
 //!   watcher recorded of it from its history doesn't count, since retrying a release that
