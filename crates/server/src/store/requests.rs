@@ -32,6 +32,8 @@ pub enum RequestState {
     Stale,
     /// It waited too long. Ask again.
     Expired,
+    /// Someone cancelled it, or a rollback took its place. Ask again.
+    Cancelled,
 }
 
 impl RequestState {
@@ -41,6 +43,7 @@ impl RequestState {
             "approved" => Ok(Self::Approved),
             "stale" => Ok(Self::Stale),
             "expired" => Ok(Self::Expired),
+            "cancelled" => Ok(Self::Cancelled),
             _ => Err(StoreError::Corrupt("request state")),
         }
     }
@@ -359,6 +362,41 @@ impl Store {
         .await?;
         let event = closing_event(EventKind::RequestStale, request, reason);
         self.append(tx, &event).await
+    }
+
+    /// Cancels `deployment`'s open request, or with `only` just that one if it is, with its
+    /// audit row naming who. Gives whether it ended one. `reason` is the controller's own
+    /// text.
+    ///
+    /// # Errors
+    /// A clock, database or audit failure, or [`StoreError::Corrupt`] for an unreadable
+    /// row.
+    pub async fn cancel_open_request(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        (deployment, only): (&DeploymentId, Option<i64>),
+        by: &Value,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE deploy_requests
+             SET state = 'cancelled', closed_at = ?, closed_reason = ?
+             WHERE deployment = ?3 AND state = 'awaiting_approval' AND (?4 IS NULL OR id = ?4)
+             RETURNING {COLUMNS}"
+        )))
+        .bind(self.clock.now()?)
+        .bind(reason)
+        .bind(deployment.as_ref())
+        .bind(only)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let mut event = closing_event(EventKind::RequestCancelled, &stored_request(&row)?, reason);
+        event.detail["by"] = by.clone();
+        self.append(tx, &event).await?;
+        Ok(true)
     }
 
     /// The request's state as of `tx`.

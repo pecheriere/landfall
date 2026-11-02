@@ -2,6 +2,7 @@
 
 mod approving;
 mod auditing;
+mod cancelling;
 mod concurrent;
 mod credentials;
 mod grants;

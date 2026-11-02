@@ -39,8 +39,9 @@ CREATE INDEX sessions_by_expiry ON sessions (expires_at);
 -- awaiting_approval -> stale, when the running digest moves away from expected_running,
 --                      or the release's record changes
 -- awaiting_approval -> expired, by the controller's clock
+-- awaiting_approval -> cancelled, by whoever may, or by a rollback that takes its place
 --
--- Nothing leaves the last three: asking again makes a new row with a new nonce.
+-- Nothing leaves the last four: asking again makes a new row with a new nonce.
 -- `expected_running` is NULL for a first deploy. `closed_reason` is the controller's own
 -- text.
 CREATE TABLE deploy_requests (
@@ -53,7 +54,7 @@ CREATE TABLE deploy_requests (
     expected_running TEXT,
     nonce            BLOB NOT NULL UNIQUE CHECK (length(nonce) = 32),
     state            TEXT NOT NULL
-        CHECK (state IN ('awaiting_approval', 'approved', 'stale', 'expired')),
+        CHECK (state IN ('awaiting_approval', 'approved', 'stale', 'expired', 'cancelled')),
     requested_by     TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
     expires_at       INTEGER NOT NULL,

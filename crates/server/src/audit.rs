@@ -97,6 +97,10 @@ pub enum EventKind {
     RequestStale,
     /// A request waited too long for an approver.
     RequestExpired,
+    /// A request was cancelled, by someone or by a rollback taking its place.
+    RequestCancelled,
+    /// A principal's cancelling of a request was refused.
+    CancelRefused,
 }
 
 impl EventKind {
@@ -129,6 +133,8 @@ impl EventKind {
             Self::ApprovalRefused => "approval_refused",
             Self::RequestStale => "request_stale",
             Self::RequestExpired => "request_expired",
+            Self::RequestCancelled => "request_cancelled",
+            Self::CancelRefused => "cancel_refused",
         }
     }
 }

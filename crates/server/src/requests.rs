@@ -1,5 +1,6 @@
 //! Asking for a deploy and approving one: `POST /api/v1/deployments/{id}/requests`,
-//! `GET /api/v1/approvals` and `POST /api/v1/approvals/{id}`.
+//! `GET /api/v1/approvals`, `POST /api/v1/approvals/{id}` and `POST
+//! /api/v1/approvals/{id}/cancel`.
 //!
 //! The controller carries an approval and can't make one. What it does here is keep the
 //! gate: who may ask, who may sign, and that what reaches a host was signed, by that
@@ -25,82 +26,42 @@
 //! - promotion, as the watcher goes by it, but for a rollback, which must not have to wait.
 //!   Promotion is the controller's alone to enforce. It is read just before the
 //!   transaction, as a store on one connection could not read it during one.
-//! - no other request open, no deploy active, and a host that can take it.
+//! - no other request open, no deploy active, and a host that can take it. A rollback by
+//!   someone with the `rollback` grant takes an open request's place, cancelling it in the
+//!   same transaction: nobody's forgotten or stolen request gets to stand in its way.
 //!
 //! Each refusal someone can be held to has an audit row, in the transaction of whatever
 //! else it changed. Handlers take a [`Principal`] first and read a body only after it may
 //! ask, so nobody else gets a body read.
 
+mod approving;
+mod asking;
+mod cancelling;
+
 use axum::Router;
 use axum::body::Body;
-use axum::extract::rejection::PathRejection;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::State;
+use axum::http::header;
 use axum::middleware;
 use axum::response::Response;
 use axum::routing::{any, get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use landfall_approval::{
-    Assertion, CoseKey, Expect, MAX_AUTHENTICATOR_DATA_BYTES, MAX_CLIENT_DATA_BYTES,
-    MAX_SIGNATURE_BYTES, verify,
-};
-use landfall_core::config::{Config, Deployment, MAX_CREDENTIAL_ID_LEN, Permission};
-use landfall_core::ids::{DeploymentId, HostId, ReleaseTag};
+use landfall_core::config::{Config, Deployment, Permission};
+use landfall_core::ids::{DeploymentId, HostId, PrincipalId, ReleaseTag};
 use landfall_core::intent::DeployIntent;
-use landfall_core::protocol::{Approval, AssertionText};
-use landfall_core::rule::{Decision, decide};
-use landfall_core::text::{quoted, shown};
-use semver::Version;
-use serde::{Deserialize, Serialize};
+use landfall_core::text::shown;
+use serde::Serialize;
 use serde_json::json;
 use sqlx::{Sqlite, Transaction};
 
 use crate::agent_api::{ApiProblem, ApiState, deadline, json as json_answer, read_body};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
-use crate::report::REFUSAL_SHOWN_CHARS;
-use crate::store::{
-    NewRequest, RequestSnapshot, RequestState, StoreError, StoredRequest, WatchedRunning,
-};
-use crate::watcher::promotion_waits_for;
+use crate::store::{RequestSnapshot, RequestState, StoreError, StoredRequest, WatchedRunning};
 
-/// A request is one tag, at most 128 bytes.
-const MAX_REQUEST_BODY_BYTES: usize = 1024;
-
-/// An assertion at the limits of every field, in base64url and JSON, leaves room in this.
-const MAX_APPROVAL_BODY_BYTES: usize = 32 * 1024;
-
-const _: () = assert!(
-    (MAX_CREDENTIAL_ID_LEN
-        + MAX_AUTHENTICATOR_DATA_BYTES
-        + MAX_CLIENT_DATA_BYTES
-        + MAX_SIGNATURE_BYTES)
-        .div_ceil(3)
-        * 4
-        + 1024
-        <= MAX_APPROVAL_BODY_BYTES
-);
-
-const NO_GRANT_TO_ASK: &str = "no grant lets this principal ask for this deployment";
-const NO_GRANT_TO_APPROVE: &str =
-    "no grant lets this principal approve here, and a token never can";
 const BAD_BODY: &str = "the body is not a valid request";
 const UNREADABLE_BODY: &str = "the body could not be read within its limits";
-
-/// `POST .../requests`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AskBody {
-    tag: ReleaseTag,
-}
-
-/// `POST /approvals/{id}`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApproveBody {
-    assertion: AssertionText,
-}
 
 /// A request, as a principal may see it, with what a passkey signs.
 #[derive(Debug, Serialize)]
@@ -110,7 +71,7 @@ struct RequestView<'a> {
     intent: &'a DeployIntent,
     challenge: String,
     state: &'static str,
-    requested_by: &'a landfall_core::ids::PrincipalId,
+    requested_by: &'a PrincipalId,
     created_at: i64,
     expires_at: i64,
     can_approve: bool,
@@ -267,212 +228,6 @@ fn ready_host(snapshot: &RequestSnapshot) -> Result<&WatchedRunning, Stop> {
     Ok(running)
 }
 
-/// Whether promotion holds this release back: not for a downgrade, the manual rollback.
-async fn promotion_holds(
-    state: &ApiState,
-    d: &Deployment,
-    tag: &ReleaseTag,
-    version: &Version,
-) -> Result<bool, StoreError> {
-    let store = state.store();
-    let running = store.watch_view(d.id(), d.host()).await?.running;
-    let running_version = running
-        .and_then(|running| running.tag)
-        .and_then(|running| d.origin().tags().parse_tag(&running).ok());
-    if running_version.is_some_and(|running| *version < running) {
-        return Ok(false);
-    }
-    let Some(digest) = store
-        .release(d.id(), tag)
-        .await?
-        .and_then(|release| release.digest)
-    else {
-        return Ok(false);
-    };
-    Ok(
-        promotion_waits_for(store, state.config(), d.id(), tag, &digest)
-            .await?
-            .is_some(),
-    )
-}
-
-/// Everything about a request but its nonce, judged in `tx`: the intent to record.
-async fn judge_request(
-    state: &ApiState,
-    tx: &mut Transaction<'_, Sqlite>,
-    principal: &Principal,
-    (d, tag, version): (&Deployment, &ReleaseTag, &Version),
-    nonce: [u8; 32],
-) -> Result<DeployIntent, Stop> {
-    let snapshot = state
-        .store()
-        .request_snapshot(tx, (d.id(), d.host(), tag))
-        .await?;
-    if snapshot.open_request {
-        return Err(refused(
-            HumanProblem::RequestOpen,
-            "the deployment already has a request waiting for an approver",
-        ));
-    }
-    if snapshot.active_deploy {
-        return Err(refused(
-            HumanProblem::DeploymentBusy,
-            "the deployment has a deploy queued or running",
-        ));
-    }
-    let running = ready_host(&snapshot)?;
-    let held = state.store().release_held(tx, d.id(), tag).await?;
-    let settled = snapshot
-        .release
-        .as_ref()
-        .filter(|release| !held && release.verified_under(state.config().hash()))
-        .and_then(|release| release.settled());
-    let Some((commit, digest)) = settled else {
-        return Err(refused(
-            HumanProblem::ReleaseNotVerified,
-            "no verified record of this release for this configuration",
-        ));
-    };
-    let running_version = match &running.tag {
-        None => None,
-        Some(running) => match d.origin().tags().parse_tag(running) {
-            Ok(version) => Some(version),
-            Err(_) => {
-                return Err(refused(
-                    HumanProblem::HostNotReady,
-                    "the running tag does not match the deployment's tag pattern",
-                ));
-            }
-        },
-    };
-    match decide(d.rule(), running_version.as_ref(), version) {
-        Decision::Refused(_) => {
-            return Err(refused(
-                HumanProblem::ReleaseRefused,
-                "the rule refuses this release",
-            ));
-        }
-        Decision::Auto | Decision::NeedsApproval | Decision::Manual => {}
-    }
-    let downgrade = running_version
-        .as_ref()
-        .is_some_and(|running| version < running);
-    let needs = if downgrade {
-        Permission::Rollback
-    } else {
-        Permission::Request
-    };
-    if !can(state.config(), principal, d.id(), needs) {
-        return Err(refused(
-            HumanProblem::Forbidden,
-            "no grant lets this principal ask for this: a lower version takes rollback, and \
-             any other takes request",
-        ));
-    }
-    Ok(DeployIntent {
-        deployment: d.id().clone(),
-        tag: tag.clone(),
-        commit: commit.clone(),
-        digest: digest.clone(),
-        expected_running: running.digest.clone(),
-        nonce,
-    })
-}
-
-/// `POST /api/v1/deployments/{name}/{stage}/requests`.
-async fn ask(
-    State(state): State<ApiState>,
-    principal: Principal,
-    path: Result<Path<(String, String)>, PathRejection>,
-    body: Body,
-) -> Result<Response, HumanProblem> {
-    let config = state.config();
-    let raw = path.map_or_else(|_| String::new(), |Path((a, b))| format!("{a}/{b}"));
-    let deployment = raw
-        .parse::<DeploymentId>()
-        .ok()
-        .and_then(|id| config.deployment(&id));
-    let subject = Subject {
-        kind: EventKind::RequestRefused,
-        deployment,
-        about: Some(&raw),
-        request: None,
-        tag: None,
-    };
-    let may_ask = |d: &&Deployment| {
-        can(config, &principal, d.id(), Permission::Request)
-            || can(config, &principal, d.id(), Permission::Rollback)
-    };
-    let Some(d) = deployment.filter(may_ask) else {
-        return Err(refuse_alone(
-            &state,
-            &principal,
-            subject,
-            visibility(config, &principal, deployment.map(Deployment::id)),
-            NO_GRANT_TO_ASK,
-        )
-        .await);
-    };
-    let asked: AskBody = match parsed_body(&state, body, MAX_REQUEST_BODY_BYTES).await {
-        Ok(asked) => asked,
-        Err((problem, why)) => {
-            return Err(refuse_alone(&state, &principal, subject, problem, why).await);
-        }
-    };
-    let tag = &asked.tag;
-    let subject = Subject {
-        tag: Some(tag),
-        ..subject
-    };
-    let Ok(version) = d.origin().tags().parse_tag(tag) else {
-        return Err(refuse_alone(
-            &state,
-            &principal,
-            subject,
-            HumanProblem::ReleaseNotVerified,
-            "the tag is not one of this deployment's releases",
-        )
-        .await);
-    };
-    if promotion_holds(&state, d, tag, &version).await? {
-        return Err(refuse_alone(
-            &state,
-            &principal,
-            subject,
-            HumanProblem::PromotionPending,
-            "not yet reported healthy for long enough where it is promoted from",
-        )
-        .await);
-    }
-    let mut nonce = [0; 32];
-    getrandom::fill(&mut nonce).map_err(StoreError::Random)?;
-    let store = state.store();
-    let now = store.now()?;
-    let mut tx = store.begin().await?;
-    store.expire_requests(&mut tx, now).await?;
-    match judge_request(&state, &mut tx, &principal, (d, tag, &version), nonce).await {
-        Ok(intent) => {
-            let request = NewRequest {
-                host: d.host(),
-                intent,
-                requested_by: principal.id(),
-                audited_by: principal.audited(),
-            };
-            let stored = store.insert_request(&mut tx, &request).await?;
-            tx.commit().await.map_err(StoreError::from)?;
-            let can_approve = can(config, &principal, d.id(), Permission::Approve);
-            let mut answer = json_answer(&view(&stored, can_approve), &no_store());
-            *answer.status_mut() = StatusCode::CREATED;
-            Ok(answer)
-        }
-        Err(Stop::Refused(refusal)) => {
-            refuse_in(&state, tx, &principal, subject, &refusal).await?;
-            Err(refusal.problem)
-        }
-        Err(Stop::Store(error)) => Err(error.into()),
-    }
-}
-
 /// A 403 for someone who may know this deployment exists, and for anyone else the same 404
 /// as for one that doesn't.
 fn visibility(
@@ -487,9 +242,47 @@ fn visibility(
     }
 }
 
+/// A request number as a path has it: plain digits with no leading zero, so that one
+/// request has one path.
+fn request_number(raw: &str) -> Option<i64> {
+    let canonical = !raw.starts_with('0') && raw.bytes().all(|b| b.is_ascii_digit());
+    canonical.then(|| raw.parse().ok()).flatten()
+}
+
+/// The request a path names, as it is now.
+async fn named_request(state: &ApiState, raw: &str) -> Result<Option<StoredRequest>, StoreError> {
+    match request_number(raw) {
+        Some(id) => state.store().request(id).await,
+        None => Ok(None),
+    }
+}
+
+/// Why this state can't be approved or cancelled, if it can't.
+fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
+    match state {
+        RequestState::AwaitingApproval => None,
+        RequestState::Approved => Some((
+            HumanProblem::RequestClosed,
+            "the request was already approved",
+        )),
+        RequestState::Stale => Some((
+            HumanProblem::RequestStale,
+            "what is running changed since the request was made",
+        )),
+        RequestState::Expired => Some((
+            HumanProblem::RequestExpired,
+            "no approver signed the request in time",
+        )),
+        RequestState::Cancelled => Some((
+            HumanProblem::RequestCancelled,
+            "the request was cancelled",
+        )),
+    }
+}
+
 /// `GET /api/v1/approvals`: what this principal may see that waits for an approver, each
 /// saying whether they could sign it. Changes nothing. A request past its time is left out
-/// here, and ended by the next write that comes to it.
+/// here, whether or not the next tick of the watcher has ended it yet.
 async fn list(
     State(state): State<ApiState>,
     principal: Principal,
@@ -508,236 +301,6 @@ async fn list(
     Ok(json_answer(&json!({ "approvals": views }), &no_store()))
 }
 
-/// Refuses an assertion that isn't this approver's over this intent's challenge, by what
-/// the host will check. The key is the configuration's: the one the host goes by.
-fn check_assertion(
-    config: &Config,
-    principal: &Principal,
-    intent: &DeployIntent,
-    text: &AssertionText,
-) -> Result<(), Refused> {
-    let refuse = |why: String| Refused {
-        problem: HumanProblem::AssertionRefused,
-        reason: quoted(&why, REFUSAL_SHOWN_CHARS),
-    };
-    let Some(settings) = config.approval() else {
-        return Err(Refused {
-            problem: HumanProblem::ApprovalsNotConfigured,
-            reason: "the configuration has no [approval] settings".to_owned(),
-        });
-    };
-    let Some(approver) = config.approver(principal.id()) else {
-        return Err(refuse(
-            "this principal has no key in [approvers]".to_owned(),
-        ));
-    };
-    let key = CoseKey::parse(approver.public_key()).map_err(|error| refuse(error.to_string()))?;
-    let assertion = Assertion::try_from(text).map_err(|error| refuse(error.to_string()))?;
-    verify(
-        &assertion,
-        &Expect {
-            key: &key,
-            credential_id: approver.credential_id(),
-            rp_id: settings.rp_id(),
-            origin: settings.origin(),
-            challenge: &intent.challenge(),
-        },
-    )
-    .map_err(|error| refuse(error.to_string()))
-}
-
-/// Why this state can't be approved, if it can't.
-fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
-    match state {
-        RequestState::AwaitingApproval => None,
-        RequestState::Approved => Some((
-            HumanProblem::RequestClosed,
-            "the request was already approved",
-        )),
-        RequestState::Stale => Some((
-            HumanProblem::RequestStale,
-            "what is running changed since the request was made",
-        )),
-        RequestState::Expired => Some((
-            HumanProblem::RequestExpired,
-            "no approver signed the request in time",
-        )),
-    }
-}
-
-/// Ends `request` as stale for `reason`, and says so to who tried it.
-async fn gone_stale(
-    state: &ApiState,
-    tx: &mut Transaction<'_, Sqlite>,
-    request: &StoredRequest,
-    reason: &str,
-) -> Result<(), Stop> {
-    state.store().stale_request(tx, request, reason).await?;
-    Err(refused(HumanProblem::RequestStale, reason))
-}
-
-/// All that could stop `request` from being approved, looked at in `tx`, whose lock is
-/// held from before the look until the commit: a host's report comes either before it,
-/// which this sees, or after it, and is about a deploy the host will judge for itself.
-async fn judge_approval(
-    state: &ApiState,
-    tx: &mut Transaction<'_, Sqlite>,
-    d: &Deployment,
-    request: &StoredRequest,
-) -> Result<(), Stop> {
-    let store = state.store();
-    store.expire_requests(tx, store.now()?).await?;
-    if let Some((problem, why)) = closed(store.request_state(tx, request.id).await?) {
-        return Err(refused(problem, why));
-    }
-    let intent = &request.intent;
-    if request.host != *d.host() {
-        return gone_stale(
-            state,
-            tx,
-            request,
-            "the deployment is on another host now, by the configuration",
-        )
-        .await;
-    }
-    let snapshot = store
-        .request_snapshot(tx, (d.id(), d.host(), &intent.tag))
-        .await?;
-    let same_release = snapshot
-        .release
-        .as_ref()
-        .and_then(|release| release.settled())
-        .is_some_and(|(commit, digest)| *commit == intent.commit && *digest == intent.digest);
-    if !same_release {
-        return gone_stale(
-            state,
-            tx,
-            request,
-            "the release's verified record changed after the request was made",
-        )
-        .await;
-    }
-    if let Some(running) = &snapshot.running
-        && running.digest != intent.expected_running
-    {
-        return gone_stale(
-            state,
-            tx,
-            request,
-            "the running digest moved after the request was made",
-        )
-        .await;
-    }
-    if snapshot.active_deploy {
-        return Err(refused(
-            HumanProblem::DeploymentBusy,
-            "the deployment has a deploy queued or running",
-        ));
-    }
-    ready_host(&snapshot)?;
-    Ok(())
-}
-
-/// `POST /api/v1/approvals/{id}`.
-async fn approve(
-    State(state): State<ApiState>,
-    principal: Principal,
-    path: Result<Path<String>, PathRejection>,
-    body: Body,
-) -> Result<Response, HumanProblem> {
-    let config = state.config();
-    let store = state.store();
-    let raw = path.map_or_else(|_| String::new(), |Path(raw)| raw);
-    let stored = match raw.parse::<i64>() {
-        Ok(id) if id > 0 => store.request(id).await?,
-        _ => None,
-    };
-    let deployment = stored
-        .as_ref()
-        .and_then(|request| config.deployment(&request.intent.deployment));
-    let subject = Subject {
-        kind: EventKind::ApprovalRefused,
-        deployment,
-        about: stored.is_none().then_some(raw.as_str()),
-        request: stored.as_ref().map(|request| request.id),
-        tag: stored.as_ref().map(|request| &request.intent.tag),
-    };
-    let allowed = deployment.filter(|d| can(config, &principal, d.id(), Permission::Approve));
-    let (Some(request), Some(d)) = (&stored, allowed) else {
-        return Err(refuse_alone(
-            &state,
-            &principal,
-            subject,
-            visibility(config, &principal, deployment.map(Deployment::id)),
-            NO_GRANT_TO_APPROVE,
-        )
-        .await);
-    };
-    // A clear answer for what's over, whatever came with the asking. The transaction below
-    // looks again, and is what counts.
-    if let Some((problem, why)) = closed(request.state) {
-        return Err(refuse_alone(&state, &principal, subject, problem, why).await);
-    }
-    let sent: ApproveBody = match parsed_body(&state, body, MAX_APPROVAL_BODY_BYTES).await {
-        Ok(sent) => sent,
-        Err((problem, why)) => {
-            return Err(refuse_alone(&state, &principal, subject, problem, why).await);
-        }
-    };
-    if let Err(refusal) = check_assertion(config, &principal, &request.intent, &sent.assertion) {
-        return Err(refuse_alone(
-            &state,
-            &principal,
-            subject,
-            refusal.problem,
-            &refusal.reason,
-        )
-        .await);
-    }
-    let approval = Approval {
-        intent: request.intent.clone(),
-        assertion: sent.assertion,
-    };
-    let mut tx = store.begin().await?;
-    match approve_in(&state, &mut tx, &principal, d, request, &approval).await {
-        Ok(deploy_id) => {
-            tx.commit().await.map_err(StoreError::from)?;
-            store.wake_agents();
-            Ok(json_answer(
-                &json!({ "request": request.id, "deploy_id": deploy_id }),
-                &no_store(),
-            ))
-        }
-        Err(Stop::Refused(refusal)) => {
-            refuse_in(&state, tx, &principal, subject, &refusal).await?;
-            Err(refusal.problem)
-        }
-        Err(Stop::Store(error)) => Err(error.into()),
-    }
-}
-
-/// The judgement and the conditional update that follows from it.
-async fn approve_in(
-    state: &ApiState,
-    tx: &mut Transaction<'_, Sqlite>,
-    principal: &Principal,
-    d: &Deployment,
-    request: &StoredRequest,
-    approval: &Approval,
-) -> Result<landfall_core::protocol::DeployId, Stop> {
-    judge_approval(state, tx, d, request).await?;
-    let queued = state
-        .store()
-        .approve_request(tx, request, principal.id(), approval)
-        .await?;
-    queued.ok_or_else(|| {
-        refused(
-            HumanProblem::RequestClosed,
-            "the request was already approved",
-        )
-    })
-}
-
 async fn not_found() -> HumanProblem {
     HumanProblem::NotFound
 }
@@ -750,9 +313,13 @@ async fn method_not_allowed() -> HumanProblem {
 pub(crate) fn router(state: ApiState) -> Router {
     let limit = state.limits().request_timeout;
     Router::new()
-        .route("/api/v1/deployments/{name}/{stage}/requests", post(ask))
+        .route(
+            "/api/v1/deployments/{name}/{stage}/requests",
+            post(asking::ask),
+        )
         .route("/api/v1/approvals", get(list))
-        .route("/api/v1/approvals/{id}", post(approve))
+        .route("/api/v1/approvals/{id}", post(approving::approve))
+        .route("/api/v1/approvals/{id}/cancel", post(cancelling::cancel))
         .route("/api/v1", any(not_found))
         .route("/api/v1/", any(not_found))
         .route("/api/v1/{*rest}", any(not_found))

@@ -38,6 +38,8 @@ pub(crate) enum HumanProblem {
     RequestExpired,
     /// The request was already approved.
     RequestClosed,
+    /// The request was cancelled: ask again.
+    RequestCancelled,
     /// The assertion isn't one by this principal for this request's intent.
     AssertionRefused,
     /// The configuration has no `[approval]`.
@@ -117,6 +119,11 @@ impl HumanProblem {
                 conflict,
                 "request_closed",
                 "this request was already approved",
+            ),
+            Self::RequestCancelled => (
+                conflict,
+                "request_cancelled",
+                "this request was cancelled; ask again for a new one",
             ),
             Self::AssertionRefused => (
                 StatusCode::FORBIDDEN,
