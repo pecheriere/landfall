@@ -1,6 +1,5 @@
-use super::{CHALLENGE, ORIGIN, ceremony, each_key};
-use crate::wire;
-use crate::{AssertionError, ClientDataError};
+use super::{CHALLENGE, ORIGIN, authenticators, ceremony, each_key, verify_as};
+use crate::{AssertionError, ClientDataError, client_data, wire};
 
 fn client_error(result: Result<(), AssertionError>) -> ClientDataError {
     match result {
@@ -271,6 +270,57 @@ fn a_refusal_names_what_was_expected_and_found() {
     });
 }
 
+/// These refusals are the journalled signal of a controller lying: two origins that
+/// differ must read differently, however late they differ.
+#[test]
+fn origins_differing_after_character_64_give_different_refusals() {
+    let origin = |last: char| format!("https://{}{last}.example", "a".repeat(60));
+    let (first, second) = (origin('x'), origin('y'));
+    assert_eq!(first[..68], second[..68]);
+
+    // As what was found.
+    for (found, other) in [(&first, &second), (&second, &first)] {
+        let mut c = ceremony();
+        c.origin.clone_from(found);
+        each_key(&c, |result| {
+            let text = result.unwrap_err().to_string();
+            assert!(text.contains(found.as_str()), "{text}");
+            assert!(!text.contains(other.as_str()), "{text}");
+        });
+    }
+
+    // As what was expected.
+    let refusal = |expected: &str| {
+        let json = honest_with("");
+        client_data::check(
+            &json,
+            &client_data::Expected {
+                kind: "webauthn.get",
+                challenge: &CHALLENGE,
+                origin: expected,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+    };
+    assert_ne!(refusal(&first), refusal(&second));
+}
+
+#[test]
+fn a_type_differing_after_character_64_gives_a_different_refusal() {
+    let kind = |last: char| format!("{}{last}", "a".repeat(70));
+    let refusal = |found: String| {
+        let mut c = ceremony();
+        c.kind = Some(found);
+        let authenticator = authenticators().into_iter().next().unwrap();
+        let assertion = authenticator.assertion(&c).unwrap();
+        verify_as(&authenticator, &assertion)
+            .unwrap_err()
+            .to_string()
+    };
+    assert_ne!(refusal(kind('x')), refusal(kind('y')));
+}
+
 #[test]
 fn hostile_text_is_quoted_and_truncated_in_errors() {
     let long = format!(
@@ -278,10 +328,20 @@ fn hostile_text_is_quoted_and_truncated_in_errors() {
         "x".repeat(10_000)
     );
     let mut c = ceremony();
-    c.origin = long;
+    c.origin.clone_from(&long);
     each_key(&c, |result| {
         let text = result.unwrap_err().to_string();
-        assert!(text.len() < 300, "{}", text.len());
+        assert!(text.len() < 400, "{}", text.len());
+        assert!(!text.contains('\n'), "{text}");
+        assert!(!text.contains('\u{202e}'), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+    });
+    let mut c = ceremony();
+    c.kind = Some(long);
+    each_key(&c, |result| {
+        let text = result.unwrap_err().to_string();
+        assert!(text.contains("type"), "{text}");
+        assert!(text.len() < 400, "{}", text.len());
         assert!(!text.contains('\n'), "{text}");
         assert!(!text.contains('\u{202e}'), "{text}");
         assert!(!text.contains('\u{1b}'), "{text}");

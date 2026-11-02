@@ -21,7 +21,8 @@ use super::{
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
 use crate::text::quoted;
 
-/// How much of a TOML message is kept: enough for its list of what was expected.
+/// How much of a TOML message is kept, in characters before escaping: enough for its list
+/// of what was expected.
 const TOML_MESSAGE_CHARS: usize = 200;
 
 /// What's wrong and on which line. Never the error's own text, which shows the line, and

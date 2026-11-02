@@ -39,7 +39,7 @@ pub use signer::SignerKey;
 use thiserror::Error;
 
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
-use crate::text::{quoted, shown};
+use crate::text::quoted;
 
 #[cfg(test)]
 mod tests;
@@ -50,8 +50,20 @@ mod raw;
 
 mod signer;
 
-/// How much of what a key check says is kept.
+/// How much of a value from the file an error keeps, in characters before escaping. Less
+/// than an approver's Ed25519 key, 56 characters of base64url, so that one put in the
+/// wrong field doesn't print whole.
+const VALUE_CHARS: usize = 48;
+
+/// How much of what a key check says is kept, in characters before escaping.
 const REASON_CHARS: usize = 200;
+
+/// A value written in the file or given as an identifier, escaped and capped for an
+/// error, for configuration and identifier errors. Elsewhere,
+/// [`shown`](crate::text::shown) keeps more.
+pub(crate) fn shown_in_config(text: &str) -> String {
+    quoted(text, VALUE_CHARS)
+}
 
 /// Why a configuration file was refused. Every variant names the deployment
 /// (or section) and the offending value, escaped and bounded.
@@ -68,7 +80,7 @@ pub enum ConfigError {
     #[error("configuration is not valid: {0}")]
     Toml(String),
     /// A field has a malformed value.
-    #[error("deployment {deployment}: {field} {} is invalid: {reason}", shown(.value))]
+    #[error("deployment {deployment}: {field} {} is invalid: {reason}", shown_in_config(.value))]
     Invalid {
         /// The deployment the value belongs to.
         deployment: DeploymentId,
@@ -105,7 +117,7 @@ pub enum ConfigError {
     )]
     MissingApproval,
     /// `approval.origin` is not an origin as a browser writes it.
-    #[error("approval.origin {}: {reason}", shown(.origin))]
+    #[error("approval.origin {}: {reason}", shown_in_config(.origin))]
     InvalidApprovalOrigin {
         /// The value in the file.
         origin: String,
@@ -115,8 +127,8 @@ pub enum ConfigError {
     /// `approval.rp_id` is not exactly the hostname of `approval.origin`.
     #[error(
         "approval.rp_id {} must be exactly the hostname of approval.origin, {}",
-        shown(.rp_id),
-        shown(.host)
+        shown_in_config(.rp_id),
+        shown_in_config(.host)
     )]
     RpIdNotOriginHost {
         /// The value in the file.
@@ -269,7 +281,7 @@ pub enum ConfigError {
     /// Rule 8: two deployments use the same compose directory on one host.
     #[error(
         "deployment {deployment}: compose directory {} on host {host} is already used by {other}",
-        shown(.dir)
+        shown_in_config(.dir)
     )]
     DuplicateComposeDir {
         /// The later deployment.

@@ -1,19 +1,17 @@
 //! Showing untrusted text in error messages.
 
-/// How much of a value [`shown`] keeps. Less than an approver's Ed25519 key, 56
-/// characters of base64url, so that one put in the wrong field doesn't print whole.
-pub const SHOWN_CHARS: usize = 48;
-
 /// Quotes `text` for an error message (Rust debug quoting, so control
-/// characters are escaped), shortened to [`SHOWN_CHARS`] followed by `...` so
+/// characters are escaped), shortened to 64 characters followed by `...` so
 /// a hostile value cannot flood a log line.
 #[must_use]
 pub fn shown(text: &str) -> String {
-    quoted(text, SHOWN_CHARS)
+    quoted(text, 64)
 }
 
 /// Quotes `text` as [`shown`] does, shortened to `max_chars` characters: for
-/// keeping untrusted text where more of it is worth the room.
+/// keeping untrusted text where more of it is worth the room. The count is taken
+/// before escaping, so the result is bounded but can be longer: a character can
+/// escape to as many as 10 bytes.
 #[must_use]
 pub fn quoted(text: &str, max_chars: usize) -> String {
     let cut: String = text.chars().take(max_chars).collect();
@@ -38,8 +36,8 @@ mod tests {
     fn quotes_escapes_and_truncates() {
         assert_eq!(shown("tree"), "\"tree\"");
         assert_eq!(shown("a\nb"), "\"a\\nb\"");
-        let long = "x".repeat(49);
-        assert_eq!(shown(&long), format!("\"{}\"...", "x".repeat(48)));
-        assert_eq!(shown(&long[..48]), format!("\"{}\"", "x".repeat(48)));
+        let long = "x".repeat(65);
+        assert_eq!(shown(&long), format!("\"{}\"...", "x".repeat(64)));
+        assert_eq!(shown(&long[..64]), format!("\"{}\"", "x".repeat(64)));
     }
 }

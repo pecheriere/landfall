@@ -10,6 +10,11 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::wire;
 
+/// How much of a type or an origin a refusal keeps, in characters before escaping. These
+/// refusals are the journalled signal of a controller lying, so two different values have
+/// to read differently, more than [`shown`]'s length allows.
+const SHOWN_IN_FULL_CHARS: usize = 255;
+
 /// Why client data was refused. Found values are quoted and truncated: they come
 /// from whoever sent the assertion.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -132,8 +137,8 @@ pub(crate) fn check(
 
     if data.kind != expected.kind {
         return Err(ClientDataError::Type {
-            expected: shown(expected.kind),
-            found: shown(&data.kind),
+            expected: quoted(expected.kind, SHOWN_IN_FULL_CHARS),
+            found: quoted(&data.kind, SHOWN_IN_FULL_CHARS),
         });
     }
     let challenge = wire::encode(expected.challenge);
@@ -145,8 +150,8 @@ pub(crate) fn check(
     }
     if data.origin != expected.origin {
         return Err(ClientDataError::Origin {
-            expected: shown(expected.origin),
-            found: shown(&data.origin),
+            expected: quoted(expected.origin, SHOWN_IN_FULL_CHARS),
+            found: quoted(&data.origin, SHOWN_IN_FULL_CHARS),
         });
     }
     if data.cross_origin == Some(true) {
