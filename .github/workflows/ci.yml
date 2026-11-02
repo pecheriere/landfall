@@ -87,6 +87,9 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
       - name: Lint and test the CI scripts
+        env:
+          # Without this, the test that parses the Homebrew formula skips where there's no ruby.
+          LANDFALL_TEST_REQUIRE_RUBY: "1"
         run: |
           python3 -m venv "$RUNNER_TEMP/lint"
           "$RUNNER_TEMP/lint/bin/pip" install --quiet --require-hashes --only-binary :all: \

@@ -75,6 +75,11 @@ running, and an agent can explain why in one API call.
 - Release workflows of consumed repos need nothing unusual
   (signed `v*` tags, image pushed to GHCR, `attest-build-provenance` with `push-to-registry: true` on
   the multi-arch index digest).
+- landfall's own releases add to that: static `landfall-agent` and `landfall` binaries are
+  release assets, every file a subject of one build-provenance attestation, attached as an
+  asset, and a tag is proved against the project's own key before anyone approves. This is
+  what `landfall host install` trusts, and it doesn't change what a deployment requires:
+  `origin.signed_tags` stays optional.
 
 ## 4. Architecture
 

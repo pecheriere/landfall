@@ -1,8 +1,13 @@
 name: Release
 
+# A signed tag on main publishes attested binaries and an attested image. A manual run builds and
+# checks everything the same way, with no cache, and stops before `publish`: it attests nothing
+# and writes nothing to the transparency log, so it is how to find a problem before a tag spends
+# a version number. CONTRIBUTING.md has the whole procedure.
 on:
   push:
     tags: ['v[0-9]*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -44,18 +49,222 @@ jobs:
     permissions:
       contents: read
 
-  publish:
-    needs: [on-main, crate-age, ci]
+  # So a lightweight tag, or one signed by another key, costs a tag number and nothing else: this
+  # fails before anyone is asked to approve. It reads the signers from the tagged commit, and a
+  # file with no key in it refuses every tag.
+  preflight:
+    if: github.event_name == 'push'
+    needs: on-main
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Prove the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -I .github/scripts/release_preflight.py
+          --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+
+  # GitHub silently creates a missing environment with no protection, so `publish` needs this to
+  # have read the real one. A 404 fails `gh api`, and pipefail, from `shell: bash`, fails the step.
+  environment-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read # to read the environment
+      contents: read # for the checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Refuse an environment that holds nothing back
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/release" |
+            python3 -I .github/scripts/check_environment.py
+
+  build-linux:
+    needs: on-main
+    runs-on: ubuntu-latest
+    # About what a cold build of all three takes in ci.yml, with room. No cache, on purpose.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # The same reference as .github/buildkit/Dockerfile, which a test checks.
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+          cache-binary: false
+      - name: Build the static binaries
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: binaries
+          platforms: linux/arm64,linux/amd64
+          outputs: type=local,dest=dist
+          provenance: false
+          sbom: false
+          push: false
+      - name: Check the static binaries
+        run: python3 -I .github/scripts/check_binaries.py dist
+      # The artifact's root is dist/, so it holds linux_arm64/ and linux_amd64/.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-linux
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
+
+  build-macos:
+    needs: on-main
+    # A version, not macos-latest: the label moves between OS releases. These are arm64.
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      # rust-toolchain.toml's 1.99 would float to the newest patch.
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+      - run: cargo build --release --locked -p landfall-cli --target aarch64-apple-darwin
+      # A single file's parent is the artifact's root, so it holds just `landfall`.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-macos
+          path: target/aarch64-apple-darwin/release/landfall
+          retention-days: 7
+          if-no-files-found: error
+
+  # The only run the release's own files get on a real kernel of each kind, before anyone is asked.
+  smoke:
+    needs: [build-linux, build-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: binaries-linux
+            binaries: linux_amd64/landfall linux_amd64/landfall-agent
+          - runner: ubuntu-24.04-arm
+            artifact: binaries-linux
+            binaries: linux_arm64/landfall linux_arm64/landfall-agent
+          - runner: macos-26
+            artifact: binaries-macos
+            binaries: landfall
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: binaries
+      - name: Run each native binary, and on a tag compare its version with the tag
+        shell: bash
+        env:
+          BINARIES: ${{ matrix.binaries }}
+        run: |
+          for binary in $BINARIES; do
+            # Artifacts lose the executable bit.
+            chmod +x "binaries/$binary"
+            actual=$("binaries/$binary" --version)
+            echo "$binary: $actual"
+            if [ "$GITHUB_EVENT_NAME" = push ]; then
+              test "$actual" = "${binary##*/} ${GITHUB_REF_NAME#v}"
+            fi
+          done
+
+  publish:
+    if: github.event_name == 'push'
+    needs:
+      - on-main
+      - crate-age
+      - ci
+      - preflight
+      - environment-guard
+      - build-linux
+      - build-macos
+      - smoke
+    runs-on: ubuntu-latest
+    environment: release
+    # Rebuilds the image with no cache. The wait for approval doesn't count.
+    timeout-minutes: 60
+    permissions:
+      contents: write # to create the release
+      packages: write # to push the image
+      id-token: write # for the attestations' keyless signature
+      attestations: write # to record them
+    steps:
+      # The design's rule 4 refuses a release attested by two attempts, and a tag can't be moved.
+      - name: Refuse a second attempt
+        run: |
+          if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
+            echo "::error title=Release::This is attempt $GITHUB_RUN_ATTEMPT, and a release attested by two attempts is refused by every host. Bump the version by a pull request and tag again."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries-linux
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries-macos
+          path: macos
+      - name: Assemble the release's files
+        run: >-
+          python3 -I .github/scripts/assemble_release.py assemble
+          --dist dist --macos macos --version "${GITHUB_REF_NAME#v}"
+          --repo "$GITHUB_REPOSITORY" --out out
+      # Here and not in a reusable workflow, whose identity the verifier refuses.
+      - id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/*
+      - name: Check the attestation's shape against the files
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: python3 -I .github/scripts/assemble_release.py check-bundle --bundle "$BUNDLE" --out out
+      # An independent implementation of the signature and identity checks, before anything exists
+      # to see. This doesn't prove landfall's own verifier accepts the bundle: its tests do that.
+      - name: Verify every file against that attestation
+        shell: bash
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for file in out/*; do
+            gh attestation verify "$file" --bundle "$BUNDLE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$GITHUB_REF_NAME" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+          done
+          cp "$BUNDLE" "out/landfall-${GITHUB_REF_NAME#v}.sigstore.json"
+      # A draft first, as the part that can be abandoned. From here, the way out of a failure is
+      # a new tag.
+      - name: Upload the files as a draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          flags=()
+          case "$GITHUB_REF_NAME" in
+            *-*) flags=(--prerelease --latest=false) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" out/* --draft --verify-tag --generate-notes "${flags[@]}"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           # The same reference as .github/buildkit/Dockerfile, which a test checks.
@@ -66,10 +275,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image
+        name: Name the image after this repository
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/pecheriere/landfall
+          images: ${{ steps.image.outputs.name }}
           tags: type=semver,pattern={{version}}
           flavor: latest=false
       - id: build
@@ -82,6 +295,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/pecheriere/landfall
+          subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
+          # Works only for a repository an organisation owns, with a permission this job lacks.
+          create-storage-record: false
+      # With immutable releases on, the files are locked from here.
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
