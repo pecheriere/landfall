@@ -136,8 +136,13 @@ cargo deny check
   for security fixes and must name a RUSTSEC or GHSA id.
 - Releases come from signed `v*` tags on main (`git tag -s`). `release.yml` reruns
   CI and crate-age, builds with no cache, and publishes in one job, `publish`, in
-  the `release` environment. A `workflow_dispatch` run does everything but `publish`,
-  so it attests nothing. `CONTRIBUTING.md` has the procedure.
+  the `release` environment. A `workflow_dispatch` run skips `preflight`, as it has no
+  tag, and `publish`, so it attests nothing. `CONTRIBUTING.md` has the procedure, and
+  `test_release_workflow.py` holds what the workflow must keep doing: edit the two
+  together.
+- `smoke` and `publish` download by artifact id, which can't be rebound as a name can,
+  and `publish` reruns `check_binaries.py`. macOS has no such check: `smoke` running
+  those same bytes there is what stands in for it.
 - **Release assets,** with these exact names, which the attestation and the CLI
   rely on: `landfall-agent-<v>-linux-{arm64,amd64}`,
   `landfall-<v>-linux-{arm64,amd64}`, `landfall-<v>-darwin-arm64`, `SHA256SUMS`,
@@ -151,13 +156,16 @@ cargo deny check
   tagged commit, before anyone is asked to approve. This is what landfall's CLI
   trusts about its own binaries, and has nothing to do with a deployment's optional
   `origin.signed_tags`. A signers file with no key refuses every tag.
-- **One attempt:** `publish` fails at once if `GITHUB_RUN_ATTEMPT` isn't 1, as
+- **One attempt:** `preflight` and `publish` fail at once if `GITHUB_RUN_ATTEMPT` isn't 1, as
   hosts refuse a release attested by two attempts and a tag can't be moved. The way
   out of any failed run is a version bump and a new tag.
 - **The guard:** GitHub silently creates a missing environment with no protection,
-  so `environment-guard` reads `release` with `check_environment.py`, and `publish`
-  needs it. It wants required reviewers, `prevent_self_review` off and a deployment
-  branch policy. Red until the owner creates the environment, which is correct.
+  so `environment-guard` reads `release` and its `deployment-branch-policies` with
+  `check_environment.py`, and `publish` needs it. It wants required reviewers,
+  `prevent_self_review` off, `can_admins_bypass` off, custom policies on and protected
+  branches off, and one policy, a tag policy for `v[0-9]*`. The owner's steps in
+  `CONTRIBUTING.md` must name exactly those settings. Red until the owner creates
+  the environment, which is correct.
 - `check-bundle` reads a bundle's shape only: `gh attestation verify` checks the
   signature and identity, in `publish`, on every file, before the draft exists. These
   scripts run under `python3 -I`, so they can't import each other, and tests keep

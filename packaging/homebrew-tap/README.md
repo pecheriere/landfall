@@ -18,11 +18,13 @@ SHA-256. Check it, and the tag, before copying it:
 gh release download "$tag" --repo pecheriere/landfall --pattern landfall.rb
 gh attestation verify landfall.rb --repo pecheriere/landfall \
   --signer-workflow pecheriere/landfall/.github/workflows/release.yml \
-  --source-ref "refs/tags/$tag" --deny-self-hosted-runners
+  --source-ref "refs/tags/$tag" --deny-self-hosted-runners \
+  --source-digest "$(git -C landfall rev-parse "$tag^{commit}")"
 git -C landfall -c gpg.ssh.allowedSignersFile=<allowed signers> verify-tag "$tag"
 ```
 
-`landfall` is a clone of this repository holding the tag. `<allowed signers>` is a file you keep
+`landfall` is a clone of this repository holding the tag, and `--source-digest` ties the
+attestation to the commit that signed tag names, which the ref alone doesn't. `<allowed signers>` is a file you keep
 outside it, with a line `landfall-release ssh-ed25519 <base64>` for each key in
 `crates/cli/assets/release-signers`, whose fingerprints you have compared with `SECURITY.md` and
 with a copy you got some other way, since a stolen token can change the repository too.

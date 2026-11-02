@@ -1,9 +1,10 @@
 name: Release
 
 # A signed tag on main publishes attested binaries and an attested image. A manual run builds and
-# checks everything the same way, with no cache, and stops before `publish`: it attests nothing
-# and writes nothing to the transparency log, so it is how to find a problem before a tag spends
-# a version number. CONTRIBUTING.md has the whole procedure.
+# checks the same way, with no cache, but skips `preflight`, which needs a tag, and `publish`: it
+# attests nothing and writes nothing to the transparency log, so it is how to find most problems
+# before a tag spends a version number. CONTRIBUTING.md has the whole procedure, and
+# test_release_workflow.py holds what this file must keep doing.
 on:
   push:
     tags: ['v[0-9]*']
@@ -26,22 +27,17 @@ jobs:
   crate-age:
     needs: on-main
     runs-on: ubuntu-latest
+    # About 5 minutes in ci.yml for far fewer lookups than this makes.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
-      # Pull requests check Cargo.lock against their base, but a push straight to
-      # main skips that, so every version added since the previous release is
-      # checked again here. The first release has no previous tag and checks all.
+      # Pull requests check Cargo.lock against their base, but a push straight to main skips
+      # that, so it is checked again here, and all of it. The nearest tag can't be the base: it
+      # may be a spent one, and what that run refused would pass here as unchanged.
       - name: Refuse crate versions published less than 7 days ago
-        run: |
-          if [ -z "$(git tag --list 'v[0-9]*' --merged HEAD^)" ]; then
-            python3 -I .github/scripts/crate_age.py --no-base
-          else
-            previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^)
-            python3 -I .github/scripts/crate_age.py --base "$previous"
-          fi
+        run: python3 -I .github/scripts/crate_age.py --no-base
 
   ci:
     needs: on-main
@@ -58,6 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Here too, so that a re-run stops in seconds, and not after the builds and an approval.
+      # The design's rule 4 refuses a release attested by two attempts, and a tag can't be moved.
+      - name: Refuse a second attempt
+        run: |
+          if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then
+            echo "::error title=Release::This is attempt $GITHUB_RUN_ATTEMPT, and a release attested by two attempts is refused by every host. Bump the version by a pull request and tag again."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -69,7 +73,8 @@ jobs:
           --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
 
   # GitHub silently creates a missing environment with no protection, so `publish` needs this to
-  # have read the real one. A 404 fails `gh api`, and pipefail, from `shell: bash`, fails the step.
+  # have read the real one. A 404 for the environment fails the step. One for the policies, which
+  # is what an environment without any answers, is left for the script to name.
   environment-guard:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -85,14 +90,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/environments/release" |
-            python3 -I .github/scripts/check_environment.py
+          gh api "repos/$GITHUB_REPOSITORY/environments/release" > "$RUNNER_TEMP/environment.json"
+          gh api "repos/$GITHUB_REPOSITORY/environments/release/deployment-branch-policies" \
+            > "$RUNNER_TEMP/policies.json" || true
+          python3 -I .github/scripts/check_environment.py "$RUNNER_TEMP/environment.json" \
+            "$RUNNER_TEMP/policies.json"
 
   build-linux:
     needs: on-main
     runs-on: ubuntu-latest
     # About what a cold build of all three takes in ci.yml, with room. No cache, on purpose.
     timeout-minutes: 60
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,7 +125,8 @@ jobs:
       - name: Check the static binaries
         run: python3 -I .github/scripts/check_binaries.py dist
       # The artifact's root is dist/, so it holds linux_arm64/ and linux_amd64/.
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-linux
           path: dist
@@ -130,6 +141,8 @@ jobs:
     env:
       # rust-toolchain.toml's 1.99 would float to the newest patch.
       RUSTUP_TOOLCHAIN: 1.99.0
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -137,7 +150,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
       - run: cargo build --release --locked -p landfall-cli --target aarch64-apple-darwin
       # A single file's parent is the artifact's root, so it holds just `landfall`.
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-macos
           path: target/aarch64-apple-darwin/release/landfall
@@ -145,6 +159,9 @@ jobs:
           if-no-files-found: error
 
   # The only run the release's own files get on a real kernel of each kind, before anyone is asked.
+  # By id, here and in `publish`: anything else in this run holding a runtime token, such as a
+  # test in `ci`, could overwrite an artifact by its name. That gives it a new id and removes the
+  # old one, so a download by id fails rather than take the replacement.
   smoke:
     needs: [build-linux, build-macos]
     strategy:
@@ -152,20 +169,20 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
-            artifact: binaries-linux
+            artifact-id: ${{ needs.build-linux.outputs.artifact-id }}
             binaries: linux_amd64/landfall linux_amd64/landfall-agent
           - runner: ubuntu-24.04-arm
-            artifact: binaries-linux
+            artifact-id: ${{ needs.build-linux.outputs.artifact-id }}
             binaries: linux_arm64/landfall linux_arm64/landfall-agent
           - runner: macos-26
-            artifact: binaries-macos
+            artifact-id: ${{ needs.build-macos.outputs.artifact-id }}
             binaries: landfall
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ${{ matrix.artifact }}
+          artifact-ids: ${{ matrix.artifact-id }}
           path: binaries
       - name: Run each native binary, and on a tag compare its version with the tag
         shell: bash
@@ -215,12 +232,19 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: binaries-linux
+          artifact-ids: ${{ needs.build-linux.outputs.artifact-id }}
           path: dist
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: binaries-macos
+          artifact-ids: ${{ needs.build-macos.outputs.artifact-id }}
           path: macos
+      # What's about to be attested. Artifacts lose the mode this also wants. The macOS file has
+      # no such check: `smoke` ran these same bytes, by the same id, on macOS, which is all that
+      # stands in for one.
+      - name: Check the static binaries again
+        run: |
+          chmod 0755 dist/linux_arm64/* dist/linux_amd64/*
+          python3 -I .github/scripts/check_binaries.py dist
       - name: Assemble the release's files
         run: >-
           python3 -I .github/scripts/assemble_release.py assemble
@@ -254,7 +278,8 @@ jobs:
           cp "$BUNDLE" "out/landfall-${GITHUB_REF_NAME#v}.sigstore.json"
       # A draft first, as the part that can be abandoned. From here, the way out of a failure is
       # a new tag.
-      - name: Upload the files as a draft release
+      - id: draft
+        name: Upload the files as a draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -264,7 +289,14 @@ jobs:
           case "$GITHUB_REF_NAME" in
             *-*) flags=(--prerelease --latest=false) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" out/* --draft --verify-tag --generate-notes "${flags[@]}"
+          url=$(gh release create "$GITHUB_REF_NAME" out/* --draft --verify-tag --generate-notes "${flags[@]}")
+          # By the URL it printed, and not by the tag: a draft someone planted for this tag isn't
+          # the one to publish. Anything but one id fails here.
+          id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+            jq -r --arg url "$url" --arg tag "$GITHUB_REF_NAME" \
+              '.[] | select(.draft and .html_url == $url and .tag_name == $tag) | .id')
+          [[ "$id" =~ ^[0-9]+$ ]]
+          echo "id=$id" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           # The same reference as .github/buildkit/Dockerfile, which a test checks.
@@ -304,5 +336,5 @@ jobs:
       - name: Publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: gh api --method PATCH --silent "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false
