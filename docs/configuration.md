@@ -68,8 +68,9 @@ the page that registered the passkey. Host agents take an approver's key from
 this file and nowhere else.
 
 Both values are unpadded base64url, and each is judged when the file is loaded,
-by every program that loads it. An error names the approver and never repeats
-the key.
+by every program that loads it. An error names the approver. Errors are escaped
+and bounded rather than free of key material: a public key isn't secret, and a
+message from the TOML parser may include part of one.
 
 - `credential_id` is 1 to 1023 bytes.
 - `public_key` uses ES256 (COSE algorithm -7) or EdDSA (-8), and no other

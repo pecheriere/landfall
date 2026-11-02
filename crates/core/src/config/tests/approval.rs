@@ -5,7 +5,7 @@
 //! and what's shown is what the configuration itself does around it.
 
 use super::super::{ConfigError, MAX_CREDENTIAL_ID_LEN, parse_for_tests};
-use super::{EXAMPLE, edited, id, parse_str};
+use super::{EXAMPLE, edited, fixture_key, id, parse_str};
 use crate::ids::PrincipalId;
 
 const OPERATOR: &str =
@@ -135,52 +135,142 @@ fn duplicate_approver_keys_are_refused() {
     );
 }
 
-#[test]
-fn errors_do_not_echo_a_whole_key() {
-    let key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea";
-    for text in [
-        // TOML's own error shows the line. An unknown field, with the key beside it.
-        edited(
-            OPERATOR,
-            &format!(
-                "operator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_keey = \"{key}\" }}"
+/// `value`, as written, in each field whose error shows the value itself, and a word of
+/// what each of those errors says, so that a test can't pass by reaching another error.
+fn value_in_each_shown_field(value: &str) -> Vec<(String, &'static str)> {
+    let signer = format!("maintainer = {:?}", fixture_key("signer.pub").trim_end());
+    let duplicate = EXAMPLE
+        .replacen(
+            "dir = \"/srv/compose/app\"",
+            &format!("dir = \"/{value}\""),
+            1,
+        )
+        .replacen(
+            "dir = \"/srv/compose/app-staging\"",
+            &format!("dir = \"/{value}\""),
+            1,
+        );
+    vec![
+        (
+            EXAMPLE.replacen(&signer, &format!("maintainer = \"{value}\""), 1),
+            "key type",
+        ),
+        (
+            edited(
+                APPROVAL,
+                &format!("[approval]\nrp_id = \"example.com\"\norigin = \"{value}\"\n\n"),
             ),
+            "approval.origin",
         ),
-        // The key where a table should be: serde's message quotes the value it found.
-        edited(OPERATOR, &format!("operator = \"{key}\"")),
-        // A syntax error on the same line.
-        edited(
-            OPERATOR,
-            &format!("operator = {{ credential_id = \"Y3JlZGVudGlhbA\" public_key = \"{key}\" }}"),
+        (
+            edited(
+                APPROVAL,
+                &format!("[approval]\nrp_id = \"{value}\"\norigin = \"https://example.com\"\n\n"),
+            ),
+            "approval.rp_id",
         ),
-        // A value the configuration can't decode.
+        (
+            edited("dir = \"/srv/compose/app\"", &format!("dir = \"{value}\"")),
+            "compose.dir",
+        ),
+        (duplicate, "compose directory"),
+        (
+            edited(
+                "service = \"app\" }\norigin",
+                &format!("service = \"-{value}\" }}\norigin"),
+            ),
+            "compose.service",
+        ),
+        (
+            edited(
+                "workflow = \".github/workflows/release.yml\"",
+                &format!("workflow = \"{value}\""),
+            ),
+            "origin.workflow",
+        ),
+        (
+            edited("paths = [\"state\"]", &format!("paths = [\"../{value}\"]")),
+            "backup.paths",
+        ),
+        (
+            edited(
+                "healthy_for = \"24h\"",
+                &format!("healthy_for = \"{value}\""),
+            ),
+            "promote_to.healthy_for",
+        ),
+        (
+            edited(
+                "checks = [\"container-healthy\"]",
+                &format!("checks = [\"{value}\"]"),
+            ),
+            "checks[0]",
+        ),
+        (
+            edited(
+                OPERATOR,
+                &format!(
+                    "\"{value}\" = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}"
+                ),
+            ),
+            "invalid principal id",
+        ),
+        (
+            edited(
+                "principal = \"operator\"",
+                &format!("principal = \"{value}\""),
+            ),
+            "invalid principal id",
+        ),
+        (
+            edited("host = \"home-1\"", &format!("host = \"{value}\"")),
+            "invalid host id",
+        ),
+    ]
+}
+
+#[test]
+fn a_value_we_show_never_holds_a_whole_ed25519_key() {
+    let key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea";
+    assert_eq!(key.len(), 56);
+    for (text, says) in value_in_each_shown_field(key) {
+        let err = parse_str(&text).unwrap_err().to_string();
+        assert!(err.contains(says), "{says}: {err}");
+        assert!(!err.contains(key), "{says}: {err}");
+    }
+    // Values that can't be decoded aren't shown at all.
+    for text in [
         with_operator("Y3JlZGVudGlhbA", &format!("{key}=")),
         with_operator(&format!("{key}="), "cHVibGljLWtleQ"),
-        // The key where an identifier should be.
-        edited(
-            OPERATOR,
-            &format!(
-                "{key} = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}"
-            ),
-        ),
-        edited(
-            "principal = \"operator\"",
-            &format!("principal = \"{key}\""),
-        ),
-        edited(
-            "auto = \"any\", approvers = [\"operator\"]",
-            &format!("auto = \"any\", approvers = [\"{key}\"]"),
-        ),
-        // The key where a fixed word should be.
-        edited("auto = \"patch\"", &format!("auto = \"{key}\"")),
-        edited("can = [\"view\"", &format!("can = [\"{key}\"")),
-        // The key as a name nothing expects.
-        format!("{key} = 1\n{EXAMPLE}"),
-        edited("[[grant]]", &format!("[[grant]]\n{key} = 1")),
     ] {
         let err = parse_str(&text).unwrap_err().to_string();
-        assert!(!err.contains(key), "{err}");
+        assert!(err.contains("base64url") && !err.contains(key), "{err}");
     }
+}
+
+#[test]
+fn a_value_we_show_is_escaped_and_short_at_any_length() {
+    let value = format!("\\u001b{}", "a".repeat(10_000));
+    for (text, says) in value_in_each_shown_field(&value) {
+        let err = parse_str(&text).unwrap_err().to_string();
+        assert!(err.contains(says), "{says}: {err}");
+        assert!(!err.contains('\u{1b}'), "{says}: {err}");
+        assert!(err.contains("\\u{1b}"), "{says}: {err}");
+        assert!(err.len() < 300, "{says}: {} bytes: {err}", err.len());
+    }
+}
+
+#[test]
+fn what_a_key_check_says_is_escaped_and_short() {
+    let err = parse_for_tests(EXAMPLE.as_bytes(), |_| {
+        Err(format!("\u{1b}{}", "a".repeat(10_000)))
+    })
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::InvalidApprover { .. }), "{err}");
+    let err = err.to_string();
+    assert!(err.contains("operator"), "{err}");
+    assert!(!err.contains('\u{1b}'), "{err}");
+    assert!(err.len() < 300, "{} bytes: {err}", err.len());
 }
 
 #[test]
@@ -198,28 +288,51 @@ fn a_toml_error_names_its_exact_line() {
     );
 }
 
-/// Whatever the message says and wherever TOML found the text: names and values, each
+/// A TOML message may quote what it found, so these may show part of a key: what's
+/// promised is that it's escaped and capped, wherever TOML found the text. The value is
 /// written with TOML's own escape so that the file itself parses.
 #[test]
-fn a_toml_error_is_escaped_and_short() {
+fn a_toml_message_is_escaped_and_capped() {
     let long = "a".repeat(10_000);
     for value in ["\\u001b[31mEVIL", long.as_str()] {
         for text in [
             format!("\"{value}\" = 1\n{EXAMPLE}"),
             edited("can = [\"view\"", &format!("can = [\"{value}\"")),
             edited("auto = \"patch\"", &format!("auto = \"{value}\"")),
-            edited(
-                "principal = \"operator\"",
-                &format!("principal = \"{value}\""),
-            ),
+            edited("[[grant]]", &format!("[[grant]]\n\"{value}\" = 1")),
         ] {
             let err = parse_str(&text).unwrap_err();
             assert!(matches!(err, ConfigError::Toml(_)), "{err}");
             let err = err.to_string();
             assert!(!err.contains('\u{1b}'), "{err}");
-            assert!(err.len() < 150, "{} bytes: {err}", err.len());
+            assert!(err.len() < 300, "{} bytes: {err}", err.len());
         }
     }
+
+    // Exactly 200 characters of the message are kept.
+    let err = parse_str(&format!("\"{long}\" = 1\n")).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "configuration is not valid: line 1: \"unknown field `{}\"...",
+            "a".repeat(200 - "unknown field `".len())
+        )
+    );
+}
+
+#[test]
+fn an_unknown_fields_error_still_names_what_was_expected() {
+    let err = parse_str(&format!("nope = 1\n{EXAMPLE}"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("nope") && err.contains("`signers`"), "{err}");
+    let err = parse_str(&edited(
+        "checks = [\"container-healthy\"]",
+        "checks = [\"container-healthy\"]\nnope = 1",
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("nope") && err.contains("`repo`"), "{err}");
 }
 
 #[test]

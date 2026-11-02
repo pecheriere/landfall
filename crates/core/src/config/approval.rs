@@ -30,8 +30,8 @@ const MAX_LABEL_LEN: usize = 63;
 const DEFAULT_HTTPS_PORT: u16 = 443;
 
 /// Decides whether the decoded bytes of an approver's `public_key` are a key the verifier
-/// can use, and says why not. The error is shown with the approver's name, and must not
-/// repeat the key.
+/// can use, and says why not. What it says is shown with the approver's name, escaped and
+/// capped.
 pub type KeyCheck = fn(&[u8]) -> Result<(), String>;
 
 /// The relying party every approval is checked against.

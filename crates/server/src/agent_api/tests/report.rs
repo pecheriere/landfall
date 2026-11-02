@@ -247,11 +247,9 @@ async fn a_long_reason_is_kept_in_the_tables_and_short_in_the_log() {
     assert_eq!(failure, quoted);
 
     let audit = h.last_audit_detail().await;
-    assert_eq!(audit["reason"], format!("\"{}\"...", "x".repeat(64)));
-    assert_eq!(
-        audit["steps"][0]["failure"],
-        format!("\"{}\"...", "x".repeat(64))
-    );
+    let short = format!("\"{}\"...", "x".repeat(landfall_core::text::SHOWN_CHARS));
+    assert_eq!(audit["reason"], short);
+    assert_eq!(audit["steps"][0]["failure"], short);
 }
 
 #[tokio::test]

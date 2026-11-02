@@ -25,11 +25,11 @@ impl SignerKey {
             ));
         }
         let mut key = PublicKey::from_openssh(text.trim())
-            .map_err(|e| format!("not a valid OpenSSH public key: {e}"))?;
+            .map_err(|e| format!("not a valid OpenSSH public key: {}", shown(&e.to_string())))?;
         if key.algorithm() != Algorithm::Ed25519 {
             return Err(format!(
                 "key type {} is not supported; use an ssh-ed25519 public key",
-                key.algorithm()
+                shown(key.algorithm().as_ref())
             ));
         }
         key.set_comment("");

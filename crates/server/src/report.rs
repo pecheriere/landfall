@@ -9,7 +9,7 @@
 //!
 //! The audit row holds the short form of each text, [`shown`], and the tables the
 //! long one, up to [`MAX_STORED_TEXT_CHARS`], since a failure's cause is often
-//! past its first 64 characters.
+//! past its first [`SHOWN_CHARS`](landfall_core::text::SHOWN_CHARS) characters.
 
 use landfall_core::ids::{DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
@@ -21,10 +21,10 @@ use serde_json::{Value, json};
 /// The most steps stored for one deploy. A real deploy, rollback included, has
 /// far fewer. The bound keeps the audit row under
 /// [`MAX_DETAIL_BYTES`](crate::audit::MAX_DETAIL_BYTES) with hostile text in every
-/// field: [`shown`] keeps 64 characters, each of which escapes to at most
-/// `\\u{10ffff}` in the JSON of its quoted form, 11 bytes, so about 711 bytes a
+/// field: [`shown`] keeps 48 characters, each of which escapes to at most
+/// `\\u{10ffff}` in the JSON of its quoted form, 11 bytes, so about 535 bytes a
 /// field; a step has two text fields and some 60 bytes of its own, and 32 steps
-/// are then at most 48 KiB.
+/// are then at most 36 KiB.
 pub const MAX_STORED_STEPS: usize = 32;
 
 /// The most characters kept of a reason or a step's failure in `deploys` and
@@ -301,7 +301,10 @@ mod tests {
         assert_eq!(kept, MAX_STORED_TEXT_CHARS - 8);
         let short = bounded.reason_short.unwrap();
         assert!(short.starts_with("\"a\\nb\\u{1b}[31m"), "{short}");
-        assert_eq!(short.chars().filter(|c| *c == 'x').count(), 64 - 8);
+        assert_eq!(
+            short.chars().filter(|c| *c == 'x').count(),
+            landfall_core::text::SHOWN_CHARS - 8
+        );
         assert_eq!(bounded.steps[0].name, "\"na\\nme\"");
         assert_eq!(bounded.steps[0].failure.as_deref(), Some("\"fa\\u{1b}il\""));
         assert!(bounded.refused);

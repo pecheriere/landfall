@@ -19,14 +19,17 @@ use super::{
     WITHIN_SECS_LIMIT,
 };
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
-use crate::text::shown;
+use crate::text::quoted;
+
+/// How much of a TOML message is kept: enough for its list of what was expected.
+const TOML_MESSAGE_CHARS: usize = 200;
 
 /// What's wrong and on which line. Never the error's own text, which shows the line, and
-/// the message only as [`shown`]: any message can quote what it found, raw and at any
-/// length, and that could be a key or a control character. Every message starts with
-/// words of its own, so what's kept is too short to hold a whole key after them.
+/// the message escaped and capped: any message can quote what it found, raw and at any
+/// length. It can still hold part of a key, or all of one if the message has room, which
+/// is acceptable since a public key isn't secret.
 fn toml_error(text: &str, error: &toml::de::Error) -> ConfigError {
-    let message = shown(error.message());
+    let message = quoted(error.message(), TOML_MESSAGE_CHARS);
     let line = error
         .span()
         .and_then(|span| text.get(..span.start))

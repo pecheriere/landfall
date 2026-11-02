@@ -39,7 +39,7 @@ pub use signer::SignerKey;
 use thiserror::Error;
 
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
-use crate::text::shown;
+use crate::text::{quoted, shown};
 
 #[cfg(test)]
 mod tests;
@@ -50,8 +50,11 @@ mod raw;
 
 mod signer;
 
+/// How much of what a key check says is kept.
+const REASON_CHARS: usize = 200;
+
 /// Why a configuration file was refused. Every variant names the deployment
-/// (or section) and the offending value.
+/// (or section) and the offending value, escaped and bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ConfigError {
@@ -65,7 +68,7 @@ pub enum ConfigError {
     #[error("configuration is not valid: {0}")]
     Toml(String),
     /// A field has a malformed value.
-    #[error("deployment {deployment}: {field} {value:?} is invalid: {reason}")]
+    #[error("deployment {deployment}: {field} {} is invalid: {reason}", shown(.value))]
     Invalid {
         /// The deployment the value belongs to.
         deployment: DeploymentId,
@@ -121,8 +124,8 @@ pub enum ConfigError {
         /// The hostname of `approval.origin`.
         host: String,
     },
-    /// An `[approvers]` value can't be used. Never repeats the key.
-    #[error("approver {approver}: {reason}")]
+    /// An `[approvers]` value can't be used.
+    #[error("approver {approver}: {}", quoted(.reason, REASON_CHARS))]
     InvalidApprover {
         /// The approver's name in `[approvers]`.
         approver: PrincipalId,
@@ -265,7 +268,8 @@ pub enum ConfigError {
     },
     /// Rule 8: two deployments use the same compose directory on one host.
     #[error(
-        "deployment {deployment}: compose directory {dir:?} on host {host} is already used by {other}"
+        "deployment {deployment}: compose directory {} on host {host} is already used by {other}",
+        shown(.dir)
     )]
     DuplicateComposeDir {
         /// The later deployment.
