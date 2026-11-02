@@ -85,6 +85,12 @@ pattern as signers.
 | `promote_to.deployment` | string | required if `promote_to` | Deployment to promote to; it must have the same `repo.id`. |
 | `promote_to.healthy_for` | string | required if `promote_to` | How long this deployment must stay healthy: `<n>m`, `<n>h` or `<n>d`, `n` above zero. |
 
+Healthy here is the source host's word, as the controller hears it: the host says
+the release is running, idle and without drift, and has said so within the last 15
+minutes. A host gone quiet holds the promotion back without starting the time again,
+unless the release changed. The promotion is enforced by the controller only, and
+trusts that host: a compromised source host can say what it likes.
+
 Anything outside `auto` and `approve` (major releases by default) is manual: a
 grant holder requests it and an approver approves it.
 
@@ -107,7 +113,11 @@ the same run and attempt of `origin.workflow`, and the digest the version tag
 resolves to must be among them; that one is what is deployed. Image variants
 built by one run, such as `1.2.3` and `1.2.3-alpine`, pass. A re-run release
 workflow, or a second attempt of one run, is refused, and so is a project that
-builds its variants in separate workflow runs for one tag.
+builds its variants in separate workflow runs for one tag. Re-running one failed
+job of a matrix makes attempt 2 of the run, so if that job attests, the release is
+refused, and the way out is a new tag. If the version tag's digest is not among the
+attested ones, the release waits and is tried again hourly, since the registry's
+list may be behind.
 
 The release workflow (`origin.workflow`) must meet every one of these rules,
 which are checked against the Fulcio certificate of the attestation, not

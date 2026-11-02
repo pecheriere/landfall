@@ -11,6 +11,7 @@
 //! every bundle is verified against a root that came through TUF.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -42,9 +43,9 @@ pub enum Refresh {
 /// The Sigstore trust root bundles are verified against: the Fulcio
 /// certificate authorities, Rekor logs and certificate transparency logs of
 /// the public-good instance. Only [`load_trusted_root`] makes one in
-/// production code.
+/// production code. Cloning shares it.
 #[derive(Debug, Clone)]
-pub struct TrustRoot(TrustedRoot);
+pub struct TrustRoot(Arc<TrustedRoot>);
 
 impl TrustRoot {
     /// The root for the Sigstore verifier.
@@ -56,7 +57,7 @@ impl TrustRoot {
     /// builds only, for fixtures verified offline.
     #[cfg(test)]
     pub(crate) fn from_json(json: &str) -> Self {
-        Self(TrustedRoot::from_json(json).unwrap())
+        Self(Arc::new(TrustedRoot::from_json(json).unwrap()))
     }
 }
 
@@ -126,7 +127,7 @@ async fn load_trusted_root_at(
 
     TrustedRoot::from_tuf_at(config, now)
         .await
-        .map(TrustRoot)
+        .map(|root| TrustRoot(Arc::new(root)))
         .map_err(|e| {
             let message = e.to_string();
             // The TUF client reports failures as text only; this is its message

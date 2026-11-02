@@ -24,14 +24,20 @@ use futures_util::{StreamExt as _, stream};
 use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::RunCandidate;
+use reqwest::header::HeaderValue;
 
-use crate::attestation::{AttestationError, Expected, verify_bundle};
+use crate::attestation::{AttestationError, Expected};
 use crate::fetch::{FetchError, Fetcher};
-use crate::release::{ReleaseError, image_name};
+use crate::release::{ReleaseError, image_name, verify_bundle_off_runtime};
 use crate::trust::TrustRoot;
 
 /// How long a candidate that did not verify stays ruled out.
 pub const RULED_OUT_LIFETIME: Duration = Duration::from_hours(1);
+
+/// How long a candidate with nothing to verify, or whose material was junk, is left
+/// alone. Short, since a good answer may be on its way, and there because every look
+/// at one costs requests, for each of up to some thousands of tags.
+pub const UNATTESTED_LIFETIME: Duration = Duration::from_mins(15);
 
 /// Entries kept in each map of a [`CandidateCache`]. Past this it starts again,
 /// which costs only requests: only a registry listing far more digests than any
@@ -57,7 +63,7 @@ type VerifiedKey = (DeploymentId, ImageDigest, ReleaseTag, CommitSha);
 /// A digest that did not verify.
 #[derive(Debug)]
 struct RuledOut {
-    at: Instant,
+    until: Instant,
     /// The one ref it may still verify for; `None` when it verifies for none.
     except_ref: Option<String>,
 }
@@ -73,19 +79,21 @@ struct CacheEntries {
 #[derive(Debug)]
 pub struct CandidateCache {
     ruled_out_lifetime: Duration,
+    unattested_lifetime: Duration,
     entries: Mutex<CacheEntries>,
 }
 
 impl Default for CandidateCache {
     fn default() -> Self {
-        Self::with_lifetime(RULED_OUT_LIFETIME)
+        Self::with_lifetimes(RULED_OUT_LIFETIME, UNATTESTED_LIFETIME)
     }
 }
 
 impl CandidateCache {
-    fn with_lifetime(ruled_out_lifetime: Duration) -> Self {
+    fn with_lifetimes(ruled_out_lifetime: Duration, unattested_lifetime: Duration) -> Self {
         Self {
             ruled_out_lifetime,
+            unattested_lifetime,
             entries: Mutex::default(),
         }
     }
@@ -101,8 +109,7 @@ impl CandidateCache {
 
     fn is_ruled_out(&self, key: &(DeploymentId, ImageDigest), git_ref: &str) -> bool {
         self.locked().ruled_out.get(key).is_some_and(|ruled_out| {
-            ruled_out.at.elapsed() < self.ruled_out_lifetime
-                && ruled_out.except_ref.as_deref() != Some(git_ref)
+            Instant::now() < ruled_out.until && ruled_out.except_ref.as_deref() != Some(git_ref)
         })
     }
 
@@ -114,7 +121,12 @@ impl CandidateCache {
         entries.verified.insert(key, run_url);
     }
 
-    fn keep_ruled_out(&self, key: (DeploymentId, ImageDigest), except_ref: Option<String>) {
+    fn keep_ruled_out(
+        &self,
+        key: (DeploymentId, ImageDigest),
+        except_ref: Option<String>,
+        lifetime: Duration,
+    ) {
         let mut entries = self.locked();
         if entries.ruled_out.len() >= MAX_CACHE_ENTRIES {
             entries.ruled_out.clear();
@@ -122,7 +134,7 @@ impl CandidateCache {
         entries.ruled_out.insert(
             key,
             RuledOut {
-                at: Instant::now(),
+                until: Instant::now() + lifetime,
                 except_ref,
             },
         );
@@ -151,6 +163,8 @@ pub struct AttestedDigests {
 }
 
 /// Every digest validly attested for release `tag` of `deployment`, on `commit`.
+/// `version_digest`, which was just verified for it, is always looked at whatever is
+/// remembered about it. One pull token serves the whole look.
 ///
 /// # Errors
 ///
@@ -161,15 +175,24 @@ pub async fn attested_digests(
     fetcher: &Fetcher,
     root: &TrustRoot,
     config: &Config,
-    (deployment, tag, commit): (&DeploymentId, &ReleaseTag, &CommitSha),
+    (deployment, tag, commit, version_digest): (
+        &DeploymentId,
+        &ReleaseTag,
+        &CommitSha,
+        &ImageDigest,
+    ),
     cache: &CandidateCache,
 ) -> Result<AttestedDigests, ReleaseError> {
     let d = config
         .deployment(deployment)
         .ok_or_else(|| ReleaseError::UnknownDeployment(deployment.clone()))?;
     let image = image_name(d.repo().name());
+    let token = fetcher
+        .pull_token(&image)
+        .await
+        .map_err(ReleaseError::Listing)?;
     let candidates = fetcher
-        .list_referrer_digests(&image)
+        .list_referrer_digests_with(&image, &token)
         .await
         .map_err(ReleaseError::Listing)?;
     let expected = Expected {
@@ -195,16 +218,18 @@ pub async fn attested_digests(
     for digest in candidates {
         if let Some(run_url) = cache.verified_run(&verified_key(&digest)) {
             answer.verified.push(RunCandidate { digest, run_url });
-        } else if !cache.is_ruled_out(&(deployment.clone(), digest.clone()), &git_ref) {
+        } else if digest == *version_digest
+            || !cache.is_ruled_out(&(deployment.clone(), digest.clone()), &git_ref)
+        {
             unknown.push(digest);
         }
     }
 
     // An error leaves at once, and what was learned so far stays learned.
-    let (image, expected) = (&image, &expected);
+    let (image, expected, token) = (&image, &expected, &token);
     let mut checks = stream::iter(unknown)
         .map(|digest| async move {
-            let checked = check_candidate(fetcher, root, image, &digest, expected).await;
+            let checked = check_candidate(fetcher, root, (image, token), &digest, expected).await;
             (digest, checked)
         })
         .buffer_unordered(CANDIDATES_AT_ONCE);
@@ -215,13 +240,22 @@ pub async fn attested_digests(
                 answer.verified.push(RunCandidate { digest, run_url });
             }
             Candidate::Unattested(reason) => {
+                cache.keep_ruled_out(
+                    (deployment.clone(), digest.clone()),
+                    None,
+                    cache.unattested_lifetime,
+                );
                 answer.ignored.push(IgnoredCandidate { digest, reason });
             }
             Candidate::RuledOut { reason, except_ref } => {
                 // A bundle naming another release's ref is what most of the list
                 // is, and says nothing about this release.
                 let of_another_release = except_ref.as_ref().is_some_and(|r| *r != git_ref);
-                cache.keep_ruled_out((deployment.clone(), digest.clone()), except_ref);
+                cache.keep_ruled_out(
+                    (deployment.clone(), digest.clone()),
+                    except_ref,
+                    cache.ruled_out_lifetime,
+                );
                 if !of_another_release {
                     answer.ignored.push(IgnoredCandidate { digest, reason });
                 }
@@ -236,8 +270,10 @@ pub async fn attested_digests(
 enum Candidate {
     /// With the Run Invocation URI of its certificate.
     Verified(String),
-    /// Nothing is attached yet, and something may be soon.
+    /// Nothing is attached yet, or what was served was junk, and something better
+    /// may be soon.
     Unattested(String),
+    /// A verification result: its bundle was read and does not verify.
     RuledOut {
         reason: String,
         except_ref: Option<String>,
@@ -247,25 +283,22 @@ enum Candidate {
 async fn check_candidate(
     fetcher: &Fetcher,
     root: &TrustRoot,
-    image: &str,
+    (image, token): (&str, &HeaderValue),
     digest: &ImageDigest,
     expected: &Expected<'_>,
 ) -> Result<Candidate, ReleaseError> {
-    let bundle = match fetcher.bundle(image, digest).await {
+    let bundle = match fetcher.bundle_with(image, digest, token).await {
         Ok(bundle) => bundle,
         Err(error @ (FetchError::NotFound { .. } | FetchError::Bundles { count: 0, .. })) => {
             return Ok(Candidate::Unattested(error.to_string()));
         }
         Err(error) if error.is_unavailable() => return Err(ReleaseError::Listing(error)),
-        Err(error) => {
-            return Ok(Candidate::RuledOut {
-                reason: error.to_string(),
-                except_ref: None,
-            });
-        }
+        // Junk from the registry says nothing about the digest.
+        Err(error) => return Ok(Candidate::Unattested(error.to_string())),
     };
-    match verify_bundle(&bundle, digest, root, expected) {
+    match verify_bundle_off_runtime(bundle, digest, root, expected).await? {
         Ok(attestation) => Ok(Candidate::Verified(attestation.run_url)),
+        Err(error @ AttestationError::Bundle(_)) => Ok(Candidate::Unattested(error.to_string())),
         Err(error) => {
             let except_ref = match &error {
                 AttestationError::Identity { field, found, .. } if *field == REF_CLAIM => {

@@ -110,6 +110,41 @@ async fn release_tags_come_from_every_page() {
 }
 
 #[tokio::test]
+async fn a_redirect_to_another_host_does_not_take_the_token_along() {
+    let (github, registry) = servers().await;
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(REFS))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/moved", elsewhere.uri()).as_str()),
+        )
+        .mount(&github)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/moved"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([tag_ref("v1.0.0", 1)])))
+        .mount(&elsewhere)
+        .await;
+
+    let fetcher = fetcher(&github, &registry)
+        .with_github_token("github-secret")
+        .unwrap();
+    let tags = fetcher.list_release_tags(&repo()).await.unwrap();
+    assert_eq!(tags.len(), 1, "it was followed");
+
+    let sent = github.received_requests().await.unwrap();
+    assert_eq!(
+        sent[0].headers.get("authorization").unwrap(),
+        "Bearer github-secret",
+        "the first request had it"
+    );
+    let moved = elsewhere.received_requests().await.unwrap();
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].headers.get("authorization"), None);
+}
+
+#[tokio::test]
 async fn a_next_link_is_only_a_signal_and_never_followed() {
     let (github, registry) = servers().await;
     let elsewhere = MockServer::start().await;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use landfall_core::config::Config;
-use landfall_core::ids::{CommitSha, DeploymentId, ReleaseTag};
+use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::RunCandidate;
 use landfall_core::text::shown;
 use landfall_origin::candidates::{CandidateCache, attested_digests};
@@ -47,6 +47,30 @@ fn stamp_age(cache_dir: &Path) -> Option<Duration> {
         .ok()?
         .elapsed()
         .ok()
+}
+
+/// [`stamp_age`] on a blocking thread: the disk may be slow, and the runtime's
+/// threads have others to serve.
+async fn stamp_age_off_runtime(cache_dir: &Path) -> Option<Duration> {
+    let cache_dir = cache_dir.to_owned();
+    tokio::task::spawn_blocking(move || stamp_age(&cache_dir))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Notes on a blocking thread that a refresh succeeded just now.
+async fn write_stamp_off_runtime(cache_dir: &Path) {
+    let stamp = cache_dir.join(REFRESH_STAMP);
+    let written = tokio::task::spawn_blocking(move || {
+        fs::write(stamp, format!("{:?}\n", std::time::SystemTime::now()))
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!("watcher: cannot note the TUF refresh: {error}")),
+        Err(error) => log(&format!("watcher: cannot note the TUF refresh: {error}")),
+    }
 }
 
 /// Whether a refresh is due, given how long ago the last one was.
@@ -94,15 +118,12 @@ impl ReleaseSource for LiveSource {
         if trust.root.is_some() && trust.reload_at.is_some_and(|at| Instant::now() < at) {
             return Ok(());
         }
-        let age = stamp_age(&self.cache_dir);
+        let age = stamp_age_off_runtime(&self.cache_dir).await;
         let mut good_for = age.map_or(REFRESH_RETRY, |age| REFRESH_EVERY.saturating_sub(age));
         if refresh_due(age) {
             match load_trusted_root(&self.cache_dir, Refresh::Online).await {
                 Ok(root) => {
-                    let now = format!("{:?}\n", std::time::SystemTime::now());
-                    if let Err(error) = fs::write(self.cache_dir.join(REFRESH_STAMP), now) {
-                        log(&format!("watcher: cannot note the TUF refresh: {error}"));
-                    }
+                    write_stamp_off_runtime(&self.cache_dir).await;
                     trust.root = Some(Arc::new(root));
                     trust.reload_at = Some(Instant::now() + REFRESH_EVERY);
                     return Ok(());
@@ -154,13 +175,14 @@ impl ReleaseSource for LiveSource {
         deployment: &DeploymentId,
         tag: &ReleaseTag,
         commit: &CommitSha,
+        version_digest: &ImageDigest,
     ) -> Result<Vec<RunCandidate>, ReleaseError> {
         let root = self.root().await?;
         let answer = attested_digests(
             &self.fetcher,
             &root,
             &self.config,
-            (deployment, tag, commit),
+            (deployment, tag, commit, version_digest),
             &self.candidates,
         )
         .await?;

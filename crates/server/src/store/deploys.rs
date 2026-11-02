@@ -16,6 +16,9 @@ use crate::report::BoundedReport;
 /// clears: the reason a host is given.
 const DRIFT_REASON: &str = "the running state differs from what the agent deployed";
 
+/// How often an unchanged report is noted, seconds: a poll costs no write beyond it.
+const REPORT_NOTE_EVERY_SECS: i64 = 60;
+
 /// A deploy to queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDeploy {
@@ -397,12 +400,22 @@ impl Store {
                 && s.inconsistent == inconsistent
                 && s.host == host.as_ref()
         });
+        let now = self.clock.now()?;
         if same {
+            // Nothing changed, which is itself worth knowing now and then: it
+            // tells a host that is fine from one that has gone quiet.
+            let noted = stored.as_ref().and_then(|s| s.last_report);
+            if noted.is_none_or(|at| now.saturating_sub(at) >= REPORT_NOTE_EVERY_SECS) {
+                sqlx::query("UPDATE running_states SET last_report = ? WHERE deployment = ?")
+                    .bind(now)
+                    .bind(state.deployment.as_ref())
+                    .execute(&mut **tx)
+                    .await?;
+            }
             return Ok(());
         }
         let release_changed = old_tag != tag || old_digest != digest;
         let drift_changed = old_drift != state.drift;
-        let now = self.clock.now()?;
         let healthy_since = if tag.is_none() || state.drift {
             None
         } else if release_changed || old_drift {
@@ -436,13 +449,13 @@ impl Store {
         sqlx::query(
             "INSERT INTO running_states
                  (deployment, host, tag, digest, drift, phase, busy, inconsistent, updated_at,
-                  healthy_since)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  healthy_since, last_report)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?9)
              ON CONFLICT (deployment) DO UPDATE SET
                  host = excluded.host, tag = excluded.tag, digest = excluded.digest,
                  drift = excluded.drift, phase = excluded.phase, busy = excluded.busy,
                  inconsistent = excluded.inconsistent, updated_at = excluded.updated_at,
-                 healthy_since = excluded.healthy_since",
+                 healthy_since = excluded.healthy_since, last_report = excluded.last_report",
         )
         .bind(state.deployment.as_ref())
         .bind(host.as_ref())
@@ -470,6 +483,7 @@ struct StoredRunning {
     busy: bool,
     inconsistent: bool,
     healthy_since: Option<i64>,
+    last_report: Option<i64>,
 }
 
 /// The audit row for a signed report that was refused. `reason` is the
@@ -493,7 +507,7 @@ async fn stored_running(
     state: &RunningState,
 ) -> Result<Option<StoredRunning>, StoreError> {
     let row = sqlx::query(
-        "SELECT host, tag, digest, drift, phase, busy, inconsistent, healthy_since
+        "SELECT host, tag, digest, drift, phase, busy, inconsistent, healthy_since, last_report
          FROM running_states WHERE deployment = ?",
     )
     .bind(state.deployment.as_ref())
@@ -509,5 +523,6 @@ async fn stored_running(
         busy: row.try_get("busy")?,
         inconsistent: row.try_get("inconsistent")?,
         healthy_since: row.try_get("healthy_since")?,
+        last_report: row.try_get("last_report")?,
     }))
 }

@@ -4,7 +4,7 @@
 use super::*;
 
 /// `app/staging` promoting to `app/prod` after a day, both of one repository.
-const PROMOTING: &str = r#"
+pub(super) const PROMOTING: &str = r#"
 [approvers]
 operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
 
@@ -28,7 +28,7 @@ checks = ["container-healthy"]
 promote_to = { deployment = "app/prod", healthy_for = "24h" }
 "#;
 
-const STAGING: &str = "app/staging";
+pub(super) const STAGING: &str = "app/staging";
 
 #[tokio::test]
 async fn promotion_waits_for_healthy_for() {
@@ -46,6 +46,7 @@ async fn promotion_waits_for_healthy_for() {
     assert_eq!(h.deploys(PROD).await, []);
 
     h.clock.advance(24 * 60 * 60 - 1);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await, []);
 
@@ -83,8 +84,98 @@ async fn promotion_counts_from_the_drift_clearing() {
     assert_eq!(h.deploys(PROD).await, [], "only an hour since it cleared");
 
     h.clock.advance(23 * 60 * 60);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_source_host_gone_quiet_holds_promotion_back_without_resetting_the_clock() {
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+
+    // It reported once and went quiet: a day later that is no evidence of anything.
+    h.clock.advance(24 * 60 * 60);
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.tick().await;
+    let (decision, reason) = h.decision(PROD, "v1.2.4").await;
+    assert_eq!(decision, "manual");
+    assert!(reason.contains("quiet"), "{reason}");
+    assert_eq!(h.deploys(PROD).await, []);
+
+    // It is back, saying the same: its day counts from the start.
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.tick().await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_report_counts_for_a_quarter_of_an_hour() {
+    use crate::store::REPORT_FRESH_SECS;
+
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.clock.advance(24 * 60 * 60 - REPORT_FRESH_SECS);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+
+    h.clock.advance(REPORT_FRESH_SECS + 1);
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await, [], "a second too late");
+
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.clock.advance(24 * 60 * 60 - REPORT_FRESH_SECS);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+
+    h.clock.advance(REPORT_FRESH_SECS);
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+}
+
+#[tokio::test]
+async fn an_unchanged_report_is_noted_at_most_once_a_minute_and_never_audited() {
+    let h = Harness::new(PROMOTING).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    let audited = h.audit("running_changed").await.len();
+    let noted = async |h: &Harness| -> i64 {
+        sqlx::query_scalar("SELECT last_report FROM running_states")
+            .fetch_one(h.store.pool())
+            .await
+            .unwrap()
+    };
+    let first = noted(&h).await;
+
+    h.clock.advance(59);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    assert_eq!(noted(&h).await, first);
+
+    h.clock.advance(1);
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    assert_eq!(noted(&h).await, first + 60);
+    assert_eq!(h.audit("running_changed").await.len(), audited);
+}
+
+#[tokio::test]
+async fn another_hosts_report_says_nothing_about_a_source() {
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    // The configuration gives staging to this host; this is some other's word.
+    h.report(STAGING, "host-z", Some("v1.2.4")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+
+    h.clock.advance(24 * 60 * 60);
+    h.report(STAGING, "host-z", Some("v1.2.4")).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.tick().await;
+
+    assert_eq!(h.deploys(PROD).await, []);
 }
 
 #[tokio::test]

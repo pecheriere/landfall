@@ -19,6 +19,11 @@ use super::{Store, StoreError};
 use crate::audit::{AuditEvent, EventKind};
 use crate::report::MAX_STORED_TEXT_CHARS;
 
+/// How recently a host must have reported for its deployment to count as healthy,
+/// seconds. Long against its polling, so that a restart or a brief outage does not
+/// hold a promotion back.
+pub const REPORT_FRESH_SECS: i64 = 15 * 60;
+
 /// The `tag` of a hold on a whole deployment; no release tag is empty.
 const WHOLE_DEPLOYMENT: &str = "";
 
@@ -70,6 +75,8 @@ pub struct StoredRelease {
     pub digest: Option<ImageDigest>,
     /// What was decided.
     pub decision: ReleaseDecision,
+    /// Whether verification refused it, for as long as its inputs stay the same.
+    pub origin_refused: bool,
     reason: String,
     tag_object: Option<String>,
     config_hash: Option<String>,
@@ -99,8 +106,11 @@ pub struct Seen<'a> {
     pub config_hash: &'a str,
     /// The release commit, if it got as far as having one.
     pub commit: Option<&'a CommitSha>,
-    /// The release's digest, if it was settled.
+    /// The release's digest, if it was settled. `None` leaves one already recorded
+    /// as it is.
     pub digest: Option<&'a ImageDigest>,
+    /// Whether verification refused it, for as long as these inputs stay.
+    pub refused: bool,
     /// Where it came from, with hostile text in its short form: the
     /// `release_seen` row's detail.
     pub detail: Value,
@@ -116,6 +126,8 @@ pub struct Hold {
     pub since: i64,
     /// When it was last tried.
     pub last_try: i64,
+    /// Whether it is retried on the slow schedule from the start.
+    pub slow: bool,
 }
 
 impl Hold {
@@ -178,7 +190,8 @@ impl Store {
         deployment: &DeploymentId,
     ) -> Result<HashMap<String, StoredRelease>, StoreError> {
         let rows = sqlx::query(
-            "SELECT tag, commit_sha, digest, decision, reason, tag_object, config_hash
+            "SELECT tag, commit_sha, digest, decision, reason, tag_object, config_hash,
+                    origin_refused
              FROM releases WHERE deployment = ?",
         )
         .bind(deployment.as_ref())
@@ -195,6 +208,7 @@ impl Store {
                         .map(|_| parsed(row, "digest"))
                         .transpose()?,
                     decision: ReleaseDecision::parse(&row.try_get::<String, _>("decision")?)?,
+                    origin_refused: row.try_get("origin_refused")?,
                     reason: row.try_get("reason")?,
                     tag_object: optional("tag_object")?,
                     config_hash: optional("config_hash")?,
@@ -240,20 +254,23 @@ impl Store {
             ),
             None => (None, None, None, None, None),
         };
-        // Without a `seen`, whatever is known of its origin stays as it is.
+        // Without a `seen`, whatever is known of its origin stays as it is. A commit
+        // or digest already recorded is never overwritten by none.
         sqlx::query(
             "INSERT INTO releases
                  (deployment, tag, commit_sha, digest, decision, reason, seen_at,
-                  tag_object, config_hash, origin)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                  tag_object, config_hash, origin, origin_refused)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12)
              ON CONFLICT (deployment, tag) DO UPDATE SET
                  decision = excluded.decision,
                  reason = excluded.reason,
-                 commit_sha = CASE WHEN ?11 THEN excluded.commit_sha ELSE commit_sha END,
-                 digest = CASE WHEN ?11 THEN excluded.digest ELSE digest END,
+                 commit_sha = COALESCE(excluded.commit_sha, commit_sha),
+                 digest = COALESCE(excluded.digest, digest),
                  tag_object = CASE WHEN ?11 THEN excluded.tag_object ELSE tag_object END,
                  config_hash = CASE WHEN ?11 THEN excluded.config_hash ELSE config_hash END,
                  origin = CASE WHEN ?11 THEN excluded.origin ELSE origin END,
+                 origin_refused = CASE WHEN ?11 THEN excluded.origin_refused
+                                       ELSE origin_refused END,
                  seen_at = CASE WHEN ?11 THEN excluded.seen_at ELSE seen_at END",
         )
         .bind(deployment.as_ref())
@@ -267,6 +284,7 @@ impl Store {
         .bind(config_hash)
         .bind(origin)
         .bind(seen.is_some())
+        .bind(seen.is_some_and(|seen| seen.refused))
         .execute(&mut *tx)
         .await?;
         sqlx::query("DELETE FROM release_holds WHERE deployment = ? AND tag = ?")
@@ -313,7 +331,7 @@ impl Store {
         deployment: &DeploymentId,
     ) -> Result<(HashMap<String, Hold>, Option<Hold>), StoreError> {
         let rows = sqlx::query(
-            "SELECT tag, reason, since, last_try FROM release_holds WHERE deployment = ?",
+            "SELECT tag, reason, since, last_try, slow FROM release_holds WHERE deployment = ?",
         )
         .bind(deployment.as_ref())
         .fetch_all(&self.pool)
@@ -326,6 +344,7 @@ impl Store {
                 reason: row.try_get("reason")?,
                 since: row.try_get("since")?,
                 last_try: row.try_get("last_try")?,
+                slow: row.try_get("slow")?,
             };
             if tag == WHOLE_DEPLOYMENT {
                 whole = Some(hold);
@@ -337,7 +356,8 @@ impl Store {
     }
 
     /// Records why `tag`, or with `None` the whole deployment, cannot be decided
-    /// yet. A reason already standing only notes the try and adds no audit row.
+    /// yet, and whether it is `slow` to retry. A reason already standing only notes
+    /// the try and adds no audit row.
     ///
     /// # Errors
     /// A clock, database or audit failure.
@@ -346,6 +366,7 @@ impl Store {
         (deployment, host): (&DeploymentId, &HostId),
         tag: Option<&ReleaseTag>,
         reason: &str,
+        slow: bool,
     ) -> Result<(), StoreError> {
         let stored = stored_reason(reason);
         let key = tag.map_or(WHOLE_DEPLOYMENT, AsRef::as_ref);
@@ -366,17 +387,18 @@ impl Store {
                 .await?;
         } else {
             sqlx::query(
-                "INSERT INTO release_holds (deployment, tag, reason, since, last_try)
-                 VALUES (?, ?, ?, ?, ?)
+                "INSERT INTO release_holds (deployment, tag, reason, since, last_try, slow)
+                 VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT (deployment, tag) DO UPDATE SET
                      reason = excluded.reason, since = excluded.since,
-                     last_try = excluded.last_try",
+                     last_try = excluded.last_try, slow = excluded.slow",
             )
             .bind(deployment.as_ref())
             .bind(key)
             .bind(&stored)
             .bind(now)
             .bind(now)
+            .bind(slow)
             .execute(&mut *tx)
             .await?;
             let event = AuditEvent {
@@ -391,15 +413,19 @@ impl Store {
         Ok(())
     }
 
-    /// Ends the hold on a whole deployment. A reason going away is not itself an
-    /// event: what comes next is.
+    /// Ends the hold on `tag`, or with `None` on the whole deployment. A reason
+    /// going away is not itself an event: what comes next is.
     ///
     /// # Errors
     /// A database failure.
-    pub async fn clear_deployment_hold(&self, deployment: &DeploymentId) -> Result<(), StoreError> {
+    pub async fn clear_hold(
+        &self,
+        deployment: &DeploymentId,
+        tag: Option<&ReleaseTag>,
+    ) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM release_holds WHERE deployment = ? AND tag = ?")
             .bind(deployment.as_ref())
-            .bind(WHOLE_DEPLOYMENT)
+            .bind(tag.map_or(WHOLE_DEPLOYMENT, AsRef::as_ref))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -489,25 +515,28 @@ impl Store {
     }
 
     /// Whether release (`tag`, `digest`) has been healthy on `source` for at
-    /// least `seconds`, by this controller's clock from what its host reported:
-    /// since it was first reported running, if it still is; or, if a later release
-    /// has replaced it, from its deploy finishing until that one's did.
+    /// least `seconds`, by this controller's clock from what `host`, whose it is,
+    /// reported: since it was first reported running, if it still is and its host
+    /// has reported within [`REPORT_FRESH_SECS`]; or, if a later release has
+    /// replaced it, from its deploy finishing until that one's did. A host's word
+    /// is all this is: silence holds it back, and does not start the time again.
     ///
     /// # Errors
     /// A clock or database failure.
     pub async fn healthy_for(
         &self,
-        source: &DeploymentId,
+        (source, host): (&DeploymentId, &HostId),
         tag: &ReleaseTag,
         digest: &ImageDigest,
         seconds: u64,
     ) -> Result<bool, StoreError> {
         let wanted = i64::try_from(seconds).unwrap_or(i64::MAX);
         let row = sqlx::query(
-            "SELECT tag, digest, drift, phase, healthy_since FROM running_states
-             WHERE deployment = ?",
+            "SELECT tag, digest, drift, phase, healthy_since, last_report FROM running_states
+             WHERE deployment = ? AND host = ?",
         )
         .bind(source.as_ref())
+        .bind(host.as_ref())
         .fetch_optional(&self.pool)
         .await?;
         if let Some(row) = row {
@@ -517,18 +546,22 @@ impl Store {
                 let idle = row.try_get::<String, _>("phase")? == "idle";
                 let drift: bool = row.try_get("drift")?;
                 let since: Option<i64> = row.try_get("healthy_since")?;
+                let last_report: Option<i64> = row.try_get("last_report")?;
                 let now = self.clock.now()?;
                 return Ok(idle
                     && !drift
+                    && last_report.is_some_and(|at| now.saturating_sub(at) <= REPORT_FRESH_SECS)
                     && since.is_some_and(|since| now.saturating_sub(since) >= wanted));
             }
         }
         let deployed = sqlx::query(
             "SELECT id, finished_at FROM deploys
-             WHERE deployment = ? AND tag = ? AND digest = ? AND outcome = 'deployed'
+             WHERE deployment = ? AND host = ? AND tag = ? AND digest = ?
+                 AND outcome = 'deployed'
              ORDER BY id DESC LIMIT 1",
         )
         .bind(source.as_ref())
+        .bind(host.as_ref())
         .bind(tag.as_ref())
         .bind(digest.as_ref())
         .fetch_optional(&self.pool)
@@ -540,9 +573,10 @@ impl Store {
         let started: i64 = deployed.try_get("finished_at")?;
         let replaced: Option<i64> = sqlx::query_scalar(
             "SELECT min(finished_at) FROM deploys
-             WHERE deployment = ? AND id > ? AND outcome = 'deployed'",
+             WHERE deployment = ? AND host = ? AND id > ? AND outcome = 'deployed'",
         )
         .bind(source.as_ref())
+        .bind(host.as_ref())
         .bind(id)
         .fetch_one(&self.pool)
         .await?;

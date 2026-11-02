@@ -19,6 +19,7 @@ sha1-checked.workspace = true
 sha2.workspace = true
 sigstore-verify.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 base64.workspace = true

@@ -18,7 +18,9 @@
 //! calls [`verify_release_origin`], which is all of this but the last step.
 
 use landfall_core::config::{Config, SignerKey};
-use landfall_core::ids::{CommitSha, DeploymentId, PrincipalId, ReleaseTag, RepoName, TagError};
+use landfall_core::ids::{
+    CommitSha, DeploymentId, ImageDigest, PrincipalId, ReleaseTag, RepoName, TagError,
+};
 use landfall_core::release::{
     DigestRuleError, Platform, PlatformError, RunRuleError, require_platform, select_release_digest,
 };
@@ -94,21 +96,31 @@ pub enum ReleaseError {
     /// There is no Sigstore trust root to verify against.
     #[error("no trust root")]
     NoTrustRoot,
+    /// The verification was stopped before it ended, as the process stops.
+    #[error("verification was interrupted")]
+    Interrupted,
 }
 
 impl ReleaseError {
-    /// Whether the release itself was refused: a verification check failed
-    /// on material that was obtained (tag pattern, signature, served content,
-    /// digest rule, attestation, platform). `false` when it could not be
-    /// verified: the deployment is unknown, or material could not be fetched
-    /// ([`FetchError::is_unavailable`]), which may succeed on a later try.
+    /// Whether the release itself was refused: a verification result, which holds
+    /// until the release changes (tag pattern, signature, digest rule, the run rule,
+    /// attestation, platform). `false` for anything one bad answer from a server can
+    /// cause, which may be otherwise on a later try: material that could not be
+    /// fetched, was the wrong shape or did not match what named it; a version tag's
+    /// digest not listed; a bundle that does not parse; an unknown deployment.
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         match self {
-            Self::UnknownDeployment(_) | Self::Listing(_) | Self::NoTrustRoot => false,
-            Self::TagObject(e) | Self::TagCommit(e) | Self::Index(e) | Self::Bundle(e) => {
-                !e.is_unavailable()
-            }
+            Self::UnknownDeployment(_)
+            | Self::Listing(_)
+            | Self::NoTrustRoot
+            | Self::Interrupted
+            | Self::TagObject(_)
+            | Self::TagCommit(_)
+            | Self::Index(_)
+            | Self::Bundle(_)
+            | Self::Runs(RunRuleError::VersionDigestOutside { .. })
+            | Self::Attestation(AttestationError::Bundle(_)) => false,
             Self::TagPattern(_)
             | Self::TagSignature(_)
             | Self::Digest(_)
@@ -116,6 +128,13 @@ impl ReleaseError {
             | Self::Attestation(_)
             | Self::Platform(_) => true,
         }
+    }
+
+    /// Whether this may pass with the registry's list catching up, and so is
+    /// worth trying only now and then: the version tag's digest is not listed.
+    #[must_use]
+    pub fn is_slow_to_retry(&self) -> bool {
+        matches!(self, Self::Runs(RunRuleError::VersionDigestOutside { .. }))
     }
 
     /// The fetch that failed, if that is what this is: for telling a rate limit
@@ -135,7 +154,8 @@ impl ReleaseError {
             | Self::Runs(_)
             | Self::Attestation(_)
             | Self::Platform(_)
-            | Self::NoTrustRoot => None,
+            | Self::NoTrustRoot
+            | Self::Interrupted => None,
         }
     }
 }
@@ -253,8 +273,9 @@ pub async fn verify_release_origin(
         tag,
         commit: &commit,
     };
-    let attestation =
-        verify_bundle(&bundle, digest, root, &expected).map_err(ReleaseError::Attestation)?;
+    let attestation = verify_bundle_off_runtime(bundle, digest, root, &expected)
+        .await?
+        .map_err(ReleaseError::Attestation)?;
 
     Ok(ReleaseOrigin {
         commit,
@@ -262,6 +283,47 @@ pub async fn verify_release_origin(
         attestation,
         platforms,
     })
+}
+
+/// [`verify_bundle`] on a blocking thread, since it is signature checks with no
+/// waiting in them. A panic in it goes on as a panic here.
+///
+/// # Errors
+///
+/// [`ReleaseError::Interrupted`] if the runtime dropped it; its own answer is the
+/// inner result.
+pub(crate) async fn verify_bundle_off_runtime(
+    bundle: Vec<u8>,
+    digest: &ImageDigest,
+    root: &TrustRoot,
+    expected: &Expected<'_>,
+) -> Result<Result<VerifiedAttestation, AttestationError>, ReleaseError> {
+    let digest = digest.clone();
+    let root = root.clone();
+    let (repo, tag, commit, workflow) = (
+        expected.repo.clone(),
+        expected.tag.clone(),
+        expected.commit.clone(),
+        expected.workflow.to_owned(),
+    );
+    let (repo_id, owner_id) = (expected.repo_id, expected.owner_id);
+    let joined = tokio::task::spawn_blocking(move || {
+        let expected = Expected {
+            repo: &repo,
+            repo_id,
+            owner_id,
+            workflow: &workflow,
+            tag: &tag,
+            commit: &commit,
+        };
+        verify_bundle(&bundle, &digest, &root, &expected)
+    })
+    .await;
+    match joined {
+        Ok(answer) => Ok(answer),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => Err(ReleaseError::Interrupted),
+    }
 }
 
 #[cfg(test)]
@@ -274,7 +336,7 @@ mod tests {
 
     use landfall_core::config::{self, Config};
     use landfall_core::ids::{DeploymentId, ReleaseTag};
-    use landfall_core::release::{Platform, PlatformError};
+    use landfall_core::release::{Platform, PlatformError, ReleaseRun, RunRuleError};
     use landfall_core::tag::TagVerifyError;
     use wiremock::MockServer;
 
@@ -824,13 +886,60 @@ checks = ["container-healthy"]
             other => panic!("{other:?}"),
         }
 
-        // Material that was served and failed a check is a refusal.
+        // A verification result is a refusal.
         assert!(ReleaseError::TagSignature(TagVerifyError::NotSigned).is_refusal());
+        let run = |run| ReleaseRun { run, attempt: 1 };
+        let runs = vec![run(1), run(2)];
+        assert!(ReleaseError::Runs(RunRuleError::SeveralRuns { runs }).is_refusal());
+        assert!(
+            ReleaseError::Attestation(AttestationError::Signature("x".to_owned())).is_refusal()
+        );
+
+        // What one bad answer from a server can cause is not: a 200 HTML error
+        // page must not refuse a release for good.
         let bundles = |count| FetchError::Bundles {
             digest: VW_DIGEST.parse().unwrap(),
             count,
         };
-        assert!(ReleaseError::Bundle(bundles(2)).is_refusal());
+        let url = || "https://example.test/x".to_owned();
+        let json = || FetchError::Json {
+            url: url(),
+            source: serde_json::from_str::<u8>("<html>").unwrap_err(),
+        };
+        let malformed = || FetchError::Malformed {
+            url: url(),
+            reason: "x".to_owned(),
+        };
+        let media_type = || FetchError::MediaType {
+            url: url(),
+            found: "text/html".to_owned(),
+            expected: "json",
+        };
+        let too_large = || FetchError::TooLarge {
+            url: url(),
+            limit: 1,
+        };
+        for fetch in [json(), malformed(), media_type(), too_large()] {
+            assert!(!ReleaseError::Index(fetch).is_refusal());
+        }
+        for fetch in [json(), malformed(), media_type(), too_large()] {
+            assert!(!ReleaseError::TagObject(fetch).is_refusal());
+        }
+        for fetch in [json(), malformed(), media_type(), too_large()] {
+            assert!(!ReleaseError::TagCommit(fetch).is_refusal());
+        }
+        for fetch in [json(), malformed(), media_type(), too_large()] {
+            assert!(!ReleaseError::Bundle(fetch).is_refusal());
+        }
+        assert!(!ReleaseError::Bundle(bundles(2)).is_refusal());
+        assert!(
+            !ReleaseError::Attestation(AttestationError::Bundle("junk".to_owned())).is_refusal()
+        );
+        let outside = ReleaseError::Runs(RunRuleError::VersionDigestOutside {
+            digest: VW_DIGEST.parse().unwrap(),
+        });
+        assert!(!outside.is_refusal());
+        assert!(outside.is_slow_to_retry());
         // A release still being published has no provenance bundle yet.
         assert!(!ReleaseError::Bundle(bundles(0)).is_refusal());
         assert!(!ReleaseError::UnknownDeployment(deployment()).is_refusal());

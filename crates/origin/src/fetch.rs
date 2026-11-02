@@ -607,8 +607,18 @@ impl Fetcher {
     /// the digest, [`FetchError::Digest`] when a manifest or the bundle does
     /// not match its descriptor, and the transport and parsing errors.
     pub async fn bundle(&self, image: &str, digest: &ImageDigest) -> Result<Vec<u8>, FetchError> {
-        check_image(image)?;
-        let token = self.registry_token(image).await?;
+        let token = self.pull_token(image).await?;
+        self.bundle_with(image, digest, &token).await
+    }
+
+    /// [`Fetcher::bundle`] with a token from [`Fetcher::pull_token`], for looking at
+    /// many digests of one image.
+    pub(crate) async fn bundle_with(
+        &self,
+        image: &str,
+        digest: &ImageDigest,
+        token: &HeaderValue,
+    ) -> Result<Vec<u8>, FetchError> {
         let referrers_tag = digest.as_ref().replacen(':', "-", 1);
         let url = self.manifest_url(image, &referrers_tag)?;
         let accept = format!("{OCI_INDEX}, {OCI_MANIFEST}");
@@ -617,7 +627,7 @@ impl Fetcher {
             count: 0,
         };
         let response = match self
-            .registry_get(&url, &accept, Some(&token), MANIFEST_LIMIT)
+            .registry_get(&url, &accept, Some(token), MANIFEST_LIMIT)
             .await
         {
             Err(FetchError::NotFound { .. }) => return Err(no_bundle()),
@@ -646,7 +656,7 @@ impl Fetcher {
                 };
                 let manifest_url = self.manifest_url(image, descriptor.digest.as_ref())?;
                 let response = self
-                    .registry_get(&manifest_url, OCI_MANIFEST, Some(&token), MANIFEST_LIMIT)
+                    .registry_get(&manifest_url, OCI_MANIFEST, Some(token), MANIFEST_LIMIT)
                     .await?;
                 let found = media_type(&response.headers);
                 if found != OCI_MANIFEST {
@@ -700,7 +710,7 @@ impl Fetcher {
         segments.extend(["blobs", layer.digest.as_ref()]);
         let blob_url = join(&self.endpoints.registry, &segments)?;
         let response = self
-            .registry_get(&blob_url, BUNDLE_TYPE, Some(&token), MAX_BUNDLE_BYTES)
+            .registry_get(&blob_url, BUNDLE_TYPE, Some(token), MAX_BUNDLE_BYTES)
             .await?;
         layer.check_content(&blob_url, &response.body)?;
         Ok(response.body)
@@ -741,6 +751,12 @@ impl Fetcher {
         }
         check_object_id(&url, &object.object.sha)?;
         Ok(object)
+    }
+
+    /// A pull token for `image`, whose name is checked first.
+    pub(crate) async fn pull_token(&self, image: &str) -> Result<HeaderValue, FetchError> {
+        check_image(image)?;
+        self.registry_token(image).await
     }
 
     /// An anonymous pull token for `image`, as an `Authorization` value.

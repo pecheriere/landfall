@@ -1,7 +1,94 @@
 //! What fails, and what that leaves working: holds, retries and backoff.
 
 use super::super::backoff::{BACKOFF_MAX_SECS, BACKOFF_START_SECS, RATE_LIMIT_MAX_SECS};
+use super::promotion::{PROMOTING, STAGING};
 use super::*;
+
+#[tokio::test]
+async fn tags_that_keep_failing_do_not_starve_a_release_below_them() {
+    let h = Harness::running("v1.2.3").await;
+    let junk: Vec<String> = (100..100 + 2 * VERIFICATIONS_PER_TICK)
+        .map(|n| format!("v1.2.{n}"))
+        .collect();
+    let mut tags: Vec<&str> = junk.iter().map(String::as_str).collect();
+    tags.push("v1.2.4");
+    h.fake.tags(PROD, &tags);
+    for tag in &junk {
+        h.fake
+            .locked()
+            .verify_fails
+            .insert(tag.clone(), no_bundle("v1.2.0"));
+    }
+
+    for _ in 0..3 {
+        h.tick().await;
+        h.clock.advance(300);
+    }
+
+    assert_eq!(
+        h.deploys(PROD).await,
+        [("v1.2.4".to_owned(), "queued".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_tag_below_the_running_version_is_hardly_ever_tried_again() {
+    let h = Harness::running("v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.2"]);
+    h.fake
+        .locked()
+        .verify_fails
+        .insert("v1.2.2".to_owned(), no_bundle("v1.2.2"));
+
+    h.tick().await;
+    assert_eq!(h.fake.verify_count(), 1);
+    h.clock.advance(EAGER_RETRY_SECS + SLOW_RETRY_SECS);
+    h.tick().await;
+    assert_eq!(h.fake.verify_count(), 1);
+    h.clock.advance(BELOW_RUNNING_RETRY_SECS);
+    h.tick().await;
+    assert_eq!(h.fake.verify_count(), 2);
+}
+
+#[tokio::test]
+async fn a_deadline_leaves_a_reason_once() {
+    let mut h = Harness::running("v1.2.3").await;
+    h.state = Arc::new(WatcherState::with_deadline(Duration::from_millis(50)));
+    h.fake.locked().tags_hang.insert(PROD.to_owned());
+    h.fake.tags(OTHER, &[]);
+
+    h.tick().await;
+    h.clock.advance(BACKOFF_START_SECS);
+    h.tick().await;
+
+    let held = h.hold_reason(PROD, "").await.unwrap();
+    assert!(held.contains("deadline"), "{held}");
+    let audited = h.audit("release_held").await;
+    let of_deadline = audited
+        .iter()
+        .filter(|d| d["reason"].to_string().contains("deadline"));
+    assert_eq!(of_deadline.count(), 1, "{audited:?}");
+}
+
+#[tokio::test]
+async fn each_deployment_of_a_repository_gets_its_turn() {
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.3")).await;
+    h.fake.tags(STAGING, &["v1.2.4"]);
+    // The first in the file stops the repository's work each time.
+    h.fake
+        .locked()
+        .tags_fail
+        .insert(PROD.to_owned(), server_error());
+
+    h.tick().await;
+    assert_eq!(h.deploys(STAGING).await, []);
+
+    h.clock.advance(BACKOFF_START_SECS);
+    h.tick().await;
+    assert_eq!(h.deploys(STAGING).await.len(), 1);
+}
 
 #[tokio::test]
 async fn unreadable_tag_list_fails_closed() {

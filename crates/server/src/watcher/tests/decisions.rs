@@ -165,10 +165,9 @@ async fn hostile_text_in_a_refusal_is_quoted_and_bounded() {
     h.fake.locked().verify_fails.insert(
         "v1.2.4".to_owned(),
         Box::new(move || {
-            ReleaseError::Index(FetchError::Malformed {
-                url: "https://example.test/x".to_owned(),
-                reason: hostile.clone(),
-            })
+            ReleaseError::Attestation(landfall_origin::attestation::AttestationError::Signature(
+                hostile.clone(),
+            ))
         }),
     );
 
@@ -258,7 +257,7 @@ async fn image_variants_from_one_run_pass_and_the_version_tags_digest_is_pinned(
 }
 
 #[tokio::test]
-async fn a_version_tags_digest_outside_the_attested_ones_refuses_the_release() {
+async fn a_short_list_at_first_look_holds_the_release_slowly_and_refuses_nothing() {
     let h = Harness::running("v1.2.3").await;
     h.fake.tags(PROD, &["v1.2.4"]);
     h.fake
@@ -272,10 +271,121 @@ async fn a_version_tags_digest_outside_the_attested_ones_refuses_the_release() {
 
     h.tick().await;
 
-    let (decision, reason) = h.decision(PROD, "v1.2.4").await;
-    assert_eq!(decision, "refused");
-    assert!(reason.contains("version tag's digest"), "{reason}");
+    let held = h.hold_reason(PROD, "v1.2.4").await.unwrap();
+    assert!(held.contains("version tag's digest"), "{held}");
+    assert_eq!(h.decided_count().await, 0);
     assert_eq!(h.deploys(PROD).await, []);
+
+    // On the slow schedule from the start, and queueing nothing meanwhile.
+    h.clock.advance(SLOW_RETRY_SECS - 1);
+    h.tick().await;
+    assert_eq!(h.fake.verify_count(), 1);
+    assert_eq!(h.deploys(PROD).await, []);
+
+    // The registry's list catches up, and the release was never lost.
+    h.fake.locked().own_digest_unlisted.clear();
+    h.clock.advance(1);
+    h.tick().await;
+    assert_eq!(h.fake.verify_count(), 2);
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+    assert_eq!(h.hold_reason(PROD, "v1.2.4").await, None);
+}
+
+#[tokio::test]
+async fn a_short_list_at_queue_time_keeps_the_digest_and_queues_nothing_during_the_hold() {
+    let h = Harness::running("v1.2.3").await;
+    h.report_busy(PROD, HOST, "v1.2.3").await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    h.tick().await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+
+    h.fake
+        .locked()
+        .own_digest_unlisted
+        .insert("v1.2.4".to_owned());
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.tick().await;
+
+    let recorded = |h: &Harness| {
+        let pool = h.store.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>("SELECT digest FROM releases")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
+    assert_eq!(
+        recorded(&h).await.as_deref(),
+        Some(digest("v1.2.4").as_ref())
+    );
+    let held = h.hold_reason(PROD, "v1.2.4").await.unwrap();
+    assert!(held.contains("version tag's digest"), "{held}");
+    assert_eq!(h.deploys(PROD).await, []);
+    let looks = h.fake.enumerations.load(Ordering::SeqCst);
+
+    // Even with the list back, the hold stands until its next try.
+    h.fake.locked().own_digest_unlisted.clear();
+    h.clock.advance(SLOW_RETRY_SECS - 1);
+    h.tick().await;
+    assert_eq!(h.fake.enumerations.load(Ordering::SeqCst), looks);
+    assert_eq!(h.deploys(PROD).await, []);
+
+    h.clock.advance(1);
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+    assert_eq!(h.hold_reason(PROD, "v1.2.4").await, None);
+}
+
+#[tokio::test]
+async fn one_bad_answer_from_a_server_holds_a_release_and_refuses_nothing() {
+    let url = || "https://example.test/x".to_owned();
+    let makes: Vec<MakeError> = vec![
+        Box::new(move || {
+            ReleaseError::Index(FetchError::Json {
+                url: url(),
+                source: serde_json::from_str::<u8>("<html>").unwrap_err(),
+            })
+        }),
+        Box::new(move || {
+            ReleaseError::TagObject(FetchError::Malformed {
+                url: url(),
+                reason: "x".to_owned(),
+            })
+        }),
+        Box::new(move || {
+            ReleaseError::TagCommit(FetchError::MediaType {
+                url: url(),
+                found: "text/html".to_owned(),
+                expected: "json",
+            })
+        }),
+        Box::new(move || {
+            ReleaseError::Bundle(FetchError::TooLarge {
+                url: url(),
+                limit: 1,
+            })
+        }),
+    ];
+    for make in makes {
+        let h = Harness::running("v1.2.3").await;
+        h.fake.tags(PROD, &["v1.2.4"]);
+        h.fake
+            .locked()
+            .verify_fails
+            .insert("v1.2.4".to_owned(), make);
+
+        h.tick().await;
+        assert_eq!(h.decided_count().await, 0);
+        assert!(h.hold_reason(PROD, "v1.2.4").await.is_some());
+        assert_eq!(h.deploys(PROD).await, []);
+
+        h.fake.locked().verify_fails.clear();
+        h.tick().await;
+        assert_eq!(h.deploys(PROD).await.len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -336,6 +446,19 @@ async fn a_second_run_that_comes_after_verification_stops_the_deploy() {
     let (decision, reason) = h.decision(PROD, "v1.2.4").await;
     assert_eq!(decision, "refused");
     assert!(reason.contains("workflow runs"), "{reason}");
+    assert_eq!(h.deploys(PROD).await, []);
+
+    // What was recorded stays recorded, and the refusal is recorded once.
+    let recorded: Option<String> = sqlx::query_scalar("SELECT digest FROM releases")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(recorded.as_deref(), Some(digest("v1.2.4").as_ref()));
+    let looks = h.fake.enumerations.load(Ordering::SeqCst);
+    let decisions = h.audit("rule_decision").await.len();
+    h.tick().await;
+    assert_eq!(h.fake.enumerations.load(Ordering::SeqCst), looks);
+    assert_eq!(h.audit("rule_decision").await.len(), decisions);
     assert_eq!(h.deploys(PROD).await, []);
 }
 

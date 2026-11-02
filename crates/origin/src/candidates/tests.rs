@@ -10,7 +10,9 @@ use serde_json::json;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::{AttestedDigests, CandidateCache, attested_digests};
+use super::{
+    AttestedDigests, CandidateCache, RULED_OUT_LIFETIME, UNATTESTED_LIFETIME, attested_digests,
+};
 use crate::attestation::SLSA_PROVENANCE;
 use crate::fetch::OCI_INDEX;
 use crate::release::ReleaseError;
@@ -127,13 +129,24 @@ impl Mocks {
         cache: &CandidateCache,
         tag: &str,
     ) -> Result<AttestedDigests, ReleaseError> {
+        // A version digest nothing in these tests lists.
+        self.ask_for(config, cache, tag, &other_digest('9')).await
+    }
+
+    async fn ask_for(
+        &self,
+        config: &Config,
+        cache: &CandidateCache,
+        tag: &str,
+        version_digest: &ImageDigest,
+    ) -> Result<AttestedDigests, ReleaseError> {
         let tag: ReleaseTag = tag.parse().unwrap();
         let commit: CommitSha = COMMIT.parse().unwrap();
         attested_digests(
             &fetcher(&self.github, &self.registry),
             &TrustRoot::from_json(TRUSTED_ROOT),
             config,
-            (&deployment(), &tag, &commit),
+            (&deployment(), &tag, &commit, version_digest),
             cache,
         )
         .await
@@ -196,7 +209,7 @@ async fn a_candidate_with_nothing_attached_is_ignored() {
 }
 
 #[tokio::test]
-async fn a_candidate_with_no_provenance_bundle_is_looked_at_again() {
+async fn a_candidate_with_no_provenance_bundle_is_looked_at_again_only_in_time() {
     let empty = other_digest('b');
     let mocks = Mocks::listing(&[&empty]).await;
     mount_manifest(
@@ -207,10 +220,78 @@ async fn a_candidate_with_no_provenance_bundle_is_looked_at_again() {
         None,
     )
     .await;
+    // Thousands of these must not cost a request each on every look.
     let cache = CandidateCache::default();
     assert_eq!(mocks.ask(&cache, TAG).await.unwrap().ignored.len(), 1);
+    assert_eq!(mocks.ask(&cache, TAG).await.unwrap().ignored.len(), 0);
+
     // It may be being published right now.
-    assert_eq!(mocks.ask(&cache, TAG).await.unwrap().ignored.len(), 1);
+    let soon = CandidateCache::with_lifetimes(RULED_OUT_LIFETIME, Duration::ZERO);
+    assert_eq!(mocks.ask(&soon, TAG).await.unwrap().ignored.len(), 1);
+    assert_eq!(mocks.ask(&soon, TAG).await.unwrap().ignored.len(), 1);
+}
+
+#[tokio::test]
+async fn one_junk_answer_about_the_version_digest_does_not_stick() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    // A 200 that is an HTML error page, once, in place of the referrer index.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v2/{REPO}/manifests/{}",
+            referrers_tag(&real_digest())
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("<html>oops</html>", "text/html"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&mocks.registry)
+        .await;
+    let cache = CandidateCache::default();
+    let config = config(121_898_717);
+
+    let first = mocks
+        .ask_for(&config, &cache, TAG, &real_digest())
+        .await
+        .unwrap();
+    assert_eq!(first.verified, []);
+    assert_eq!(first.ignored.len(), 1, "{first:?}");
+
+    let second = mocks
+        .ask_for(&config, &cache, TAG, &real_digest())
+        .await
+        .unwrap();
+    assert_eq!(second.verified, [real_candidate()]);
+}
+
+#[tokio::test]
+async fn the_digest_just_verified_is_looked_at_whatever_is_remembered() {
+    let mocks = Mocks::listing(&[&real_digest()]).await;
+    let cache = CandidateCache::default();
+    cache.keep_ruled_out((deployment(), real_digest()), None, RULED_OUT_LIFETIME);
+    let config = config(121_898_717);
+
+    // Any other digest stays ruled out, this one does not.
+    assert_eq!(mocks.ask(&cache, TAG).await.unwrap().verified, []);
+    let answer = mocks
+        .ask_for(&config, &cache, TAG, &real_digest())
+        .await
+        .unwrap();
+    assert_eq!(answer.verified, [real_candidate()]);
+}
+
+#[tokio::test]
+async fn one_token_serves_a_whole_look() {
+    let (a, b) = (other_digest('a'), other_digest('b'));
+    let mocks = Mocks::listing(&[&real_digest(), &a, &b]).await;
+    mocks.ask(&CandidateCache::default(), TAG).await.unwrap();
+    let tokens = mocks
+        .registry
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/token")
+        .count();
+    assert_eq!(tokens, 1);
 }
 
 #[tokio::test]
@@ -308,7 +389,8 @@ async fn live_the_fixture_release_has_two_variants_from_one_run() {
     let tag: ReleaseTag = TAG.parse().unwrap();
     let commit: CommitSha = COMMIT.parse().unwrap();
     let cache = CandidateCache::default();
-    let target = (&deployment(), &tag, &commit);
+    let version_digest = real_digest();
+    let target = (&deployment(), &tag, &commit, &version_digest);
     let config = config(121_898_717);
 
     let answer = attested_digests(&fetcher, &root, &config, target, &cache)
@@ -343,7 +425,7 @@ async fn live_the_fixture_release_has_two_variants_from_one_run() {
 #[tokio::test]
 async fn what_ruled_a_candidate_out_is_forgotten_in_time() {
     let mocks = Mocks::listing(&[&real_digest()]).await;
-    let cache = CandidateCache::with_lifetime(Duration::ZERO);
+    let cache = CandidateCache::with_lifetimes(Duration::ZERO, UNATTESTED_LIFETIME);
     for tag in ["2.0.0", "2.0.1"] {
         mocks.ask(&cache, tag).await.unwrap();
     }

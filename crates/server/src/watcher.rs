@@ -18,10 +18,10 @@
 
 mod backoff;
 mod source;
+mod ticking;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use landfall_core::config::{Config, Deployment};
@@ -34,12 +34,10 @@ use landfall_origin::fetch::{FetchError, ListedTag, RateLimitReset};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin};
 use semver::Version;
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, watch};
-use tokio::task::JoinSet;
 
 pub use self::backoff::WatcherState;
 pub use self::source::LiveSource;
-use crate::agent_api::log;
+pub use self::ticking::{run, tick};
 use crate::report::MAX_STORED_TEXT_CHARS;
 use crate::store::{
     Hold, NewDeploy, ReleaseDecision, Seen, Store, StoreError, StoredRelease, WatchView,
@@ -66,6 +64,9 @@ const EAGER_RETRY_SECS: i64 = 60 * 60;
 /// ...and after that this often, seconds: an old tag that was released before the
 /// project attested its images will never have a bundle.
 const SLOW_RETRY_SECS: i64 = 60 * 60;
+/// How often a failure is tried on a tag below the running version, seconds: only an
+/// operator could want it, so it is not worth a place in the rate limit.
+const BELOW_RUNNING_RETRY_SECS: i64 = 24 * 60 * 60;
 
 /// A deploy that never touched the service may go ahead later, up to this many
 /// tries for one release.
@@ -98,11 +99,14 @@ pub trait ReleaseSource: Send + Sync + 'static {
     ) -> impl Future<Output = Result<ReleaseOrigin, ReleaseError>> + Send;
 
     /// Every digest validly attested for the release, on its verified `commit`.
+    /// `version_digest`, the one verified for it, is looked at whatever is remembered
+    /// about it.
     fn attested_digests(
         &self,
         deployment: &DeploymentId,
         tag: &ReleaseTag,
         commit: &CommitSha,
+        version_digest: &ImageDigest,
     ) -> impl Future<Output = Result<Vec<RunCandidate>, ReleaseError>> + Send;
 }
 
@@ -163,8 +167,8 @@ enum Failure {
     Stop(Stop, String),
     /// The release itself is refused.
     Refuse(String),
-    /// Only this release waits.
-    Hold(String),
+    /// Only this release waits, and whether it is slow to try again.
+    Hold(String, bool),
 }
 
 fn classify(error: &ReleaseError) -> Failure {
@@ -176,7 +180,7 @@ fn classify(error: &ReleaseError) -> Failure {
             Failure::Stop(Stop::Outage, describe(error))
         }
         _ if error.is_refusal() => Failure::Refuse(describe(error)),
-        _ => Failure::Hold(describe(error)),
+        _ => Failure::Hold(describe(error), error.is_slow_to_retry()),
     }
 }
 
@@ -221,6 +225,7 @@ enum HostReadiness {
 
 /// A release its rule makes automatic.
 struct AutoRelease {
+    version: Version,
     listed: ListedTag,
     settled: Settled,
 }
@@ -267,9 +272,16 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         (self.d.id(), self.d.host())
     }
 
-    async fn hold_tag(&mut self, tag: &ReleaseTag, reason: &str) -> Result<(), StoreError> {
+    async fn hold_tag(
+        &mut self,
+        tag: &ReleaseTag,
+        reason: &str,
+        slow: bool,
+    ) -> Result<(), StoreError> {
         let known = self.holds.get(tag.as_ref()).is_some_and(|h| h.says(reason));
-        self.store.set_hold(self.key(), Some(tag), reason).await?;
+        self.store
+            .set_hold(self.key(), Some(tag), reason, slow)
+            .await?;
         if !known {
             self.summary.held += 1;
         }
@@ -302,7 +314,23 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         Ok(())
     }
 
-    /// Records a release as refused before a digest was settled.
+    /// Whether a release on hold is due another try: every tick for a while, then
+    /// slowly; slowly from the start if the hold says so; hardly ever if it is below
+    /// the running version.
+    fn retry_due(&self, hold: &Hold, version: &Version, now: i64) -> bool {
+        let below_running = self.running_version.as_ref().is_some_and(|r| version < r);
+        let wait = if below_running {
+            BELOW_RUNNING_RETRY_SECS
+        } else if hold.slow || now.saturating_sub(hold.since) >= EAGER_RETRY_SECS {
+            SLOW_RETRY_SECS
+        } else {
+            0
+        };
+        now.saturating_sub(hold.last_try) >= wait
+    }
+
+    /// Records a release as refused by verification, for as long as its inputs stay
+    /// the same. A digest it had before stays recorded.
     async fn record_refusal(
         &mut self,
         listed: &ListedTag,
@@ -327,6 +355,7 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             config_hash: config.hash(),
             commit,
             digest: None,
+            refused: true,
             detail,
             origin,
         };
@@ -346,8 +375,8 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             .get(listed.tag.as_ref())
             .filter(|row| row.has_inputs(&listed.object, config_hash))
         {
-            return Ok(match (&row.commit, &row.digest) {
-                (Some(commit), Some(digest)) => Looked::Settled(Settled {
+            return Ok(match (&row.commit, &row.digest, row.origin_refused) {
+                (Some(commit), Some(digest), false) => Looked::Settled(Settled {
                     commit: commit.clone(),
                     digest: digest.clone(),
                     fresh: None,
@@ -362,8 +391,7 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         }
         let now = self.store.now()?;
         if let Some(hold) = self.holds.get(listed.tag.as_ref())
-            && now.saturating_sub(hold.since) >= EAGER_RETRY_SECS
-            && now.saturating_sub(hold.last_try) < SLOW_RETRY_SECS
+            && !self.retry_due(hold, version, now)
         {
             return Ok(Looked::Held);
         }
@@ -386,7 +414,7 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         let digest = &origin.attestation.digest;
         let candidates = match self
             .source
-            .attested_digests(id, &listed.tag, &origin.commit)
+            .attested_digests(id, &listed.tag, &origin.commit, digest)
             .await
         {
             Ok(candidates) => candidates,
@@ -414,15 +442,15 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
     ) -> Result<Looked, StoreError> {
         match classify(error) {
             Failure::Stop(stop, reason) => {
-                self.hold_tag(&listed.tag, &reason).await?;
+                self.hold_tag(&listed.tag, &reason, false).await?;
                 Ok(Looked::Stopped(stop))
             }
             Failure::Refuse(reason) => {
                 self.record_refusal(listed, commit, &reason).await?;
                 Ok(Looked::Refused)
             }
-            Failure::Hold(reason) => {
-                self.hold_tag(&listed.tag, &reason).await?;
+            Failure::Hold(reason, slow) => {
+                self.hold_tag(&listed.tag, &reason, slow).await?;
                 Ok(Looked::Held)
             }
         }
@@ -464,7 +492,12 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             if promotion.deployment() == self.d.id()
                 && !self
                     .store
-                    .healthy_for(source.id(), tag, digest, promotion.healthy_for_secs())
+                    .healthy_for(
+                        (source.id(), source.host()),
+                        tag,
+                        digest,
+                        promotion.healthy_for_secs(),
+                    )
                     .await?
             {
                 return Ok(Some(source.id()));
@@ -509,28 +542,46 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         }
         if let Some(source) = self.promotion_waits_for(tag, digest).await? {
             let reason = format!(
-                "waits for promotion: not yet healthy for long enough on {source} (enforced by \
-                 the controller only)"
+                "waits for promotion: not yet reported healthy for long enough on {source}, or \
+                 it has gone quiet (enforced by the controller only)"
             );
             return Ok((ReleaseDecision::Manual, reason));
         }
         Ok((decision, reason.to_owned()))
     }
 
-    /// Goes through the deployment's releases, newest first. Gives the ones its
-    /// rule makes automatic, and what stopped the look, if anything. What was
-    /// settled before a stop still counts: everything not looked at is older, so
-    /// a rate limit met among old tags does not hold up a new release.
+    /// Whether this release has failed before and has not been settled since, and
+    /// so waits for what has never been tried.
+    fn is_retry(&self, listed: &ListedTag) -> bool {
+        self.holds.contains_key(listed.tag.as_ref())
+            && !self
+                .stored
+                .get(listed.tag.as_ref())
+                .is_some_and(|row| row.has_inputs(&listed.object, self.config.hash()))
+    }
+
+    /// Goes through the deployment's releases, newest first, those never tried before
+    /// those that failed, so that tags that keep failing cannot starve a release
+    /// below them. Gives the ones its rule makes automatic, highest first, and what
+    /// stopped the look, if anything. What was settled before a stop still counts: a
+    /// rate limit met among old tags does not hold up a new release.
     async fn go_through(
         &mut self,
         releases: &[(Version, ListedTag)],
     ) -> Result<(Vec<AutoRelease>, Option<Stop>), StoreError> {
+        let (retries, first_looks): (Vec<_>, Vec<_>) = releases
+            .iter()
+            .partition(|(_, listed)| self.is_retry(listed));
         let mut autos = Vec::new();
-        for (version, listed) in releases {
+        let mut stopped = None;
+        for (version, listed) in first_looks.into_iter().chain(retries) {
             let settled = match self.look_at_origin(version, listed).await? {
                 Looked::Settled(settled) => settled,
                 Looked::Refused | Looked::Held => continue,
-                Looked::Stopped(stop) => return Ok((autos, Some(stop))),
+                Looked::Stopped(stop) => {
+                    stopped = Some(stop);
+                    break;
+                }
             };
             let (decision, reason) = self.decision(version, &listed.tag, &settled.digest).await?;
             let config = self.config;
@@ -539,6 +590,7 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
                 config_hash: config.hash(),
                 commit: Some(&settled.commit),
                 digest: Some(&settled.digest),
+                refused: false,
                 detail: detail.clone(),
                 origin: origin.clone(),
             });
@@ -546,12 +598,14 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
                 .await?;
             if decision == ReleaseDecision::Auto {
                 autos.push(AutoRelease {
+                    version: version.clone(),
                     listed: listed.clone(),
                     settled,
                 });
             }
         }
-        Ok((autos, None))
+        autos.sort_by(|a, b| b.version.cmp(&a.version));
+        Ok((autos, stopped))
     }
 
     /// Whether the host can take a deploy now.
@@ -569,9 +623,50 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         }
     }
 
-    /// Queues the highest of `autos` that can go. A release verified in an earlier
-    /// tick has its digests enumerated again first, since a second digest may have
-    /// come since. Gives what to hold the deployment for, and what stopped it.
+    /// Whether `auto` may go: one verified in an earlier tick has its digests
+    /// enumerated again, since a second run may have come since, unless it is on
+    /// hold and not yet due another try. Gives whether it may, and what stopped it.
+    async fn still_one_run(
+        &mut self,
+        auto: &AutoRelease,
+    ) -> Result<(bool, Option<Stop>), StoreError> {
+        let AutoRelease {
+            version,
+            listed,
+            settled,
+        } = auto;
+        if settled.fresh.is_some() {
+            return Ok((true, None));
+        }
+        let hold = self.holds.get(listed.tag.as_ref());
+        let was_waiting = hold.is_some();
+        let now = self.store.now()?;
+        if hold.is_some_and(|hold| !self.retry_due(hold, version, now)) {
+            return Ok((false, None));
+        }
+        let enumerated = self
+            .source
+            .attested_digests(self.d.id(), &listed.tag, &settled.commit, &settled.digest)
+            .await
+            .and_then(|candidates| one_run(self.d.repo().name(), &settled.digest, &candidates));
+        match enumerated {
+            Ok(()) => {
+                if was_waiting {
+                    self.store
+                        .clear_hold(self.d.id(), Some(&listed.tag))
+                        .await?;
+                }
+                Ok((true, None))
+            }
+            Err(error) => match self.failed(listed, Some(&settled.commit), &error).await? {
+                Looked::Stopped(stop) => Ok((false, Some(stop))),
+                Looked::Settled(_) | Looked::Refused | Looked::Held => Ok((false, None)),
+            },
+        }
+    }
+
+    /// Queues the highest of `autos` that can go. One refused or on hold is skipped,
+    /// and is not queued. Gives what to hold the deployment for, and what stopped it.
     async fn queue_highest(
         &mut self,
         autos: Vec<AutoRelease>,
@@ -584,29 +679,20 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             HostReadiness::Occupied => return Ok((None, None)),
             HostReadiness::Held(reason) => return Ok((Some(reason), None)),
         }
-        for AutoRelease { listed, settled } in autos {
-            if settled.fresh.is_none() {
-                let enumerated = self
-                    .source
-                    .attested_digests(self.d.id(), &listed.tag, &settled.commit)
-                    .await
-                    .and_then(|candidates| {
-                        one_run(self.d.repo().name(), &settled.digest, &candidates)
-                    });
-                if let Err(error) = enumerated {
-                    match self.failed(&listed, Some(&settled.commit), &error).await? {
-                        Looked::Refused => continue,
-                        Looked::Stopped(stop) => return Ok((None, Some(stop))),
-                        Looked::Settled(_) | Looked::Held => return Ok((None, None)),
-                    }
-                }
+        for auto in autos {
+            let (may_go, stop) = self.still_one_run(&auto).await?;
+            if stop.is_some() {
+                return Ok((None, stop));
+            }
+            if !may_go {
+                continue;
             }
             let deploy = NewDeploy {
                 deployment: self.d.id().clone(),
                 host: self.d.host().clone(),
-                tag: listed.tag,
-                digest: settled.digest,
-                commit: settled.commit,
+                tag: auto.listed.tag,
+                digest: auto.settled.digest,
+                commit: auto.settled.commit,
             };
             if let Some(id) = self
                 .store
@@ -639,12 +725,14 @@ async fn settle_whole_hold(
 ) -> Result<(), StoreError> {
     match (reason, whole) {
         (None, None) => {}
-        (None, Some(_)) => store.clear_deployment_hold(d.id()).await?,
+        (None, Some(_)) => store.clear_hold(d.id(), None).await?,
         (Some(reason), whole) => {
             if !whole.is_some_and(|hold| hold.says(reason)) {
                 summary.held += 1;
             }
-            store.set_hold((d.id(), d.host()), None, reason).await?;
+            store
+                .set_hold((d.id(), d.host()), None, reason, false)
+                .await?;
         }
     }
     Ok(())
@@ -683,7 +771,7 @@ async fn watch_deployment<S: ReleaseSource>(
         Err(error) => {
             let (stop, reason) = match classify(&error) {
                 Failure::Stop(stop, reason) => (stop, reason),
-                Failure::Refuse(reason) | Failure::Hold(reason) => (Stop::Outage, reason),
+                Failure::Refuse(reason) | Failure::Hold(reason, _) => (Stop::Outage, reason),
             };
             settle_whole_hold(store, d, whole, Some(&reason), &mut summary).await?;
             return Ok((summary, Some(stop)));
@@ -719,170 +807,6 @@ async fn watch_deployment<S: ReleaseSource>(
     // deployment's own hold is about the deployment.
     settle_whole_hold(store, d, whole, hold, &mut summary).await?;
     Ok((summary, stop))
-}
-
-/// One tick of one repository's deployments, within its deadline.
-async fn watch_repository<S: ReleaseSource>(
-    store: Store,
-    config: Arc<Config>,
-    source: Arc<S>,
-    state: Arc<WatcherState>,
-    (repo, deployments): (u64, Vec<usize>),
-) -> TickSummary {
-    let mut summary = TickSummary::default();
-    let now = match store.now() {
-        Ok(now) => now,
-        Err(error) => {
-            log(&format!("watcher: {error}"));
-            summary.failed = 1;
-            return summary;
-        }
-    };
-    if state.is_waiting(repo, now) {
-        summary.backed_off = deployments.len();
-        return summary;
-    }
-    let work = async {
-        for index in deployments {
-            let d = &config.deployments()[index];
-            match watch_deployment(&store, &config, source.as_ref(), d).await {
-                Ok((done, stop)) => {
-                    summary.add(done);
-                    if let Some(stop) = stop {
-                        return Ok(Some(stop));
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(None)
-    };
-    let answer = tokio::time::timeout(state.repo_deadline, work).await;
-    // A wait counts from when the work ended, which can be long after it began.
-    let now = store.now().unwrap_or(now);
-    match answer {
-        Ok(Ok(None)) => state.succeeded(repo),
-        Ok(Ok(Some(Stop::RateLimited(reset)))) => state.rate_limited(repo, reset, now),
-        Ok(Ok(Some(Stop::Outage))) => state.failed(repo, now),
-        Ok(Err(error)) => {
-            log(&format!("watcher: repository id {repo}: {error}"));
-            summary.failed += 1;
-        }
-        Err(_) => {
-            log(&format!(
-                "watcher: repository id {repo} ran past its deadline"
-            ));
-            state.failed(repo, now);
-            summary.failed += 1;
-        }
-    }
-    summary
-}
-
-/// Holds every deployment for `reason`: nothing can be verified.
-async fn hold_everything(store: &Store, config: &Config, reason: &str) -> TickSummary {
-    let mut summary = TickSummary::default();
-    for d in config.deployments() {
-        let result = async {
-            let (_, whole) = store.holds_of(d.id()).await?;
-            settle_whole_hold(store, d, whole.as_ref(), Some(reason), &mut summary).await
-        }
-        .await;
-        if let Err(error) = result {
-            log(&format!("watcher: {error}"));
-            summary.failed += 1;
-        }
-    }
-    summary
-}
-
-/// One look at every configured deployment. A panic, an error or a hang in one
-/// repository's work stays there.
-pub async fn tick<S: ReleaseSource>(
-    store: &Store,
-    config: &Arc<Config>,
-    source: &Arc<S>,
-    state: &Arc<WatcherState>,
-) -> TickSummary {
-    if let Err(reason) = source.prepare().await {
-        return hold_everything(store, config, &reason).await;
-    }
-    let mut repositories: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
-    for (index, d) in config.deployments().iter().enumerate() {
-        repositories.entry(d.repo().id()).or_default().push(index);
-    }
-    let permits = Arc::new(Semaphore::new(REPOS_AT_ONCE));
-    let mut tasks = JoinSet::new();
-    for repository in repositories {
-        let work = watch_repository(
-            store.clone(),
-            Arc::clone(config),
-            Arc::clone(source),
-            Arc::clone(state),
-            repository,
-        );
-        let permits = Arc::clone(&permits);
-        tasks.spawn(async move {
-            // Never closed, so this always gets one.
-            let _permit = permits.acquire_owned().await;
-            work.await
-        });
-    }
-    let mut summary = TickSummary::default();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(done) => summary.add(done),
-            Err(error) => {
-                log(&format!("watcher: a repository's work stopped: {error}"));
-                summary.failed += 1;
-            }
-        }
-    }
-    summary
-}
-
-/// Ends when `stop` says so, or when nobody is left to say it.
-async fn until_stopped(stop: &mut watch::Receiver<bool>) {
-    drop(stop.wait_for(|stop| *stop).await);
-}
-
-/// Ticks every `interval` until `stop` says so, then lets go of whatever is in
-/// flight: dropping it rolls back any transaction, and the next start looks again.
-pub async fn run<S: ReleaseSource>(
-    store: Store,
-    config: Arc<Config>,
-    source: Arc<S>,
-    interval: Duration,
-    mut stop: watch::Receiver<bool>,
-) {
-    let state = Arc::new(WatcherState::default());
-    loop {
-        let job = tokio::spawn({
-            let (store, config, source, state) = (
-                store.clone(),
-                Arc::clone(&config),
-                Arc::clone(&source),
-                Arc::clone(&state),
-            );
-            async move { tick(&store, &config, &source, &state).await }
-        });
-        let abort = job.abort_handle();
-        tokio::select! {
-            joined = job => {
-                if let Err(error) = joined {
-                    log(&format!("watcher: a tick stopped: {error}"));
-                }
-            }
-            () = until_stopped(&mut stop) => {
-                abort.abort();
-                return;
-            }
-        }
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {}
-            () = until_stopped(&mut stop) => return,
-        }
-    }
 }
 
 #[cfg(test)]

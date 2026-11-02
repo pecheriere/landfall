@@ -8,7 +8,7 @@ mod running;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use landfall_core::config;
 use landfall_core::protocol::{
@@ -17,6 +17,7 @@ use landfall_core::protocol::{
 use landfall_origin::attestation::VerifiedAttestation;
 use sha2::{Digest as _, Sha256};
 use sqlx::Row as _;
+use tokio::sync::watch;
 
 use super::*;
 use crate::report::BoundedReport;
@@ -214,6 +215,7 @@ impl ReleaseSource for Fake {
         deployment: &DeploymentId,
         tag: &ReleaseTag,
         _commit: &CommitSha,
+        _version_digest: &ImageDigest,
     ) -> Result<Vec<RunCandidate>, ReleaseError> {
         self.nothing_in_the_way().await;
         self.enumerations.fetch_add(1, Ordering::SeqCst);

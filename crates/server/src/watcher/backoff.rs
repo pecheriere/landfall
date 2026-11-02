@@ -27,6 +27,8 @@ struct Backoff {
 #[derive(Debug)]
 pub struct WatcherState {
     backoffs: Mutex<HashMap<u64, Backoff>>,
+    /// Whose turn it is to go first in each repository, as a count of looks.
+    turns: Mutex<HashMap<u64, usize>>,
     pub(super) repo_deadline: Duration,
 }
 
@@ -40,8 +42,19 @@ impl WatcherState {
     pub(super) fn with_deadline(repo_deadline: Duration) -> Self {
         Self {
             backoffs: Mutex::default(),
+            turns: Mutex::default(),
             repo_deadline,
         }
+    }
+
+    /// The count of looks at `repo` before this one.
+    pub(super) fn next_turn(&self, repo: u64) -> usize {
+        // Each step leaves the map valid, so a panic elsewhere changes nothing.
+        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        let turn = turns.entry(repo).or_insert(0);
+        let this = *turn;
+        *turn = turn.wrapping_add(1);
+        this
     }
 
     fn locked(&self) -> MutexGuard<'_, HashMap<u64, Backoff>> {

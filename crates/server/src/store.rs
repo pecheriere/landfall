@@ -29,7 +29,8 @@ use tokio::sync::watch;
 pub use self::agent::NONCE_LIFETIME_SECS;
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
-    FinishedDeploy, Hold, ReleaseDecision, Seen, StoredRelease, WatchView, WatchedRunning,
+    FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,
+    WatchedRunning,
 };
 use crate::audit::{AuditEvent, AuditReport, EventKind, GENESIS, MAX_DETAIL_BYTES, RowFields};
 

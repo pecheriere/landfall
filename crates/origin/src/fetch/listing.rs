@@ -11,12 +11,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use landfall_core::ids::{ImageDigest, ReleaseTag, RepoName};
 use reqwest::Url;
-use reqwest::header::{HeaderMap, LINK};
+use reqwest::header::{HeaderMap, HeaderValue, LINK};
 use serde::Deserialize;
 
-use super::{
-    FetchError, Fetched, Fetcher, MANIFEST_LIMIT, check_image, check_object_id, join, parse,
-};
+use super::{FetchError, Fetched, Fetcher, MANIFEST_LIMIT, check_object_id, join, parse};
 
 /// The most tags read of one list, counting every tag it names, whether it is
 /// of interest or not. Past this the list is an error and not a shorter list: a
@@ -181,8 +179,16 @@ impl Fetcher {
     /// [`FetchError::Malformed`] for a cursor that comes round again, and the
     /// transport, status and parsing errors.
     pub async fn list_referrer_digests(&self, image: &str) -> Result<Vec<ImageDigest>, FetchError> {
-        check_image(image)?;
-        let token = self.registry_token(image).await?;
+        let token = self.pull_token(image).await?;
+        self.list_referrer_digests_with(image, &token).await
+    }
+
+    /// [`Fetcher::list_referrer_digests`] with a token from [`Fetcher::pull_token`].
+    pub(crate) async fn list_referrer_digests_with(
+        &self,
+        image: &str,
+        token: &HeaderValue,
+    ) -> Result<Vec<ImageDigest>, FetchError> {
         let mut segments = vec!["v2"];
         segments.extend(image.split('/'));
         segments.extend(["tags", "list"]);
@@ -199,7 +205,7 @@ impl Fetcher {
                 url.query_pairs_mut().append_pair("last", cursor);
             }
             let response = self
-                .registry_get(&url, "application/json", Some(&token), MANIFEST_LIMIT)
+                .registry_get(&url, "application/json", Some(token), MANIFEST_LIMIT)
                 .await?;
             let tags = parse::<TagList>(&url, &response.body)?
                 .tags

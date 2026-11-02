@@ -152,9 +152,14 @@ All must pass:
    (`.../actions/runs/<id>/attempts/<n>`) names it, and the digest the version tag resolves to must
    be among them. Several digests from one run are image variants of the release, and only the
    version tag's is pinned. Two runs, or two attempts of one run, are a re-run release workflow, and
-   the release is refused, naming both; so is one whose version tag's digest is outside the set, or
-   whose run URI does not read strictly as that shape. A project building its variants in separate
-   workflow runs for one tag is refused too.
+   the release is refused, naming both; so is one whose run URI does not read strictly as that
+   shape. A project building its variants in separate workflow runs for one tag is refused too. A
+   version tag's digest outside the set is not refused, since a registry's list can be behind: the
+   release waits and is tried again hourly, and is not queued meanwhile.
+
+   Only a verification result refuses a release for good: signature, attestation, this rule. Anything
+   one bad answer from a server can cause (material unavailable, the wrong shape or not matching what
+   named it) is a hold, tried again later.
 5. **Platform present.** The digest is a multi-arch index containing the host's platform. The index
    digest is what is pinned and recorded.
 
