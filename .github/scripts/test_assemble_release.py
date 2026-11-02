@@ -1,18 +1,17 @@
 """Unit tests for assemble_release.py, on small files and made-up bundles built here."""
 
 import base64
-import contextlib
 import hashlib
-import io
 import json
+import math
 import os
+import re
 import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import assemble_release
 from assemble_release import RefusedError, Release
@@ -198,6 +197,51 @@ class AssembleTests(TempDirTestCase):
         with self.assertRaisesRegex(RefusedError, "not a regular file"):
             self.assemble()
 
+    def test_a_link_on_the_way_to_an_input_is_refused(self) -> None:
+        """A link further up could copy anything readable as well, and nothing is written."""
+        elsewhere = self.tmp / "elsewhere"
+        shutil.copytree(self.dist, elsewhere)
+        for name, path, target in (
+            ("a platform directory", self.dist / "linux_arm64", elsewhere / "linux_arm64"),
+            ("--dist itself", self.dist, elsewhere),
+            ("--macos itself", self.macos, elsewhere),
+        ):
+            with self.subTest(name=name):
+                held = path.with_name(f"{path.name}.held")
+                path.rename(held)
+                path.symlink_to(target)
+                with self.assertRaisesRegex(RefusedError, "is a link"):
+                    self.assemble()
+                self.assertFalse(self.out.exists())
+                path.unlink()
+                held.rename(path)
+
+    def test_an_output_that_is_a_link_is_refused(self) -> None:
+        """Files written through it would land somewhere nobody named."""
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.out.symlink_to(elsewhere)
+        with self.assertRaisesRegex(RefusedError, "is a link"):
+            self.assemble()
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_a_directory_as_an_input_is_refused(self) -> None:
+        """A sentence, not a traceback from the copy."""
+        path = self.input_file("macos/landfall")
+        path.unlink()
+        path.mkdir()
+        with self.assertRaisesRegex(RefusedError, "not a regular file"):
+            self.assemble()
+
+    def test_generated_files_have_their_mode_whatever_the_umask(self) -> None:
+        """A release asset mustn't depend on the runner's umask."""
+        self.addCleanup(os.umask, os.umask(0o077))
+        self.assemble()
+        for name in ("SHA256SUMS", "landfall.rb"):
+            with self.subTest(name=name):
+                mode = stat.S_IMODE((self.out / name).stat().st_mode)
+                self.assertEqual(mode, LICENCE_MODE)
+
     def test_missing_licence_is_refused(self) -> None:
         """The table lists them, so a release without one isn't the release it describes."""
         (self.root / "LICENSE-APACHE").unlink()
@@ -319,6 +363,8 @@ class ReleaseTests(unittest.TestCase):
             '1.2.3"; system("x")#',
             "1.2.3-#{x}",
             f"{chr(0x661)}.{chr(0x662)}.{chr(0x663)}",
+            "1.2.3-01",
+            "1.2.3-rc.01",
         ):
             with self.subTest(version=version), self.assertRaisesRegex(RefusedError, "version"):
                 Release(version, REPO)
@@ -345,6 +391,9 @@ class ReleaseTests(unittest.TestCase):
     def test_good_names_pass(self) -> None:
         """A prerelease with hyphens and dots, and a repository name with both."""
         Release("10.20.30-rc.1-a", "some-owner/some.repo_name-1")
+        for version in ("1.2.3-0", "1.2.3-0a", "1.2.3-rc.10", "1.2.3-01a", "1.2.3--"):
+            with self.subTest(version=version):
+                Release(version, REPO)
 
 
 class CheckBundleTests(TempDirTestCase):
@@ -479,6 +528,63 @@ class CheckBundleTests(TempDirTestCase):
                     document["dsseEnvelope"]["payload"] = "!!!"
                 self.assert_refused(document)
 
+    def test_wrong_types_are_refused(self) -> None:
+        """Each position that wants an object, a list or text, given something else."""
+        material = "verificationMaterial"
+        for name, change in {
+            "tlog entries that are text": lambda d: d[material].update(tlogEntries="x"),
+            "tlog entries that are an object": lambda d: d[material].update(tlogEntries={"a": 1}),
+            "a tlog entry that is text": lambda d: d[material].update(tlogEntries=["x"]),
+            "a proof that is text": lambda d: d[material]["tlogEntries"][0].update(
+                inclusionProof="x"
+            ),
+            "a numeric payload": lambda d: d["dsseEnvelope"].update(payload=1),
+        }.items():
+            with self.subTest(name=name):
+                document = bundle(statement(self.subjects))
+                change(document)
+                self.assert_refused(document)
+
+    def test_digests_of_the_wrong_type_are_refused(self) -> None:
+        """A digest that isn't an object holding text can't be compared with a file's."""
+        for digest in ("x", ["x"], {"sha256": 1}, None):
+            with self.subTest(digest=digest):
+                subject = {"name": "one", "digest": digest}
+                self.assert_refused(bundle(statement([subject, self.subjects[1]])), "one", "sha256")
+
+    def test_nan_and_deep_nesting_are_refused(self) -> None:
+        """Python's `json` would take the one, and on some versions raise for the other."""
+        for name, raw in {
+            "NaN": '{"mediaType": NaN}\n',
+            "Infinity": '{"mediaType": -Infinity}\n',
+            "deep nesting": "[" * 100_000 + "\n",
+        }.items():
+            with self.subTest(name=name):
+                self.bundle_path.write_text(raw, encoding="utf-8")
+                with self.assertRaisesRegex(RefusedError, "not valid"):
+                    assemble_release.check_bundle(self.bundle_path, self.out)
+
+    def test_an_unreadable_directory_is_refused(self) -> None:
+        """Missing, or a file where a directory should be."""
+        (self.tmp / "afile").write_bytes(b"x")
+        self.bundle_path.write_text("{}\n", encoding="utf-8")
+        for path in (self.tmp / "missing", self.tmp / "afile"):
+            with self.subTest(path=path), self.assertRaisesRegex(RefusedError, "could not be read"):
+                assemble_release.check_bundle(self.bundle_path, path)
+
+    def test_the_limit_is_the_verifiers(self) -> None:
+        """Read from the Rust constant, as its comment says: a bundle this accepts, it must too."""
+        source = (REPOSITORY_ROOT / "crates/origin/src/attestation.rs").read_text(encoding="utf-8")
+        found = re.search(r"const MAX_BUNDLE_BYTES: usize = (\d+) \* (\d+) \* (\d+);", source)
+        self.assertIsNotNone(found)
+        rust = math.prod(int(factor) for factor in found.groups())
+        self.assertEqual(assemble_release.MAX_BUNDLE_BYTES, rust)
+
+    def test_long_values_are_shortened_in_a_message(self) -> None:
+        """A hostile value can't fill a log line."""
+        self.assertEqual(assemble_release.shown("x" * 200), "x" * 200)
+        self.assertEqual(assemble_release.shown("x" * 201), "x" * 200 + "...")
+
     def test_a_payload_with_characters_outside_base64_is_refused(self) -> None:
         """A lenient decoder would skip them, and another reader might not."""
         document = bundle(statement(self.subjects))
@@ -559,84 +665,6 @@ class CheckBundleTests(TempDirTestCase):
         with self.assertRaises(RefusedError) as caught:
             self.check()
         self.assertNotIn("\n", str(caught.exception))
-
-
-class MainTests(TempDirTestCase):
-    """The command line, and what comes out of it."""
-
-    def run_main(self, *argv: str) -> tuple[int, str]:
-        """Run `main`. Return its exit status and what it printed."""
-        printed = io.StringIO()
-        with contextlib.redirect_stdout(printed):
-            status = assemble_release.main(list(argv))
-        return status, printed.getvalue()
-
-    def test_check_bundle_failure_is_an_annotation_and_exit_one(self) -> None:
-        """A refusal says why, in the form GitHub shows."""
-        out = self.tmp / "out"
-        out.mkdir()
-        (out / "one").write_bytes(b"first")
-        path = self.tmp / "bundle.json"
-        path.write_text("{}\n", encoding="utf-8")
-        status, printed = self.run_main("check-bundle", "--bundle", str(path), "--out", str(out))
-        self.assertEqual(status, 1)
-        self.assertTrue(printed.startswith("::error title=Release files::"), printed)
-
-    def test_check_bundle_success_is_exit_zero(self) -> None:
-        """The good bundle through the command line."""
-        out = self.tmp / "out"
-        out.mkdir()
-        (out / "one").write_bytes(b"first")
-        document = bundle(statement([{"name": "one", "digest": {"sha256": sha256(b"first")}}]))
-        path = self.tmp / "bundle.json"
-        path.write_text(json.dumps(document) + "\n", encoding="utf-8")
-        status, _ = self.run_main("check-bundle", "--bundle", str(path), "--out", str(out))
-        self.assertEqual(status, 0)
-
-    def test_assemble_takes_licences_from_the_repository(self) -> None:
-        """Through the command line, with the real licence files, into a new directory."""
-        dist = self.tmp / "dist"
-        macos = self.tmp / "macos"
-        for name in INPUTS:
-            path = self.tmp / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"binary")
-        out = self.tmp / "out"
-        status, _ = self.run_main(
-            "assemble",
-            "--dist",
-            str(dist),
-            "--macos",
-            str(macos),
-            "--version",
-            VERSION,
-            "--repo",
-            REPO,
-            "--out",
-            str(out),
-        )
-        self.assertEqual(status, 0)
-        self.assertEqual({path.name for path in out.iterdir()}, {*BINARIES, *OTHERS})
-
-    def test_assemble_failure_is_an_annotation_and_exit_one(self) -> None:
-        """A bad version stops it before anything else."""
-        with mock.patch.object(assemble_release, "assemble") as assemble:
-            status, printed = self.run_main(
-                "assemble",
-                "--dist",
-                "d",
-                "--macos",
-                "m",
-                "--version",
-                "nope",
-                "--repo",
-                REPO,
-                "--out",
-                "o",
-            )
-        self.assertEqual(status, 1)
-        self.assertIn("::error title=Release files::", printed)
-        assemble.assert_not_called()
 
 
 if __name__ == "__main__":

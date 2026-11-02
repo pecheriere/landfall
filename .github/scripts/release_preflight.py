@@ -17,8 +17,7 @@ an argument was checked against a pattern first. `ssh-keygen` reads the signed b
 everything else from files in a private directory, with no token in its environment.
 
 This runs under `python3 -I`, which keeps a script's directory off the import path, so it stands
-alone. `test_release_preflight.py` keeps the two patterns it shares with `assemble_release.py`
-equal.
+alone. `test_release_scripts_run.py` keeps what it shares with `assemble_release.py` equal.
 
 Usage: release_preflight.py --tag TAG --sha COMMIT --repo OWNER/NAME
 """
@@ -41,7 +40,8 @@ SIGNERS_FILE = Path("crates/cli/assets/release-signers")
 
 VERSION = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
 )
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.+$)[A-Za-z0-9._-]+")
 COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -66,7 +66,10 @@ FIELDS_IN_A_KEY_LINE = 2
 
 PRINCIPAL = "landfall-release"
 NAMESPACE = "git"
-SSH_SIGNATURE_ARMOR = "-----BEGIN SSH SIGNATURE-----"
+# One block and nothing else: `ssh-keygen` reads the first block, and `verify_tag` the last.
+SSH_SIGNATURE = re.compile(
+    r"-----BEGIN SSH SIGNATURE-----\n[A-Za-z0-9+/=\n]+-----END SSH SIGNATURE-----\n?"
+)
 
 # Edwards25519, for what a key must be. The checks are `landfall-approval`'s for a passkey, and
 # issue 36's for a signer: `ssh-keygen` verifies with a small-order key, whose signatures anyone
@@ -142,12 +145,17 @@ def signer_line_fault(line: str) -> str | None:
 def parse_signers(text: str) -> list[str]:
     r"""Return the keys in a signers file: at least one, each a whole line, and none twice.
 
-    Only `\n` ends a line. A blank line or one that starts with `#` is skipped, and everything
-    else must be exactly a key: a key's comment usually carries a name, so one is refused.
+    Only `\n` ends a line, and a carriage return anywhere is refused, as an editor can show such
+    a file unlike how it's read. An empty line, or one whose first character is `#`, is skipped.
+    Everything else must be exactly a key: a key's comment usually carries a name, so one is
+    refused. The Rust parser of this file must apply the same rule.
     """
+    if "\r" in text:
+        msg = "the signers file holds a carriage return"
+        raise RefusedError(msg)
     keys: list[str] = []
     for number, line in enumerate(text.split("\n"), start=1):
-        if not line.strip() or line.lstrip().startswith("#"):
+        if not line or line.startswith("#"):
             continue
         fault = signer_line_fault(line)
         if fault is not None:
@@ -181,7 +189,8 @@ def read_signers(root: Path) -> list[str]:
     """Return the keys in this repository's signers file."""
     path = root / SIGNERS_FILE
     try:
-        text = path.read_text(encoding="utf-8")
+        # As bytes: reading as text would turn a carriage return into a line's end.
+        text = path.read_bytes().decode("utf-8")
     except (OSError, ValueError) as error:
         msg = f"{SIGNERS_FILE} could not be read: {shown(error)}"
         raise RefusedError(msg) from error
@@ -270,8 +279,11 @@ def signed_material(answer: object, requested: str) -> tuple[dict[str, Any], str
     if not isinstance(payload, str) or not isinstance(signature, str):
         msg = "GitHub's answer has a payload or signature that isn't text"
         raise RefusedError(msg)
-    if not signature.startswith(SSH_SIGNATURE_ARMOR):
-        msg = "the tag's signature is not an SSH signature (git tag -s with gpg.format = ssh)"
+    if not payload.endswith("\n"):
+        msg = "the tag object's signed bytes have no final newline, which the CLI can't read"
+        raise RefusedError(msg)
+    if not SSH_SIGNATURE.fullmatch(signature):
+        msg = "the tag's signature is not one SSH signature (git tag -s with gpg.format = ssh)"
         raise RefusedError(msg)
     return answer, payload, signature
 
@@ -406,6 +418,9 @@ def main(argv: list[str] | None = None) -> int:
         preflight(args.tag, args.sha, args.repo, ROOT, gh_api)
     except RefusedError as refusal:
         print(f"::error title=Release preflight::{refusal}")
+        return 1
+    except OSError as error:
+        print(f"::error title=Release preflight::{shown(error)}")
         return 1
     print(f"{args.tag} is signed by a release key and points at {args.sha}")
     return 0

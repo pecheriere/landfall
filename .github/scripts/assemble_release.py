@@ -11,8 +11,7 @@ accept, or one that doesn't cover exactly these files, fails with a sentence bef
 public.
 
 This runs under `python3 -I`, which keeps a script's directory off the import path, so it stands
-alone. `test_release_preflight.py` keeps the two patterns it shares with `release_preflight.py`
-equal.
+alone. `test_release_scripts_run.py` keeps what it shares with `release_preflight.py` equal.
 
 Usage:
     assemble_release.py assemble --dist DIR --macos DIR --version V --repo OWNER/NAME --out DIR
@@ -35,7 +34,8 @@ ROOT = Path(__file__).resolve().parents[2]
 # What may reach a file name, a URL and a Ruby string. SemVer with no build metadata, in ASCII.
 VERSION = re.compile(
     r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
 )
 REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.+$)[A-Za-z0-9._-]+")
 
@@ -126,22 +126,25 @@ def sha256_of(path: Path) -> str:
         return hashlib.file_digest(file, "sha256").hexdigest()
 
 
-def binary_sources(dist: Path, macos: Path, release: Release) -> dict[str, Path]:
-    """Map each binary's name in the release to where a build job left it."""
+def binary_sources(dist: Path, macos: Path, release: Release) -> dict[str, tuple[Path, Path]]:
+    """Map each binary's name in the release to a build job's directory and a path in it."""
     sources = {
-        release.binary("landfall", "darwin-arm64"): macos / "landfall",
+        release.binary("landfall", "darwin-arm64"): (macos, Path("landfall")),
     }
     for directory, platform in (("linux_arm64", "linux-arm64"), ("linux_amd64", "linux-amd64")):
         for program in ("landfall-agent", "landfall"):
-            sources[release.binary(program, platform)] = dist / directory / program
+            sources[release.binary(program, platform)] = (dist, Path(directory, program))
     return sources
 
 
-def check_input(path: Path) -> None:
-    """Refuse an input that isn't a file with something in it, without following a link."""
-    if path.is_symlink():
-        msg = f"{shown(path)} is not a regular file"
-        raise RefusedError(msg)
+def check_input(base: Path, relative: Path) -> None:
+    """Refuse an input that isn't a file with something in it, or is reached through a link."""
+    path = base
+    for part in ("", *relative.parts):
+        path = path / part
+        if path.is_symlink():
+            msg = f"{shown(path)} is a link, not a regular file or a directory"
+            raise RefusedError(msg)
     if not path.exists():
         msg = f"{shown(path)} is missing"
         raise RefusedError(msg)
@@ -155,6 +158,9 @@ def check_input(path: Path) -> None:
 
 def prepare_output(out: Path) -> None:
     """Make the output directory, which must hold nothing: all it holds gets attested."""
+    if out.is_symlink():
+        msg = f"{shown(out)} is a link, and files written through it would land elsewhere"
+        raise RefusedError(msg)
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         msg = f"{shown(out)} is not empty, and everything in it would be attested"
@@ -189,16 +195,17 @@ def sums(out: Path) -> str:
 def assemble(dist: Path, macos: Path, release: Release, out: Path, root: Path) -> None:
     """Write a release's files. All the inputs are checked before anything is written."""
     sources = binary_sources(dist, macos, release)
-    licences = [root / name for name in LICENCES]
-    for path in (*sources.values(), *licences):
-        check_input(path)
+    for base, relative in sources.values():
+        check_input(base, relative)
+    for name in LICENCES:
+        check_input(root, Path(name))
     prepare_output(out)
-    for name, source in sources.items():
-        shutil.copyfile(source, out / name)
+    for name, (base, relative) in sources.items():
+        shutil.copyfile(base / relative, out / name)
         (out / name).chmod(BINARY_MODE)
-    for licence in licences:
-        shutil.copyfile(licence, out / licence.name)
-        (out / licence.name).chmod(TEXT_MODE)
+    for name in LICENCES:
+        shutil.copyfile(root / name, out / name)
+        (out / name).chmod(TEXT_MODE)
     write_text(out / FORMULA, formula(release, out))
     # Last, because it covers the formula, and sums() would list itself if it already existed.
     write_text(out / SUMS, sums(out))
@@ -416,6 +423,9 @@ def main(argv: list[str] | None = None) -> int:
             check_bundle(args.bundle, args.out)
     except RefusedError as refusal:
         print(f"::error title=Release files::{refusal}")
+        return 1
+    except OSError as error:
+        print(f"::error title=Release files::{shown(error)}")
         return 1
     return 0
 
