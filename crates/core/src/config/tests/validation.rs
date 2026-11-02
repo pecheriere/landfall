@@ -33,6 +33,28 @@ fn unknown_fields_are_errors() {
     assert!(err.to_string().contains("rul"), "{err}");
 }
 
+/// Two spellings of one entry must never leave the file saying one thing to a reader and
+/// another to the parser: a signer or an approver named twice could otherwise be replaced by
+/// a line further down.
+#[test]
+fn duplicate_keys_are_errors() {
+    for text in [
+        edited("[signers]", "[signers]\nmaintainer = \"x\""),
+        edited("[signers]", "[signers]\n\"maintainer\" = \"x\""),
+        edited("[signers]", "[signers]\n\"\\u006daintainer\" = \"x\""),
+        edited("[approvers]", "[approvers]\noperator = {}"),
+        edited("[[grant]]", "[approvers.operator]\n[[grant]]"),
+        edited("[[grant]]", "[approval]\n[[grant]]"),
+        edited("[[grant]]", "[signers]\n[[grant]]"),
+        edited("host = ", "host = \"home-2\"\nhost = "),
+        edited("repo = { name", "repo = { name = \"example/other\", name"),
+    ] {
+        let err = parse_str(&text).unwrap_err();
+        assert!(matches!(err, ConfigError::Toml(_)), "{err}");
+        assert!(err.to_string().contains("duplicate key"), "{err}");
+    }
+}
+
 #[test]
 fn each_validation_rule_is_enforced() {
     // 1: duplicate ids.
