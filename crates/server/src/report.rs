@@ -9,7 +9,9 @@
 //!
 //! The audit row holds the short form of each text, [`shown`], and the tables the
 //! long one, up to [`MAX_STORED_TEXT_CHARS`], since a failure's cause is often
-//! past its first 64 characters.
+//! past its first 64 characters. A host's refusal keeps [`REFUSAL_SHOWN_CHARS`] in the
+//! audit row too: only one of a report's reasons, so it adds under 3 KiB to the bound
+//! that [`MAX_STORED_STEPS`] gives.
 
 use landfall_core::ids::{DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
@@ -33,6 +35,11 @@ pub const MAX_STORED_TEXT_CHARS: usize = 1024;
 
 /// The most post-deploy checks stored for one deploy, across its steps.
 pub const MAX_STORED_CHECKS: usize = 128;
+
+/// The most characters of a host's refusal in the audit row. A refusal is the signal of a
+/// controller lying, and the origin, digest or nonce that tells two of them apart comes
+/// past [`shown`]'s first 64.
+pub const REFUSAL_SHOWN_CHARS: usize = 256;
 
 /// One step, ready to store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +177,14 @@ impl BoundedReport {
             // controller are upgraded together.
             _ => ("unknown", None, None),
         };
+        let refused = matches!(report.outcome, ReportedOutcome::Refused { .. });
+        let reason_short = reason.map(|text| {
+            if refused {
+                quoted(text, REFUSAL_SHOWN_CHARS)
+            } else {
+                shown(text)
+            }
+        });
         let mut checks_left = MAX_STORED_CHECKS;
         let mut checks_dropped = 0;
         let steps = report
@@ -184,10 +199,10 @@ impl BoundedReport {
             tag: report.tag.clone(),
             digest: report.digest.clone(),
             outcome,
-            refused: matches!(report.outcome, ReportedOutcome::Refused { .. }),
+            refused,
             reason: reason.map(|text| stored_text(text)),
             rollback_reason: rollback_reason.map(|text| stored_text(text)),
-            reason_short: reason.map(|text| shown(text)),
+            reason_short,
             rollback_reason_short: rollback_reason.map(|text| shown(text)),
             steps,
             steps_dropped: report.steps.len().saturating_sub(MAX_STORED_STEPS),
@@ -224,7 +239,7 @@ mod tests {
 
     use super::{
         BoundedReport, DeployId, DeployReportBody, MAX_STORED_STEPS, MAX_STORED_TEXT_CHARS,
-        ReportedDetail, ReportedOutcome, ReportedStep, Value,
+        REFUSAL_SHOWN_CHARS, ReportedDetail, ReportedOutcome, ReportedStep, Value,
     };
     use crate::audit::MAX_DETAIL_BYTES;
 
@@ -301,10 +316,40 @@ mod tests {
         assert_eq!(kept, MAX_STORED_TEXT_CHARS - 8);
         let short = bounded.reason_short.unwrap();
         assert!(short.starts_with("\"a\\nb\\u{1b}[31m"), "{short}");
-        assert_eq!(short.chars().filter(|c| *c == 'x').count(), 64 - 8);
+        assert_eq!(
+            short.chars().filter(|c| *c == 'x').count(),
+            REFUSAL_SHOWN_CHARS - 8
+        );
         assert_eq!(bounded.steps[0].name, "\"na\\nme\"");
         assert_eq!(bounded.steps[0].failure.as_deref(), Some("\"fa\\u{1b}il\""));
         assert!(bounded.refused);
+    }
+
+    #[test]
+    fn a_hosts_refusal_keeps_its_reason_in_the_audit_row() {
+        let tail = "https://evil.example";
+        let reason = format!("approval refused: {}{tail}", "x".repeat(200));
+        let audit = |outcome| {
+            BoundedReport::new(&report(outcome, Vec::new())).audit_detail("v1.2.3")["reason"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let refused = audit(ReportedOutcome::Refused {
+            reason: reason.clone(),
+        });
+        assert!(refused.contains(tail), "{refused}");
+        // Escaped as any other, and bounded.
+        let hostile_reason = hostile(1000);
+        let refused = audit(ReportedOutcome::Refused {
+            reason: hostile_reason,
+        });
+        assert!(!refused.contains('\u{10ffff}'), "{refused}");
+        assert!(refused.ends_with("\"..."), "{refused}");
+        assert_eq!(refused.matches("\\u{10ffff}").count(), REFUSAL_SHOWN_CHARS);
+        // Nothing else takes more room than it did.
+        let rolled_back = audit(ReportedOutcome::RolledBack { reason });
+        assert!(!rolled_back.contains(tail), "{rolled_back}");
     }
 
     #[test]

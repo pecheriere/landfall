@@ -2,7 +2,7 @@
 //! and what each host says is running.
 
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag};
-use landfall_core::protocol::{DeployId, DeployWork, HeldBack, Phase, RunningState};
+use landfall_core::protocol::{Approval, DeployId, DeployWork, HeldBack, Phase, RunningState};
 use serde_json::json;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, SqliteConnection, Transaction};
@@ -16,6 +16,9 @@ use crate::report::BoundedReport;
 /// A deployment whose running state has drifted gets no new deploy until it
 /// clears: the reason a host is given.
 const DRIFT_REASON: &str = "the running state differs from what the agent deployed";
+
+/// Why a request made for another running digest can't be approved any more.
+const RUNNING_MOVED: &str = "the running digest moved after the request was made";
 
 /// How often an unchanged report is noted, seconds: a poll costs no write beyond it.
 const REPORT_NOTE_EVERY_SECS: i64 = 60;
@@ -84,7 +87,11 @@ fn deploy_work(row: &SqliteRow) -> Result<DeployWork, StoreError> {
         tag: parsed(row, "tag")?,
         digest: parsed(row, "digest")?,
         commit: parsed(row, "commit_sha")?,
-        approval: None,
+        approval: row
+            .try_get::<Option<String>, _>("approval")?
+            .map(|text| serde_json::from_str::<Approval>(&text))
+            .transpose()
+            .map_err(|_| StoreError::Corrupt("deploy approval"))?,
     })
 }
 
@@ -115,9 +122,27 @@ impl Store {
         tx: &mut Transaction<'_, Sqlite>,
         deploy: &NewDeploy,
     ) -> Result<DeployId, StoreError> {
+        self.insert_deploy(tx, deploy, None).await
+    }
+
+    /// Queues a deploy under a new number, carrying the approval of a request if it took
+    /// one: the row is new each time, so a number a host has answered is never asked
+    /// again.
+    pub(super) async fn insert_deploy(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        deploy: &NewDeploy,
+        approved: Option<(i64, &Approval)>,
+    ) -> Result<DeployId, StoreError> {
+        let approval = approved
+            .map(|(_, approval)| serde_json::to_string(approval))
+            .transpose()?;
+        let request = approved.map(|(request, _)| request);
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO deploys (deployment, host, tag, digest, commit_sha, state, created_at)
-             VALUES (?, ?, ?, ?, ?, 'queued', ?)
+            "INSERT INTO deploys
+                 (deployment, host, tag, digest, commit_sha, state, created_at, approval,
+                  request_id)
+             VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
              RETURNING id",
         )
         .bind(deploy.deployment.as_ref())
@@ -126,6 +151,8 @@ impl Store {
         .bind(deploy.digest.as_ref())
         .bind(deploy.commit.as_ref())
         .bind(self.clock.now()?)
+        .bind(approval)
+        .bind(request)
         .fetch_one(&mut **tx)
         .await?;
         let event = AuditEvent {
@@ -137,6 +164,7 @@ impl Store {
                 "tag": deploy.tag,
                 "digest": deploy.digest,
                 "commit": deploy.commit,
+                "request": request,
             }),
         };
         self.append(tx, &event).await?;
@@ -167,7 +195,7 @@ impl Store {
         // One deploy at a time per host: a claimed one sorts first, and until
         // it is reported nothing else is handed out.
         let rows = sqlx::query(
-            "SELECT d.id, d.deployment, d.tag, d.digest, d.commit_sha,
+            "SELECT d.id, d.deployment, d.tag, d.digest, d.commit_sha, d.approval,
                     d.state = 'claimed' AS claimed, COALESCE(r.drift, 0) AS drift
              FROM deploys d
              LEFT JOIN running_states r ON r.deployment = d.deployment AND r.host = d.host
@@ -307,25 +335,21 @@ impl Store {
         .bind(id)
         .execute(&mut *tx)
         .await?;
-        for (position, step) in (0_i64..).zip(&report.steps) {
-            sqlx::query(
-                "INSERT INTO deploy_steps (deploy_id, position, name, millis, failure, detail)
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(id)
-            .bind(position)
-            .bind(&step.name)
-            .bind(step.millis)
-            .bind(step.failure.as_deref())
-            .bind(step.detail.as_deref())
-            .execute(&mut *tx)
-            .await?;
-        }
+        insert_steps(&mut tx, id, report).await?;
         if matches!(
             report.outcome,
             "rolled_back" | "rollback_failed" | "failed_no_previous"
         ) {
             start_health_over(&mut tx, &deployment, self.clock.now()?).await?;
+        }
+        if report.outcome == "deployed" {
+            self.stale_other_requests(
+                &mut tx,
+                &deployment,
+                Some(report.digest.as_ref()),
+                RUNNING_MOVED,
+            )
+            .await?;
         }
         let tag: String = row.try_get("tag")?;
         let event = AuditEvent {
@@ -468,6 +492,8 @@ impl Store {
             let detail = json!({ "tag": tag, "digest": digest, "previous_tag": old_tag });
             self.append(tx, &event(EventKind::RunningChanged, detail))
                 .await?;
+            self.stale_other_requests(tx, &state.deployment, digest, RUNNING_MOVED)
+                .await?;
         }
         if drift_changed {
             let detail = json!({ "drift": state.drift });
@@ -506,6 +532,29 @@ impl Store {
         .await?;
         Ok(())
     }
+}
+
+/// Stores the steps of a report on the deploy numbered `id`.
+async fn insert_steps(
+    connection: &mut SqliteConnection,
+    id: i64,
+    report: &BoundedReport,
+) -> Result<(), StoreError> {
+    for (position, step) in (0_i64..).zip(&report.steps) {
+        sqlx::query(
+            "INSERT INTO deploy_steps (deploy_id, position, name, millis, failure, detail)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(position)
+        .bind(&step.name)
+        .bind(step.millis)
+        .bind(step.failure.as_deref())
+        .bind(step.detail.as_deref())
+        .execute(&mut *connection)
+        .await?;
+    }
+    Ok(())
 }
 
 /// A `running_states` row.

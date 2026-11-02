@@ -462,6 +462,53 @@ The rule for `--controller` is the same on `enrol` and `run`:
 
 Redirects are not followed.
 
+## API tokens, requests and approvals
+
+Grants live in the configuration. A person signs in with a passkey, and a program holds an
+API token, which acts for a principal the configuration names, with that principal's grants.
+`approve` is never a token's, whatever the file says. On the controller, as its user:
+
+```sh
+landfall-server token create --principal ci --config fleet.toml --db /var/lib/landfall-server/controller.db
+landfall-server token revoke --id 3 --db /var/lib/landfall-server/controller.db
+landfall-server passkey-invite --principal operator --config fleet.toml --db /var/lib/landfall-server/controller.db
+```
+
+`token create` prints the token once, as JSON, with its id. Only a hash is kept, and revoking
+works from the token's next use. A token whose principal has gone from the configuration
+stops working when the controller next loads it. `passkey-invite` prints a one-time link,
+valid for an hour; another for the same person replaces it.
+
+Send a token as `Authorization: Bearer <token>`. No credentials, or a token that is malformed,
+unknown or revoked, all get the same `401 unauthenticated`. With credentials and no grant at
+all on a deployment, the answer is the same `404 not_found` as for one that doesn't exist;
+with another grant on it, `403 forbidden`. Every refusal to someone who proved who they are
+is in the audit log (`request_refused`, `approval_refused`, `access_refused`).
+
+**To ask for a deploy,** a principal with `request` sends
+`POST /api/v1/deployments/{name}/{stage}/requests` with `{"tag": "v1.2.3"}`; a lower version
+than the running one, a manual rollback, takes `rollback` instead. The controller makes the
+intent itself, from its verified record of the release and the host's last report. The tag
+must be a release the watcher verified under this configuration and hasn't refused or put on
+hold since. So asking too soon after a new tag, or just after the configuration changed, gets
+`409 release_not_verified` until the watcher's next look. Other refusals are
+`409`s with a stable code: `request_open` (one open request a deployment), `deployment_busy`,
+`host_not_ready`, `release_refused` (what is running already, or a pre-release the rule
+doesn't take) and `promotion_pending`. A rollback doesn't wait for promotion.
+
+**To approve one,** `GET /api/v1/approvals` lists what you may see, with each intent and its
+challenge, and `POST /api/v1/approvals/{id}` takes the passkey's assertion, fresh each time,
+as `{"assertion": {...}}`. It must be by the caller's own key in `[approvers]`, for exactly
+that intent. Approving queues a deploy under a new number, which carries the assertion to the
+host.
+
+A request goes `stale` when the host reports another running digest, `409 request_stale` to
+anyone who tries it, and `expired` after 24 hours by the controller's clock, so that one
+nobody signs doesn't keep the next one out. Neither comes back: ask again, which makes a new
+intent to sign. An approved request is never queued twice either. If the host then refuses or
+defers its deploy, the deployment is free again, and retrying takes a new request, a new
+assertion and a new deploy number.
+
 ## Running the agent
 
 `landfall-agent run` polls the controller, and on each work item decides for itself.
@@ -591,8 +638,8 @@ of a release that failed here each run only on a person's approval. The controll
 it and can't make one. The host checks all of this itself, and an approval that fails any of
 it is `refused` at priority 2, with the reason in full in the host's journal, up to 255
 characters of whatever origin or type the assertion claimed. **Read it there:** the report
-carries 4,096 characters of it, the controller keeps 1,024 on the deploy, and its audit
-row 64, where two different origins can read the same.
+carries 4,096 characters of it, the controller keeps 1,024 on the deploy and 256 in the
+`deploy_refused` audit row, escaped.
 
 - Its deployment, tag, commit and digest are those of the work, and the commit and digest
   are what the release verifies to here.

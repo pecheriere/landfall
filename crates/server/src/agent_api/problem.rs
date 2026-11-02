@@ -61,6 +61,11 @@ pub(crate) enum ApiProblem {
 }
 
 impl ApiProblem {
+    /// The stable code, for an audit row.
+    pub(crate) fn code(self) -> &'static str {
+        self.parts().1.as_str()
+    }
+
     fn parts(self) -> (StatusCode, ProblemCode, &'static str) {
         match self {
             Self::Unsigned => (
@@ -142,24 +147,30 @@ impl ApiProblem {
     }
 }
 
+/// An `application/problem+json` answer.
+pub(crate) fn problem_response(status: StatusCode, code: &str, title: &str) -> Response {
+    let problem = Problem {
+        code: code.to_owned(),
+        title: title.to_owned(),
+        status: status.as_u16(),
+    };
+    // Strings and an integer: serialising this cannot fail, and if it ever
+    // did, an empty body with the right status is still a refusal.
+    let body = serde_json::to_vec(&problem).unwrap_or_default();
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(PROBLEM_CONTENT_TYPE),
+    );
+    response
+}
+
 impl IntoResponse for ApiProblem {
     fn into_response(self) -> Response {
         let (status, code, title) = self.parts();
-        let problem = Problem {
-            code: code.as_str().to_owned(),
-            title: title.to_owned(),
-            status: status.as_u16(),
-        };
-        // Strings and an integer: serialising this cannot fail, and if it ever
-        // did, an empty body with the right status is still a refusal.
-        let body = serde_json::to_vec(&problem).unwrap_or_default();
-        let mut response = Response::new(Body::from(body));
-        *response.status_mut() = status;
+        let mut response = problem_response(status, code.as_str(), title);
         let headers = response.headers_mut();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static(PROBLEM_CONTENT_TYPE),
-        );
         if matches!(self, Self::RateLimited | Self::NoncesExhausted | Self::Busy) {
             headers.insert(
                 header::RETRY_AFTER,
@@ -181,7 +192,7 @@ impl From<StoreError> for ApiProblem {
             StoreError::NotClaimed => Self::NotClaimed,
             busy if busy.is_busy() => Self::Busy,
             other => {
-                log(&format!("agent API: {other}"));
+                log(&format!("API: {other}"));
                 Self::Internal
             }
         }

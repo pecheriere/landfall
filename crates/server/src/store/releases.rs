@@ -12,6 +12,7 @@ use landfall_core::protocol::DeployId;
 use landfall_core::text::quoted;
 use serde_json::{Value, json};
 use sqlx::Row as _;
+use sqlx::sqlite::SqliteRow;
 
 use super::deploys::{NewDeploy, observed_secs, parsed};
 use super::{Store, StoreError};
@@ -107,6 +108,12 @@ impl StoredRelease {
     pub fn has_inputs(&self, tag_object: &str, config_hash: &str) -> bool {
         self.tag_object.as_deref() == Some(tag_object)
             && self.config_hash.as_deref() == Some(config_hash)
+    }
+
+    /// Whether it was last looked at under this configuration.
+    #[must_use]
+    pub fn verified_under(&self, config_hash: &str) -> bool {
+        self.config_hash.as_deref() == Some(config_hash)
     }
 }
 
@@ -213,24 +220,21 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
-            .map(|row| {
-                let optional = |column: &'static str| row.try_get::<Option<String>, _>(column);
-                let release = StoredRelease {
-                    commit: optional("commit_sha")?
-                        .map(|_| parsed(row, "commit_sha"))
-                        .transpose()?,
-                    digest: optional("digest")?
-                        .map(|_| parsed(row, "digest"))
-                        .transpose()?,
-                    decision: ReleaseDecision::parse(&row.try_get::<String, _>("decision")?)?,
-                    origin_refused: row.try_get("origin_refused")?,
-                    reason: row.try_get("reason")?,
-                    tag_object: optional("tag_object")?,
-                    config_hash: optional("config_hash")?,
-                };
-                Ok((row.try_get("tag")?, release))
-            })
+            .map(|row| Ok((row.try_get("tag")?, stored_release(row)?)))
             .collect()
+    }
+
+    /// What is recorded of this one release, outside any transaction.
+    ///
+    /// # Errors
+    /// A database failure, or [`StoreError::Corrupt`] for an unreadable row.
+    pub async fn release(
+        &self,
+        deployment: &DeploymentId,
+        tag: &ReleaseTag,
+    ) -> Result<Option<StoredRelease>, StoreError> {
+        let mut connection = self.pool.acquire().await?;
+        release_of(&mut connection, deployment, tag).await
     }
 
     /// Records what was decided about a release, with its audit rows, and ends any
@@ -605,8 +609,43 @@ impl Store {
     }
 }
 
+fn stored_release(row: &SqliteRow) -> Result<StoredRelease, StoreError> {
+    let optional = |column: &'static str| row.try_get::<Option<String>, _>(column);
+    Ok(StoredRelease {
+        commit: optional("commit_sha")?
+            .map(|_| parsed(row, "commit_sha"))
+            .transpose()?,
+        digest: optional("digest")?
+            .map(|_| parsed(row, "digest"))
+            .transpose()?,
+        decision: ReleaseDecision::parse(&row.try_get::<String, _>("decision")?)?,
+        origin_refused: row.try_get("origin_refused")?,
+        reason: row.try_get("reason")?,
+        tag_object: optional("tag_object")?,
+        config_hash: optional("config_hash")?,
+    })
+}
+
+/// What is recorded of this release.
+pub(super) async fn release_of(
+    connection: &mut sqlx::SqliteConnection,
+    deployment: &DeploymentId,
+    tag: &ReleaseTag,
+) -> Result<Option<StoredRelease>, StoreError> {
+    let row = sqlx::query(
+        "SELECT tag, commit_sha, digest, decision, reason, tag_object, config_hash,
+                origin_refused
+         FROM releases WHERE deployment = ? AND tag = ?",
+    )
+    .bind(deployment.as_ref())
+    .bind(tag.as_ref())
+    .fetch_optional(connection)
+    .await?;
+    row.as_ref().map(stored_release).transpose()
+}
+
 /// What `host` last said about `deployment`, if it is that host's now.
-async fn running_of(
+pub(super) async fn running_of(
     connection: &mut sqlx::SqliteConnection,
     deployment: &DeploymentId,
     host: &HostId,

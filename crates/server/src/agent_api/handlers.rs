@@ -37,7 +37,7 @@ const CONFIG_DRIFT_REASON: &str =
 type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
 
 /// A `200` with a JSON body.
-fn json<T: Serialize>(value: &T, extra: &[(HeaderName, &'static str)]) -> Response {
+pub(crate) fn json<T: Serialize>(value: &T, extra: &[(HeaderName, &'static str)]) -> Response {
     match serde_json::to_vec(value) {
         Ok(body) => {
             let mut response = Response::new(Body::from(body));

@@ -3,8 +3,10 @@
 
 pub mod agent_api;
 pub mod audit;
+pub mod auth;
 pub mod cli;
 pub mod report;
+mod requests;
 pub mod serve;
 pub mod store;
 pub mod watcher;
@@ -40,7 +42,9 @@ pub fn router(state: ApiState) -> Router {
     let health = Router::new()
         .route("/healthz", get(healthz))
         .with_state(state.store().clone());
-    health.merge(agent_api::router(state))
+    health
+        .merge(agent_api::router(state.clone()))
+        .merge(requests::router(state))
 }
 
 #[cfg(test)]

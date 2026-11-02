@@ -42,11 +42,12 @@ use landfall_core::config::Config;
 use landfall_core::ids::HostId;
 use tokio::sync::{oneshot, watch};
 
-use self::problem::ApiProblem;
-pub(crate) use self::problem::log;
+pub(crate) use self::handlers::json;
+pub(crate) use self::problem::{ApiProblem, log, problem_response};
 use self::rate_limit::RateLimiter;
 pub(crate) use self::rate_limit::source_key;
 pub(crate) use self::refusal_log::RefusalLog;
+pub(crate) use self::signed::read_body;
 use crate::store::Store;
 
 /// The API's limits.
@@ -122,7 +123,7 @@ impl ApiState {
 
     /// Writes a refusal nobody can be held to to the capped log, with the
     /// connection's source. `what` is the controller's own text.
-    fn note_refusal(&self, extensions: &Extensions, what: &str) {
+    pub(crate) fn note_refusal(&self, extensions: &Extensions, what: &str) {
         let source = extensions.get::<ConnectInfo<SocketAddr>>().map_or_else(
             || "an unknown source".to_owned(),
             |peer| peer.0.ip().to_string(),
@@ -157,6 +158,16 @@ impl ApiState {
         &self.store
     }
 
+    /// The configuration, as it was read at start-up.
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// The API's limits.
+    pub(crate) fn limits(&self) -> Limits {
+        self.limits
+    }
+
     /// Ends every long poll now, with whatever it has, and makes later ones
     /// answer at once: the server is stopping and should not wait them out.
     pub fn begin_shutdown(&self) {
@@ -166,7 +177,11 @@ impl ApiState {
 
 /// Answers a request that passes `limit` with a problem. Dropping the handler
 /// rolls back any transaction it had open.
-async fn deadline(State(limit): State<Duration>, request: Request, next: Next) -> Response {
+pub(crate) async fn deadline(
+    State(limit): State<Duration>,
+    request: Request,
+    next: Next,
+) -> Response {
     match tokio::time::timeout(limit, next.run(request)).await {
         Ok(response) => response,
         Err(_) => ApiProblem::SlowRequest.into_response(),

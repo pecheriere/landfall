@@ -77,6 +77,26 @@ pub enum EventKind {
     /// A signed report was refused: for a deploy that is not the signer's, or
     /// one never handed out.
     ReportRefused,
+    /// An API token was made for a principal.
+    TokenCreated,
+    /// An API token was revoked.
+    TokenRevoked,
+    /// A one-time link to register a passkey was issued.
+    PasskeyInviteIssued,
+    /// Someone who proved who they are was refused before any particular action.
+    AccessRefused,
+    /// A principal asked for a deploy, and the intent for it was made.
+    DeployRequested,
+    /// A principal's request for a deploy was refused.
+    RequestRefused,
+    /// A verified assertion approved a request, and its deploy was queued.
+    RequestApproved,
+    /// A principal's approval was refused.
+    ApprovalRefused,
+    /// A request can't be approved any more: what it was made from changed.
+    RequestStale,
+    /// A request waited too long for an approver.
+    RequestExpired,
 }
 
 impl EventKind {
@@ -99,6 +119,16 @@ impl EventKind {
             Self::RunningInconsistent => "running_inconsistent",
             Self::EnrolRefused => "enrol_refused",
             Self::ReportRefused => "report_refused",
+            Self::TokenCreated => "token_created",
+            Self::TokenRevoked => "token_revoked",
+            Self::PasskeyInviteIssued => "passkey_invite_issued",
+            Self::AccessRefused => "access_refused",
+            Self::DeployRequested => "deploy_requested",
+            Self::RequestRefused => "request_refused",
+            Self::RequestApproved => "request_approved",
+            Self::ApprovalRefused => "approval_refused",
+            Self::RequestStale => "request_stale",
+            Self::RequestExpired => "request_expired",
         }
     }
 }

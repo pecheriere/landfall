@@ -33,14 +33,18 @@ passkey approvals. Agents drive it through a typed API. Design:
   the audit log, serves the API and the web UI. A library plus a thin binary;
   modules: `store` (the only code that touches SQLite: migrations, transactions,
   appending to and verifying the audit log, enrolment codes, hosts, nonces,
-  deploys, running state, release decisions and holds), `audit` (audit events and
-  the hash-chain encoding), `report` (bounding a deploy report before it is
-  stored), `agent_api` (the routes agents call: signed-request extractor,
-  handlers, problem answers, rate limit), `watcher` (release discovery, origin
+  deploys, running state, release decisions and holds, API tokens, sessions, deploy
+  requests), `audit` (audit events and the hash-chain encoding), `report` (bounding
+  a deploy report before it is stored), `agent_api` (the routes agents call:
+  signed-request extractor, handlers, problem answers, rate limit), `auth` (the
+  `Principal` extractor, which makes the exact-`Origin` check for a session, `can`,
+  the one place that says what a principal may do, secrets that are only stored
+  hashed, and the human API's problem answers), `requests` (the human API's routes:
+  asking for a deploy and approving one), `watcher` (release discovery, origin
   verification, rule decisions and queueing, behind a `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `cli`
-  (`serve`, `enrol-code`, `backup`, `audit verify`, `audit show`, behind the thin
-  `main.rs`).
+  (`serve`, `enrol-code`, `token`, `passkey-invite`, `backup`, `audit verify`, `audit
+  show`, behind the thin `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:

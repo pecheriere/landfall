@@ -1,3 +1,5 @@
+mod tokens;
+
 use clap::{CommandFactory as _, Parser as _};
 
 use landfall_core::config::ConfigError;
