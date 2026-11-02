@@ -14,7 +14,7 @@ use landfall_core::text::{quoted, shown};
 use serde_json::{Value, json};
 use sqlx::Row as _;
 
-use super::deploys::{NewDeploy, parsed};
+use super::deploys::{NewDeploy, observed_secs, parsed};
 use super::{Store, StoreError};
 use crate::agent_api::log;
 use crate::audit::{AuditEvent, EventKind};
@@ -536,13 +536,14 @@ impl Store {
         Ok(Some(id))
     }
 
-    /// Whether release (`tag`, `digest`) has been healthy on `source` for at
+    /// Whether release (`tag`, `digest`) has been observed healthy on `source` for at
     /// least `seconds`, by this controller's clock from what `host`, whose it is,
-    /// reported: since it was first reported running, if it still is and its host
-    /// has reported within [`REPORT_FRESH_SECS`]; or, if a later release has
-    /// replaced it, for as long as it was observed healthy up to its last report
-    /// before that. A host's word is all this is: silence holds it back, does not
-    /// start the time again, and does not count.
+    /// reported. A stretch counts if the host said idle without drift at its start, and
+    /// said anything again within [`REPORT_FRESH_SECS`]. While it runs, its host must
+    /// also have reported within that; once a later release has replaced it, it counts
+    /// up to its last report before that. A host's word is all this is: silence holds
+    /// it back, does not start the time again, and does not count, and the time goes on
+    /// when the host is back.
     ///
     /// # Errors
     /// A clock or database failure.
@@ -555,7 +556,7 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let wanted = i64::try_from(seconds).unwrap_or(i64::MAX);
         let row = sqlx::query(
-            "SELECT tag, digest, drift, phase, healthy_since, last_report FROM running_states
+            "SELECT tag, digest, drift, phase, healthy_secs, last_report FROM running_states
              WHERE deployment = ? AND host = ?",
         )
         .bind(source.as_ref())
@@ -568,13 +569,15 @@ impl Store {
             if current {
                 let idle = row.try_get::<String, _>("phase")? == "idle";
                 let drift: bool = row.try_get("drift")?;
-                let since: Option<i64> = row.try_get("healthy_since")?;
+                let secs: Option<i64> = row.try_get("healthy_secs")?;
                 let last_report: Option<i64> = row.try_get("last_report")?;
                 let now = self.clock.now()?;
                 return Ok(idle
                     && !drift
                     && last_report.is_some_and(|at| now.saturating_sub(at) <= REPORT_FRESH_SECS)
-                    && since.is_some_and(|since| now.saturating_sub(since) >= wanted));
+                    && secs.is_some_and(|secs| {
+                        observed_secs(secs, last_report, true, now) >= wanted
+                    }));
             }
         }
         let observed: Option<i64> = sqlx::query_scalar(

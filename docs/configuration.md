@@ -87,12 +87,13 @@ pattern as signers.
 
 Healthy here is the source host's word, as the controller hears it: the host says
 the release is running, idle and without drift, and has said so within the last 15
-minutes. A host gone quiet holds the promotion back without starting the time again,
-unless the release changed. A rollback starts the time again for the version it puts
-back. A release that has since been replaced counts for as long as it was observed
-healthy, up to the last report before that, and time it spent drifted or unheard of
-counts for nothing. The promotion is enforced by the controller only, and trusts that
-host: a compromised source host can say what it likes.
+minutes. Only such time counts, whether the release still runs or has since been
+replaced, in which case it counts up to the last report before that. Time a host was
+unheard of for longer than those 15 minutes, or a deploy was under way, doesn't count: a
+host gone quiet holds the promotion back, and its time goes on from where it was when it
+is back. Drift clearing and a rollback start the time again for what then runs. The
+promotion is enforced by the controller only, and trusts that host: a compromised source
+host can say what it likes.
 
 Anything outside `auto` and `approve` (major releases by default) is manual: a
 grant holder requests it and an approver approves it.

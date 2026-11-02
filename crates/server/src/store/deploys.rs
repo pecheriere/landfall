@@ -8,6 +8,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, SqliteConnection, Transaction};
 use tokio::sync::watch;
 
+use super::releases::REPORT_FRESH_SECS;
 use super::{Store, StoreError};
 use crate::audit::{AuditEvent, EventKind};
 use crate::report::BoundedReport;
@@ -327,11 +328,11 @@ impl Store {
             "rolled_back" | "rollback_failed" | "failed_no_previous"
         ) {
             // The previous version has just been put back, and a poll may never have
-            // said so while it was happening. Time starts again; if it has drifted
-            // it stays unknown.
+            // said so while it was happening. Time starts again from this report; if
+            // it has drifted it stays unknown.
             sqlx::query(
-                "UPDATE running_states SET healthy_since = ?
-                 WHERE deployment = ? AND healthy_since IS NOT NULL",
+                "UPDATE running_states SET healthy_secs = 0, last_report = ?
+                 WHERE deployment = ? AND healthy_secs IS NOT NULL",
             )
             .bind(self.clock.now()?)
             .bind(deployment.as_ref())
@@ -439,16 +440,24 @@ impl Store {
                 && s.host == host.as_ref()
         });
         let now = self.clock.now()?;
+        let accrued = stored.as_ref().and_then(|s| {
+            s.healthy_secs
+                .map(|secs| observed_secs(secs, s.last_report, s.phase == "idle" && !s.drift, now))
+        });
         if same {
             // Nothing changed, which is itself worth knowing now and then: it
             // tells a host that is fine from one that has gone quiet.
             let noted = stored.as_ref().and_then(|s| s.last_report);
             if noted.is_none_or(|at| now.saturating_sub(at) >= REPORT_NOTE_EVERY_SECS) {
-                sqlx::query("UPDATE running_states SET last_report = ? WHERE deployment = ?")
-                    .bind(now)
-                    .bind(state.deployment.as_ref())
-                    .execute(&mut **tx)
-                    .await?;
+                sqlx::query(
+                    "UPDATE running_states SET last_report = ?, healthy_secs = ?
+                     WHERE deployment = ?",
+                )
+                .bind(now)
+                .bind(accrued)
+                .bind(state.deployment.as_ref())
+                .execute(&mut **tx)
+                .await?;
             }
             return Ok(());
         }
@@ -460,12 +469,12 @@ impl Store {
             state.phase,
             Phase::RollingBack | Phase::Restored | Phase::RolledBack
         );
-        let healthy_since = if tag.is_none() || state.drift || rolling_back {
+        let healthy_secs = if tag.is_none() || state.drift || rolling_back {
             None
         } else if release_changed || old_drift {
-            Some(now)
+            Some(0)
         } else {
-            stored.as_ref().and_then(|s| s.healthy_since).or(Some(now))
+            accrued.or(Some(0))
         };
         if release_changed && let Some(stored) = &stored {
             keep_observed_health(tx, &state.deployment, stored).await?;
@@ -496,13 +505,13 @@ impl Store {
         sqlx::query(
             "INSERT INTO running_states
                  (deployment, host, tag, digest, drift, phase, busy, inconsistent, updated_at,
-                  healthy_since, last_report)
+                  healthy_secs, last_report)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?9)
              ON CONFLICT (deployment) DO UPDATE SET
                  host = excluded.host, tag = excluded.tag, digest = excluded.digest,
                  drift = excluded.drift, phase = excluded.phase, busy = excluded.busy,
                  inconsistent = excluded.inconsistent, updated_at = excluded.updated_at,
-                 healthy_since = excluded.healthy_since, last_report = excluded.last_report",
+                 healthy_secs = excluded.healthy_secs, last_report = excluded.last_report",
         )
         .bind(state.deployment.as_ref())
         .bind(host.as_ref())
@@ -513,7 +522,7 @@ impl Store {
         .bind(busy)
         .bind(inconsistent)
         .bind(now)
-        .bind(healthy_since)
+        .bind(healthy_secs)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -529,23 +538,41 @@ struct StoredRunning {
     phase: String,
     busy: bool,
     inconsistent: bool,
-    healthy_since: Option<i64>,
+    healthy_secs: Option<i64>,
     last_report: Option<i64>,
+}
+
+/// How long a release has been observed healthy by `now`: `secs` up to its last report,
+/// and the time since, if the host said then that it was healthy and hasn't gone quiet
+/// since. A longer silence says nothing either way, so it doesn't count, and the time
+/// goes on from where it was when the host is back. The one rule for promotion, whether
+/// the release runs or was replaced.
+pub(super) fn observed_secs(
+    secs: i64,
+    last_report: Option<i64>,
+    was_healthy: bool,
+    now: i64,
+) -> i64 {
+    let since = last_report.map_or(0, |at| now.saturating_sub(at).max(0));
+    if was_healthy && since <= REPORT_FRESH_SECS {
+        secs.saturating_add(since)
+    } else {
+        secs
+    }
 }
 
 /// Keeps how long the release `stored` names was observed healthy, up to its last
 /// report, as another takes its place: the longest it ever was, should it have run
-/// more than once.
+/// more than once. The time since that report isn't its: another release came in it.
 async fn keep_observed_health(
     connection: &mut SqliteConnection,
     deployment: &DeploymentId,
     stored: &StoredRunning,
 ) -> Result<(), StoreError> {
-    let (Some(tag), Some(digest), Some(since), Some(last_report)) = (
+    let (Some(tag), Some(digest), Some(healthy_secs)) = (
         stored.tag.as_deref(),
         stored.digest.as_deref(),
-        stored.healthy_since,
-        stored.last_report,
+        stored.healthy_secs,
     ) else {
         return Ok(());
     };
@@ -559,7 +586,7 @@ async fn keep_observed_health(
     .bind(&stored.host)
     .bind(tag)
     .bind(digest)
-    .bind(last_report.saturating_sub(since).max(0))
+    .bind(healthy_secs)
     .execute(connection)
     .await?;
     Ok(())
@@ -586,7 +613,7 @@ async fn stored_running(
     state: &RunningState,
 ) -> Result<Option<StoredRunning>, StoreError> {
     let row = sqlx::query(
-        "SELECT host, tag, digest, drift, phase, busy, inconsistent, healthy_since, last_report
+        "SELECT host, tag, digest, drift, phase, busy, inconsistent, healthy_secs, last_report
          FROM running_states WHERE deployment = ?",
     )
     .bind(state.deployment.as_ref())
@@ -601,7 +628,7 @@ async fn stored_running(
         phase: row.try_get("phase")?,
         busy: row.try_get("busy")?,
         inconsistent: row.try_get("inconsistent")?,
-        healthy_since: row.try_get("healthy_since")?,
+        healthy_secs: row.try_get("healthy_secs")?,
         last_report: row.try_get("last_report")?,
     }))
 }

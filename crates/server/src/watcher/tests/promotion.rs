@@ -32,6 +32,17 @@ promote_to = { deployment = "app/prod", healthy_for = "24h" }
 
 pub(super) const STAGING: &str = "app/staging";
 
+/// Staging's host goes on saying it runs `tag`, ten minutes apart, for `seconds`.
+async fn keep_saying(h: &Harness, tag: &str, seconds: i64) {
+    let mut left = seconds;
+    while left > 0 {
+        let step = left.min(10 * 60);
+        h.clock.advance(step);
+        h.report(STAGING, HOST, Some(tag)).await;
+        left -= step;
+    }
+}
+
 #[tokio::test]
 async fn promotion_waits_for_healthy_for() {
     let h = Harness::new(PROMOTING).await;
@@ -47,8 +58,7 @@ async fn promotion_waits_for_healthy_for() {
     assert!(reason.contains("controller only"), "{reason}");
     assert_eq!(h.deploys(PROD).await, []);
 
-    h.clock.advance(24 * 60 * 60 - 1);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 24 * 60 * 60 - 1).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await, []);
 
@@ -72,7 +82,7 @@ async fn promotion_counts_from_the_drift_clearing() {
     h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.fake.tags(PROD, &["v1.2.4"]);
 
-    h.clock.advance(23 * 60 * 60);
+    keep_saying(&h, "v1.2.4", 23 * 60 * 60).await;
     let mut drifted = Harness::state_of(STAGING, Some("v1.2.4"));
     drifted.drift = true;
     h.report_state(HOST, drifted).await;
@@ -81,25 +91,25 @@ async fn promotion_counts_from_the_drift_clearing() {
     assert_eq!(h.deploys(PROD).await, [], "drifted");
 
     h.report(STAGING, HOST, Some("v1.2.4")).await;
-    h.clock.advance(60 * 60);
+    keep_saying(&h, "v1.2.4", 60 * 60).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await, [], "only an hour since it cleared");
 
-    h.clock.advance(23 * 60 * 60);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 23 * 60 * 60).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await.len(), 1);
 }
 
 #[tokio::test]
-async fn a_source_host_gone_quiet_holds_promotion_back_without_resetting_the_clock() {
+async fn a_source_host_gone_quiet_stops_its_clock_and_it_goes_on_when_it_is_back() {
     let h = Harness::new(PROMOTING).await;
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.fake.tags(PROD, &["v1.2.4"]);
+    keep_saying(&h, "v1.2.4", 12 * 60 * 60).await;
 
-    // It reported once and went quiet: a day later that is no evidence of anything.
-    h.clock.advance(24 * 60 * 60);
+    // Quiet for far longer than the day it needs: that is no evidence of anything.
+    h.clock.advance(48 * 60 * 60);
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.tick().await;
     let (decision, reason) = h.decision(PROD, "v1.2.4").await;
@@ -107,11 +117,66 @@ async fn a_source_host_gone_quiet_holds_promotion_back_without_resetting_the_clo
     assert!(reason.contains("quiet"), "{reason}");
     assert_eq!(h.deploys(PROD).await, []);
 
-    // It is back, saying the same: its day counts from the start.
+    // It is back, saying the same: the silence didn't count, and neither did it undo
+    // the half day before.
     h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await, [], "half a day so far");
+    keep_saying(&h, "v1.2.4", 12 * 60 * 60 - 1).await;
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await, [], "a second short");
+    keep_saying(&h, "v1.2.4", 1).await;
     h.tick().await;
     assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
     assert_eq!(h.deploys(PROD).await.len(), 1);
+}
+
+/// A failed try at another release, say: the release that runs is the same throughout.
+async fn deploying_for(h: &Harness, tag: &str, seconds: i64) {
+    let mut deploying = Harness::state_of(STAGING, Some(tag));
+    deploying.phase = Phase::Deploying;
+    deploying.busy = true;
+    let mut left = seconds;
+    while left > 0 {
+        let step = left.min(10 * 60);
+        h.report_state(HOST, deploying.clone()).await;
+        h.clock.advance(step);
+        left -= step;
+    }
+    h.report(STAGING, HOST, Some(tag)).await;
+}
+
+#[tokio::test]
+async fn time_that_is_not_idle_does_not_count_for_the_release_that_runs() {
+    let h = Harness::new(PROMOTING).await;
+    h.report(PROD, HOST, Some("v1.2.3")).await;
+    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    h.fake.tags(PROD, &["v1.2.4"]);
+    keep_saying(&h, "v1.2.4", 12 * 60 * 60).await;
+    deploying_for(&h, "v1.2.4", 24 * 60 * 60).await;
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await, []);
+    keep_saying(&h, "v1.2.4", 12 * 60 * 60).await;
+    h.tick().await;
+    assert_eq!(h.deploys(PROD).await.len(), 1);
+}
+
+#[tokio::test]
+async fn time_that_is_not_idle_does_not_count_for_a_replaced_release() {
+    let h = replaced_after(async |h| {
+        keep_saying(h, "v1.2.4", 12 * 60 * 60).await;
+        deploying_for(h, "v1.2.4", 24 * 60 * 60).await;
+    })
+    .await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "manual");
+
+    let h = replaced_after(async |h| {
+        keep_saying(h, "v1.2.4", 12 * 60 * 60).await;
+        deploying_for(h, "v1.2.4", 24 * 60 * 60).await;
+        keep_saying(h, "v1.2.4", 12 * 60 * 60).await;
+    })
+    .await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
 }
 
 #[tokio::test]
@@ -121,8 +186,7 @@ async fn a_report_counts_for_a_quarter_of_an_hour() {
     let h = Harness::new(PROMOTING).await;
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
-    h.clock.advance(24 * 60 * 60 - REPORT_FRESH_SECS);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 24 * 60 * 60 - REPORT_FRESH_SECS).await;
     h.fake.tags(PROD, &["v1.2.4"]);
 
     h.clock.advance(REPORT_FRESH_SECS + 1);
@@ -132,8 +196,7 @@ async fn a_report_counts_for_a_quarter_of_an_hour() {
     let h = Harness::new(PROMOTING).await;
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
-    h.clock.advance(24 * 60 * 60 - REPORT_FRESH_SECS);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 24 * 60 * 60 - REPORT_FRESH_SECS).await;
     h.fake.tags(PROD, &["v1.2.4"]);
 
     h.clock.advance(REPORT_FRESH_SECS);
@@ -204,8 +267,7 @@ async fn promotion_counts_a_release_the_source_has_since_replaced() {
     h.tick().await;
     h.finish(HOST, ReportedOutcome::Deployed {}).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
-    h.clock.advance(25 * 60 * 60);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 25 * 60 * 60).await;
     h.fake.tags(STAGING, &["v1.2.4", "v1.2.5"]);
     h.tick().await;
     h.finish(HOST, ReportedOutcome::Deployed {}).await;
@@ -246,6 +308,15 @@ async fn elapsed_time_is_no_promotion_for_a_release_replaced_after_going_quiet()
     let h = replaced_after(async |h| h.clock.advance(25 * 60 * 60)).await;
     assert_eq!(h.decision(PROD, "v1.2.4").await.0, "manual");
     assert_eq!(h.deploys(PROD).await, []);
+
+    // One report after the silence, as the host comes back, makes it no better.
+    let h = replaced_after(async |h| {
+        h.clock.advance(24 * 60 * 60);
+        h.report(STAGING, HOST, Some("v1.2.4")).await;
+    })
+    .await;
+    assert_eq!(h.decision(PROD, "v1.2.4").await.0, "manual");
+    assert_eq!(h.deploys(PROD).await, []);
 }
 
 #[tokio::test]
@@ -271,8 +342,7 @@ async fn elapsed_time_is_no_promotion_for_a_release_replaced_while_drifted() {
 #[tokio::test]
 async fn a_replaced_release_counts_what_it_was_seen_to_do_and_no_more() {
     let h = replaced_after(async |h| {
-        h.clock.advance(24 * 60 * 60 - 1);
-        h.report(STAGING, HOST, Some("v1.2.4")).await;
+        keep_saying(h, "v1.2.4", 24 * 60 * 60 - 1).await;
         h.clock.advance(60 * 60);
     })
     .await;
@@ -282,11 +352,7 @@ async fn a_replaced_release_counts_what_it_was_seen_to_do_and_no_more() {
         "a second short"
     );
 
-    let h = replaced_after(async |h| {
-        h.clock.advance(24 * 60 * 60);
-        h.report(STAGING, HOST, Some("v1.2.4")).await;
-    })
-    .await;
+    let h = replaced_after(async |h| keep_saying(h, "v1.2.4", 24 * 60 * 60).await).await;
     assert_eq!(h.decision(PROD, "v1.2.4").await.0, "auto");
     assert_eq!(h.deploys(PROD).await.len(), 1);
 }
@@ -298,20 +364,17 @@ async fn a_rollback_starts_the_time_again_for_what_it_put_back() {
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
     h.fake.tags(PROD, &["v1.2.4"]);
-    h.clock.advance(23 * 60 * 60);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 23 * 60 * 60).await;
     let mut rolling = Harness::state_of(STAGING, Some("v1.2.4"));
     rolling.phase = Phase::RollingBack;
     rolling.busy = true;
     h.report_state(HOST, rolling).await;
     h.report(STAGING, HOST, Some("v1.2.4")).await;
-    h.clock.advance(23 * 60 * 60);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 23 * 60 * 60).await;
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await, [], "23 hours since it came back");
-    h.clock.advance(60 * 60);
-    h.report(STAGING, HOST, Some("v1.2.4")).await;
+    keep_saying(&h, "v1.2.4", 60 * 60).await;
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.tick().await;
     assert_eq!(h.deploys(PROD).await.len(), 1);
@@ -321,8 +384,7 @@ async fn a_rollback_starts_the_time_again_for_what_it_put_back() {
     h.report(PROD, HOST, Some("v1.2.3")).await;
     h.report(STAGING, HOST, Some("v1.2.3")).await;
     h.fake.tags(STAGING, &["v1.2.4"]);
-    h.clock.advance(24 * 60 * 60);
-    h.report(STAGING, HOST, Some("v1.2.3")).await;
+    keep_saying(&h, "v1.2.3", 24 * 60 * 60).await;
     h.tick().await;
     h.finish(
         HOST,
@@ -332,11 +394,11 @@ async fn a_rollback_starts_the_time_again_for_what_it_put_back() {
     )
     .await;
     h.report(STAGING, HOST, Some("v1.2.3")).await;
-    let at: Option<i64> =
-        sqlx::query_scalar("SELECT healthy_since FROM running_states WHERE deployment = ?")
+    let secs: Option<i64> =
+        sqlx::query_scalar("SELECT healthy_secs FROM running_states WHERE deployment = ?")
             .bind(STAGING)
             .fetch_one(h.store.pool())
             .await
             .unwrap();
-    assert_eq!(at, Some(h.store.now().unwrap()));
+    assert_eq!(secs, Some(0));
 }

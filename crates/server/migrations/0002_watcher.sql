@@ -11,17 +11,20 @@ ALTER TABLE releases ADD COLUMN origin TEXT;
 ALTER TABLE releases ADD COLUMN origin_refused INTEGER NOT NULL DEFAULT 0
     CHECK (origin_refused IN (0, 1));
 
--- When the current release began counting as healthy, for promotion: the report
--- that first named it, or that said its drift had cleared. NULL while nothing is
--- deployed or it has drifted. `last_report` is when the host last said anything
--- about the deployment, written at most once a minute when nothing else changed,
--- so that silence can be told from health.
-ALTER TABLE running_states ADD COLUMN healthy_since INTEGER;
+-- How long the current release has been observed healthy, in seconds, up to
+-- `last_report`, for promotion. It starts at the report that first names the release,
+-- or that says its drift has cleared or a rollback is over. Time between two reports
+-- counts if the first said idle without drift, and they are no further apart than a
+-- host that has gone quiet. NULL while nothing is deployed or it has drifted.
+-- `last_report` is when the host last said anything about the deployment, written at
+-- most once a minute when nothing else changed, so that silence can be told from
+-- health.
+ALTER TABLE running_states ADD COLUMN healthy_secs INTEGER;
 ALTER TABLE running_states ADD COLUMN last_report INTEGER;
 
--- How long a release was observed healthy, from `healthy_since` up to its last
--- report, the longest it ever was, kept when another release replaces it: what
--- promotion goes by once it no longer runs.
+-- How long a release was observed healthy, `healthy_secs` as of its last report, the
+-- longest it ever was, kept when another release replaces it: what promotion goes by
+-- once it no longer runs.
 CREATE TABLE replaced_releases (
     deployment   TEXT NOT NULL,
     host         TEXT NOT NULL,
