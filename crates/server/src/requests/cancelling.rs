@@ -9,7 +9,9 @@ use axum::response::Response;
 use landfall_core::config::Permission;
 use serde_json::json;
 
-use super::{Refused, Subject, closed, named_request, no_store, refuse_alone, refuse_in, visibility};
+use super::{
+    Refused, Subject, closed, named_request, no_store, refuse_alone, refuse_in, visibility,
+};
 use crate::agent_api::{ApiState, json as json_answer};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};

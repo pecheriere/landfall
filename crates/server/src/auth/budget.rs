@@ -98,21 +98,39 @@ mod tests {
     fn it_counts_what_it_refuses_and_hands_the_count_over_once() {
         let mut budget = Budget::new(1, 2, 4);
         let alice = id("alice");
-        assert_eq!(budget.spend(&alice, false, 100), Spent::Within { dropped: 0 });
-        assert_eq!(budget.spend(&alice, false, 100), Spent::Within { dropped: 0 });
+        assert_eq!(
+            budget.spend(&alice, false, 100),
+            Spent::Within { dropped: 0 }
+        );
+        assert_eq!(
+            budget.spend(&alice, false, 100),
+            Spent::Within { dropped: 0 }
+        );
         assert_eq!(budget.spend(&alice, false, 100), Spent::Over);
         assert_eq!(budget.spend(&alice, false, 100), Spent::Over);
-        assert_eq!(budget.spend(&alice, false, 101), Spent::Within { dropped: 2 });
-        assert_eq!(budget.spend(&alice, false, 102), Spent::Within { dropped: 0 });
+        assert_eq!(
+            budget.spend(&alice, false, 101),
+            Spent::Within { dropped: 2 }
+        );
+        assert_eq!(
+            budget.spend(&alice, false, 102),
+            Spent::Within { dropped: 0 }
+        );
     }
 
     #[test]
     fn a_session_and_a_token_of_one_principal_spend_apart() {
         let mut budget = Budget::new(1, 1, 4);
         let alice = id("alice");
-        assert_eq!(budget.spend(&alice, false, 100), Spent::Within { dropped: 0 });
+        assert_eq!(
+            budget.spend(&alice, false, 100),
+            Spent::Within { dropped: 0 }
+        );
         assert_eq!(budget.spend(&alice, false, 100), Spent::Over);
-        assert_eq!(budget.spend(&alice, true, 100), Spent::Within { dropped: 0 });
+        assert_eq!(
+            budget.spend(&alice, true, 100),
+            Spent::Within { dropped: 0 }
+        );
     }
 
     #[test]
@@ -120,6 +138,9 @@ mod tests {
         let mut budget = Budget::new(1, 1, 4);
         let alice = id("alice");
         budget.keep_dropped(&alice, false, 5);
-        assert_eq!(budget.spend(&alice, false, 100), Spent::Within { dropped: 5 });
+        assert_eq!(
+            budget.spend(&alice, false, 100),
+            Spent::Within { dropped: 5 }
+        );
     }
 }

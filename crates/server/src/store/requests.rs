@@ -308,9 +308,25 @@ impl Store {
         Ok(())
     }
 
+    /// Ends every open request past its time now, in a transaction of its own: for the
+    /// watcher's tick, so that one nobody comes back to is still ended, and audited, near
+    /// its time.
+    ///
+    /// # Errors
+    /// A clock, database or audit failure, or [`StoreError::Corrupt`] for an unreadable
+    /// row.
+    pub async fn settle_expired_requests(&self) -> Result<(), StoreError> {
+        let now = self.clock.now()?;
+        let mut tx = self.begin().await?;
+        self.expire_requests(&mut tx, now).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Ends `deployment`'s open request if it was made for another running digest than
     /// `running`, with its audit row. In the transaction of the report that says so, so
-    /// that nothing can approve it after that report stands.
+    /// that nothing can approve it after that report stands. One past its time is expired
+    /// first, whatever the report says: that is what became of it.
     ///
     /// # Errors
     /// A clock, database or audit failure, or [`StoreError::Corrupt`] for an unreadable
@@ -322,13 +338,15 @@ impl Store {
         running: Option<&str>,
         reason: &str,
     ) -> Result<(), StoreError> {
+        let now = self.clock.now()?;
+        self.expire_requests(tx, now).await?;
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE deploy_requests
              SET state = 'stale', closed_at = ?, closed_reason = ?
              WHERE deployment = ? AND state = 'awaiting_approval' AND expected_running IS NOT ?
              RETURNING {COLUMNS}"
         )))
-        .bind(self.clock.now()?)
+        .bind(now)
         .bind(reason)
         .bind(deployment.as_ref())
         .bind(running)
@@ -417,9 +435,15 @@ impl Store {
 
     /// Moves `request` from waiting to approved and queues its deploy under a new number,
     /// carrying `approval`, with the audit rows of both. `None` if it wasn't waiting any
-    /// more, and nothing has changed: the update is conditional, so of any number of
-    /// approvals at once, one gets through. After committing, call
+    /// more, and nothing has changed. After committing, call
     /// [`wake_agents`](Self::wake_agents).
+    ///
+    /// That of any number of approvals at once one gets through comes from
+    /// [`begin`](Self::begin)'s `BEGIN IMMEDIATE`: the write lock is taken before the caller
+    /// looks at the state, so the look and this update can't interleave with another
+    /// writer's, and this update never finds the row changed since. The conditional update
+    /// is a second layer under that, in case the look moves or a caller skips it, and the
+    /// unique index on `deploys.request_id` a third.
     ///
     /// # Errors
     /// A clock, serialisation, database or audit failure, including the deployment having

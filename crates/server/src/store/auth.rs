@@ -4,7 +4,7 @@ use landfall_core::ids::PrincipalId;
 use serde_json::json;
 use sqlx::Row as _;
 
-use super::{Store, StoreError};
+use super::{Store, StoreError, migrator};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{ApiToken, PasskeyInvite, SessionToken};
 
@@ -167,6 +167,28 @@ impl Store {
         self.append(&mut tx, &event).await?;
         tx.commit().await?;
         Ok(invite)
+    }
+
+    /// Whether every migration this program has was applied: only [`open`](Self::open)
+    /// applies them, so a command that opens a database as it finds it can ask.
+    ///
+    /// # Errors
+    /// A database failure.
+    pub async fn schema_is_current(&self) -> Result<bool, StoreError> {
+        let table: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if table.is_none() {
+            return Ok(false);
+        }
+        let applied: Option<i64> =
+            sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        let wanted = migrator().iter().map(|migration| migration.version).max();
+        Ok(applied >= wanted)
     }
 
     /// Records one event on its own, for what changes nothing but the log.

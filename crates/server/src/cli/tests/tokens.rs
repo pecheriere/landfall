@@ -247,3 +247,61 @@ async fn these_need_a_database_that_is_there() {
     let result = execute(Cli::try_parse_from(line).unwrap(), &mut out).await;
     assert!(matches!(result, Err(CliError::NoDatabase { .. })));
 }
+
+/// As this program sees a database that no `serve` of this version has opened.
+const COMMANDS: [&[&str]; 3] = [
+    &[
+        "token",
+        "create",
+        "--principal",
+        "ci",
+        "--config",
+        "CONFIG",
+        "--db",
+        "DB",
+    ],
+    &["token", "revoke", "--id", "1", "--db", "DB"],
+    &[
+        "passkey-invite",
+        "--principal",
+        "ci",
+        "--config",
+        "CONFIG",
+        "--db",
+        "DB",
+    ],
+];
+
+async fn says_to_run_serve(files: &Files) {
+    for command in COMMANDS {
+        let (result, out) = files.run(command).await;
+        let error = result.unwrap_err();
+        assert!(matches!(error, CliError::OutOfDate { .. }), "{error}");
+        assert!(error.to_string().contains("serve"), "{error}");
+        assert!(!error.to_string().contains("no such table"), "{error}");
+        assert_eq!(out, "");
+    }
+}
+
+#[tokio::test]
+async fn an_older_database_gets_told_to_run_serve() {
+    let files = Files::new().await;
+    let store = Store::open_existing(&files.db).await.unwrap();
+    for statement in [
+        "DROP TABLE api_tokens",
+        "DROP TABLE passkey_invites",
+        "DELETE FROM _sqlx_migrations WHERE version = 3",
+    ] {
+        sqlx::query(statement).execute(store.pool()).await.unwrap();
+    }
+    store.close().await;
+    says_to_run_serve(&files).await;
+}
+
+#[tokio::test]
+async fn a_database_never_migrated_gets_told_to_run_serve() {
+    let files = Files::new().await;
+    std::fs::remove_file(&files.db).unwrap();
+    std::fs::write(&files.db, "").unwrap();
+    says_to_run_serve(&files).await;
+}

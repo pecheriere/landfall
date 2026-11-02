@@ -4,7 +4,7 @@ use axum::http::{Method, StatusCode};
 use landfall_core::protocol::Phase;
 use serde_json::json;
 
-use super::{APPROVALS, Answer, Caller, Harness, HOST, PROD, digest, request_of};
+use super::{APPROVALS, Answer, Caller, HOST, Harness, PROD, digest, request_of};
 
 impl Harness {
     async fn cancel(&self, id: i64, caller: &Caller) -> Answer {
@@ -34,7 +34,10 @@ async fn the_asker_an_approver_or_a_rollback_holder_can_cancel() {
         let id = h.asked_by_carol().await;
         let answer = h.cancel(id, caller).await;
         assert_eq!(answer.status, StatusCode::OK, "{caller:?}: {answer:?}");
-        assert_eq!(answer.json(), json!({ "request": id, "state": "cancelled" }));
+        assert_eq!(
+            answer.json(),
+            json!({ "request": id, "state": "cancelled" })
+        );
         assert_eq!(h.request_state(id).await, "cancelled");
     }
     let rows = h.audited("request_cancelled").await;
@@ -43,7 +46,11 @@ async fn the_asker_an_approver_or_a_rollback_holder_can_cancel() {
     assert_eq!(rows[1]["by"]["principal"], "alice");
     assert_eq!(rows[1]["by"]["via"], "session");
     assert_eq!(rows[3]["by"]["via"], "token");
-    assert!(rows[1]["reason"].as_str().unwrap().contains("alice"), "{}", rows[1]);
+    assert!(
+        rows[1]["reason"].as_str().unwrap().contains("alice"),
+        "{}",
+        rows[1]
+    );
     assert_eq!(h.store.verify_audit().await.unwrap().first_bad, None);
 }
 
@@ -66,7 +73,10 @@ async fn nobody_else_can_cancel_and_each_try_is_audited() {
     assert_eq!(absent.status, hidden.status);
     assert_eq!(absent.body, hidden.body);
 
-    assert_eq!(h.cancel(id, &Caller::Nobody).await.code(), "unauthenticated");
+    assert_eq!(
+        h.cancel(id, &Caller::Nobody).await.code(),
+        "unauthenticated"
+    );
     assert_eq!(h.request_state(id).await, "awaiting_approval");
     assert_eq!(h.audited("request_cancelled").await.len(), 0);
     let rows = h.audited("cancel_refused").await;
@@ -173,7 +183,10 @@ async fn a_rollback_supersedes_an_open_request() {
     assert_eq!(rows[0]["request"], open);
     assert_eq!(rows[0]["by"]["principal"], "erin");
     let reason = rows[0]["reason"].as_str().unwrap();
-    assert!(reason.contains("rollback") && reason.contains("v1.0.0"), "{reason}");
+    assert!(
+        reason.contains("rollback") && reason.contains("v1.0.0"),
+        "{reason}"
+    );
 }
 
 #[tokio::test]
@@ -182,9 +195,15 @@ async fn nothing_else_supersedes_an_open_request() {
     let open = rollback_stage(&h).await;
     // A higher release, even from someone who can roll back or approve.
     h.verified(PROD, HOST, "v1.3.0", '3').await;
-    assert_eq!(h.ask(&h.token("alice").await, "v1.3.0").await.code(), "request_open");
+    assert_eq!(
+        h.ask(&h.token("alice").await, "v1.3.0").await.code(),
+        "request_open"
+    );
     // A lower one, from someone without the rollback grant.
-    assert_eq!(h.ask(&h.token("carol").await, "v1.0.0").await.code(), "request_open");
+    assert_eq!(
+        h.ask(&h.token("carol").await, "v1.0.0").await.code(),
+        "request_open"
+    );
     assert_eq!(h.request_state(open).await, "awaiting_approval");
 }
 
@@ -193,7 +212,8 @@ async fn a_rollback_that_is_itself_refused_leaves_the_open_request_alone() {
     let h = Harness::new().await;
     let open = rollback_stage(&h).await;
     let erin = h.token("erin").await;
-    h.reports_state(Some(("v1.1.0", '1')), true, Phase::Idle, false).await;
+    h.reports_state(Some(("v1.1.0", '1')), true, Phase::Idle, false)
+        .await;
     assert_eq!(h.ask(&erin, "v1.0.0").await.code(), "host_not_ready");
     assert_eq!(h.request_state(open).await, "awaiting_approval");
     assert_eq!(h.audited("request_cancelled").await.len(), 0);

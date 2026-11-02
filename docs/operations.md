@@ -247,6 +247,10 @@ other: a newer agent's new report outcome gets `bad_request` from an older
 controller, and the deploy stays claimed until the two match. Reports are kept in the
 meanwhile, and a deploy already running finishes. landfall never deploys itself.
 
+Only `serve` upgrades the database, when it starts. So run `serve` from the new version before
+`token` or `passkey-invite`, which otherwise say the database is older than they are, and do
+nothing.
+
 ## Connections to the controller
 
 Prefer direct connections to the controller, over a tailnet for example. The
@@ -500,14 +504,33 @@ doesn't take) and `promotion_pending`. A rollback doesn't wait for promotion.
 challenge, and `POST /api/v1/approvals/{id}` takes the passkey's assertion, fresh each time,
 as `{"assertion": {...}}`. It must be by the caller's own key in `[approvers]`, for exactly
 that intent. Approving queues a deploy under a new number, which carries the assertion to the
-host.
+host. Everything that bears on it is looked at again then. What may pass by itself leaves the
+request open, and you can try again: `promotion_pending` if the release isn't healthy for long
+enough where it is promoted from any more, `release_not_verified` if the watcher has put it on
+hold or hasn't looked at it under this configuration, `host_not_ready` and `deployment_busy`.
+
+**To cancel one,** `POST /api/v1/approvals/{id}/cancel` is for whoever asked, and for anyone
+with `approve` or `rollback` on that deployment. A deployment has one open request at a time,
+so this is how to get one nobody will sign out of the way. A rollback by someone with `rollback`
+does it by itself: it takes the open request's place, which ends as `cancelled` with a reason
+naming the rollback. **Revoking a token doesn't touch a request it opened:** that stays open,
+and an approver can still sign it, until someone cancels it or it expires. If you revoke a
+token because it was stolen, look at `GET /api/v1/approvals` and cancel what it asked for.
 
 A request goes `stale` when the host reports another running digest, `409 request_stale` to
-anyone who tries it, and `expired` after 24 hours by the controller's clock, so that one
-nobody signs doesn't keep the next one out. Neither comes back: ask again, which makes a new
-intent to sign. An approved request is never queued twice either. If the host then refuses or
-defers its deploy, the deployment is free again, and retrying takes a new request, a new
-assertion and a new deploy number.
+anyone who tries it, and `expired` after 24 hours by the controller's clock, ended by the
+watcher's next tick, so that one nobody signs doesn't keep the next one out. None of `stale`,
+`expired` and `cancelled` comes back: ask again, which makes a new intent to sign. An approved
+request is never queued twice either. If the host then refuses or defers its deploy, the
+deployment is free again, and retrying takes a new request, a new assertion and a new deploy
+number.
+
+**Each principal has a budget for state changes,** so that a credential gone wrong can't fill
+the audit log or crowd out the agents' writes: 120 at once, refilling at one a second, with a
+principal's tokens and its person's session counted apart. Reads don't count, and neither use
+comes near it in normal work. Over it, a call gets `429 rate_limited` with `Retry-After`, and
+writes nothing. The first call back within it writes an `access_throttled` audit row saying how
+many were `dropped`. That count is kept in memory, so a restart loses one not yet written.
 
 ## Running the agent
 

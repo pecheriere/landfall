@@ -147,7 +147,16 @@ async fn an_approval_without_a_grant_and_one_that_does_not_exist_read_the_same()
     assert_eq!(absent.status, hidden.status);
     assert_eq!(absent.body, hidden.body);
     // Not even numbers that can't be.
-    for path in ["0", "-1", "99999999999999999999", "x", "%FF", "+1", "01", "00"] {
+    for path in [
+        "0",
+        "-1",
+        "99999999999999999999",
+        "x",
+        "%FF",
+        "+1",
+        "01",
+        "00",
+    ] {
         let answer = h
             .post(&format!("{APPROVALS}/{path}"), &otto, &json!({}))
             .await;

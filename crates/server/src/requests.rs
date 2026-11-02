@@ -273,10 +273,9 @@ fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
             HumanProblem::RequestExpired,
             "no approver signed the request in time",
         )),
-        RequestState::Cancelled => Some((
-            HumanProblem::RequestCancelled,
-            "the request was cancelled",
-        )),
+        RequestState::Cancelled => {
+            Some((HumanProblem::RequestCancelled, "the request was cancelled"))
+        }
     }
 }
 

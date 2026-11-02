@@ -1,9 +1,9 @@
 //! Racing against itself, on a real file with real connections.
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use landfall_core::intent::DeployIntent;
 
-use super::{Answer, Harness};
+use super::{APPROVALS, Answer, Harness};
 use crate::store::Store;
 
 /// A harness on a file, so that writers really do meet.
@@ -67,6 +67,30 @@ async fn a_report_and_approvals_at_once_go_one_way_or_the_other() {
     } else {
         assert_eq!(answer.code(), "request_stale");
         assert_eq!(h.request_state(id).await, "stale");
+        assert_eq!(h.count_deploys().await, 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_and_a_cancel_at_once_go_one_way_or_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = on_a_file(&dir).await;
+    let (id, intent) = h.opened().await;
+    let alice = h.session("alice").await;
+    let bob = h.session("bob").await;
+    let cancel = format!("{APPROVALS}/{id}/cancel");
+    let (approved, cancelled) = tokio::join!(
+        h.approve(id, &alice, &h.keys.alice, &intent),
+        h.call(Method::POST, &cancel, &bob, Vec::new()),
+    );
+    if approved.status == StatusCode::OK {
+        assert_eq!(cancelled.code(), "request_closed");
+        assert_eq!(h.request_state(id).await, "approved");
+        assert_eq!(h.count_deploys().await, 1);
+    } else {
+        assert_eq!(approved.code(), "request_cancelled");
+        assert_eq!(cancelled.status, StatusCode::OK, "{cancelled:?}");
+        assert_eq!(h.request_state(id).await, "cancelled");
         assert_eq!(h.count_deploys().await, 0);
     }
 }

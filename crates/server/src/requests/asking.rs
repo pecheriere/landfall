@@ -52,8 +52,7 @@ async fn judge_request(
         .as_ref()
         .and_then(Option::as_ref)
         .is_some_and(|running| version < running);
-    let may_roll_back =
-        downgrade && can(state.config(), principal, d.id(), Permission::Rollback);
+    let may_roll_back = downgrade && can(state.config(), principal, d.id(), Permission::Rollback);
     if snapshot.open_request && !may_roll_back {
         return Err(refused(
             HumanProblem::RequestOpen,

@@ -305,8 +305,7 @@ mod tests {
         // A refusal keeps far more of its reason, and that fits too.
         let long = hostile(2 * REFUSAL_SHOWN_CHARS);
         let steps = vec![step(&text, Some(&text), None); MAX_STORED_STEPS];
-        let refused =
-            BoundedReport::new(&report(ReportedOutcome::Refused { reason: long }, steps));
+        let refused = BoundedReport::new(&report(ReportedOutcome::Refused { reason: long }, steps));
         let detail = refused.audit_detail(&"t".repeat(128)).to_string();
         assert!(detail.len() < MAX_DETAIL_BYTES, "{}", detail.len());
     }

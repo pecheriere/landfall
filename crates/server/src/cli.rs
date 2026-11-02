@@ -229,6 +229,12 @@ pub enum CliError {
         /// The failure.
         source: StoreError,
     },
+    /// The database's schema is older than this program's: `serve` brings it up to date.
+    #[error("database {} is older than this program; run `serve` from this version once to upgrade it, then try again", .path.display())]
+    OutOfDate {
+        /// The file.
+        path: PathBuf,
+    },
     /// `token create` was given a principal the configuration doesn't name: a token for
     /// them would not work.
     #[error("the configuration has no principal {0}: no grant and not in [approvers]")]

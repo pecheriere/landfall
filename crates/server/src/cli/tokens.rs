@@ -2,7 +2,7 @@
 //! `enrol-code`, while `serve` runs or not.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use landfall_core::ids::PrincipalId;
@@ -10,6 +10,7 @@ use serde_json::json;
 
 use super::{CliError, EXIT_OK, load_config, opened};
 use crate::auth::named_in_config;
+use crate::store::Store;
 
 /// Where a passkey invite's page is. The code goes after `#`: a browser doesn't send that
 /// part, so it reaches no access log.
@@ -62,6 +63,20 @@ pub(super) struct PasskeyInviteArgs {
     db: PathBuf,
 }
 
+/// The database `serve` uses, if it has the tables these commands use: only `serve`
+/// migrates, so a database from before an upgrade gets told so rather than a raw error.
+async fn upgraded(db: &Path) -> Result<Store, CliError> {
+    let store = opened(db).await?;
+    let current = store.schema_is_current().await;
+    if !current? {
+        store.close().await;
+        return Err(CliError::OutOfDate {
+            path: db.to_owned(),
+        });
+    }
+    Ok(store)
+}
+
 pub(super) async fn token(command: TokenCommand, out: &mut impl Write) -> Result<u8, CliError> {
     match command {
         TokenCommand::Create(args) => create(args, out).await,
@@ -74,7 +89,7 @@ async fn create(args: TokenCreateArgs, out: &mut impl Write) -> Result<u8, CliEr
     if !named_in_config(&config, &args.principal) {
         return Err(CliError::UnknownPrincipal(args.principal));
     }
-    let store = opened(&args.db).await?;
+    let store = upgraded(&args.db).await?;
     let made = store.create_token(&args.principal).await;
     store.close().await;
     let (id, token) = made?;
@@ -84,7 +99,7 @@ async fn create(args: TokenCreateArgs, out: &mut impl Write) -> Result<u8, CliEr
 }
 
 async fn revoke(args: TokenRevokeArgs, out: &mut impl Write) -> Result<u8, CliError> {
-    let store = opened(&args.db).await?;
+    let store = upgraded(&args.db).await?;
     let revoked = store.revoke_token(args.id).await;
     store.close().await;
     let line = json!({ "id": args.id, "already_revoked": !revoked? });
@@ -100,7 +115,7 @@ pub(super) async fn passkey_invite(
     let Some(settings) = config.approval() else {
         return Err(CliError::NoApprovalSettings);
     };
-    let store = opened(&args.db).await?;
+    let store = upgraded(&args.db).await?;
     let issued = store.issue_passkey_invite(&args.principal).await;
     store.close().await;
     let code = issued?.reveal();

@@ -183,12 +183,7 @@ async fn judge_approval(
     };
     if !downgrade
         && store
-            .promotion_waits_for_on(
-                tx,
-                state.config(),
-                d.id(),
-                (&intent.tag, &intent.digest),
-            )
+            .promotion_waits_for_on(tx, state.config(), d.id(), (&intent.tag, &intent.digest))
             .await?
             .is_some()
     {

@@ -120,7 +120,10 @@ impl ApiState {
     #[must_use]
     pub fn new(store: Store, config: Config, limits: Limits) -> Self {
         // Every principal the configuration can name, at most: it never changes while running.
-        let principals = config.grants().len().saturating_add(config.approvers().len());
+        let principals = config
+            .grants()
+            .len()
+            .saturating_add(config.approvers().len());
         Self {
             budget: Arc::new(Mutex::new(Budget::new(
                 limits.principal_rate_per_second,

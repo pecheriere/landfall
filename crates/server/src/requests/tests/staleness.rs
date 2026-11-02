@@ -43,6 +43,17 @@ async fn request_goes_stale_when_the_running_digest_moves() {
 }
 
 #[tokio::test]
+async fn a_report_that_comes_after_its_time_finds_it_expired_and_not_stale() {
+    let h = Harness::new().await;
+    let (id, _) = h.opened().await;
+    h.clock.advance(3 * 24 * 60 * 60);
+    h.reports(Some(("v1.0.1", '2'))).await;
+    assert_eq!(h.request_state(id).await, "expired");
+    assert_eq!(h.audited("request_expired").await.len(), 1);
+    assert_eq!(h.audited("request_stale").await.len(), 0);
+}
+
+#[tokio::test]
 async fn a_new_tag_on_the_same_digest_is_not_a_move() {
     let h = Harness::new().await;
     let (id, _) = h.opened().await;

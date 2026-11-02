@@ -38,9 +38,10 @@ passkey approvals. Agents drive it through a typed API. Design:
   a deploy report before it is stored), `agent_api` (the routes agents call:
   signed-request extractor, handlers, problem answers, rate limit), `auth` (the
   `Principal` extractor, which makes the exact-`Origin` check for a session, `can`,
-  the one place that says what a principal may do, secrets that are only stored
-  hashed, and the human API's problem answers), `requests` (the human API's routes:
-  asking for a deploy and approving one), `watcher` (release discovery, origin
+  the one place that says what a principal may do, each principal's budget for state
+  changes, secrets that are only stored hashed, and the human API's problem answers),
+  `requests` (the human API's routes: `asking` for a deploy, `approving` one and
+  `cancelling` one), `watcher` (release discovery, origin
   verification, rule decisions and queueing, behind a `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `cli`
   (`serve`, `enrol-code`, `token`, `passkey-invite`, `backup`, `audit verify`, `audit

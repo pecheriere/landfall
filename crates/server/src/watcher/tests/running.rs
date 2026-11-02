@@ -10,6 +10,38 @@ use super::super::{TICK_INTERVAL, VERIFICATIONS_PER_TICK, run};
 use super::{HOST, Harness, PATCH_RULE, PROD, config_text};
 
 #[tokio::test]
+async fn a_tick_ends_a_request_past_its_time_with_its_audit_row() {
+    let h = Harness::running("v1.2.3").await;
+    for statement in [
+        "INSERT INTO releases (deployment, tag, decision, reason, seen_at)
+         VALUES ('app/prod', 'v1.3.0', 'manual', 'why', 0)",
+        "INSERT INTO deploy_requests
+             (deployment, host, tag, commit_sha, digest, nonce, state, requested_by, created_at,
+              expires_at)
+         VALUES ('app/prod', 'host-a', 'v1.3.0', '0000000000000000000000000000000000000000',
+                 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+                 zeroblob(32), 'awaiting_approval', 'someone', 0, 1)",
+    ] {
+        sqlx::query(statement)
+            .execute(h.store.pool())
+            .await
+            .unwrap();
+    }
+    assert_eq!(h.audit("request_expired").await.len(), 0);
+    h.tick().await;
+    let state: String = sqlx::query_scalar("SELECT state FROM deploy_requests")
+        .fetch_one(h.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "expired");
+    assert_eq!(h.audit("request_expired").await.len(), 1);
+    // Once.
+    h.tick().await;
+    assert_eq!(h.audit("request_expired").await.len(), 1);
+    h.chain_is_intact().await;
+}
+
+#[tokio::test]
 async fn no_database_connection_is_held_across_the_network() {
     let h = Harness::running("v1.2.3").await;
     // The store under test has one connection, so anything holding a transaction
