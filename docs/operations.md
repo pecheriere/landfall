@@ -1143,7 +1143,7 @@ its check holds, and each check is something the controller can't make so.
 | `no approval came with it` | An automatic deploy was queued, and the rule or what runs changed so that it no longer is. | You changed that just before this. A controller making up work looks just like this, so without that it is an alert. |
 | `this host's nonce log can't say` | [The log](#the-nonce-log) is damaged, full, or has the wrong owner or mode. | A `nonce_log_unusable` line, and the file itself, which the controller can't reach. |
 | `was already spent on this host` | A crash just as the approval was spent. | [Telling a crash from a replay](#telling-a-crash-from-a-replay). |
-| `verification: release run: the release was attested by <N> workflow runs` | A second run for that tag came after the watcher recorded the release, as it doesn't look again at one that isn't automatic ([#30](https://github.com/pecheriere/landfall/issues/30)). | The repository's runs for that tag show a second one, it started after the release was first waiting, and the rule doesn't make this move automatic, as an automatic one is looked at again. Otherwise it is an alert. That rules out a lying controller, whose token has no scopes, and not someone who can run the workflow: **check who started the second run.** |
+| `verification: release run: the release was attested by <N> workflow runs` | A second run for that tag came after the watcher recorded the release, as it doesn't look again at one that isn't automatic ([#30](https://github.com/pecheriere/landfall/issues/30)). | The repository's runs for that tag show a second one, which by GitHub's times started more than five minutes, one look of the watcher, after the first finished, and the rule doesn't make this move automatic, as an automatic one is looked at again. Otherwise it is an alert. A lying controller can't start a run, though it can deliver a tag someone else re-ran: **check who started the second run.** |
 | `verification: platform: the image has no <platform> platform` | The release isn't built for this host's architecture, which the watcher doesn't look at, having no platform of its own. | The list the reason gives leaves this host's out, and `landfall verify --platform` says the same. |
 
 **Every other `verification:` reason isn't explained by this table:** a tag signature, an
@@ -1160,15 +1160,16 @@ unit they are under:**
 - **`journalctl -u "landfall-agent-recover@$(systemd-escape app/prod).service"`:** someone ran
   `recover` on the host, which the controller has no way to start. **This clears it only if
   `recover` ran between your tap and this refusal,** by the host's journal time and your own memory
-  of the tap, as the audit log's times are the controller's, and you can find out who ran it. A
-  `recover` before your tap can't explain it, since the intent would then have named `<B>`: that is
-  an alert.
+  of the tap, as the audit log's times are the controller's, the agent was down in between or the
+  tap was moments before, and you can find out who ran it. Otherwise the approval was held, as the
+  agent delivers at its next poll. A `recover` before your tap can't explain it either, since the
+  intent would then have named `<B>`. Each of those is an alert.
 - **`journalctl -u landfall-agent.service`:** the controller delivered it, and **nothing here clears
   that: treat it as an alert.** The controller chooses when to deliver and serves the page, so it
   sees when you open it and can time a deploy to any moment around your tap, or hold an approval for
-  weeks. The one honest way is rare: the agent was stopped just after reporting that deploy, before
-  its next poll said what runs, and the request was asked for and signed while it was down. Its stop
-  shows in the host's own journal.
+  weeks. We know of almost no honest way: it would take an agent stopped within seconds of finishing
+  that deploy, before its next poll said what runs, with the request asked for and signed while it
+  was down, and its stop would show in the host's own journal.
 - **You can't find it:** assume the worst, and then check whether the state directory was rebuilt or
   restored, which moves the record with no line, whether the journal is volatile or was vacuumed,
   and whether someone ran `recover` at a shell, whose lines went to that terminal and whose report
@@ -1206,10 +1207,9 @@ it as an attempt. Otherwise, going by what follows it:
   controller's restart and what it says about that deploy count for little, as a lying one can
   restart itself and say what it likes. If you still want the release, it takes a new approval.
 - **A replay:** the tag has `deploy_step` lines and its `deploy_finished` succeeded, the report was
-  delivered (`report_delivered`, by the deploy's number), the agent didn't restart, and the
-  controller wasn't [restored from a backup](#backing-up-and-restoring), yet the approval has come
-  again under a later number. Treat that as an alert. It gets nothing from it, as the approval is
-  spent.
+  delivered (`report_delivered`, by the deploy's number), and the controller wasn't [restored from
+  a backup](#backing-up-and-restoring), yet the approval has come again under a later number. Treat
+  that as an alert. It gets nothing from it, as the approval is spent.
 - **No such line at all, for a nonce in the log:** the log was changed by something other
   than the agent, or the journal has lost it. Treat it as an alert.
 
