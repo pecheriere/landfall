@@ -33,14 +33,17 @@ use std::fmt;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+pub use signer::SignerKey;
 use thiserror::Error;
 
-mod raw;
-mod signer;
-
-pub use signer::SignerKey;
-
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
+
+#[cfg(test)]
+mod tests;
+
+mod raw;
+
+mod signer;
 
 /// Why a configuration file was refused. Every variant names the deployment
 /// (or section) and the offending value.
@@ -478,12 +481,14 @@ getters!(Config, c {
     /// agents and the controller compare these to detect configuration drift.
     hash: &str => &c.hash,
 });
+
 getters!(Approver, a {
     /// `WebAuthn` credential id (opaque base64url text).
     credential_id: &str => &a.credential_id,
     /// COSE public key (opaque base64url text).
     public_key: &str => &a.public_key,
 });
+
 getters!(Deployment, d {
     /// `<name>/<stage>`.
     id: &DeploymentId => &d.id,
@@ -504,6 +509,7 @@ getters!(Deployment, d {
     /// Promotion to another deployment once healthy.
     promote_to: Option<&Promotion> => d.promote_to.as_ref(),
 });
+
 getters!(Repo, r {
     /// `<owner>/<repo>`.
     name: &RepoName => &r.name,
@@ -512,12 +518,14 @@ getters!(Repo, r {
     /// GitHub owner id.
     owner_id: u64 => r.owner_id,
 });
+
 getters!(Compose, c {
     /// Absolute, canonical directory of the compose project.
     dir: &str => &c.dir,
     /// Service name.
     service: &str => &c.service,
 });
+
 getters!(Origin, o {
     /// Release workflow path.
     workflow: &str => &o.workflow,
@@ -529,6 +537,7 @@ getters!(Origin, o {
     /// `signed_tags` is off.
     signers: &[PrincipalId] => &o.signers,
 });
+
 getters!(Rule, r {
     /// Deploy without a human up to this level.
     auto: Option<Level> => r.auto,
@@ -539,18 +548,21 @@ getters!(Rule, r {
     /// Whether prerelease versions are eligible.
     prereleases: bool => r.prereleases,
 });
+
 getters!(Backup, b {
     /// Canonical relative paths; never empty.
     paths: &[String] => &b.paths,
     /// Whether the service is stopped while copying.
     stop: bool => b.stop,
 });
+
 getters!(Promotion, p {
     /// The deployment promoted to; exists and is not part of a cycle.
     deployment: &DeploymentId => &p.deployment,
     /// How long the source must stay healthy, in seconds.
     healthy_for_secs: u64 => p.healthy_for_secs,
 });
+
 getters!(Grant, g {
     /// Who.
     principal: &PrincipalId => &g.principal,
@@ -744,813 +756,4 @@ fn promotion_cycle(config: &Config, start: &Deployment) -> Option<Vec<Deployment
         current = next;
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EXAMPLE: &str = r#"
-[signers]
-maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
-
-[approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
-
-[[deployment]]
-id = "app/prod"
-repo = { name = "example/app", id = 1234, owner_id = 5678 }
-host = "home-1"
-compose = { dir = "/srv/compose/app", service = "app" }
-origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
-rule = { auto = "patch", approve = "minor", approvers = ["operator"] }
-checks = [{ http = "/health", network = "app_app", port = 8080, expect = 200 }]
-backup = { paths = ["state"], stop = true }
-
-[[deployment]]
-id = "app/staging"
-repo = { name = "example/app", id = 1234, owner_id = 5678 }
-host = "home-1"
-compose = { dir = "/srv/compose/app-staging", service = "app" }
-origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
-rule = { auto = "any", approvers = ["operator"] }
-checks = ["container-healthy"]
-promote_to = { deployment = "app/prod", healthy_for = "24h" }
-
-[[grant]]
-principal = "operator"
-deployments = ["app/prod", "app/staging"]
-can = ["view", "request", "approve", "rollback"]
-"#;
-
-    fn id(s: &str) -> DeploymentId {
-        s.parse().unwrap()
-    }
-
-    fn parse_str(text: &str) -> Result<Config, ConfigError> {
-        parse(text.as_bytes())
-    }
-
-    fn edited(from: &str, to: &str) -> String {
-        assert!(EXAMPLE.contains(from), "fixture lacks {from:?}");
-        EXAMPLE.replacen(from, to, 1)
-    }
-
-    fn fixture_key(file: &str) -> String {
-        std::fs::read_to_string(format!(
-            "{}/tests/fixtures/tag/{file}",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap()
-    }
-
-    fn with_signer(value: &str) -> String {
-        EXAMPLE.replacen(
-            &format!("maintainer = {:?}", fixture_key("signer.pub").trim_end()),
-            &format!("maintainer = {value:?}"),
-            1,
-        )
-    }
-
-    #[test]
-    fn signer_keys_are_parsed() {
-        let config = parse_str(EXAMPLE).unwrap();
-        let maintainer: PrincipalId = "maintainer".parse().unwrap();
-        let key = config.signer(&maintainer).unwrap();
-        assert_eq!(
-            key.fingerprint(),
-            "SHA256:aN9xB/PG8u3ubV37qOIeOe3nPDkWfAzfFl+We+g5ASA"
-        );
-        assert!(config.signer(&"nobody".parse().unwrap()).is_none());
-
-        // The comment is ignored: the same key with one is the same key.
-        let commented = with_signer(&format!(
-            "{} laptop key",
-            fixture_key("signer.pub").trim_end()
-        ));
-        let other = parse_str(&commented).unwrap();
-        assert_eq!(other.signer(&maintainer), Some(key));
-    }
-
-    #[test]
-    fn non_ed25519_signer_is_rejected() {
-        let err = parse_str(&with_signer(&fixture_key("ecdsa.pub"))).unwrap_err();
-        let ConfigError::InvalidSigner { signer, reason } = &err else {
-            panic!("{err}");
-        };
-        assert_eq!(signer.to_string(), "maintainer");
-        assert!(reason.contains("ecdsa-sha2-nistp256"), "{reason}");
-    }
-
-    #[test]
-    fn garbage_signer_is_rejected() {
-        for garbage in [
-            "",
-            "not a key",
-            "ssh-ed25519",
-            "ssh-ed25519 AAAA",
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyOnly",
-        ] {
-            let err = parse_str(&with_signer(garbage)).unwrap_err();
-            assert!(
-                matches!(&err, ConfigError::InvalidSigner { signer, .. } if signer.to_string() == "maintainer"),
-                "{garbage:?}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn duplicate_signer_keys_are_rejected() {
-        let key = fixture_key("signer.pub");
-        let text = EXAMPLE.replacen(
-            "[approvers]",
-            &format!(
-                "backup = {:?}\n\n[approvers]",
-                format!("{} spare", key.trim_end())
-            ),
-            1,
-        );
-        assert_eq!(
-            parse_str(&text).unwrap_err(),
-            ConfigError::DuplicateSignerKey {
-                first: "backup".parse().unwrap(),
-                second: "maintainer".parse().unwrap(),
-            }
-        );
-    }
-
-    #[test]
-    fn signed_tags_defaults_to_true() {
-        let config = parse_str(EXAMPLE).unwrap();
-        let prod = config.deployment(&id("app/prod")).unwrap();
-        assert!(prod.origin().signed_tags());
-    }
-
-    #[test]
-    fn unsigned_deployment_needs_no_signers() {
-        let text = edited(
-            "tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-            "tags = \"v*\", signed_tags = false }\nrule = { auto = \"patch\"",
-        );
-        let config = parse_str(&text).unwrap();
-        let prod = config.deployment(&id("app/prod")).unwrap();
-        assert!(!prod.origin().signed_tags());
-        assert_eq!(prod.origin().signers(), &[]);
-        // An explicit empty list is accepted too.
-        let explicit = edited(
-            "tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-            "tags = \"v*\", signed_tags = false, signers = [] }\nrule = { auto = \"patch\"",
-        );
-        assert!(parse_str(&explicit).is_ok());
-        // signed_tags on (the default) still needs signers.
-        let err = parse_str(&edited(
-            "signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-            "signed_tags = true }\nrule = { auto = \"patch\"",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::NoSigners(_)), "{err}");
-    }
-
-    #[test]
-    fn signers_with_signed_tags_off_is_rejected() {
-        let err = parse_str(&edited(
-            "signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-            "signers = [\"maintainer\"], signed_tags = false }\nrule = { auto = \"patch\"",
-        ))
-        .unwrap_err();
-        assert_eq!(err, ConfigError::SignersWithoutSignedTags(id("app/prod")));
-    }
-
-    #[test]
-    fn example_parses() {
-        let config = parse_str(EXAMPLE).unwrap();
-        let prod = config.deployment(&id("app/prod")).unwrap();
-        assert_eq!(prod.rule().auto(), Some(Level::Patch));
-        assert_eq!(prod.rule().approve(), Some(Level::Minor));
-        assert!(!prod.rule().prereleases());
-        assert_eq!(prod.compose().service(), "app");
-        let staging = config.deployment(&id("app/staging")).unwrap();
-        assert_eq!(staging.promote_to().unwrap().healthy_for_secs(), 86_400);
-        let host: HostId = "home-1".parse().unwrap();
-        assert_eq!(config.deployments_for_host(&host).count(), 2);
-        let other: HostId = "home-2".parse().unwrap();
-        assert_eq!(config.deployments_for_host(&other).count(), 0);
-        assert_eq!(config.grants()[0].can().len(), 4);
-    }
-
-    #[test]
-    fn unknown_fields_are_errors() {
-        let text = edited(
-            "checks = [\"container-healthy\"]",
-            "checks = [\"container-healthy\"]\nrul = { auto = \"patch\" }",
-        );
-        let err = parse_str(&text).unwrap_err();
-        assert!(matches!(err, ConfigError::Toml(_)));
-        assert!(err.to_string().contains("rul"), "{err}");
-    }
-
-    #[test]
-    fn each_validation_rule_is_enforced() {
-        // 1: duplicate ids.
-        let err = parse_str(&edited("id = \"app/staging\"", "id = \"app/prod\"")).unwrap_err();
-        assert!(matches!(err, ConfigError::DuplicateDeployment(_)), "{err}");
-        assert!(err.to_string().contains("app/prod"));
-
-        // 2: unknown or empty origin signers.
-        let err = parse_str(&edited(
-            "signers = [\"maintainer\"]",
-            "signers = [\"nobody\"]",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::UnknownSigner { .. }), "{err}");
-        assert!(err.to_string().contains("app/prod") && err.to_string().contains("nobody"));
-        let err = parse_str(&edited("signers = [\"maintainer\"]", "signers = []")).unwrap_err();
-        assert!(matches!(err, ConfigError::NoSigners(_)), "{err}");
-        assert!(err.to_string().contains("app/prod"));
-
-        // 3: approvers always non-empty and known.
-        let err = parse_str(&edited(
-            "approvers = [\"operator\"] }\nchecks = [\"container",
-            "approvers = [] }\nchecks = [\"container",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::NoApprovers(_)), "{err}");
-        assert!(err.to_string().contains("app/staging"));
-        let err = parse_str(&edited(
-            "approve = \"minor\", approvers = [\"operator\"]",
-            "approve = \"minor\", approvers = [\"ghost\"]",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::UnknownApprover { .. }), "{err}");
-        assert!(err.to_string().contains("app/prod") && err.to_string().contains("ghost"));
-
-        // 4: approve must be broader than auto.
-        let err = parse_str(&edited("approve = \"minor\"", "approve = \"patch\"")).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::ApproveNotBroader { .. }),
-            "{err}"
-        );
-        assert!(err.to_string().contains("app/prod"));
-
-        // 5: checks non-empty.
-        let err = parse_str(&edited(
-            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]",
-            "checks = []",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::NoChecks(_)), "{err}");
-        assert!(err.to_string().contains("app/prod"));
-
-        // 6: promotion target unknown, itself, or a cycle.
-        let err = parse_str(&edited(
-            "deployment = \"app/prod\", healthy_for",
-            "deployment = \"app/none\", healthy_for",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::UnknownPromotion { .. }), "{err}");
-        assert!(err.to_string().contains("app/staging") && err.to_string().contains("app/none"));
-        let err = parse_str(&edited(
-            "deployment = \"app/prod\", healthy_for",
-            "deployment = \"app/staging\", healthy_for",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::SelfPromotion(_)), "{err}");
-        assert!(err.to_string().contains("app/staging"));
-        let cyclic = edited(
-            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]",
-            "checks = [\"container-healthy\"]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
-        );
-        let err = parse_str(&cyclic).unwrap_err();
-        assert!(matches!(err, ConfigError::PromotionCycle { .. }), "{err}");
-        assert!(
-            err.to_string()
-                .contains("app/prod -> app/staging -> app/prod"),
-            "{err}"
-        );
-
-        // 7: grants.
-        let err = parse_str(&edited(
-            "deployments = [\"app/prod\", \"app/staging\"]",
-            "deployments = [\"app/none\"]",
-        ))
-        .unwrap_err();
-        assert!(
-            matches!(err, ConfigError::UnknownGrantDeployment { .. }),
-            "{err}"
-        );
-        assert!(err.to_string().contains("app/none") && err.to_string().contains("operator"));
-        let err = parse_str(&edited(
-            "principal = \"operator\"",
-            "principal = \"maintainer\"",
-        ))
-        .unwrap_err();
-        assert!(
-            matches!(err, ConfigError::ApproveWithoutApprover { .. }),
-            "{err}"
-        );
-        assert!(err.to_string().contains("maintainer"));
-
-        // 8: one deployment per host and compose directory.
-        let err = parse_str(&edited(
-            "dir = \"/srv/compose/app-staging\"",
-            "dir = \"/srv/compose/app\"",
-        ))
-        .unwrap_err();
-        assert!(
-            matches!(err, ConfigError::DuplicateComposeDir { .. }),
-            "{err}"
-        );
-        assert!(err.to_string().contains("app/staging") && err.to_string().contains("app/prod"));
-    }
-
-    #[test]
-    fn http_check_requires_a_port() {
-        let err = parse_str(&with_staging_checks(
-            "[{ http = \"/h\", network = \"app\", expect = 200 }]",
-        ))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
-        let err = err.to_string();
-        assert!(err.contains("port") && err.contains("app/staging"), "{err}");
-    }
-
-    #[test]
-    fn port_zero_is_rejected() {
-        for port in ["0", "65536", "-1"] {
-            let check =
-                format!("[{{ http = \"/h\", network = \"app\", port = {port}, expect = 200 }}]");
-            assert!(parse_str(&with_staging_checks(&check)).is_err(), "{port}");
-        }
-        for port in ["1", "65535"] {
-            let check =
-                format!("[{{ http = \"/h\", network = \"app\", port = {port}, expect = 200 }}]");
-            assert!(parse_str(&with_staging_checks(&check)).is_ok(), "{port}");
-        }
-    }
-
-    #[test]
-    fn two_deployments_cannot_share_a_directory() {
-        let err = parse_str(&edited(
-            "dir = \"/srv/compose/app-staging\", service = \"app\"",
-            "dir = \"/srv/compose/app\", service = \"other\"",
-        ))
-        .unwrap_err();
-        assert!(
-            matches!(err, ConfigError::DuplicateComposeDir { .. }),
-            "{err}"
-        );
-        let err = err.to_string();
-        assert!(
-            err.contains("app/staging") && err.contains("app/prod"),
-            "{err}"
-        );
-        assert!(err.contains("/srv/compose/app"), "{err}");
-    }
-
-    #[test]
-    fn malformed_values_name_the_deployment() {
-        for (from, to) in [
-            ("dir = \"/srv/compose/app\"", "dir = \"srv/compose/app\""),
-            ("dir = \"/srv/compose/app\"", "dir = \"/srv/../app\""),
-            (
-                "service = \"app\" }\norigin = { workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-                "service = \"App\" }\norigin = { workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-            ),
-            (
-                "workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-                "workflow = \"release.yml\", tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"",
-            ),
-            ("paths = [\"state\"]", "paths = [\"/etc\"]"),
-            ("paths = [\"state\"]", "paths = [\"a/../b\"]"),
-            ("paths = [\"state\"]", "paths = []"),
-            ("healthy_for = \"24h\"", "healthy_for = \"24\""),
-            ("healthy_for = \"24h\"", "healthy_for = \"0h\""),
-        ] {
-            let err = parse_str(&edited(from, to)).unwrap_err();
-            assert!(matches!(err, ConfigError::Invalid { .. }), "{to}: {err}");
-            assert!(err.to_string().contains("app/"), "{err}");
-        }
-    }
-
-    #[test]
-    fn durations_use_minutes_hours_days() {
-        for (text, secs) in [("90m", 5_400), ("2h", 7_200), ("1d", 86_400)] {
-            let config = parse_str(&edited(
-                "healthy_for = \"24h\"",
-                &format!("healthy_for = \"{text}\""),
-            ))
-            .unwrap();
-            let staging = config.deployment(&id("app/staging")).unwrap();
-            assert_eq!(staging.promote_to().unwrap().healthy_for_secs(), secs);
-        }
-    }
-
-    #[test]
-    fn checks_parse_in_both_forms() {
-        let all = "checks = [\"container-healthy\", { http = \"/health\", network = \"app\", port = 8080, expect = 200 }, { command = [\"/app\", \"healthcheck\"] }, { no_log_match = \"panicked\", within_secs = 30 }]";
-        let config = parse_str(&edited("checks = [\"container-healthy\"]", all)).unwrap();
-        let staging = config.deployment(&id("app/staging")).unwrap();
-        assert_eq!(
-            staging.checks(),
-            vec![
-                Check::ContainerHealthy,
-                Check::Http {
-                    path: "/health".into(),
-                    network: "app".into(),
-                    port: 8080,
-                    expect: 200
-                },
-                Check::Command {
-                    argv: vec!["/app".into(), "healthcheck".into()]
-                },
-                Check::NoLogMatch {
-                    pattern: "panicked".into(),
-                    within_secs: 30
-                },
-            ]
-        );
-        for bad in [
-            "{ http = \"/h\", command = [\"x\"] }",
-            "{ http = \"/h\" }",
-            "{ command = [] }",
-            "{ no_log_match = \"x\" }",
-            "{}",
-            "\"unknown\"",
-        ] {
-            let text = edited(
-                "checks = [\"container-healthy\"]",
-                &format!("checks = [{bad}]"),
-            );
-            let err = parse_str(&text).unwrap_err();
-            assert!(
-                matches!(
-                    &err,
-                    ConfigError::Invalid { deployment, field, .. }
-                        if deployment.as_ref() == "app/staging" && field == "checks[0]"
-                ),
-                "{bad}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn sha256_hex_matches_the_empty_input_vector() {
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn hash_covers_exactly_the_file_bytes() {
-        let config = parse_str(EXAMPLE).unwrap();
-        assert_eq!(config.hash(), sha256_hex(EXAMPLE.as_bytes()));
-        // Same meaning, different bytes: a different hash.
-        let spaced = format!("{EXAMPLE}\n");
-        let other = parse_str(&spaced).unwrap();
-        assert_ne!(other.hash(), config.hash());
-    }
-
-    #[test]
-    fn non_utf8_bytes_are_refused() {
-        let mut bytes = EXAMPLE.as_bytes().to_vec();
-        bytes.insert(10, 0xff);
-        assert_eq!(
-            parse(&bytes).unwrap_err(),
-            ConfigError::NotUtf8 { offset: 10 }
-        );
-    }
-
-    #[test]
-    fn unknown_key_in_a_check_table_is_named() {
-        let text = edited(
-            "checks = [\"container-healthy\"]",
-            "checks = [{ http = \"/h\", netwrok = \"app\", expect = 200 }]",
-        );
-        let err = parse_str(&text).unwrap_err();
-        assert!(matches!(err, ConfigError::Toml(_)), "{err}");
-        assert!(err.to_string().contains("netwrok"), "{err}");
-    }
-
-    #[test]
-    fn check_errors_name_the_entry_and_the_keys() {
-        let text = edited(
-            "checks = [\"container-healthy\"]",
-            "checks = [\"container-healthy\", \"container-healthy\", { http = \"/h\", command = [\"x\"] }]",
-        );
-        let err = parse_str(&text).unwrap_err().to_string();
-        assert!(err.contains("app/staging"), "{err}");
-        assert!(err.contains("checks[2]"), "{err}");
-        assert!(err.contains("http") && err.contains("command"), "{err}");
-        assert!(!err.contains("{...}"), "{err}");
-
-        let text = edited("checks = [\"container-healthy\"]", "checks = [\"healthy\"]");
-        let err = parse_str(&text).unwrap_err().to_string();
-        assert!(
-            err.contains("checks[0]") && err.contains("healthy"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn compose_dir_must_be_canonical() {
-        // Spellings of the same directory as app/prod's must not slip past
-        // the one-service-per-host rule.
-        for dir in [
-            "/srv/compose/app/",
-            "/srv//compose/app",
-            "/srv/./compose/app",
-            "/srv/compose/app/.",
-            "/srv/compose/../compose/app",
-            "/",
-            "//",
-        ] {
-            let text = edited(
-                "dir = \"/srv/compose/app-staging\"",
-                &format!("dir = \"{dir}\""),
-            );
-            let err = parse_str(&text).unwrap_err();
-            assert!(
-                matches!(&err, ConfigError::Invalid { field, .. } if field == "compose.dir"),
-                "{dir}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn backup_paths_must_be_canonical() {
-        for path in ["state/", "a//b", "./state", "state/."] {
-            let text = edited("paths = [\"state\"]", &format!("paths = [\"{path}\"]"));
-            assert!(
-                matches!(parse_str(&text), Err(ConfigError::Invalid { .. })),
-                "{path}"
-            );
-        }
-    }
-
-    #[test]
-    fn log_checks_stay_within_what_the_agent_can_run() {
-        let long = "x".repeat(LOG_PATTERN_LIMIT + 1);
-        for bad in [
-            format!("[\"container-healthy\", {{ no_log_match = \"{long}\", within_secs = 1 }}]"),
-            "[\"container-healthy\", { no_log_match = \"a\\nb\", within_secs = 1 }]".to_owned(),
-            "[\"container-healthy\", { no_log_match = \"x\", within_secs = 3601 }]".to_owned(),
-        ] {
-            let err = parse_str(&with_staging_checks(&bad)).unwrap_err();
-            assert!(
-                matches!(
-                    &err,
-                    ConfigError::Invalid { deployment, field, .. }
-                        if deployment.as_ref() == "app/staging" && field == "checks[1]"
-                ),
-                "{err}"
-            );
-        }
-        let longest = "x".repeat(LOG_PATTERN_LIMIT);
-        let at_the_limits = format!(
-            "[\"container-healthy\", {{ no_log_match = \"{longest}\", within_secs = 3600 }}]"
-        );
-        assert!(parse_str(&with_staging_checks(&at_the_limits)).is_ok());
-    }
-
-    /// The fixture with app/staging's check list replaced by `checks`.
-    fn with_staging_checks(checks: &str) -> String {
-        edited(
-            "checks = [\"container-healthy\"]",
-            &format!("checks = {checks}"),
-        )
-    }
-
-    #[test]
-    fn a_deployment_needs_a_check_that_observes_the_service() {
-        let text = with_staging_checks("[{ no_log_match = \"panicked\", within_secs = 30 }]");
-        let err = parse_str(&text).unwrap_err();
-        assert_eq!(err, ConfigError::NoObservingCheck(id("app/staging")));
-        assert!(err.to_string().contains("app/staging"), "{err}");
-        for observing in [
-            "[\"container-healthy\", { no_log_match = \"panicked\", within_secs = 30 }]",
-            "[{ command = [\"/app\", \"healthcheck\"] }, { no_log_match = \"x\", within_secs = 1 }]",
-            "[{ no_log_match = \"x\", within_secs = 1 }, { http = \"/\", network = \"app\", port = 8080, expect = 204 }]",
-        ] {
-            assert!(
-                parse_str(&with_staging_checks(observing)).is_ok(),
-                "{observing}"
-            );
-        }
-    }
-
-    #[test]
-    fn http_checks_validate_path_network_and_status() {
-        for (check, field, value) in [
-            (
-                "{ http = \"/h\", network = \"app\", port = 8080, expect = 0 }",
-                "checks[0].expect",
-                "0",
-            ),
-            (
-                "{ http = \"/h\", network = \"app\", port = 8080, expect = 99 }",
-                "checks[0].expect",
-                "99",
-            ),
-            (
-                "{ http = \"/h\", network = \"app\", port = 8080, expect = 600 }",
-                "checks[0].expect",
-                "600",
-            ),
-            (
-                "{ http = \"/h\\r\\nX: y\", network = \"app\", port = 8080, expect = 200 }",
-                "checks[0].http",
-                "/h\r\nX: y",
-            ),
-            (
-                "{ http = \"/a b\", network = \"app\", port = 8080, expect = 200 }",
-                "checks[0].http",
-                "/a b",
-            ),
-            (
-                "{ http = \"/caf\u{e9}\", network = \"app\", port = 8080, expect = 200 }",
-                "checks[0].http",
-                "/caf\u{e9}",
-            ),
-            (
-                "{ http = \"health\", network = \"app\", port = 8080, expect = 200 }",
-                "checks[0].http",
-                "health",
-            ),
-            (
-                "{ http = \"/h\", network = \"n n\", port = 8080, expect = 200 }",
-                "checks[0].network",
-                "n n",
-            ),
-            (
-                "{ http = \"/h\", network = \"\", port = 8080, expect = 200 }",
-                "checks[0].network",
-                "",
-            ),
-            (
-                "{ http = \"/h\", network = \"-net\", port = 8080, expect = 200 }",
-                "checks[0].network",
-                "-net",
-            ),
-        ] {
-            let err = parse_str(&with_staging_checks(&format!("[{check}]"))).unwrap_err();
-            assert!(
-                matches!(
-                    &err,
-                    ConfigError::Invalid { field: f, value: v, .. } if f == field && v == value
-                ),
-                "{check}: {err}"
-            );
-        }
-        let long = format!("n{}", "x".repeat(128));
-        let err = parse_str(&with_staging_checks(&format!(
-            "[{{ http = \"/h\", network = \"{long}\", port = 8080, expect = 200 }}]"
-        )))
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
-        let at_limit = format!("n{}", "x".repeat(127));
-        for check in [
-            "{ http = \"/h?a=1&b=%20\", network = \"app_net.1-x\", port = 8080, expect = 100 }"
-                .to_owned(),
-            format!("{{ http = \"/\", network = \"{at_limit}\", port = 8080, expect = 599 }}"),
-        ] {
-            assert!(
-                parse_str(&with_staging_checks(&format!("[{check}]"))).is_ok(),
-                "{check}"
-            );
-        }
-    }
-
-    #[test]
-    fn workflow_is_a_file_directly_in_the_workflows_directory() {
-        let from = "workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }\nrule = { auto = \"patch\"";
-        for bad in [
-            ".github/workflows/.yml",
-            ".github/workflows/a/b.yml",
-            ".github/workflows/a b@refs.yml",
-            ".github/workflows/release.json",
-            ".github/workflows/../workflows/release.yml",
-            "x/.github/workflows/release.yml",
-        ] {
-            let to = from.replace(".github/workflows/release.yml", bad);
-            let err = parse_str(&edited(from, &to)).unwrap_err();
-            assert!(
-                matches!(
-                    &err,
-                    ConfigError::Invalid { field, value, .. }
-                        if field == "origin.workflow" && value == bad
-                ),
-                "{bad}: {err}"
-            );
-            assert!(!err.to_string().contains("without '..'"), "{err}");
-        }
-        for ok in [
-            ".github/workflows/release.yaml",
-            ".github/workflows/Release_v2.1-x.yml",
-        ] {
-            let to = from.replace(".github/workflows/release.yml", ok);
-            assert!(parse_str(&edited(from, &to)).is_ok(), "{ok}");
-        }
-    }
-
-    #[test]
-    fn promotion_cycle_reports_the_loop() {
-        // app/canary -> app/staging -> app/prod -> app/staging: the error is
-        // reported for app/canary and names only the loop.
-        let canary = r#"
-[[deployment]]
-id = "app/canary"
-repo = { name = "example/app", id = 1234, owner_id = 5678 }
-host = "home-1"
-compose = { dir = "/srv/compose/app-canary", service = "app" }
-origin = { workflow = ".github/workflows/release.yml", tags = "v*", signers = ["maintainer"] }
-rule = { auto = "any", approvers = ["operator"] }
-checks = ["container-healthy"]
-promote_to = { deployment = "app/staging", healthy_for = "1h" }
-
-[[deployment]]
-id = "app/prod""#;
-        let text = edited("\n[[deployment]]\nid = \"app/prod\"", canary);
-        let text = text.replacen(
-            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]",
-            "checks = [{ http = \"/health\", network = \"app_app\", port = 8080, expect = 200 }]\npromote_to = { deployment = \"app/staging\", healthy_for = \"1h\" }",
-            1,
-        );
-        let err = parse_str(&text).unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::PromotionCycle {
-                deployment: id("app/canary"),
-                chain: vec![id("app/staging"), id("app/prod"), id("app/staging")],
-            }
-        );
-        assert!(
-            err.to_string().ends_with(
-                "app/canary: promote_to chain forms a cycle: app/staging -> app/prod -> app/staging"
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn promotion_stays_within_one_repository() {
-        let text = edited(
-            "id = \"app/staging\"\nrepo = { name = \"example/app\", id = 1234",
-            "id = \"app/staging\"\nrepo = { name = \"example/app\", id = 4321",
-        );
-        let err = parse_str(&text).unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::PromotionRepoMismatch {
-                deployment: id("app/staging"),
-                target: id("app/prod"),
-                repo_id: 4321,
-                target_repo_id: 1234,
-            }
-        );
-        assert!(err.to_string().contains("app/staging"), "{err}");
-    }
-
-    #[test]
-    fn grants_must_list_deployments_and_permissions() {
-        let principal: PrincipalId = "operator".parse().unwrap();
-        let err = parse_str(&edited(
-            "deployments = [\"app/prod\", \"app/staging\"]",
-            "deployments = []",
-        ))
-        .unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::EmptyGrant {
-                principal: principal.clone(),
-                field: "deployments"
-            }
-        );
-        assert!(err.to_string().contains("operator"), "{err}");
-        let err = parse_str(&edited(
-            "can = [\"view\", \"request\", \"approve\", \"rollback\"]",
-            "can = []",
-        ))
-        .unwrap_err();
-        assert_eq!(
-            err,
-            ConfigError::EmptyGrant {
-                principal,
-                field: "can"
-            }
-        );
-    }
-
-    #[test]
-    fn approve_not_broader_names_levels_in_config_spelling() {
-        let err = parse_str(&edited("approve = \"minor\"", "approve = \"patch\"")).unwrap_err();
-        let text = err.to_string();
-        assert!(
-            text.contains("rule.approve = \"patch\"") && text.contains("rule.auto = \"patch\""),
-            "{text}"
-        );
-        assert!(!text.contains("Patch"), "{text}");
-        assert_eq!(Level::Minor.to_string(), "minor");
-        assert_eq!(Level::Any.to_string(), "any");
-    }
 }

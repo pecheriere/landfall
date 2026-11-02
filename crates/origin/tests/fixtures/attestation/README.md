@@ -1,7 +1,7 @@
 # Attestation fixture
 
 A real GitHub build-provenance bundle from a public, widely used third-party
-project, verified offline by the tests in `crates/origin/src/attestation.rs`.
+project, verified offline by the tests in `crates/origin/src/attestation/tests/`.
 
 | What | Value |
 |---|---|
@@ -31,7 +31,7 @@ the build trigger `push` and the runner environment `github-hosted`.
 - `index.json`: the image index itself, the exact bytes the registry serves
   for the release tag (their sha256 is the index digest). It lists
   `linux/amd64`, `linux/arm64`, `linux/arm/v7` and `linux/arm/v6`, each with
-  a buildx attestation manifest. With it, `crates/origin/src/release.rs`
+  a buildx attestation manifest. With it, `crates/origin/src/release/tests/`
   verifies the whole release offline against mock GitHub and registry
   servers (as a deployment with `signed_tags = false`: the project's tags are
   not signed by a key in these fixtures).

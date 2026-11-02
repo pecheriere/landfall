@@ -35,13 +35,19 @@ passkey approvals. Agents drive it through a typed API. Design:
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:
   `state` (the agent's own directory: deployed and in-progress records,
-  the previous override, reports, a per-deployment lock), `safefs` (the only
-  code that may touch a directory a container can write to: no-follow walking
-  by directory descriptor, atomic write, snapshot, restore, prune),
-  `docker` (the only code that runs the Docker CLI, behind a trait), `compose`
+  the previous override, reports, a per-deployment lock; `state/` has `error`,
+  `records`, `dir` and `deployment`), `safefs` (the only code that may touch a
+  directory a container can write to: no-follow walking by directory
+  descriptor, atomic write, snapshot, restore, prune; `safefs/` has `error`,
+  `paths`, `files`, `snapshot`, `removal` and `copy`),
+  `docker` (the only code that runs the Docker CLI, behind a trait in
+  `docker.rs`; `docker/` has the `cli` driver, `process` for running commands,
+  `parse` for their output, `scan`, `types` and `error`), `compose`
   (the override file the agent owns, compose directory resolution), `checks`
   (post-deploy checks: health, HTTP probe, command, log window), `deploy` (the
-  sequence, rollback and recovery, recording every step in a report), `journal`
+  sequence, rollback and recovery, drift, recording every step in a report;
+  `deploy/` has `sequence`, `preflight`, `rollback`, `recovery`, `drift`,
+  `report`, `error`, `files` and `offload`), `journal`
   (the only code that writes to stderr: syslog-prefixed JSON lines), `client`
   (the `Controller` trait and the signing HTTP client), `enrol` (the host's key
   and the enrolment request), `daemon` (`run`: one poll is `daemon::step`, which
@@ -106,7 +112,10 @@ cargo deny check
 - Keep files small: split a source file by responsibility before it passes
   about 800 lines of code, and move a large test module into its own file. When
   a change would push a file past that, split it in the same change, or track
-  the split as an issue (#18 lists the current ones).
+  the split as an issue. The parts of `foo.rs`
+  go in `foo/`, its tests in `foo/tests.rs` (shared fixtures) and
+  `foo/tests/<scenario>.rs`, as `daemon` does. A test names what it imports
+  rather than using `use super::*`.
 
 ## Testing rules
 
@@ -116,7 +125,7 @@ coverage.
 Tests against a real Docker are `#[ignore]`d and named with a `docker_` prefix,
 which is how CI selects them:
 `cargo test -p landfall-agent --all-features --locked -- --ignored docker`.
-`docker_e2e.rs` lists what each needs. The `foreign_owner` tests need root and
+`docker_e2e/main.rs` lists what each needs. The `foreign_owner` tests need root and
 skip without it, unless `LANDFALL_TEST_REQUIRE_ROOT` is set, as it is in CI, which
 makes that a failure.
 
