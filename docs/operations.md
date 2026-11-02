@@ -183,7 +183,7 @@ restoring a backup on purpose, expect the check to fail, and keep a new head.
 **A copy of `controller.db` isn't a backup.** While the controller runs, and after it
 was killed, its latest changes are in `controller.db-wal` beside it, and a host can be
 missing from a copy of the one file. Use the command, which needs no `sqlite3` and works
-while `serve` runs, also in its container (`docker exec landfall landfall-server backup
+while `serve` runs, also in its container (`docker exec landfall /landfall-server backup
 ...`, to a path on the volume):
 
 ```sh
@@ -426,7 +426,7 @@ landfall-server enrol-code --host home-1 --db /var/lib/landfall-server/controlle
 ```
 
 Run it as the controller's user, as the database is private to it, while `serve` runs or
-not; in a container, `docker exec landfall landfall-server enrol-code --host home-1 --db
+not; in a container, `docker exec landfall /landfall-server enrol-code --host home-1 --db
 /data/controller.db`. The database has to exist, so start `serve` once first.
 
 Put the code in a regular file on the host that only the agent's user can read (a
