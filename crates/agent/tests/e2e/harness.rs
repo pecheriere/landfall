@@ -559,7 +559,8 @@ impl Fleet {
         self.seed_on(&SimDocker(self.world.clone()), &release).await;
     }
 
-    async fn connection(&self) -> SqliteConnection {
+    /// A connection that only reads.
+    pub async fn connection(&self) -> SqliteConnection {
         let options = SqliteConnectOptions::new()
             .filename(&self.db)
             .read_only(true);

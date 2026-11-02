@@ -206,38 +206,79 @@ is what can tell later that the backup is the one you took: a backup is as easy 
 the database. Until you overwrite it with a restore, `audit verify --at <head_seq>` on the
 live database must print the same hash, or the log has been changed since.
 
-To restore, stop the agents first, letting any deploy finish, then the controller:
+To restore:
 
-```sh
-rm -f controller.db-wal controller.db-shm
-cp /backups/controller-2026-11-01.db controller.db
-```
+1. **Stop the agents,** letting any deploy finish, **then the controller.** An agent left running
+   reports deploys the backup has never heard of under numbers it hands out again. Each report says
+   which release it is of, so one for another release can't finish the deploy under its number: it
+   is refused for good (`report_refused` on the controller, `report_rejected` on the host), and the
+   outcome then is only in the engine's copy under `<deployment>/reports/`.
+2. **Write down what was revoked since the backup, from the database you are about to replace.** A
+   token revoked since then works again once the backup is back. `audit show` has no filter of its
+   own and shows the newest rows up to `--limit`, so ask for all of them. These rows name no
+   deployment, so leave out `--deployment`:
 
-Removing the other two files first matters: `SQLite` would apply a log of the old database
-to the new. Then start the controller, and then the agents. An agent left running reports
-deploys the backup has never heard of under numbers it hands out again. Each report says
-which release it is of, so one for another release can't finish the deploy under its
-number: it is refused for good (`report_refused` on the controller, `report_rejected` on
-the host), and the outcome then is only in the engine's copy under
-`<deployment>/reports/`. Hosts stay enrolled as of the backup, and tell it what runs on
-their next poll. Whatever happened since is gone from the log, so `audit verify --at`
-with a head kept since fails, as it should: keep a new head. Deploy numbers start over from
-the backup, which hosts cope with: [a number goes with its release](#a-release-that-rolled-back-isnt-retried).
+   ```sh
+   landfall-server audit show --db controller.db --limit 4294967295 \
+     | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
+   ```
 
-**Who may do what goes back with it.** A token revoked since the backup works again, and so does a
-session signed out or a stored passkey replaced since. Before you overwrite the database, have
-`audit show` list its `token_revoked` and `passkey_registered` rows, as the restored log won't have
-them, and revoke or register those again. Invites, requests and approvals are as of the backup too.
+3. **Put the backup in place.** Removing the other two files first matters: `SQLite` would apply a log
+   of the old database to the new.
+
+   ```sh
+   rm -f controller.db-wal controller.db-shm
+   cp /backups/controller-2026-11-01.db controller.db
+   ```
+
+4. **Revoke those tokens again, before `serve` starts,** so that they don't work in between. This needs
+   no `serve`. An id that says `there is no API token with this id` was made after the backup, and is gone
+   with it:
+
+   ```sh
+   grep '"kind":"token_revoked"' changed-since-backup.txt | sed -E 's/.*"token":([0-9]+).*/\1/' \
+     | while read -r id; do landfall-server token revoke --id "$id" --db controller.db; done
+   ```
+
+   **If the old database is lost, or you don't trust it,** you can't know what was revoked. Revoke every
+   token the restored log knows of, and make new ones afterwards:
+
+   ```sh
+   landfall-server audit show --db controller.db --limit 4294967295 \
+     | grep '"kind":"token_created"' | sed -E 's/.*"token":([0-9]+).*/\1/' \
+     | while read -r id; do landfall-server token revoke --id "$id" --db controller.db; done
+   ```
+
+   A backup from before an upgrade gets `run serve from this version once` instead. Do that on a port
+   nothing forwards to, stop it, and then revoke.
+5. **Start the controller, and then the agents.** Hosts stay enrolled as of the backup, and tell it what
+   runs on their next poll.
+6. **Register again whoever has a `passkey_registered` row** in that file, from a new invite: the
+   stored key is back to the old one. A session signed out since the backup works again too, until its
+   12 hours are up or that person registers again. With no list to go by, invite everyone without a key
+   in `[approvers]`.
+7. **Keep a new head.** Whatever happened since is gone from the log, so `audit verify --at` with a head
+   kept since fails, as it should.
+
+Deploy numbers start over from the backup, which hosts cope with:
+[a number goes with its release](#a-release-that-rolled-back-isnt-retried). Invites, requests and
+approvals are as of the backup too.
 
 **An approval comes through a restore safely, as the hosts keep their own count of them:**
 
 - One made since the backup is gone, and nothing runs on it. The request is open again if the backup
-  has it open, and takes a new tap.
+  has it open, and takes a new tap. **That tap may run nothing:** if its new deploy gets a number this
+  host already finished for that release, the host answers with its report of then, with no `up` and
+  nothing spent, so the row can read `deployed` while another version runs. Check what runs with
+  `landfall-agent status`. If it didn't move and you still want it, ask again, which makes a new
+  request and a new number.
 - One the backup holds as queued, for a deploy that has since run, is delivered again under its
   number. The host answers with its report of that deploy (`finished_work_delivered_again`), and the
   service isn't touched.
 - Delivered under another number, it is refused at priority 2: by what the host runs, if it has moved
-  on, or by [the nonce log](#the-nonce-log), if the digest it names is running again.
+  on, or by [the nonce log](#the-nonce-log), if the digest it names is running again. Deploy numbers
+  aren't per deployment, so a request reopened by a restore can honestly get another number. Nothing
+  ran. If you still want the release, ask again.
 
 ### Rebuilding a controller from nothing
 
@@ -763,7 +804,8 @@ hands it, and the page comes from the controller. If the controller is compromis
 
 **It can** show you one release and have you sign another, on any deployment whose `rule.approvers`
 lists you. That includes a lower version, so a tap can be turned into a rollback to an old release,
-and an old release may have bugs a newer one fixed. It can do the same with a tap meant for signing
+and an old release may have bugs a newer one fixed. It also includes a release on this host's
+[record of failures](#a-release-that-rolled-back-isnt-retried), which an approval retries. It can do the same with a tap meant for signing
 in. It can then hold what you signed and deliver it later, since a host has no clock it trusts, for as
 long as the digest it names is running. It can show its own key at registration in place of yours,
 which is why a key is reviewed and the fingerprint compared. And it can say anything it likes in its
@@ -789,13 +831,14 @@ own pages and its own audit log, including leaving your tap out or writing one t
 could put a request's intent hash in a sign-in ceremony, and a person signing in would have
 approved it without knowing. It is within the residual risk of design 6.3: the ceremony runs on the
 controller's page, which can already show one thing and have another signed. The host still only
-runs a maintainer-signed release for that deployment, from the digest it is running. The page can't
+runs a release that verifies for that deployment, which is maintainer-signed if `origin.signed_tags` is
+on, from the digest it is running. The page can't
 prove what it asks you to sign. Computing the hash on your own machine is the stronger path, and is
 planned as `landfall approve`, which doesn't exist yet.
 
 **How you'd know.** Each of these refusals leaves the service alone and goes in the host's journal as
 `controller_work_refused` at priority 2, which is the record the controller can't change, so alert on
-that. The controller's `deploy_refused` audit row has the reason too, as long as it is honest. What
+that, and then [read it](#reading-a-refusal-at-priority-2), as some have honest causes. The controller's `deploy_refused` audit row has the reason too, as long as it is honest. What
 the page can't be caught by is a good signature over something you didn't mean: compare
 `approval_about_to_be_spent` in the host's journal, which names the approver and the release, with what
 you approved. `crates/agent/tests/e2e/approvals/` shows the refusals, with the controller's database
@@ -806,8 +849,9 @@ written to directly.
 **Nothing stops.** The service keeps running, automatic deploys and automatic rollbacks take no
 passkey, and a session already open goes on. What waits is whatever takes an approval by that key.
 If another approver is listed for a deployment, they can sign in the meantime. `[approvers]` holds
-one key for a name, so a second device means a second name, listed in the same `rule.approvers`. Have
-one before you need it. Nothing in the controller can stand in for the file, so with no approver left
+one key for a name, so a second device means a second name, listed in the same `rule.approvers` and
+with an `approve` grant of its own, since the file doesn't ask for one and the controller won't let
+that name approve without it. Have one before you need it. Nothing in the controller can stand in for the file, so with no approver left
 it takes someone who can change the file on every host.
 
 **For an approver:**
@@ -828,9 +872,14 @@ it takes someone who can change the file on every host.
 **If it may have been stolen and not lost,** do the above at once, and read back from when it went: the
 controller's `signed_in` and `request_approved` rows, and `approval_about_to_be_spent` in each host's
 journal. A thief with only the passkey can sign in and approve what's asked, with that person's grants.
-Until each host restarts with the new file, it still accepts that key's signature, and a session
-outlives what you do in the file for as long as [the section above](#registering-and-who-signs-in-as-whom)
-says.
+Until each host restarts with the new file, it still accepts that key's signature.
+
+**These steps can leave the thief a session.** Step 1 ends the sessions that exist, but until the file
+changes the old key can still open a new one, as the file's key decides. That session outlives the
+restart on the new file. It keeps the person's grants, so it can ask, roll back and cancel, and it can't
+approve, which takes a fresh assertion by the key now in the file. It ends after its 12 hours, or when
+the person registers again, which is one more key and one more change to the file. So make the file
+change quickly after step 1.
 
 ## Running the agent
 
@@ -930,9 +979,9 @@ What isn't so is answered in one of two ways, and nothing runs either way:
   failed, or the release is on this host's record of failures. It is journalled as
   `controller_work_refused`, and the controller doesn't ask again. For a request the rule,
   an approval or verification refuses that is priority 2, critical: **treat it as an
-  alert**, since an honest controller decides by the same rule and doesn't ask. There is one
-  honest way to get there, a crash just as an approval was spent: see
-  [telling a crash from a replay](#telling-a-crash-from-a-replay).
+  alert**, since it is how a lying controller shows. An honest controller decides by the same
+  rule and mostly doesn't ask, but it can get here in a few ways, so
+  [read it](#reading-a-refusal-at-priority-2) before you decide what it means.
 - **`deferred`, not now:** an unfinished deploy, drift, state or evidence that can't be
   read, a clock behind the release, or a wait for verification that has reached its bound.
   All of these pass. It is journalled as `controller_work_deferred`, at priority 3, error,
@@ -1003,6 +1052,25 @@ held back by a controller say, stays good indefinitely. It works if it is delive
 as long as what it names as running is running then, and that includes a digest that has
 gone and come back. What it can install is still only the one release it names, verified here.
 
+#### Reading a refusal at priority 2
+
+Nothing ran, and nothing was spent unless the reason says it was spent already. The reason is in the
+host's journal. These are the honest ways to get one, each with what would show it:
+
+| Reason | Honest cause | What shows it |
+|---|---|---|
+| `it is for a host running <A>, and this host has <B> on record` | The host moved while an approval was queued: a `recover`, or a deploy by hand. A queued approval can't be cancelled yet ([#30](https://github.com/pecheriere/landfall/issues/30)) and the controller delivers it. | The host's journal has `deploy_step` and `deploy_finished` lines that took it to `<B>`, after the approval. |
+| The same, or `was already spent on this host` | The controller was [restored from a backup](#backing-up-and-restoring) holding that approval. | You restored it, just before this. |
+| `no approver in this host's configuration has credential` | The approver's key was [replaced](#losing-a-passkey) while the approval was on its way. | You changed the file just before this, and the credential is the old one. |
+| `was already spent on this host` | A crash just as the approval was spent. | [Telling a crash from a replay](#telling-a-crash-from-a-replay). |
+| `verification: ...` | A second run appeared for a tag after the watcher recorded it, which it doesn't look at again for a release that isn't automatic (also [#30](https://github.com/pecheriere/landfall/issues/30)). | The repository's runs for that tag. |
+
+**What to do:** look in that host's journal for what moved it, and if it explains the refusal and you
+still want the release, ask again, which makes a new intent for what runs now. **If none of these
+explains it, treat it as a controller lying:** nothing honest makes a move that the host's journal has
+no line for, and a signature that doesn't verify (`the signature does not verify`) or a challenge that
+doesn't match (`clientDataJSON challenge`) has no honest route here at all.
+
 #### Telling a crash from a replay
 
 Every delivery of a spent approval is refused with `was already spent on this host, and this
@@ -1024,9 +1092,9 @@ it as an attempt. Otherwise, going by what follows it:
   lost track of how the deploy ended delivers it again. Look at what the controller says about
   that deploy, and if you still want the release, it takes a new approval.
 - **A replay:** the tag has `deploy_step` lines and its `deploy_finished` succeeded, the report
-  was delivered (`report_delivered`, by the deploy's number), and nothing restarted, yet the
-  approval has come again under a later number. Treat that as an alert. It gets nothing from it,
-  as the approval is spent.
+  was delivered (`report_delivered`, by the deploy's number), nothing restarted, and the controller
+  wasn't [restored from a backup](#backing-up-and-restoring), yet the approval has come again under a
+  later number. Treat that as an alert. It gets nothing from it, as the approval is spent.
 - **No such line at all, for a nonce in the log:** the log was changed by something other
   than the agent, or the journal has lost it. Treat it as an alert.
 

@@ -28,8 +28,9 @@
 //! A sign-in tap is `webauthn.get`, like an approval's. So a compromised controller could put an
 //! intent's hash in a sign-in ceremony, and a person's tap would approve that. It is within the
 //! residual risk of design 6.3, where a controller's page can already show one thing and have
-//! another signed, and the host still only runs a maintainer-signed release on what it is told
-//! to expect. Computing the hash locally, planned as `landfall approve`, is the stronger path.
+//! another signed, and the host still only runs a release that verifies, maintainer-signed if
+//! `signed_tags` is on, on what it is told to expect. Computing the hash locally, planned as
+//! `landfall approve`, is the stronger path.
 
 use axum::body::Body;
 use axum::extract::{Request, State};

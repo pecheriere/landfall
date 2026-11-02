@@ -244,8 +244,8 @@ deployment. The full key reference and validation rules are in `docs/configurati
 - **What the operator sees:** the ceremony runs on the controller's page, so the page could show
   one thing while the challenge covers another. Because every deployable release is maintainer-signed,
   upward-only for auto, and bound to the running digest, the worst a lying controller can do with a
-  tap is install a different maintainer-signed release, a lower one included, once, on a deployment
-  whose `rule.approvers` lists that person. Accepted for v0 and stated in the docs, along with what
+  tap is install a different maintainer-signed release, a lower one or one on that host's record of
+  failures included, once, on a deployment whose `rule.approvers` lists that person. Accepted for v0 and stated in the docs, along with what
   `signed_tags = false` leaves of "maintainer-signed". `landfall approve`, planned and not yet built,
   computes the intent hash locally and shows it next to the page's, for anyone who wants the stronger
   path.

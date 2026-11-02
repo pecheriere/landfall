@@ -114,6 +114,61 @@ async fn a_backup_from_before_the_approval_forgets_it_and_nothing_runs() {
     controller.stop().await;
 }
 
+/// The backup is older than a deploy that ran, and its request is open. A new tap gets a number
+/// the host finished for that same release, so the row reads as that deploy did and nothing
+/// moves. Safe and not stuck: asking again goes under another number, and runs.
+#[tokio::test]
+async fn a_new_tap_under_a_number_the_host_finished_runs_nothing_and_asking_again_does() {
+    let Scene {
+        fleet,
+        desk,
+        mut controller,
+        request,
+    } = scene().await;
+    let copy = backup(&fleet, "open.db");
+
+    let mut agent = fleet.agent();
+    let first = desk.approve(&request).await;
+    wait_deploy(&fleet, first).await;
+    fleet.wait_running("v1.3.0").await;
+    wait_askable(&fleet, "v1.2.3").await;
+    let down = desk.ask_in_person("v1.2.3").await;
+    let rollback = desk.approve(&down).await;
+    wait_deploy(&fleet, rollback).await;
+    fleet.wait_running("v1.2.3").await;
+    let ups = fleet.world.ups();
+    let spent = nonces_spent(&fleet);
+    agent.stop().await;
+    controller.stop().await;
+
+    restore(&fleet, &copy);
+    let mut controller = fleet.controller().await;
+    let mut agent = fleet.agent();
+
+    let again = desk.approve(&request).await;
+    assert_eq!(again, first, "the numbers start over");
+    let answered = wait_deploy(&fleet, again).await;
+
+    // It reads as what happened then, and that isn't what happened now: check what runs.
+    assert_eq!(answered.outcome.as_deref(), Some("deployed"));
+    assert_eq!(fleet.journalled("finished_work_delivered_again"), 1);
+    assert!(runs(&fleet, "v1.2.3"));
+    assert_eq!(fleet.world.ups(), ups);
+    assert_eq!(nonces_spent(&fleet), spent);
+
+    wait_askable(&fleet, "v1.3.0").await;
+    let asked = desk.ask("v1.3.0").await;
+    let next = desk.approve(&asked).await;
+    assert_ne!(next, first);
+    let finished = wait_deploy(&fleet, next).await;
+    assert_eq!(finished.outcome.as_deref(), Some("deployed"));
+    assert!(runs(&fleet, "v1.3.0"));
+    assert_eq!(fleet.world.ups(), ups + 1);
+
+    agent.stop().await;
+    controller.stop().await;
+}
+
 /// The backup is from after the approval and before its delivery, and it is restored after the
 /// deploy ran. The controller delivers it again, under its number, in all honesty.
 #[tokio::test]

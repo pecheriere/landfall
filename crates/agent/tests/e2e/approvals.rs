@@ -362,7 +362,7 @@ pub async fn wait_askable(fleet: &Fleet, tag: &str) {
                 .await
                 .iter()
                 .any(|row| row.kind == "rule_decision" && row.detail["tag"] == tag);
-            let mut connection = lying_connection(fleet).await;
+            let mut connection = fleet.connection().await;
             let idle = sqlx::query(
                 "SELECT phase = 'idle' AND busy = 0 AND drift = 0 AS idle FROM running_states",
             )

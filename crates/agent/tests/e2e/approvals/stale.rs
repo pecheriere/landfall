@@ -71,6 +71,11 @@ async fn a_request_goes_stale_when_the_host_moves_and_asking_again_makes_a_new_i
 
 /// The approval is on its way when the host moves, by a deploy the controller hasn't heard of:
 /// the controller delivers it, as it can't know better, and the host has the last word.
+///
+/// This pins issue #30, that a queued approved row can't be cancelled. Fixing that may stop the
+/// delivery, and then the refusal row, the reason and its journal line go with it. What must survive
+/// the fix is the rest: no `up`, no nonce spent, `v1.2.4` on the record and running, and that asking
+/// again runs under a new number.
 #[tokio::test]
 async fn a_host_that_moved_refuses_the_approval_on_its_own_record_and_stays_as_it_is() {
     let key = SoftwareAuthenticator::es256().unwrap();
