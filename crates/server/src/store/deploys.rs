@@ -271,10 +271,7 @@ impl Store {
             tx.commit().await?;
             return Err(StoreError::UnknownDeploy);
         }
-        if deployment != report.deployment
-            || row.try_get::<String, _>("tag")? != report.tag.as_ref()
-            || row.try_get::<String, _>("digest")? != report.digest.as_ref()
-        {
+        if !report_is_of(report, &deployment, &row)? {
             // All of these are validated identifiers.
             let reason = format!(
                 "a report of another release under this number: {} {} {}",
@@ -327,17 +324,7 @@ impl Store {
             report.outcome,
             "rolled_back" | "rollback_failed" | "failed_no_previous"
         ) {
-            // The previous version has just been put back, and a poll may never have
-            // said so while it was happening. Time starts again from this report; if
-            // it has drifted it stays unknown.
-            sqlx::query(
-                "UPDATE running_states SET healthy_secs = 0, last_report = ?
-                 WHERE deployment = ? AND healthy_secs IS NOT NULL",
-            )
-            .bind(self.clock.now()?)
-            .bind(deployment.as_ref())
-            .execute(&mut *tx)
-            .await?;
+            start_health_over(&mut tx, &deployment, self.clock.now()?).await?;
         }
         let tag: String = row.try_get("tag")?;
         let event = AuditEvent {
@@ -440,10 +427,7 @@ impl Store {
                 && s.host == host.as_ref()
         });
         let now = self.clock.now()?;
-        let accrued = stored.as_ref().and_then(|s| {
-            s.healthy_secs
-                .map(|secs| observed_secs(secs, s.last_report, s.phase == "idle" && !s.drift, now))
-        });
+        let accrued = stored.as_ref().and_then(|s| accrued_health(s, now));
         if same {
             // Nothing changed, which is itself worth knowing now and then: it
             // tells a host that is fine from one that has gone quiet.
@@ -463,13 +447,7 @@ impl Store {
         }
         let release_changed = old_tag != tag || old_digest != digest;
         let drift_changed = old_drift != state.drift;
-        // A rollback puts the previous version back: what it was seen to do before
-        // that doesn't speak for it now.
-        let rolling_back = matches!(
-            state.phase,
-            Phase::RollingBack | Phase::Restored | Phase::RolledBack
-        );
-        let healthy_secs = if tag.is_none() || state.drift || rolling_back {
+        let healthy_secs = if tag.is_none() || state.drift || rolling_back(state.phase) {
             None
         } else if release_changed || old_drift {
             Some(0)
@@ -540,6 +518,53 @@ struct StoredRunning {
     inconsistent: bool,
     healthy_secs: Option<i64>,
     last_report: Option<i64>,
+}
+
+/// Whether `report` says it is of the deploy in `row`, of `deployment`.
+fn report_is_of(
+    report: &BoundedReport,
+    deployment: &DeploymentId,
+    row: &SqliteRow,
+) -> Result<bool, StoreError> {
+    Ok(*deployment == report.deployment
+        && row.try_get::<String, _>("tag")? == report.tag.as_ref()
+        && row.try_get::<String, _>("digest")? == report.digest.as_ref())
+}
+
+/// A rollback puts the previous version back: what it was seen to do before that doesn't
+/// speak for it now.
+fn rolling_back(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::RollingBack | Phase::Restored | Phase::RolledBack
+    )
+}
+
+/// The previous version has just been put back, and a poll may never have said so while
+/// it was happening. Time starts again from this report; if it has drifted it stays
+/// unknown.
+async fn start_health_over(
+    connection: &mut SqliteConnection,
+    deployment: &DeploymentId,
+    now: i64,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "UPDATE running_states SET healthy_secs = 0, last_report = ?
+         WHERE deployment = ? AND healthy_secs IS NOT NULL",
+    )
+    .bind(now)
+    .bind(deployment.as_ref())
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// How long the release in `stored` has been observed healthy by `now`.
+fn accrued_health(stored: &StoredRunning, now: i64) -> Option<i64> {
+    let was_healthy = stored.phase == "idle" && !stored.drift;
+    stored
+        .healthy_secs
+        .map(|secs| observed_secs(secs, stored.last_report, was_healthy, now))
 }
 
 /// How long a release has been observed healthy by `now`: `secs` up to its last report,

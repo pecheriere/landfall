@@ -479,7 +479,7 @@ pub(super) async fn remember_failure(state_dir: &Path, id: &DeploymentId, releas
 pub(super) enum Keep<'a> {
     /// It is how this deploy ended: on record for good, and the claim released.
     Finished {
-        record: FinishedDeploy,
+        record: Box<FinishedDeploy>,
         claimed: Option<&'a DeploymentId>,
     },
     /// It answers a request and ends nothing on this host: only sent.

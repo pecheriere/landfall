@@ -351,13 +351,13 @@ fn journal_held_back(held_back: &[HeldBack], options: &DaemonOptions) {
 }
 
 /// What the ledger keeps of a work item that has ended with `body`.
-fn finished_record(work: &DeployWork, body: &DeployReportBody) -> FinishedDeploy {
-    FinishedDeploy {
+fn finished_record(work: &DeployWork, body: &DeployReportBody) -> Box<FinishedDeploy> {
+    Box::new(FinishedDeploy {
         deployment: work.deployment.clone(),
         tag: work.tag.clone(),
         digest: work.digest.clone(),
         report: body.clone(),
-    }
+    })
 }
 
 /// How a work item that didn't run is answered.
