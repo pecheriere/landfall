@@ -84,7 +84,9 @@ the key.
 The relying party that passkeys sign for and that hosts check approvals against.
 It is required as soon as the file has a deployment, because any deployment can
 need an approval: first deploys are always manual. A file with no deployments
-may leave it out, and is judged by the same rules if it has one.
+may leave it out, and is judged by the same rules if it has one. Registering a
+passkey needs it too, because a passkey is created for this relying party, so set
+it in your first file even before that file has any deployments or approvers.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -272,6 +274,11 @@ listed action on each listed deployment of every one of its grants.
 What a host accepts is decided by that deployment's `rule.approvers` alone, so a
 grant of `approve` must be on deployments whose `rule.approvers` lists the
 principal, and the file is refused if it isn't.
+
+The reverse is allowed: a principal in `rule.approvers` with no `approve` grant
+loads, and a host accepts that person's signature. So removing a grant does not
+revoke anything at the host. To revoke an approver, remove them from
+`rule.approvers`.
 
 ## Validation rules
 

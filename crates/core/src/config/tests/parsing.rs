@@ -1,6 +1,6 @@
 //! The hash, the encoding, and what the parser names in an error.
 
-use super::super::{ConfigError, LOG_PATTERN_LIMIT, parse, sha256_hex};
+use super::super::{ConfigError, LOG_PATTERN_LIMIT, parse_for_tests, sha256_hex};
 use super::checks::with_staging_checks;
 use super::{EXAMPLE, edited, parse_str};
 
@@ -27,7 +27,7 @@ fn non_utf8_bytes_are_refused() {
     let mut bytes = EXAMPLE.as_bytes().to_vec();
     bytes.insert(10, 0xff);
     assert_eq!(
-        parse(&bytes, |_| Ok(())).unwrap_err(),
+        parse_for_tests(&bytes, |_| Ok(())).unwrap_err(),
         ConfigError::NotUtf8 { offset: 10 }
     );
 }

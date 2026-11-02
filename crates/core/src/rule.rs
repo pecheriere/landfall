@@ -101,7 +101,7 @@ checks = ["container-healthy"]
             level("auto", auto),
             level("approve", approve),
         );
-        let config = config::parse(text.as_bytes(), |_| Ok(())).unwrap();
+        let config = config::parse_for_tests(text.as_bytes(), |_| Ok(())).unwrap();
         config.deployments()[0].rule().clone()
     }
 

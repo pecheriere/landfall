@@ -537,7 +537,8 @@ macro_rules! getters {
 getters!(Config, c {
     /// Trusted tag-signing keys, by name.
     signers: &BTreeMap<PrincipalId, SignerKey> => &c.signers,
-    /// The relying party approvals are checked against: there whenever a deployment is.
+    /// The relying party approvals are checked against. `None` on a file with no
+    /// deployments, which loads without it: whatever needs it refuses on `None`.
     approval: Option<&Approval> => c.approval.as_ref(),
     /// Passkey approvers, by name.
     approvers: &BTreeMap<PrincipalId, Approver> => &c.approvers,
@@ -655,6 +656,16 @@ pub fn parse(bytes: &[u8], check: KeyCheck) -> Result<Config, ConfigError> {
     let config = raw::build(text, sha256_hex(bytes), check)?;
     validate(&config)?;
     Ok(config)
+}
+
+/// [`parse`], for this crate's tests, which can't link the real check.
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this crate can't link the verifier, so its tests supply a stand-in check"
+)]
+pub(crate) fn parse_for_tests(bytes: &[u8], check: KeyCheck) -> Result<Config, ConfigError> {
+    parse(bytes, check)
 }
 
 /// Rules 2 to 6 for one deployment (the chain check in rule 6 is separate).

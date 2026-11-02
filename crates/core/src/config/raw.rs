@@ -19,18 +19,14 @@ use super::{
     WITHIN_SECS_LIMIT,
 };
 use crate::ids::{DeploymentId, HostId, PrincipalId, RepoName, TagPattern};
+use crate::text::shown;
 
-/// What's wrong and on which line. Not the error's own text, which shows the line, or
-/// serde's mention of a string it didn't expect, which quotes it: either could be a key.
+/// What's wrong and on which line. Never the error's own text, which shows the line, and
+/// the message only as [`shown`]: any message can quote what it found, raw and at any
+/// length, and that could be a key or a control character. Every message starts with
+/// words of its own, so what's kept is too short to hold a whole key after them.
 fn toml_error(text: &str, error: &toml::de::Error) -> ConfigError {
-    let message = error.message();
-    let message = match (
-        message.strip_prefix("invalid type: string "),
-        message.rfind(", expected"),
-    ) {
-        (Some(_), Some(end)) => format!("invalid type: string{}", &message[end..]),
-        _ => message.to_owned(),
-    };
+    let message = shown(error.message());
     let line = error
         .span()
         .and_then(|span| text.get(..span.start))

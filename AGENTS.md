@@ -18,7 +18,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   No I/O: `cose` (COSE keys, ES256 and EdDSA only), `client_data`,
   `authenticator_data`, `assertion`, `registration`, `config` (`parse_config`, how
   every binary loads a configuration: core takes this crate's key check as a
-  required argument, because the check needs cryptography core doesn't link), and
+  required argument, because the check needs cryptography core doesn't link, and
+  clippy refuses a direct call to core's `parse`), and
   `software`, a software authenticator for tests, behind the `test-support`
   feature, which only dev-dependencies may enable.
 - `landfall-origin` (`crates/origin`): release origin verification that needs

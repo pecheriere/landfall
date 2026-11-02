@@ -17,6 +17,10 @@ use crate::cose::CoseKey;
 ///
 /// As [`landfall_core::config::parse`], with [`ConfigError::InvalidApprover`] for a key
 /// [`CoseKey::parse`] refuses.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one place the real check is supplied: everything else calls this function"
+)]
 pub fn parse_config(bytes: &[u8]) -> Result<Config, ConfigError> {
     config::parse(bytes, check_key)
 }

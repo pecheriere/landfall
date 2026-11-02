@@ -1,6 +1,6 @@
 //! Parsing and validating a fleet configuration.
 
-use super::{Config, ConfigError, parse};
+use super::{Config, ConfigError, parse_for_tests};
 use crate::ids::DeploymentId;
 
 mod approval;
@@ -52,7 +52,7 @@ fn id(s: &str) -> DeploymentId {
 }
 
 fn parse_str(text: &str) -> Result<Config, ConfigError> {
-    parse(text.as_bytes(), |_| Ok(()))
+    parse_for_tests(text.as_bytes(), |_| Ok(()))
 }
 
 fn edited(from: &str, to: &str) -> String {

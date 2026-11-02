@@ -4,7 +4,7 @@
 //! are tested in `crates/approval`, against the real check. Here the check is a stand-in,
 //! and what's shown is what the configuration itself does around it.
 
-use super::super::{ConfigError, MAX_CREDENTIAL_ID_LEN, parse};
+use super::super::{ConfigError, MAX_CREDENTIAL_ID_LEN, parse_for_tests};
 use super::{EXAMPLE, edited, id, parse_str};
 use crate::ids::PrincipalId;
 
@@ -60,10 +60,10 @@ fn approver_key_must_parse() {
             Err("not that key".to_owned())
         }
     };
-    assert!(parse(EXAMPLE.as_bytes(), only_that_key).is_ok());
+    assert!(parse_for_tests(EXAMPLE.as_bytes(), only_that_key).is_ok());
     let text = with_operator("Y3JlZGVudGlhbA", "b3RoZXIta2V5");
     assert_eq!(
-        parse(text.as_bytes(), only_that_key).unwrap_err(),
+        parse_for_tests(text.as_bytes(), only_that_key).unwrap_err(),
         ConfigError::InvalidApprover {
             approver: principal("operator"),
             reason: "not that key".to_owned(),
@@ -156,14 +156,70 @@ fn errors_do_not_echo_a_whole_key() {
         // A value the configuration can't decode.
         with_operator("Y3JlZGVudGlhbA", &format!("{key}=")),
         with_operator(&format!("{key}="), "cHVibGljLWtleQ"),
+        // The key where an identifier should be.
+        edited(
+            OPERATOR,
+            &format!(
+                "{key} = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}"
+            ),
+        ),
+        edited(
+            "principal = \"operator\"",
+            &format!("principal = \"{key}\""),
+        ),
+        edited(
+            "auto = \"any\", approvers = [\"operator\"]",
+            &format!("auto = \"any\", approvers = [\"{key}\"]"),
+        ),
+        // The key where a fixed word should be.
+        edited("auto = \"patch\"", &format!("auto = \"{key}\"")),
+        edited("can = [\"view\"", &format!("can = [\"{key}\"")),
+        // The key as a name nothing expects.
+        format!("{key} = 1\n{EXAMPLE}"),
+        edited("[[grant]]", &format!("[[grant]]\n{key} = 1")),
     ] {
         let err = parse_str(&text).unwrap_err().to_string();
         assert!(!err.contains(key), "{err}");
     }
+}
 
-    let err = parse_str(&edited(OPERATOR, &format!("operator = \"{key}\""))).unwrap_err();
+#[test]
+fn a_toml_error_names_its_exact_line() {
+    let err = parse_str(&edited(OPERATOR, "operator = 1")).unwrap_err();
     let err = err.to_string();
-    assert!(err.contains("line ") && err.contains("expected"), "{err}");
+    assert!(
+        err.starts_with("configuration is not valid: line 10: "),
+        "{err}"
+    );
+    let err = parse_str("unknown = 1\n").unwrap_err().to_string();
+    assert!(
+        err.starts_with("configuration is not valid: line 1: "),
+        "{err}"
+    );
+}
+
+/// Whatever the message says and wherever TOML found the text: names and values, each
+/// written with TOML's own escape so that the file itself parses.
+#[test]
+fn a_toml_error_is_escaped_and_short() {
+    let long = "a".repeat(10_000);
+    for value in ["\\u001b[31mEVIL", long.as_str()] {
+        for text in [
+            format!("\"{value}\" = 1\n{EXAMPLE}"),
+            edited("can = [\"view\"", &format!("can = [\"{value}\"")),
+            edited("auto = \"patch\"", &format!("auto = \"{value}\"")),
+            edited(
+                "principal = \"operator\"",
+                &format!("principal = \"{value}\""),
+            ),
+        ] {
+            let err = parse_str(&text).unwrap_err();
+            assert!(matches!(err, ConfigError::Toml(_)), "{err}");
+            let err = err.to_string();
+            assert!(!err.contains('\u{1b}'), "{err}");
+            assert!(err.len() < 150, "{} bytes: {err}", err.len());
+        }
+    }
 }
 
 #[test]
@@ -324,7 +380,7 @@ fn without_deployments_the_approval_settings_are_optional() {
     );
     let refuse_every_key = |_: &[u8]| Err("refused".to_owned());
     let text = "[approvers]\noperator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }\n";
-    let err = parse(text.as_bytes(), refuse_every_key).unwrap_err();
+    let err = parse_for_tests(text.as_bytes(), refuse_every_key).unwrap_err();
     assert!(matches!(err, ConfigError::InvalidApprover { .. }), "{err}");
 }
 
