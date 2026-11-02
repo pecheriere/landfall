@@ -155,7 +155,9 @@ must not appear in the name of any other test.
 
 `crates/agent/tests/e2e/` runs the controller and the agent together as real
 processes, over loopback and a real SQLite file. The agent has `landfall-server` as a
-dev-dependency for it; the server depends on nothing of the agent's.
+dev-dependency for it; the server depends on nothing of the agent's. `e2e/approvals/` is a
+person's way through it, with a software passkey over the real routes, and has the controller lie by
+writing to its own database: a host's refusal is the point of those.
 
 `crates/server/tests/browser/` drives the web pages in a real browser with Chromium's virtual
 authenticator. It is `#[ignore]`d and named with a `browser_` prefix, and needs Node, `openssl`

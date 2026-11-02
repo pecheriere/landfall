@@ -20,6 +20,7 @@
 
 #![cfg(test)]
 
+mod approvals;
 mod binaries;
 mod docker;
 mod flow;

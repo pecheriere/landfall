@@ -81,7 +81,7 @@ async fn live_the_real_binaries_verify_a_real_release_both_ends() {
         origin: "origin = { workflow = \".github/workflows/release.yml\", tags = \"*\", signed_tags = false }"
             .to_owned(),
         checks: "checks = [\"container-healthy\"]".to_owned(),
-        compose: None,
+        ..FleetOptions::default()
     });
     let stubs = tempfile::tempdir().unwrap();
     let bin = stub_docker(stubs.path());

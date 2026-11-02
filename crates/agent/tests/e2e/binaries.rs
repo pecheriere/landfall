@@ -35,14 +35,14 @@ async fn the_real_commands_enrol_run_and_stop_on_a_signal() {
         })
         .await;
 
-    // And it says so where an operator is looking.
-    assert!(
-        fleet
-            .log("controller")
-            .contains("hold: app/prod everything:"),
-        "{}",
-        fleet.log("controller")
-    );
+    // And it says so where an operator is looking, just after the row commits.
+    fleet
+        .wait_until("the hold in the controller's log", async || {
+            fleet
+                .log("controller")
+                .contains("hold: app/prod everything:")
+        })
+        .await;
 
     // A plain http URL is refused unless asked for, and nothing is sent.
     let code = fleet.enrol_code();

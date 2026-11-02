@@ -10,12 +10,12 @@ configuration file in [`configuration.md`](configuration.md).
 The agent has four commands: `enrol` and `run` connect it to a controller, `status` and
 `recover` work on the host alone.
 
-**The first deploy of a deployment can't be asked for yet.** A first deploy is manual: the
-controller records it as such and waits, and a host runs it only on
-[an approval it verifies itself](#an-approval-is-verified-on-the-host). The host's side of
-that is here, and the controller doesn't yet ask anyone for one, which comes with the
-approval ceremony and the human API. A deployment starts to move once the agent has a
-release on record.
+**The first deploy of a deployment is asked for and approved.** It is manual: the controller
+records it as such and waits, and a host runs it only on
+[an approval it verifies itself](#an-approval-is-verified-on-the-host). [From nothing to a first
+deploy](#from-nothing-to-a-first-deploy) has the steps. There is no web UI beyond the three
+minimal pages yet, and no `landfall` command for any of it: a program calls
+[the API](#api-tokens-requests-and-approvals).
 
 ## Running the controller
 
@@ -224,6 +224,21 @@ their next poll. Whatever happened since is gone from the log, so `audit verify 
 with a head kept since fails, as it should: keep a new head. Deploy numbers start over from
 the backup, which hosts cope with: [a number goes with its release](#a-release-that-rolled-back-isnt-retried).
 
+**Who may do what goes back with it.** A token revoked since the backup works again, and so does a
+session signed out or a stored passkey replaced since. Before you overwrite the database, have
+`audit show` list its `token_revoked` and `passkey_registered` rows, as the restored log won't have
+them, and revoke or register those again. Invites, requests and approvals are as of the backup too.
+
+**An approval comes through a restore safely, as the hosts keep their own count of them:**
+
+- One made since the backup is gone, and nothing runs on it. The request is open again if the backup
+  has it open, and takes a new tap.
+- One the backup holds as queued, for a deploy that has since run, is delivered again under its
+  number. The host answers with its report of that deploy (`finished_work_delivered_again`), and the
+  service isn't touched.
+- Delivered under another number, it is refused at priority 2: by what the host runs, if it has moved
+  on, or by [the nonce log](#the-nonce-log), if the digest it names is running again.
+
 ### Rebuilding a controller from nothing
 
 With no backup, an empty database does: the releases are in GitHub, and what runs and what
@@ -237,7 +252,8 @@ with the key it has. On each host, in this order:
 4. Start the agent.
 
 A host's memory of what failed stays, so a release that rolled back there isn't tried
-again. Approvals and anything else only the controller knew are gone.
+again. Approvals, tokens, sessions, stored passkeys and anything else only the controller knew are
+gone: make new tokens, and anyone with grants and no key in `[approvers]` registers again.
 
 ## Upgrading
 
@@ -578,8 +594,79 @@ rollback can still take its place, and reports from hosts are recorded whatever 
 
 The pages are `/passkeys/register`, `/sign-in` and `/approvals`. They are served by the
 controller, and need the configuration's `[approval]`: with none, registering and signing in
-answer `503 approvals_not_configured`. The origin must be `https`, so the controller, which
-serves plain HTTP, sits behind a TLS-terminating proxy that leaves `Origin` as the browser sent it.
+answer `503 approvals_not_configured`.
+
+### HTTPS and the RP ID
+
+**WebAuthn only works in a secure context,** and the session cookie is `Secure`, so people reach the
+controller over `https`, though it serves plain HTTP itself. Something in front of it has to
+terminate TLS. Either of these fits:
+
+- **A tailnet name, with `tailscale serve`** forwarding to the controller's `--listen` port. The
+  name is the machine's, such as `landfall.example-tailnet.ts.net`, and is reachable only on the
+  tailnet, which suits a controller that nothing outside needs.
+- **A TLS-terminating reverse proxy** of your own, with a certificate for a name you own.
+
+Whichever it is, **it must leave `Origin` as the browser sent it,** or every state change is refused
+with `bad_origin`, and it should be listed in [`trusted_proxies`](configuration.md#server) if it
+appends to `X-Forwarded-For` (see [the limits](#limits-for-what-anyone-can-send) for what
+happens if it isn't). Check for your proxy that it does both.
+
+`[approval]` then holds what the browser's address bar shows, and that hostname alone:
+
+```toml
+[approval]
+origin = "https://landfall.example-tailnet.ts.net"
+rp_id = "landfall.example-tailnet.ts.net"
+```
+
+**A passkey belongs to its RP ID,** so moving the controller to another name takes a new passkey from
+everyone and a new line in the file for each approver, since a browser won't offer the old one there
+and hosts wouldn't accept it. Pick the name you mean to keep. `origin` and `rp_id` are in the file
+hosts hash too, so changing them means every host has the new file before it gets more work.
+[The configuration](configuration.md#approval) has the exact rules.
+
+**What has and hasn't been tried.** The ceremonies have run in Chrome with its virtual authenticator,
+over a throwaway certificate on `https://localhost` with the test's own TLS terminator, and with a
+software authenticator through the real routes end to end. **They have not run through `tailscale
+serve` or any production proxy, or on a real device: no phone, no synced passkey, no hardware key.**
+Safari's rules on when a ceremony may start and how a password manager's extension behaves are both
+unknown here, so try a registration and a sign-in before you rely on them, and keep the way back
+in [Losing a passkey](#losing-a-passkey) in mind.
+
+### From nothing to a first deploy
+
+1. Start with a file that has `[approval]` and no deployments, as a deployment needs an approver,
+   who needs a key. Run `serve` with it.
+2. `landfall-server passkey-invite --principal operator --config fleet.toml --db controller.db`, and
+   open the link it prints.
+3. Create the passkey. The page shows a line for `[approvers]`. Copy it into the file, and add the
+   deployment, with `operator` in `rule.approvers`, and the grants:
+
+   ```toml
+   [approvers]
+   operator = { credential_id = "...", public_key = "..." }
+
+   [[grant]]
+   principal = "operator"
+   deployments = ["app/prod"]
+   can = ["view", "request", "approve", "rollback"]
+   ```
+
+4. Have it reviewed, comparing the fingerprint with the one the page showed, and put the same file on
+   the controller and on every host. Restart `serve`.
+5. [Enrol the host](#enrolling-a-host) and start its agent. The watcher looks at releases when it
+   starts and every five minutes after that, and records the release as `manual`. Nothing starts.
+6. Ask for the release: `landfall-server token create --principal operator ...` gives a token, which
+   goes with `POST /api/v1/deployments/app/prod/requests`. No page has a button for asking yet.
+7. Sign in at `/sign-in`, open `/approvals`, check what it shows, and approve with your passkey. A
+   token can't do this step. The host checks what you signed for itself, and runs it.
+
+Later releases go by the rule. What takes an approval waits as `needs_approval` or `manual`, and steps
+6 and 7 are how it goes on. A lower version is [a manual rollback](#api-tokens-requests-and-approvals),
+and a release that rolled back is [retried](#a-release-that-rolled-back-isnt-retried), the same way.
+
+### Registering, and who signs in as whom
 
 **To register,** open the link `passkey-invite` printed and create a passkey. The code is after
 the `#`, so it reaches no access log, and the page takes it out of the address bar at once. A
@@ -634,7 +721,9 @@ Every failed sign-in gets the same `403 sign_in_refused`, whether the credential
 signature bad, or the key one that may not sign in, and nothing before that names anyone. Each
 challenge lasts five minutes and works once, and a sign-in's can't finish a registration.
 
-**Limits, for what anyone can send.** Every `POST` here wants the exact `Origin`, or
+### Limits, for what anyone can send
+
+Every `POST` here wants the exact `Origin`, or
 `403 bad_origin`. Each `begin`, and each `finish` that turns out bad, comes from a bucket per source:
 30 at once, refilling at two a second, apart from the agents' so that a flood leaves them their
 nonces. Over it is `429 rate_limited`. A `finish` with a live challenge and a good answer costs
@@ -650,7 +739,9 @@ two `begin`s a second can keep everyone from beginning a sign-in for as long as 
 sessions have expired, nobody can then approve. With it, each client has its own bucket, and it
 takes many addresses to do that. Limit these paths at the proxy too if it faces the internet.
 
-**In the audit log:** `passkey_registered`, `signed_in` and `signed_out`, each with its change.
+### In the audit log
+
+`passkey_registered`, `signed_in` and `signed_out`, each with its change.
 Failures are counts, since anyone who knows a credential id could cause them. One row each watcher
 interval for each principal, kind and reason, and when the controller stops, each with how many
 `attempts`, the `reason`, `first_seen`, up to eight `sources` and how many attempts came `from_others`:
@@ -665,12 +756,81 @@ interval for each principal, kind and reason, and when the controller stops, eac
 Each also goes to the capped log as it happens, with who it came from. A crash loses a count not yet
 written. A failure naming nobody goes only to the capped log.
 
+### What a lying controller page can and can't do
+
+A person can't read a challenge. It is the hash of an intent, so a passkey signs what the page
+hands it, and the page comes from the controller. If the controller is compromised, then:
+
+**It can** show you one release and have you sign another, on any deployment whose `rule.approvers`
+lists you. That includes a lower version, so a tap can be turned into a rollback to an old release,
+and an old release may have bugs a newer one fixed. It can do the same with a tap meant for signing
+in. It can then hold what you signed and deliver it later, since a host has no clock it trusts, for as
+long as the digest it names is running. It can show its own key at registration in place of yours,
+which is why a key is reviewed and the fingerprint compared. And it can say anything it likes in its
+own pages and its own audit log, including leaving your tap out or writing one that never happened.
+
+**It can't** run anything without a tap, as hosts check a signature by the key in their own file:
+
+- **Sign for you.** An approval made up with another key, or with another credential, is refused.
+- **Use your tap on anything but what it signed.** Carried to another release, the challenge doesn't
+  match, and it is refused. It covers the deployment, the tag, the commit, the digest, what must be
+  running, and a nonce.
+- **Install what doesn't verify.** The host verifies the release for itself, and a digest or commit
+  other than the one signed is refused. With `origin.signed_tags` on that means a maintainer-signed
+  release. With it off, it means whatever that workflow built for a tag.
+- **Use a tap twice,** or after the host has moved on. Only the digest it names, and only once, however
+  the database is restored and whatever number it comes under.
+- **Run what a rule refuses,** which is the version already running or a pre-release the rule doesn't
+  take.
+- **Burn your approval by asking wrongly.** A refusal spends no nonce. Only a good approval is spent,
+  just before the deploy starts, [but for two failures of the disk](#an-approval-is-verified-on-the-host).
+
 **A sign-in tap is `webauthn.get` too,** the same kind as an approval. So a compromised controller
 could put a request's intent hash in a sign-in ceremony, and a person signing in would have
 approved it without knowing. It is within the residual risk of design 6.3: the ceremony runs on the
 controller's page, which can already show one thing and have another signed. The host still only
 runs a maintainer-signed release for that deployment, from the digest it is running. The page can't
-prove what it asks you to sign. `landfall approve`, computing the hash locally, is the stronger path.
+prove what it asks you to sign. Computing the hash on your own machine is the stronger path, and is
+planned as `landfall approve`, which doesn't exist yet.
+
+**How you'd know.** Each of these refusals leaves the service alone and goes in the host's journal as
+`controller_work_refused` at priority 2, which is the record the controller can't change, so alert on
+that. The controller's `deploy_refused` audit row has the reason too, as long as it is honest. What
+the page can't be caught by is a good signature over something you didn't mean: compare
+`approval_about_to_be_spent` in the host's journal, which names the approver and the release, with what
+you approved. `crates/agent/tests/e2e/approvals/` shows the refusals, with the controller's database
+written to directly.
+
+### Losing a passkey
+
+**Nothing stops.** The service keeps running, automatic deploys and automatic rollbacks take no
+passkey, and a session already open goes on. What waits is whatever takes an approval by that key.
+If another approver is listed for a deployment, they can sign in the meantime. `[approvers]` holds
+one key for a name, so a second device means a second name, listed in the same `rule.approvers`. Have
+one before you need it. Nothing in the controller can stand in for the file, so with no approver left
+it takes someone who can change the file on every host.
+
+**For an approver:**
+
+1. On the controller, `landfall-server passkey-invite --principal <name> ...`, and register a new
+   passkey from its link. That needs no sign-in. It replaces the stored key and ends that person's
+   sessions. The new key can't sign in yet, and trying gets `sign_in_barred_key` in the log: expected,
+   this once.
+2. Replace the person's line under `[approvers]` by pull request, comparing the fingerprint.
+3. Put the file on every host and the controller, and restart them all, as each reads it once. A host
+   with the old file gets no work until it has the new one, and the release needs the watcher's next
+   look under the new file before it can be asked for.
+4. From then on the old key is nobody. An approval it signed that hasn't reached the host yet is
+   refused there at priority 2, which is expected this once: ask again and sign with the new key.
+
+**For someone with grants and no key in `[approvers]`:** only step 1. The stored key is all there was.
+
+**If it may have been stolen and not lost,** do the above at once, and read back from when it went: the
+controller's `signed_in` and `request_approved` rows, and `approval_about_to_be_spent` in each host's
+journal. A thief with only the passkey can sign in and approve what's asked, with that person's grants.
+Until each host restarts with the new file, it still accepts that key's signature, and a session
+outlives what you do in the file for as long as [the section above](#registering-and-who-signs-in-as-whom)
+says.
 
 ## Running the agent
 

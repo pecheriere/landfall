@@ -233,6 +233,12 @@ pub struct FleetOptions {
     pub checks: String,
     /// The compose directory, if not one of the fleet's own.
     pub compose: Option<PathBuf>,
+    /// The deployment's rule, as configuration.
+    pub rule: String,
+    /// The line of `operator`, the one approver, under `[approvers]`.
+    pub approver: String,
+    /// More of the file, after the deployment: its grants.
+    pub grants: String,
 }
 
 impl Default for FleetOptions {
@@ -243,6 +249,9 @@ impl Default for FleetOptions {
             origin: "origin = { workflow = \".github/workflows/release.yml\", tags = \"v*\", signed_tags = false }".to_owned(),
             checks: CHECK_COMMAND.to_owned(),
             compose: None,
+            rule: "rule = { auto = \"patch\", approvers = [\"operator\"] }".to_owned(),
+            approver: "operator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }".to_owned(),
+            grants: String::new(),
         }
     }
 }
@@ -287,11 +296,14 @@ impl Fleet {
         });
         let text = format!(
             "[approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
-             [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
+             [approvers]\n{approver}\n\
              [[deployment]]\nid = \"{DEPLOYMENT}\"\n\
              repo = {{ name = \"{repo}\", id = {repo_id}, owner_id = {owner_id} }}\n\
              host = \"{HOST}\"\ncompose = {{ dir = {compose:?}, service = \"app\" }}\n\
-             {origin}\nrule = {{ auto = \"patch\", approvers = [\"operator\"] }}\n{checks}\n",
+             {origin}\n{rule}\n{checks}\n{grants}",
+            approver = options.approver,
+            rule = options.rule,
+            grants = options.grants,
             repo = options.repo,
             repo_id = options.repo_ids.0,
             owner_id = options.repo_ids.1,

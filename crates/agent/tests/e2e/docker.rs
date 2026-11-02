@@ -13,21 +13,21 @@ use crate::harness::{Fleet, FleetOptions};
 #[path = "../support/compose_project.rs"]
 mod compose_project;
 
-use compose_project::ComposeProject;
+pub use compose_project::ComposeProject;
 
-const REPO: &str = "containerd/busybox";
+pub const REPO: &str = "containerd/busybox";
 /// Tag 1.36: it fails the deployment's check.
-const FAILS: &str = "sha256:7b3ccabffc97de872a30dfd234fd972a66d247c8cfc69b0550f276481852627c";
+pub const FAILS: &str = "sha256:7b3ccabffc97de872a30dfd234fd972a66d247c8cfc69b0550f276481852627c";
 /// Tag 1.28: it passes.
-const PASSES: &str = "sha256:141c253bc4c3fd0a201d32dc1f493bcf3fff003b6df416dea4f41046e0f37d47";
-const CHECK: &str =
+pub const PASSES: &str = "sha256:141c253bc4c3fd0a201d32dc1f493bcf3fff003b6df416dea4f41046e0f37d47";
+pub const CHECK: &str =
     "checks = [{ command = [\"sh\", \"-c\", \"! busybox | head -n 1 | grep -q v1.36\"] }]";
 
-fn digest(text: &str) -> ImageDigest {
+pub fn digest(text: &str) -> ImageDigest {
     text.parse().unwrap()
 }
 
-async fn running_image(fleet: &Fleet) -> String {
+pub async fn running_image(fleet: &Fleet) -> String {
     let docker = DockerCli::new();
     let id = docker
         .container_at(&fleet.compose, "app")
@@ -37,9 +37,8 @@ async fn running_image(fleet: &Fleet) -> String {
     docker.inspect(&id).await.unwrap().image
 }
 
-#[tokio::test]
-#[ignore = "needs Docker"]
-async fn docker_controller_and_agent_deploy_roll_back_and_finish_through_a_stop() {
+/// A service that sleeps as this user, in a project the override applies to.
+pub fn sleeping_project() -> ComposeProject {
     let (uid, gid) = (
         rustix::process::geteuid().as_raw(),
         rustix::process::getegid().as_raw(),
@@ -52,6 +51,13 @@ async fn docker_controller_and_agent_deploy_roll_back_and_finish_through_a_stop(
         format!("COMPOSE_FILE=compose.yaml:{OVERRIDE_FILE}\n"),
     )
     .unwrap();
+    project
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn docker_controller_and_agent_deploy_roll_back_and_finish_through_a_stop() {
+    let project = sleeping_project();
     let fleet = Fleet::with(FleetOptions {
         repo: REPO.to_owned(),
         checks: CHECK.to_owned(),

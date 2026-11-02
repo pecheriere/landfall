@@ -221,7 +221,8 @@ deployment. The full key reference and validation rules are in `docs/configurati
 ### 6.2 Rule kinds
 - `auto = "patch" | "minor" | "any"`: deploy without a human when the new version is **higher** than
   the running one and differs by at most that part. Downgrades are never automatic.
-- `approve = "minor" | "any"`: versions covered need a passkey approval from one of `approvers`.
+- `approve = "patch" | "minor" | "any"`: versions covered need a passkey approval from one of
+  `approvers`, and it must be broader than `auto`.
 - Anything outside `auto` and `approve` (major, by default) is manual: a grant holder must request it
   **and** an approver must approve it. So every non-automatic deploy, and every rollback
   that is not the automatic one after a failed check, carries an approval the host verifies.
@@ -237,13 +238,17 @@ deployment. The full key reference and validation rules are in `docs/configurati
   hostname (never a parent domain); UP and UV flags set; challenge = hash of the intent it received.
 - **Replay:** the intent names the digest that must be running now. The agent refuses if it
   isn't, and records used nonces on disk, so an approval works once and only from the state it was
-  given for. No dependence on the host clock (a Pi without RTC).
+  given for. No dependence on the host clock (a Pi without RTC). So a controller database restored
+  to before a deploy can deliver its approval again, and the host refuses it, leaving the service
+  alone: the end-to-end tests do just that, under the same number and a new one.
 - **What the operator sees:** the ceremony runs on the controller's page, so the page could show
   one thing while the challenge covers another. Because every deployable release is maintainer-signed,
-  upward-only for auto, and bound to the running digest, the worst a lying controller can do with an
-  approval is install a different maintainer-signed release on that same deployment. Accepted for v0 and
-  stated in the docs. The CLI also offers `landfall approve` that computes the intent hash locally and
-  shows it next to the page's, for anyone who wants the stronger path.
+  upward-only for auto, and bound to the running digest, the worst a lying controller can do with a
+  tap is install a different maintainer-signed release, a lower one included, once, on a deployment
+  whose `rule.approvers` lists that person. Accepted for v0 and stated in the docs, along with what
+  `signed_tags = false` leaves of "maintainer-signed". `landfall approve`, planned and not yet built,
+  computes the intent hash locally and shows it next to the page's, for anyone who wants the stronger
+  path.
 - **Registration:** passkeys are registered on the controller's page, which shows the new
   credential's public-key fingerprint. The operator copies key and fingerprint into the config by pull
   request; the agent only trusts keys from that file. Accepted residual risk: a compromised controller
@@ -352,9 +357,9 @@ lines of a reused container do not; a replaced container's logs are not scanned.
 ## 8. Identity and grants
 
 ### 8.1 Principals
-- Humans: sign in with a passkey; approvals always need a fresh assertion.
-- Agents: an API token per agent (hashed at rest, shown once). Identity through a
-  trusted reverse-proxy header is out of v0.
+- Humans: sign in with a passkey, for a session of 12 hours; approvals always need a fresh assertion.
+- Agents: an API token per agent (hashed at rest, shown once), which can ask but never approve. Identity
+  through a trusted reverse-proxy header is out of v0.
 - Host agents: an Ed25519 key generated on the host; the public key is enrolled with a one-time code
   bound to that host and requests are signed. A request signs a single-use nonce from the controller,
   not the clock, as a Pi may have no RTC. A host agent can only fetch its own host's work and report on

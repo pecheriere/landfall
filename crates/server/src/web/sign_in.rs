@@ -29,7 +29,7 @@
 //! intent's hash in a sign-in ceremony, and a person's tap would approve that. It is within the
 //! residual risk of design 6.3, where a controller's page can already show one thing and have
 //! another signed, and the host still only runs a maintainer-signed release on what it is told
-//! to expect. `landfall approve`, computing the hash locally, is the stronger path.
+//! to expect. Computing the hash locally, planned as `landfall approve`, is the stronger path.
 
 use axum::body::Body;
 use axum::extract::{Request, State};
