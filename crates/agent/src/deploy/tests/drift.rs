@@ -145,7 +145,7 @@ async fn an_image_that_is_not_the_pinned_one_is_never_shown() {
     assert_eq!(seen.running_image_matches, Some(false));
 }
 
-/// Against a real Docker daemon, as in `checks.rs`.
+/// Against a real Docker daemon, as in `checks/tests/real.rs`.
 mod real {
     use super::super::{
         DeployError, DeployPlan, OVERRIDE_FILE, PREVIOUS, STOP_TRUE, StateDir, deployment, fs,

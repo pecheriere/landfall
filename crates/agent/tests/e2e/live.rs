@@ -23,7 +23,7 @@ use crate::harness::{DEPLOYMENT, Fleet, FleetOptions};
 const STUB: &str = "#!/bin/sh\nif [ \"$1\" = ps ]; then exit 0; fi\nexit 1\n";
 
 /// A stub `docker` in a directory of its own, for the first place on a `PATH`. See
-/// the stubs in `docker.rs` for why `cp` makes it.
+/// the stubs in `src/docker/tests.rs` for why `cp` makes it.
 fn stub_docker(dir: &std::path::Path) -> std::path::PathBuf {
     let bin = dir.join("bin");
     fs::create_dir(&bin).unwrap();

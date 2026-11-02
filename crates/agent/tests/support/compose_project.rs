@@ -1,7 +1,7 @@
 //! A compose project on a real Docker daemon, for tests.
 //!
 //! Compiled into the library's unit tests (`testing.rs`) and the end-to-end
-//! tests (`docker_e2e.rs`, `docker_daemon.rs`) with `#[path]`, so it depends on
+//! tests (`docker_e2e/main.rs`, `docker_daemon.rs`) with `#[path]`, so it depends on
 //! none of them.
 
 use std::fs;

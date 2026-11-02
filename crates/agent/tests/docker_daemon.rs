@@ -1,6 +1,6 @@
 //! One poll of the daemon against a real Docker daemon, with a fake controller
 //! and a fake verifier: no test repository signs real releases. `#[ignore]`d, as
-//! in `docker_e2e.rs`, which has the images and what each test needs. This one
+//! in `docker_e2e/main.rs`, which has the images and what each test needs. This one
 //! runs as any user who can reach Docker.
 
 #![cfg(test)]

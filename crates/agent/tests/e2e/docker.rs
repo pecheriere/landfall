@@ -1,5 +1,5 @@
 //! The same way a release takes, on a real Docker daemon. The verifier stays fake,
-//! as no test repository signs real releases. `#[ignore]`d as in `docker_e2e.rs`,
+//! as no test repository signs real releases. `#[ignore]`d as in `docker_e2e/main.rs`,
 //! which has the images. It runs as any user who can reach Docker.
 
 use std::fs;
