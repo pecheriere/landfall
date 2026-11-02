@@ -13,7 +13,8 @@
 //!
 //! The signature counter is not checked: synced passkeys report 0, and a replay is
 //! stopped by the host's nonce log and the running digest named in the intent.
-//! Nothing here reads a clock or does I/O. Callers cap the size of what they pass.
+//! Nothing here reads a clock or does I/O. Callers cap the size of what they pass; an
+//! assertion off the wire goes through `Assertion`'s `TryFrom<&AssertionText>`, which does.
 //!
 //! [`parse_config`] is how a binary loads its configuration, because the keys in it are
 //! judged by the parser that verifying uses.
@@ -30,7 +31,10 @@ mod software;
 mod tests;
 mod wire;
 
-pub use assertion::{Assertion, AssertionError, Expect, verify};
+pub use assertion::{
+    Assertion, AssertionError, Expect, MAX_AUTHENTICATOR_DATA_BYTES, MAX_CLIENT_DATA_BYTES,
+    MAX_SIGNATURE_BYTES, verify,
+};
 pub use authenticator_data::AuthenticatorDataError;
 pub use client_data::ClientDataError;
 pub use config::parse_config;

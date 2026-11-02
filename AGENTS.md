@@ -21,7 +21,7 @@ passkey approvals. Agents drive it through a typed API. Design:
   required argument, because the check needs cryptography core doesn't link, and
   clippy refuses a direct call to core's `parse`), and
   `software`, a software authenticator for tests, behind the `test-support`
-  feature, which only dev-dependencies may enable.
+  feature, which only dev-dependencies may enable, as a step in CI checks.
 - `landfall-origin` (`crates/origin`): release origin verification that needs
   the Sigstore stack or the network: build-provenance bundles and their
   Fulcio certificate identity, the TUF trust root, and the fetchers for
@@ -45,8 +45,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:
   `state` (the agent's own directory: deployed and in-progress records,
-  the previous override, reports, a per-deployment lock; `state/` has `error`,
-  `records`, `dir` and `deployment`), `safefs` (the only code that may touch a
+  the previous override, reports, a per-deployment lock, the log of used approval
+  nonces; `state/` has `error`, `records`, `dir`, `deployment` and `nonces`), `safefs`
+  (the only code that may touch a
   directory a container can write to: no-follow walking by directory
   descriptor, atomic write, snapshot, restore, prune; `safefs/` has `error`,
   `paths`, `files`, `snapshot`, `removal` and `copy`),
@@ -61,7 +62,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   (the only code that writes to stderr: syslog-prefixed JSON lines), `client`
   (the `Controller` trait and the signing HTTP client), `enrol` (the host's key
   and the enrolment request), `daemon` (`run`: one poll is `daemon::step`, which
-  judges each work item by the host's own rule and records, deploys, and keeps
+  judges each work item by the host's own rule and records, verifies an approval and
+  spends its nonce under the deployment's lock (`daemon/approval.rs`), deploys, and keeps
   reports in an outbox until acknowledged), `cli` (`status`, `recover`, `enrol`
   and `run`, behind the thin `main.rs`). `daemon::run_with` and the server's
   `cli::run_watching` take a fake verifier and source, for the end-to-end tests;

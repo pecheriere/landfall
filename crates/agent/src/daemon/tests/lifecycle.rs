@@ -149,13 +149,13 @@ async fn work_delivered_again_during_a_deploy_is_left_alone() {
 #[tokio::test]
 async fn held_back_reasons_are_quoted_and_said_once() {
     let f = fixture(PATCH_RULE);
-    let held = WorkResponse {
+    let held = Box::new(WorkResponse {
         work: None,
         held_back: vec![HeldBack {
             deployment: id(),
             reason: format!("hash\n<2>forged{}", "x".repeat(10_000)),
         }],
-    };
+    });
     let controller = FakeController::with([Answer::Work(held.clone()), Answer::Work(held)]);
     let verifier = FakeVerifier::passes();
     poll(&f, &controller, &verifier).await;

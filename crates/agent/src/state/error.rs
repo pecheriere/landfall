@@ -65,6 +65,14 @@ pub enum StateError {
     /// A report id is not a plain file name.
     #[error("state: report id {0:?} must be 1 to 128 of [A-Za-z0-9_-]")]
     InvalidReportId(String),
+    /// The log of used approval nonces can't be trusted, so no approval can be either.
+    #[error("state: the nonce log {path} can't be used: {reason}")]
+    NonceLog {
+        /// The file.
+        path: PathBuf,
+        /// What is wrong with it.
+        reason: String,
+    },
 }
 
 pub(super) fn io_err(op: &'static str, path: &Path) -> impl FnOnce(io::Error) -> StateError {

@@ -86,6 +86,22 @@ impl DeploymentState {
         self.write_json(FAILED_RELEASES, &failed)
     }
 
+    /// Takes a release off the record: it has deployed since it failed. Written only if
+    /// it was on it.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the record can't be read or written.
+    pub fn remove_failed_release(&self, release: &FailedRelease) -> Result<(), StateError> {
+        let mut failed = self.failed_releases()?;
+        let before = failed.len();
+        failed.retain(|listed| listed != release);
+        if failed.len() == before {
+            return Ok(());
+        }
+        self.write_json(FAILED_RELEASES, &failed)
+    }
+
     /// How long verification has been unable to run, if it has. One that cannot
     /// be read is set aside and counts as none.
     ///

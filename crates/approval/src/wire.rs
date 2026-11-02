@@ -12,6 +12,11 @@ pub(crate) fn encode(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// The bytes of a text form.
+pub(crate) fn decode(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    URL_SAFE_NO_PAD.decode(text)
+}
+
 /// Serde adapter: serializes bytes as their text form.
 pub(crate) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&encode(bytes))
@@ -20,7 +25,5 @@ pub(crate) fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::E
 /// Serde adapter: deserializes bytes from their text form.
 pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
     let text = String::deserialize(d)?;
-    URL_SAFE_NO_PAD
-        .decode(&text)
-        .map_err(|_| serde::de::Error::custom("not unpadded base64url"))
+    decode(&text).map_err(|_| serde::de::Error::custom("not unpadded base64url"))
 }

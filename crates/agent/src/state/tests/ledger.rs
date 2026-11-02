@@ -29,6 +29,7 @@ fn asked(id: u64) -> DeployWork {
         tag: entry.tag,
         digest: entry.digest,
         commit: "b".repeat(40).parse().unwrap(),
+        approval: None,
     }
 }
 

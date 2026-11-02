@@ -43,7 +43,7 @@ pub use error::{DeployError, FileFailure};
 pub(crate) use offload::{Unfinished, on_thread_within};
 pub use recovery::recover;
 pub use report::{CheckTiming, DeployReport, Outcome, Step, StepDetail, StepResult};
-pub use sequence::run;
+pub use sequence::{run, run_holding};
 
 /// Timing and retention of the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]

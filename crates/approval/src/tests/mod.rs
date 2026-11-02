@@ -7,6 +7,7 @@ mod config;
 mod cose;
 mod malformed;
 mod registration;
+mod text_form;
 mod vectors;
 
 use crate::{Assertion, AssertionError, Ceremony, Expect, SoftwareAuthenticator, verify};

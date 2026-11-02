@@ -11,24 +11,38 @@ use landfall_core::rule::{Decision, Refusal, decide};
 use landfall_origin::release::ReleaseOrigin;
 use serde::Serialize;
 
+use super::approval::{self, Asked, Gate};
 use super::outbox::{FailureEvidence, failure_evidence};
 use super::running::{fresh_drift, locked};
 use super::{DaemonOptions, Verifier, VerifyFailure, deployment_state, on_thread};
 use crate::deploy::DeployPlan;
 use crate::docker::Docker;
 use crate::journal::{self, Priority};
-use crate::state::{ControllerClaim, InProgress, VerificationWait};
+use crate::state::{ControllerClaim, DeployLock, InProgress, VerificationWait};
 
-/// What the host thinks of a work item.
-pub(super) enum Verdict<'a> {
-    /// It may run.
-    Go {
-        plan: Box<DeployPlan>,
-        deployment: &'a Deployment,
-        dir: &'a Path,
-    },
-    /// It may not, and that is the answer for good: its rule, a failed verification
-    /// result, or the record of failures on this host.
+/// A work item that has passed everything the host requires of it, an approval's spending
+/// aside.
+pub(super) struct GoAhead<'a> {
+    pub(super) plan: Box<DeployPlan>,
+    pub(super) deployment: &'a Deployment,
+    pub(super) dir: &'a Path,
+    pub(super) gate: Gate,
+}
+
+/// A work item the engine may start on.
+pub(super) struct Ready<'a> {
+    pub(super) plan: Box<DeployPlan>,
+    pub(super) deployment: &'a Deployment,
+    pub(super) dir: &'a Path,
+    /// The deployment's lock, held since an approval was spent. `None` for an automatic
+    /// deploy, whose engine takes the lock itself.
+    pub(super) lock: Option<DeployLock>,
+}
+
+/// Why a work item doesn't run.
+pub(super) enum Stop {
+    /// It may not, and that is the answer for good: its rule, its approval, a failed
+    /// verification result, or the record of failures on this host.
     Refuse { priority: Priority, reason: String },
     /// Not now, and the controller is told: the claim ends, so that the host's other
     /// deployments can go, and the controller may ask again later.
@@ -37,17 +51,17 @@ pub(super) enum Verdict<'a> {
     Wait { reason: String },
 }
 
-fn refuse<'a>(priority: Priority, reason: String) -> Verdict<'a> {
-    Verdict::Refuse { priority, reason }
+pub(super) fn refuse(priority: Priority, reason: String) -> Stop {
+    Stop::Refuse { priority, reason }
 }
 
-fn defer<'a>(priority: Priority, reason: String) -> Verdict<'a> {
-    Verdict::Defer { priority, reason }
+pub(super) fn defer(priority: Priority, reason: String) -> Stop {
+    Stop::Defer { priority, reason }
 }
 
 /// Why this rule's answer is not `Auto`, if it isn't. Matching every decision
 /// is what keeps a new one from falling through to a deploy.
-fn not_auto(
+pub(super) fn not_auto(
     decision: Decision,
     running: Option<&semver::Version>,
     candidate: &semver::Version,
@@ -77,11 +91,11 @@ fn not_auto(
 }
 
 /// What an unfinished deploy, or what is left of one, says about this work.
-fn held_up<'a>(
+pub(super) fn held_up(
     work: &DeployWork,
     marker: Option<&InProgress>,
     claim: Option<&ControllerClaim>,
-) -> Option<Verdict<'a>> {
+) -> Option<Stop> {
     let id = &work.deployment;
     // The number alone isn't enough: a controller whose database was rebuilt uses
     // numbers again.
@@ -91,7 +105,7 @@ fn held_up<'a>(
     match marker {
         // The controller delivers claimed work again: this is the deploy that
         // was interrupted, and `recover` will end it.
-        Some(marker) if ours => Some(Verdict::Wait {
+        Some(marker) if ours => Some(Stop::Wait {
             reason: format!(
                 "this deploy of {} was interrupted; run `landfall-agent recover --deployment {id}`",
                 marker.tag
@@ -104,7 +118,7 @@ fn held_up<'a>(
                 marker.tag
             ),
         )),
-        None if claim.is_some() => Some(Verdict::Wait {
+        None if claim.is_some() => Some(Stop::Wait {
             reason: "what is left of an earlier deploy isn't settled yet".to_owned(),
         }),
         None => None,
@@ -182,13 +196,13 @@ async fn forget_wait(state_dir: &Path, options: &DaemonOptions, id: &DeploymentI
 /// waits only for so long, and then the controller is told not now, which frees the
 /// host. The controller's next tries are paced by its own growing wait. A wait that
 /// can't be recorded has no bound to go by, so it ends at once.
-async fn waiting_verdict<'a>(
+async fn waiting_verdict(
     state_dir: &Path,
     options: &DaemonOptions,
     work: &DeployWork,
     error: &str,
     what: &str,
-) -> Verdict<'a> {
+) -> Stop {
     let waited = match note_wait(state_dir, options, work).await {
         Ok(waited) => waited,
         Err(record) => {
@@ -209,7 +223,7 @@ async fn waiting_verdict<'a>(
             ),
         );
     }
-    Verdict::Wait {
+    Stop::Wait {
         reason: format!("{what}: {error}"),
     }
 }
@@ -217,7 +231,7 @@ async fn waiting_verdict<'a>(
 /// What this host knows of the release having failed here says no, or that it can't
 /// tell yet. What runs is the digest asked for or nothing, as verification sees to
 /// later, so a name of the controller's choosing can't get around this.
-fn held_by_evidence<'a>(evidence: FailureEvidence, work: &DeployWork) -> Option<Verdict<'a>> {
+fn held_by_evidence(evidence: FailureEvidence, work: &DeployWork) -> Option<Stop> {
     #[derive(Serialize)]
     struct Unreadable<'a> {
         event: &'static str,
@@ -257,9 +271,49 @@ fn held_by_evidence<'a>(evidence: FailureEvidence, work: &DeployWork) -> Option<
     }
 }
 
+/// The release's verification by this host, which must come to what the work names.
+async fn verified<V: Verifier>(
+    verifier: &V,
+    config: &Config,
+    state_dir: &Path,
+    options: &DaemonOptions,
+    work: &DeployWork,
+) -> Result<ReleaseOrigin, Stop> {
+    let id = &work.deployment;
+    let origin = match verifier.verify(config, id, &work.tag).await {
+        Ok(origin) => origin,
+        Err(VerifyFailure::Refused(error)) => {
+            forget_wait(state_dir, options, id).await;
+            return Err(refuse(Priority::Critical, format!("verification: {error}")));
+        }
+        Err(VerifyFailure::Missing(error)) => {
+            let what = "the release is not to be found";
+            return Err(waiting_verdict(state_dir, options, work, &error, what).await);
+        }
+        Err(VerifyFailure::Unavailable(error)) => {
+            let what = "verification could not run";
+            return Err(waiting_verdict(state_dir, options, work, &error, what).await);
+        }
+        Err(VerifyFailure::ClockBehind(error)) => {
+            forget_wait(state_dir, options, id).await;
+            return Err(defer(
+                Priority::Warning,
+                format!(
+                    "this host's clock is behind the release; it deploys once the clock is synchronised: {error}"
+                ),
+            ));
+        }
+    };
+    forget_wait(state_dir, options, id).await;
+    if let Some(reason) = differs_from_asked(work, &origin) {
+        return Err(refuse(Priority::Critical, reason));
+    }
+    Ok(origin)
+}
+
 /// Goes through everything this host requires of a work item, cheapest first:
-/// the rule comes before verification, so a request the rule refuses costs no
-/// outbound request.
+/// the rule and an approval come before verification, so a request either refuses costs
+/// no outbound request.
 pub(super) async fn judge<'a, D: Docker, V: Verifier>(
     docker: &D,
     verifier: &V,
@@ -267,13 +321,13 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
     state_dir: &Path,
     options: &'a DaemonOptions,
     work: &DeployWork,
-) -> Verdict<'a> {
+) -> Result<GoAhead<'a>, Stop> {
     let id: &DeploymentId = &work.deployment;
     let (Some(deployment), Some(dir)) = (config.deployment(id), options.dirs.get(id)) else {
-        return refuse(
+        return Err(refuse(
             Priority::Critical,
             format!("{id} is not a deployment of this host"),
-        );
+        ));
     };
     let (root, owned, tag, digest) = (
         state_dir.to_owned(),
@@ -283,83 +337,75 @@ pub(super) async fn judge<'a, D: Docker, V: Verifier>(
     );
     let read = on_thread("read state", move || {
         let state = deployment_state(&root, &owned)?;
+        // The marker first. A `recover` writes the record and then removes the marker,
+        // and nothing else writes the record while the daemon isn't deploying. So with no
+        // marker seen here, what is read after it is what `recover` left, and not what
+        // it was about to replace.
+        let marker = state.in_progress()?;
         Ok((
             state.deployed()?,
-            state.in_progress()?,
+            marker,
             state.claim()?,
             failure_evidence(&state, &tag, &digest),
         ))
     })
     .await;
-    let (deployed, marker, claim, evidence) = match read {
-        Ok(read) => read,
-        Err(error) => return defer(Priority::Error, error),
-    };
-    if let Some(verdict) = held_up(work, marker.as_ref(), claim.as_ref()) {
-        return verdict;
+    let (deployed, marker, claim, evidence) =
+        read.map_err(|error| defer(Priority::Error, error))?;
+    if let Some(stop) = held_up(work, marker.as_ref(), claim.as_ref()) {
+        return Err(stop);
     }
-    let version = match deployment.origin().tags().parse_tag(&work.tag) {
-        Ok(version) => version,
-        Err(error) => return refuse(Priority::Critical, format!("tag pattern: {error}")),
-    };
+    let version = deployment
+        .origin()
+        .tags()
+        .parse_tag(&work.tag)
+        .map_err(|error| refuse(Priority::Critical, format!("tag pattern: {error}")))?;
     let running = deployed.as_ref().map(|deployed| &deployed.version);
     let decision = decide(deployment.rule(), running, &version);
-    if let Some(reason) = not_auto(decision, running, &version) {
-        return refuse(Priority::Critical, reason);
+    let not_auto = not_auto(decision, running, &version);
+    // An approval doesn't override these: to deploy the same release again takes another
+    // release, and a pre-release takes a rule that opts in.
+    if let (Decision::Refused(_), Some(reason)) = (decision, &not_auto) {
+        return Err(refuse(Priority::Critical, reason.clone()));
     }
-    if let Some(verdict) = held_by_evidence(evidence, work) {
-        return verdict;
+    let asked = Asked {
+        work,
+        deployment,
+        not_auto,
+        on_failure_record: matches!(evidence, FailureEvidence::Failed),
+        version: &version,
+        running: deployed.as_ref().map(|deployed| &deployed.digest),
+    };
+    let gate = approval::gate(config, state_dir, asked).await?;
+    // With an approval, a release on the record of failures is the manual retry.
+    let retried = matches!(gate, Gate::Approved(_)) && matches!(evidence, FailureEvidence::Failed);
+    if !retried && let Some(stop) = held_by_evidence(evidence, work) {
+        return Err(stop);
     }
     match fresh_drift(docker, deployment, dir, deployed.is_some(), options).await {
         Ok(false) => {}
         Ok(true) => {
-            return defer(
+            return Err(defer(
                 Priority::Error,
                 format!(
-                    "{id} has drifted: what runs is not what the agent deployed, so it gets no automatic deploys until that clears"
+                    "{id} has drifted: what runs is not what the agent deployed, so it gets no deploys until that clears"
                 ),
-            );
+            ));
         }
         Err(error) => {
-            return defer(
+            return Err(defer(
                 Priority::Error,
                 format!("{id}: what runs could not be read: {error}"),
-            );
+            ));
         }
     }
-    let origin = match verifier.verify(config, id, &work.tag).await {
-        Ok(origin) => origin,
-        Err(VerifyFailure::Refused(error)) => {
-            forget_wait(state_dir, options, id).await;
-            return refuse(Priority::Critical, format!("verification: {error}"));
-        }
-        Err(VerifyFailure::Missing(error)) => {
-            let what = "the release is not to be found";
-            return waiting_verdict(state_dir, options, work, &error, what).await;
-        }
-        Err(VerifyFailure::Unavailable(error)) => {
-            let what = "verification could not run";
-            return waiting_verdict(state_dir, options, work, &error, what).await;
-        }
-        Err(VerifyFailure::ClockBehind(error)) => {
-            forget_wait(state_dir, options, id).await;
-            return defer(
-                Priority::Warning,
-                format!(
-                    "this host's clock is behind the release; it deploys once the clock is synchronised: {error}"
-                ),
-            );
-        }
-    };
-    forget_wait(state_dir, options, id).await;
-    if let Some(reason) = differs_from_asked(work, &origin) {
-        return refuse(Priority::Critical, reason);
-    }
-    Verdict::Go {
+    let origin = verified(verifier, config, state_dir, options, work).await?;
+    Ok(GoAhead {
         plan: Box::new(DeployPlan::from_verified(
             deployment, &work.tag, version, &origin,
         )),
         deployment,
         dir,
-    }
+        gate,
+    })
 }

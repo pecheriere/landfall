@@ -1452,6 +1452,7 @@ dependencies = [
 name = "landfall-agent"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "getrandom 0.4.3",
  "hex",

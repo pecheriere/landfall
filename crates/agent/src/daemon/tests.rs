@@ -29,6 +29,8 @@ use crate::state::{ControllerClaim, Deployed, DeploymentState, InProgress, State
 use crate::testing::{Call, FakeDocker, running};
 
 mod after_a_deploy;
+mod approval_order;
+mod approvals;
 mod failure_evidence;
 mod lifecycle;
 mod refusals;
@@ -89,6 +91,7 @@ fn work(deploy_id: u64, tag: &str) -> DeployWork {
         tag: tag.parse().unwrap(),
         digest: NEW_DIGEST.parse().unwrap(),
         commit: COMMIT.parse().unwrap(),
+        approval: None,
     }
 }
 
@@ -113,15 +116,15 @@ fn origin(digest: &str, commit: &str) -> ReleaseOrigin {
 
 /// What the fake controller does with a `work` call.
 enum Answer {
-    Work(WorkResponse),
+    Work(Box<WorkResponse>),
     Hang,
 }
 
 fn answer(item: Option<DeployWork>) -> Answer {
-    Answer::Work(WorkResponse {
+    Answer::Work(Box::new(WorkResponse {
         work: item,
         held_back: Vec::new(),
-    })
+    }))
 }
 
 #[derive(Default)]
@@ -172,7 +175,7 @@ impl Controller for FakeController {
         self.outage()?;
         let next = self.answers.lock().unwrap().pop_front();
         match next {
-            Some(Answer::Work(response)) => Ok(response),
+            Some(Answer::Work(response)) => Ok(*response),
             Some(Answer::Hang) => std::future::pending().await,
             None => Ok(WorkResponse {
                 work: None,
@@ -214,6 +217,8 @@ struct FakeVerifier {
     calls: Mutex<usize>,
     /// Asks for a stop while it verifies.
     stop: Mutex<Option<ShutdownTrigger>>,
+    /// Changes the world while it verifies, which takes a while.
+    during: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl FakeVerifier {
@@ -222,6 +227,7 @@ impl FakeVerifier {
             result,
             calls: Mutex::new(0),
             stop: Mutex::new(None),
+            during: Mutex::new(None),
         }
     }
 
@@ -245,6 +251,9 @@ impl Verifier for FakeVerifier {
         *self.calls.lock().unwrap() += 1;
         if let Some(trigger) = &*self.stop.lock().unwrap() {
             trigger.stop();
+        }
+        if let Some(during) = &*self.during.lock().unwrap() {
+            during();
         }
         std::future::ready(self.result.clone())
     }

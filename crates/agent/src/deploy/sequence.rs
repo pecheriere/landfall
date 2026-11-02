@@ -46,6 +46,25 @@ pub async fn run<D: Docker>(
     plan: &DeployPlan,
     options: &EngineOptions,
 ) -> Result<DeployReport, DeployError> {
+    run_holding(docker, state, deployment, compose_dir, plan, options, None).await
+}
+
+/// [`run`], going on with the deployment's lock if the caller holds it already: what the
+/// caller checked under it is then still so when this starts, and nothing can come
+/// between. It must be `state`'s lock.
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_holding<D: Docker>(
+    docker: &D,
+    state: &DeploymentState,
+    deployment: &Deployment,
+    compose_dir: &Path,
+    plan: &DeployPlan,
+    options: &EngineOptions,
+    lock: Option<DeployLock>,
+) -> Result<DeployReport, DeployError> {
     let result = async {
         if plan.deployment() != deployment.id() {
             return Err(DeployError::PlanMismatch {
@@ -53,13 +72,17 @@ pub async fn run<D: Docker>(
                 deployment: deployment.id().clone(),
             });
         }
+        let lock = match lock {
+            Some(lock) => Arc::new(lock),
+            None => take_lock(state, deployment.id()).await?,
+        };
         let engine = Engine {
             docker,
             state,
             deployment,
             dir: compose_dir,
             options,
-            lock: take_lock(state, deployment.id()).await?,
+            lock,
             file_outran_deadline: AtomicBool::new(false),
             backups_outran_deadline: AtomicBool::new(false),
         };

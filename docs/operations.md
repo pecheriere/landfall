@@ -10,10 +10,12 @@ configuration file in [`configuration.md`](configuration.md).
 The agent has four commands: `enrol` and `run` connect it to a controller, `status` and
 `recover` work on the host alone.
 
-**The first deploy of a deployment can't be asked for yet.** Only automatic deploys run
-in this version, and a first deploy is manual: the controller records it as such and
-waits, and a host refuses it. A deployment starts to move once the agent has a release on
-record. Requests and approvals come with the approval ceremony and the human API.
+**The first deploy of a deployment can't be asked for yet.** A first deploy is manual: the
+controller records it as such and waits, and a host runs it only on
+[an approval it verifies itself](#an-approval-is-verified-on-the-host). The host's side of
+that is here, and the controller doesn't yet ask anyone for one, which comes with the
+approval ceremony and the human API. A deployment starts to move once the agent has a
+release on record.
 
 ## Running the controller
 
@@ -546,18 +548,19 @@ nothing unless all of this holds:
 - The deployment is one of this host's.
 - It has no unfinished deploy, and no drift: what runs is what the agent deployed.
 - The deployment's rule makes the move from what the host has on record to this tag
-  `Auto`. A first deploy, a downgrade, the version already running, a pre-release the
-  rule doesn't opt in to, or a step that needs an approval: all are refused.
+  `Auto`, or an approval this host verifies itself comes with it. A first deploy, a
+  downgrade, or a step that needs an approval is refused without one. The version already
+  running, or a pre-release the rule doesn't opt in to, is refused with one too.
 - The release verifies, with this host's own trust root, and to the digest and the
   commit the controller named.
 
 What isn't so is answered in one of two ways, and nothing runs either way:
 
-- **`refused`, for good:** the rule says no, a verification result failed, or the
-  release is on this host's record of failures. It is journalled as
-  `controller_work_refused`, and the controller doesn't ask again. For a request the rule
-  or verification refuses that is priority 2, critical: **treat it as an alert**, since
-  an honest controller decides by the same rule and doesn't ask.
+- **`refused`, for good:** the rule says no, an approval isn't good, a verification result
+  failed, or the release is on this host's record of failures. It is journalled as
+  `controller_work_refused`, and the controller doesn't ask again. For a request the rule,
+  an approval or verification refuses that is priority 2, critical: **treat it as an
+  alert**, since an honest controller decides by the same rule and doesn't ask.
 - **`deferred`, not now:** an unfinished deploy, drift, state or evidence that can't be
   read, a clock behind the release, or a wait for verification that has reached its bound.
   All of these pass. It is journalled as `controller_work_deferred`, at priority 3, error,
@@ -567,8 +570,8 @@ What isn't so is answered in one of two ways, and nothing runs either way:
   There is no last try. A newer release doesn't wait for it, older ones do, and the host
   judges each try as it would any other.
 
-What it can do: withhold work, ask again, and see what the host reports. It can
-also make the host deploy a release that is allowed by all of the above sooner than
+What it can do: withhold work, ask again, carry an approval a person gave, and see what the
+host reports. It can also make the host deploy a release that is allowed by all of the above sooner than
 promotion rules on the controller would, which are controller-enforced only. A deployment
 with `origin.signed_tags = false` has less to go on: a release is then whatever the
 configured workflow built for a tag, so someone who can push a tag and run that workflow
@@ -579,20 +582,79 @@ a GitHub token with no scopes. It never connects to a host, and no key it holds 
 Its audit log is its own account of events, and [the limit of that](#keeping-the-audit-head-elsewhere)
 applies. The host's journal is the record the controller can't change.
 
+### An approval is verified on the host
+
+A first deploy, a downgrade, a step the rule leaves to `approve` or to nobody, and a retry
+of a release that failed here each run only on a person's approval. The controller carries
+it and can't make one. The host checks all of this itself, and an approval that fails any of
+it is `refused` at priority 2, with the reason in full in the host's journal, up to 255
+characters of whatever origin or type the assertion claimed. **Read it there:** the report
+carries 4,096 characters of it, the controller keeps 1,024 on the deploy, and its audit
+row 64, where two different origins can read the same.
+
+- Its deployment, tag, commit and digest are those of the work, and the commit and digest
+  are what the release verifies to here.
+- Its expected running digest is what the host's own `deployed.json` says: nothing on record
+  matches only an approval for a first deploy. It is compared again under the deployment's
+  lock, just before the deploy starts, and that lock is held from there on. A `recover`
+  holding the lock makes the work wait, with nothing spent.
+- The credential is that of an approver in this deployment's `rule.approvers`, in this
+  host's file. Another deployment's approver is nobody here.
+- The assertion is signed by that key over this intent, with the configured origin and RP ID,
+  and with user presence and verification. Each field off the wire is capped before it is
+  decoded.
+- Its nonce isn't in the [nonce log](#the-nonce-log).
+
+An approval attached to a deploy the rule makes automatic is ignored, garbled or not, and
+isn't spent. One never overrides the version already running or a pre-release.
+
+**An approval works once, whichever way the deploy ends.** It is spent after everything
+above has passed, and before the deploy touches a file or Docker. A deploy that then fails
+or is interrupted has used it, and a crash between the two leaves it spent with the service
+as it was: the controller delivers the work again, the host refuses it as already used, and
+it takes a new approval. Refused or deferred on the way there, an approval is not spent, so
+someone without the passkey can't use it up by asking wrongly.
+
+### The nonce log
+
+`approval-nonces.log` in the state directory has one line per spent nonce, 64 lowercase
+hex digits and a newline, for the whole host. A line is appended and synced to disk before
+the deploy starts. Only an approval that has verified is written, so what grows it takes a
+person with a passkey, and it is refused at 65,000,000 bytes, a million approvals.
+
+**A log that can't be trusted refuses every approval, and automatic deploys go on.** That is
+one that is torn, holds anything but those lines, is past its bound, is a symlink or anything
+else but a regular file, belongs to another user, or is writable by group or others. The
+journal says `nonce_log_unusable` at priority 2 when the agent starts and at each approval
+refused for it, naming the file. Nothing repairs it for you:
+
+- **A torn last line** is what a crash in the middle of an append leaves, and the file's
+  size isn't a multiple of 65 bytes. The deploy it was for never started. Remove only that
+  partial last line, and leave the whole lines alone.
+- **Anything else** means something other than the agent has written there. Find out what,
+  and restore the file from a backup if you have one.
+
+Every line removed is an approval that could be replayed, as long as the digest it names as
+running is running again. Removing the whole file forgets them all. The agent reads the file
+afresh for each approval, so none of this needs a restart.
+
 ### A release that rolled back isn't retried
 
 **A release that rolled back on this host isn't retried automatically; a newer release
-is.** Retrying the same one is a manual action, which comes with the approval ceremony.
-Both ends know. The controller records `rule_decision` `refused` with `it already rolled
+is.** Retrying the same one takes [an approval](#an-approval-is-verified-on-the-host), even
+when its rule would otherwise make it automatic, and a deploy of it that succeeds takes it
+off the record. Both ends know. The controller records `rule_decision` `refused` with `it already rolled
 back on its host`, and doesn't queue it again. The host goes by its own record,
 `<deployment>/failed-releases.json`, the tag and digest of the newest 1,024 releases that
 failed here, written before the report is sent; and after that by the engine's reports
-under `<deployment>/reports/`, in case a `recover` the daemon didn't see ended one. The
-record is what counts, so removing old reports doesn't forget a failure.
+under `<deployment>/reports/`, in case a `recover` the daemon didn't see ended one, unless
+a report says the release has deployed since. The record is what counts, so removing old
+reports doesn't forget a failure.
 
 **Evidence that can't be read holds up the deploy.** If the record or any of the engine's
 reports can't be read, it could be about the release at hand, or the next one, so no
-automatic deploy of that deployment goes ahead: each is deferred. The journal says
+deploy of that deployment goes ahead, with an approval or without: each is deferred, and an
+approval isn't spent. The journal says
 `failure_evidence_unreadable` at priority 3, naming the file. Read or restore the file if
 you can; removing it clears this, and forgets any failure it recorded, so a release that
 failed can then deploy again.

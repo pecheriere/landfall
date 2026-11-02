@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 
 use crate::hex;
 use crate::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag};
+use crate::intent::DeployIntent;
 
 #[cfg(test)]
 mod tests;
@@ -571,6 +572,44 @@ pub struct DeployWork {
     pub digest: ImageDigest,
     /// The commit the tag points at.
     pub commit: CommitSha,
+    /// A person's approval of this deploy, for one that takes it. The key must be
+    /// present: `null` means there is none, and an omitted key is an error, so a
+    /// truncated payload is never read as "no approval". The host verifies it for
+    /// itself, and goes by nothing else about it.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub approval: Option<Approval>,
+}
+
+/// An approval on its way to the host: what the approver's passkey signed, and the
+/// signature. The controller has neither a key nor a say here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    /// The deploy that was approved.
+    pub intent: DeployIntent,
+    /// The passkey's assertion over that intent's challenge.
+    pub assertion: AssertionText,
+}
+
+/// What `navigator.credentials.get()` returned, each field base64url with no padding,
+/// as the wire has it.
+///
+/// Text here, rather than the bytes `landfall_approval::Assertion` holds: a field that
+/// isn't what it should be must reach the host's judgement, which refuses it for good and
+/// says so in its journal, rather than fail to parse with the whole work response, which
+/// would look like a controller that is away. The only limit on it here is the agent's
+/// body limit, [`MAX_BODY_BYTES`]: `landfall_approval` caps each field before decoding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssertionText {
+    /// The credential that signed.
+    pub credential_id: String,
+    /// The authenticator's data, as signed.
+    pub authenticator_data: String,
+    /// The browser's client data, as hashed into the signature.
+    pub client_data_json: String,
+    /// The signature.
+    pub signature: String,
 }
 
 /// A deployment the controller is not deploying to, and why.

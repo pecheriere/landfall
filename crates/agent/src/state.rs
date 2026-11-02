@@ -1,5 +1,6 @@
 //! The agent's own state directory: what is deployed, what is in progress,
-//! the previous override and the deploy reports, per deployment.
+//! the previous override and the deploy reports, per deployment, and the log of
+//! used approval nonces ([`StateDir::spend_nonce`]) for the host.
 //!
 //! The directory belongs to the agent's user and is not writable by anyone
 //! else, so nothing in it is hostile and plain file operations are enough.
@@ -8,11 +9,13 @@
 //! file's name is fixed, so a writer must hold the deployment's lock
 //! ([`DeploymentState::lock`]): two at once could mix their bytes in it. The
 //! controller's claim and the outbox have one writer, the daemon, which holds
-//! the state directory's own lock ([`StateDir::lock_daemon`]) instead.
+//! the state directory's own lock ([`StateDir::lock_daemon`]) instead. The nonce log is
+//! appended to under its own lock, and refuses a symlink or a file others can change.
 
 mod deployment;
 mod dir;
 mod error;
+mod nonces;
 mod records;
 #[cfg(test)]
 mod tests;
@@ -20,6 +23,7 @@ mod tests;
 pub use deployment::{DeployLock, DeploymentState};
 pub use dir::StateDir;
 pub use error::StateError;
+pub use nonces::{MAX_NONCE_LOG_BYTES, NonceSpend};
 pub use records::{
     ControllerClaim, Deployed, FailedRelease, FinishedDeploy, InProgress, Phase, RecordedBackup,
     VerificationWait,
@@ -52,6 +56,9 @@ const FINISHED: &str = "finished";
 const FINISHED_ORDER: &str = "order.json";
 
 const DAEMON_LOCK: &str = "daemon.lock";
+
+/// The nonce log's name in the state directory.
+pub const NONCE_LOG: &str = "approval-nonces.log";
 
 const FAILED_RELEASES: &str = "failed-releases.json";
 

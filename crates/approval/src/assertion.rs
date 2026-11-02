@@ -1,6 +1,8 @@
 //! Verifying an assertion, `WebAuthn` 7.2.
 
 use aws_lc_rs::digest::{SHA256, digest};
+use landfall_core::config::MAX_CREDENTIAL_ID_LEN;
+use landfall_core::protocol::AssertionText;
 use landfall_core::text::quoted;
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,14 @@ use crate::wire;
 /// How much of a credential id an error shows: it comes from the sender, and it
 /// isn't otherwise bounded here.
 const SHOWN_CREDENTIAL_ID: usize = 128;
+
+/// The longest authenticator data off the wire: 37 bytes and the extensions, which are
+/// short CBOR on anything real.
+pub const MAX_AUTHENTICATOR_DATA_BYTES: usize = 4096;
+/// The longest client data off the wire: browsers send a few hundred bytes.
+pub const MAX_CLIENT_DATA_BYTES: usize = 16 * 1024;
+/// The longest signature off the wire: ES256 DER is at most 72 bytes and `EdDSA` is 64.
+pub const MAX_SIGNATURE_BYTES: usize = 256;
 
 /// What `navigator.credentials.get()` returned, all bytes, base64url on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +79,51 @@ pub enum AssertionError {
     /// The signature isn't one by this key over these bytes.
     #[error("the signature does not verify")]
     Signature,
+    /// A field off the wire is longer than any real one. It wasn't decoded.
+    #[error("assertion {field}: longer than the {limit} bytes allowed")]
+    TooLong {
+        /// The field.
+        field: &'static str,
+        /// The most bytes it may decode to.
+        limit: usize,
+    },
+    /// A field off the wire isn't unpadded base64url.
+    #[error("assertion {field}: not unpadded base64url")]
+    Encoding {
+        /// The field.
+        field: &'static str,
+    },
+}
+
+/// Decodes one field of an [`AssertionText`], its length checked first: the text may be
+/// as long as the whole body it came in, and [`verify`] has no limits of its own.
+fn decoded(field: &'static str, text: &str, limit: usize) -> Result<Vec<u8>, AssertionError> {
+    if text.len() > (limit * 4).div_ceil(3) {
+        return Err(AssertionError::TooLong { field, limit });
+    }
+    wire::decode(text).map_err(|_| AssertionError::Encoding { field })
+}
+
+impl TryFrom<&AssertionText> for Assertion {
+    type Error = AssertionError;
+
+    /// Reads an assertion as the wire has it, each field capped before it is decoded.
+    fn try_from(text: &AssertionText) -> Result<Self, AssertionError> {
+        Ok(Self {
+            credential_id: decoded("credential_id", &text.credential_id, MAX_CREDENTIAL_ID_LEN)?,
+            authenticator_data: decoded(
+                "authenticator_data",
+                &text.authenticator_data,
+                MAX_AUTHENTICATOR_DATA_BYTES,
+            )?,
+            client_data_json: decoded(
+                "client_data_json",
+                &text.client_data_json,
+                MAX_CLIENT_DATA_BYTES,
+            )?,
+            signature: decoded("signature", &text.signature, MAX_SIGNATURE_BYTES)?,
+        })
+    }
 }
 
 /// Verifies `assertion` against `expect`, in the order of `WebAuthn` 7.2. Every

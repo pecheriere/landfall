@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use landfall_agent::checks::CheckOptions;
 use landfall_agent::client::{Controller, ControllerError};
 use landfall_agent::compose::{OVERRIDE_FILE, resolve_dirs};
@@ -18,11 +20,13 @@ use landfall_agent::daemon::{DaemonOptions, Shutdown, StepOutcome, Verifier, Ver
 use landfall_agent::deploy::{self, DeployPlan, EngineOptions, Outcome};
 use landfall_agent::docker::{Docker, DockerCli};
 use landfall_agent::state::{DeploymentState, StateDir};
-use landfall_approval::parse_config;
+use landfall_approval::{Ceremony, SoftwareAuthenticator, parse_config};
 use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
+use landfall_core::intent::DeployIntent;
 use landfall_core::protocol::{
-    DeployId, DeployReportBody, DeployWork, Phase, ReportedOutcome, WorkRequest, WorkResponse,
+    Approval, DeployId, DeployReportBody, DeployWork, Phase, ReportedOutcome, WorkRequest,
+    WorkResponse,
 };
 use landfall_origin::attestation::VerifiedAttestation;
 use landfall_origin::release::ReleaseOrigin;
@@ -117,6 +121,14 @@ struct Stack {
 }
 
 fn stack() -> Stack {
+    stack_for(
+        "Y3JlZGVudGlhbA",
+        "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+    )
+}
+
+/// The stack, with this credential id and key as its approver's, in base64url.
+fn stack_for(credential_id: &str, public_key: &str) -> Stack {
     let (uid, gid) = (
         rustix::process::geteuid().as_raw(),
         rustix::process::getegid().as_raw(),
@@ -139,7 +151,7 @@ fn stack() -> Stack {
     let text = format!(
         "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
          [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
-         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
+         [approvers]\noperator = {{ credential_id = \"{credential_id}\", public_key = \"{public_key}\" }}\n\
          [[deployment]]\nid = \"{DEPLOYMENT}\"\nrepo = {{ name = \"{REPO}\", id = 1, owner_id = 2 }}\n\
          host = \"home-1\"\ncompose = {{ dir = {:?}, service = \"app\" }}\n\
          origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signers = [\"maintainer\"] }}\n\
@@ -201,7 +213,81 @@ fn work(deploy_id: u64, tag: &str) -> DeployWork {
         tag: tag.parse().unwrap(),
         digest: DIGEST_B.parse().unwrap(),
         commit: COMMIT.parse().unwrap(),
+        approval: None,
     }
+}
+
+/// What a passkey gives over this intent, as the controller carries it.
+fn approval(key: &SoftwareAuthenticator, intent: &DeployIntent) -> Approval {
+    let ceremony = Ceremony::new(
+        "landfall.example",
+        "https://landfall.example",
+        &intent.challenge(),
+    );
+    let assertion = key.assertion(&ceremony).unwrap();
+    Approval {
+        intent: intent.clone(),
+        assertion: serde_json::from_value(serde_json::to_value(&assertion).unwrap()).unwrap(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn docker_daemon_step_runs_a_first_deploy_on_an_approval_verified_here() {
+    let key = SoftwareAuthenticator::es256().unwrap();
+    let stack = stack_for(
+        &URL_SAFE_NO_PAD.encode(key.credential_id()),
+        &URL_SAFE_NO_PAD.encode(key.key().unwrap().as_bytes()),
+    );
+    let intent = DeployIntent {
+        deployment: DEPLOYMENT.parse().unwrap(),
+        tag: "v1.2.3".parse().unwrap(),
+        commit: COMMIT.parse().unwrap(),
+        digest: DIGEST_B.parse().unwrap(),
+        expected_running: None,
+        nonce: [3; 32],
+    };
+
+    // The same intent, signed by a passkey this host has never heard of: nothing starts.
+    let stranger = SoftwareAuthenticator::es256().unwrap();
+    let controller = FakeController::default();
+    controller.work.lock().unwrap().push(DeployWork {
+        approval: Some(approval(&stranger, &intent)),
+        ..work(41, "v1.2.3")
+    });
+    let outcome = poll(&stack, &controller, DIGEST_B).await;
+    assert!(
+        matches!(
+            &outcome,
+            StepOutcome::Finished {
+                outcome: ReportedOutcome::Refused { .. },
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stack.project.all_containers().len(), 0);
+    assert_eq!(stack.state.deployed().unwrap(), None);
+
+    // By the approver in this host's configuration: deployed on the real daemon.
+    controller.work.lock().unwrap().push(DeployWork {
+        approval: Some(approval(&key, &intent)),
+        ..work(42, "v1.2.3")
+    });
+    let outcome = poll(&stack, &controller, DIGEST_B).await;
+    assert_eq!(
+        outcome,
+        StepOutcome::Finished {
+            deploy_id: DeployId(42),
+            outcome: ReportedOutcome::Deployed {},
+            delivered: true,
+        }
+    );
+    assert_eq!(running_image(&stack).await, image(DIGEST_B));
+    let deployed = stack.state.deployed().unwrap().unwrap();
+    assert_eq!(deployed.digest.as_ref(), DIGEST_B);
+    let root = StateDir::open(stack.state_root.path()).unwrap();
+    assert!(root.nonce_used(&[3; 32]).unwrap());
 }
 
 #[tokio::test]

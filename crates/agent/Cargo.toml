@@ -34,6 +34,10 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "signal", "sync", "time"] }
 
 [dev-dependencies]
+base64.workspace = true
+# Holds private keys in memory and signs what it is told to: a dev-dependency only.
+# CI refuses a release dependency tree that has this feature on.
+landfall-approval = { workspace = true, features = ["test-support"] }
 # The end-to-end tests run the controller too. Only in this direction: the server
 # depends on nothing of the agent's.
 landfall-server.workspace = true

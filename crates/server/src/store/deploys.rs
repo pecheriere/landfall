@@ -84,6 +84,7 @@ fn deploy_work(row: &SqliteRow) -> Result<DeployWork, StoreError> {
         tag: parsed(row, "tag")?,
         digest: parsed(row, "digest")?,
         commit: parsed(row, "commit_sha")?,
+        approval: None,
     })
 }
 
