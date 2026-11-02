@@ -1,7 +1,7 @@
 //! The command line behind the `landfall-server` binary. Results go to stdout
 //! and failures to stderr, with the exit status saying which: 0 success, 1 the
-//! audit log failed verification, 2 could not run (usage included, which is
-//! clap's own status).
+//! audit log, or a backup's, failed verification, 2 could not run (usage included,
+//! which is clap's own status).
 
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
@@ -33,7 +33,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
-/// `audit verify` ran and the log is not intact, or has no row at `--at`.
+/// `audit verify` or `backup` ran and the log is not intact, or has no row at `--at`.
 pub const EXIT_TAMPERED: u8 = 1;
 /// The command could not run: usage, configuration, database or network.
 pub const EXIT_COULD_NOT_RUN: u8 = 2;
@@ -41,7 +41,7 @@ pub const EXIT_COULD_NOT_RUN: u8 = 2;
 const EXIT_STATUS: &str = "\
 Exit status:
   0  success
-  1  audit verify ran and the audit log is not intact, or has no row at --at
+  1  audit verify or backup ran and the audit log is not intact, or has no row at --at
   2 could not run: usage, configuration, database or network";
 
 /// Watches releases, verifies their origin and coordinates deploys.
@@ -542,9 +542,13 @@ fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory as _;
+    use clap::{CommandFactory as _, Parser as _};
 
-    use super::*;
+    use super::{
+        Cli, CliError, Command, DeploymentId, EXIT_OK, EXIT_TAMPERED, HostId, OsString, Path,
+        PathBuf, ServeArgs, ServeOptions, Store, execute, github_token, release_fetcher,
+        trust_cache_dir,
+    };
 
     #[test]
     fn command_line_is_well_formed() {
@@ -811,11 +815,8 @@ mod tests {
         let held = shown_rows(db, &["--deployment", "app/prod"]).await;
         assert_eq!(held.len(), 1);
         assert_eq!(held[0]["seq"], 4);
-        assert!(
-            shown_rows(db, &["--deployment", "app/none"])
-                .await
-                .is_empty()
-        );
+        let none: [serde_json::Value; 0] = [];
+        assert_eq!(shown_rows(db, &["--deployment", "app/none"]).await, none);
         assert_eq!(std::fs::read(&path).unwrap(), before, "read only");
 
         assert!(

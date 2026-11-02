@@ -74,7 +74,7 @@ impl RefusalLog {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Admit, LINES_PER_WINDOW, WINDOW_SECS, Window};
 
     #[test]
     fn lines_are_capped_per_window_and_the_rest_counted() {

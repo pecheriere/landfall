@@ -1,6 +1,13 @@
 //! How the work runs: what it holds, how much it takes on, and stopping.
 
-use super::*;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use tokio::sync::watch;
+
+use super::super::{TICK_INTERVAL, VERIFICATIONS_PER_TICK, run};
+use super::{HOST, Harness, PATCH_RULE, PROD, config_text};
 
 #[tokio::test]
 async fn no_database_connection_is_held_across_the_network() {

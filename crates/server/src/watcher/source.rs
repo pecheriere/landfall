@@ -201,7 +201,10 @@ impl ReleaseSource for LiveSource {
 mod tests {
     use landfall_origin::fetch::Endpoints;
 
-    use super::*;
+    use super::{
+        Arc, DeploymentId, Duration, Fetcher, LiveSource, PathBuf, REFRESH_EVERY, REFRESH_STAMP,
+        ReleaseError, ReleaseSource as _, fs, refresh_due, stamp_age,
+    };
 
     const CONFIG: &str = r#"
 [approvers]

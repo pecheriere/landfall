@@ -94,7 +94,7 @@ impl RateLimiter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{IpAddr, RateLimiter};
 
     fn ip(text: &str) -> IpAddr {
         text.parse().unwrap()

@@ -193,7 +193,7 @@ impl RowFields<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{GENESIS, RowFields};
 
     fn fields() -> RowFields<'static> {
         RowFields {

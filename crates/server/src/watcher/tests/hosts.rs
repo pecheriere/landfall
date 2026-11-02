@@ -1,7 +1,12 @@
 //! Whether a host can take a deploy: what it says, and what became of the release
 //! on it before.
 
-use super::*;
+use landfall_core::protocol::{Phase, ReportedOutcome, RunningState};
+
+use super::super::{
+    DEFERRED_COOLDOWN_MAX_SECS, NOTHING_CHANGED_TRIES, TICK_INTERVAL, deferred_cooldown,
+};
+use super::{HOST, Harness, PATCH_RULE, PROD, config_text, digest};
 
 #[tokio::test]
 async fn a_queued_deploy_wakes_a_waiting_agent() {

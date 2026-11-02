@@ -251,7 +251,10 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::JoinHandle;
 
-    use super::*;
+    use super::{
+        Duration, Instant, IpAddr, Router, ServeOptions, SocketAddr, SourceCounts, SourceSlot,
+        TcpListener, run,
+    };
 
     const REQUEST: &[u8] = b"GET /peer HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n";
 

@@ -17,9 +17,12 @@ use landfall_core::protocol::{
 use landfall_origin::attestation::VerifiedAttestation;
 use sha2::{Digest as _, Sha256};
 use sqlx::Row as _;
-use tokio::sync::watch;
 
-use super::*;
+use super::{
+    CommitSha, Config, DeploymentId, Duration, FetchError, ImageDigest, ListedTag, RateLimitReset,
+    ReleaseError, ReleaseOrigin, ReleaseSource, ReleaseTag, RunCandidate, Store, TickSummary,
+    Value, WatcherState, tick,
+};
 use crate::report::BoundedReport;
 use crate::store::ManualClock;
 

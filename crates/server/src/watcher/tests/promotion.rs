@@ -1,7 +1,9 @@
 //! Promotion: no proposal to the target until the source has had the release
 //! healthy for long enough.
 
-use super::*;
+use landfall_core::protocol::{Phase, ReportedOutcome};
+
+use super::{HOST, Harness, PROD};
 
 /// `app/staging` promoting to `app/prod` after a day, both of one repository.
 pub(super) const PROMOTING: &str = r#"

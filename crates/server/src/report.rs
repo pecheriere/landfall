@@ -212,7 +212,10 @@ impl BoundedReport {
 mod tests {
     use landfall_core::protocol::ReportedCheck;
 
-    use super::*;
+    use super::{
+        BoundedReport, DeployId, DeployReportBody, MAX_STORED_STEPS, MAX_STORED_TEXT_CHARS,
+        ReportedDetail, ReportedOutcome, ReportedStep, Value,
+    };
     use crate::audit::MAX_DETAIL_BYTES;
 
     /// Every character escapes as long as a character can in a quoted form.

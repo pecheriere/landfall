@@ -1,6 +1,17 @@
 //! What gets decided about a release, why, and how often it is recorded.
 
-use super::*;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use serde_json::Value;
+use sqlx::Row as _;
+
+use super::super::SLOW_RETRY_SECS;
+use super::{
+    FetchError, HOST, Harness, MakeError, PATCH_RULE, PROD, RUN_1, RUN_1_ATTEMPT_2, RUN_2,
+    ReleaseError, candidate, commit, config, config_text, digest, not_signed,
+};
+use crate::report::MAX_STORED_TEXT_CHARS;
 
 #[tokio::test]
 async fn new_patch_release_queues_a_deploy() {

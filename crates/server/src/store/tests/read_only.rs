@@ -1,8 +1,11 @@
 //! Opening a database for inspection.
 
-use std::fs;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 
-use super::*;
+use super::super::{Store, StoreError};
+use super::{append_events, chain};
 
 /// A database with `rows` audit rows, closed so its WAL is checkpointed.
 async fn closed_database(path: &Path, rows: u32) {

@@ -1,9 +1,18 @@
 //! What fails, and what that leaves working: holds, retries and backoff.
 
-use super::super::backoff::{BACKOFF_MAX_SECS, BACKOFF_START_SECS, RATE_LIMIT_MAX_SECS};
-use super::promotion::{PROMOTING, STAGING};
-use super::*;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use super::super::backoff::{BACKOFF_MAX_SECS, BACKOFF_START_SECS, RATE_LIMIT_MAX_SECS};
+use super::super::{
+    BELOW_RUNNING_RETRY_SECS, EAGER_RETRY_SECS, SLOW_RETRY_SECS, VERIFICATIONS_PER_TICK,
+};
+use super::promotion::{PROMOTING, STAGING};
+use super::{
+    HOST, Harness, MakeError, OTHER, PROD, RateLimitReset, WatcherState, list_cap, no_bundle,
+    rate_limited, server_error,
+};
 #[tokio::test]
 async fn tags_that_keep_failing_do_not_starve_a_release_below_them() {
     let h = Harness::running("v1.2.3").await;
