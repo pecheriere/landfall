@@ -1,6 +1,7 @@
 //! The daemon against a fake controller, a fake verifier and a fake Docker. A
 //! compromised controller is the case these are mostly about: see [`refusals`].
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use jiff::Timestamp;
-use landfall_core::config::{Config, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, DeployWork, ReportedOutcome, WorkRequest, WorkResponse,
@@ -28,10 +30,30 @@ use crate::state::{ControllerClaim, Deployed, DeploymentState, InProgress, State
 use crate::testing::{Call, FakeDocker, running};
 
 mod after_a_deploy;
+mod approval_order;
+mod approvals;
 mod failure_evidence;
 mod lifecycle;
 mod refusals;
 mod reports;
+
+thread_local! {
+    static AT_ENGINE_START: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Runs what the test on this thread gave [`when_the_engine_starts`]. The daemon calls this
+/// just before it hands over to the engine.
+pub(super) fn at_engine_start() {
+    AT_ENGINE_START.with_borrow(|hook| {
+        if let Some(hook) = hook {
+            hook();
+        }
+    });
+}
+
+fn when_the_engine_starts(hook: impl Fn() + 'static) {
+    AT_ENGINE_START.set(Some(Box::new(hook)));
+}
 
 const ID: &str = "app/prod";
 const OLD_DIGEST: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -60,7 +82,8 @@ fn deployment_text(id: &str, dir: &Path, rule: &str) -> String {
 fn fleet(deployments: &str, ids: &str) -> String {
     format!(
         "[signers]\nmaintainer = \"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn\"\n\
-         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+         [approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+         [approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }}\n\
          {deployments}\
          [[grant]]\nprincipal = \"operator\"\ndeployments = [{ids}]\ncan = [\"approve\"]\n"
     )
@@ -87,6 +110,7 @@ fn work(deploy_id: u64, tag: &str) -> DeployWork {
         tag: tag.parse().unwrap(),
         digest: NEW_DIGEST.parse().unwrap(),
         commit: COMMIT.parse().unwrap(),
+        approval: None,
     }
 }
 
@@ -111,15 +135,15 @@ fn origin(digest: &str, commit: &str) -> ReleaseOrigin {
 
 /// What the fake controller does with a `work` call.
 enum Answer {
-    Work(WorkResponse),
+    Work(Box<WorkResponse>),
     Hang,
 }
 
 fn answer(item: Option<DeployWork>) -> Answer {
-    Answer::Work(WorkResponse {
+    Answer::Work(Box::new(WorkResponse {
         work: item,
         held_back: Vec::new(),
-    })
+    }))
 }
 
 #[derive(Default)]
@@ -170,7 +194,7 @@ impl Controller for FakeController {
         self.outage()?;
         let next = self.answers.lock().unwrap().pop_front();
         match next {
-            Some(Answer::Work(response)) => Ok(response),
+            Some(Answer::Work(response)) => Ok(*response),
             Some(Answer::Hang) => std::future::pending().await,
             None => Ok(WorkResponse {
                 work: None,
@@ -212,6 +236,8 @@ struct FakeVerifier {
     calls: Mutex<usize>,
     /// Asks for a stop while it verifies.
     stop: Mutex<Option<ShutdownTrigger>>,
+    /// Changes the world while it verifies, which takes a while.
+    during: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl FakeVerifier {
@@ -220,6 +246,7 @@ impl FakeVerifier {
             result,
             calls: Mutex::new(0),
             stop: Mutex::new(None),
+            during: Mutex::new(None),
         }
     }
 
@@ -243,6 +270,9 @@ impl Verifier for FakeVerifier {
         *self.calls.lock().unwrap() += 1;
         if let Some(trigger) = &*self.stop.lock().unwrap() {
             trigger.stop();
+        }
+        if let Some(during) = &*self.during.lock().unwrap() {
+            during();
         }
         std::future::ready(self.result.clone())
     }
@@ -288,7 +318,7 @@ fn bare_fixture(rule: &str) -> Fixture {
     let state_dir = root.join("state");
     fs::create_dir(&state_dir).unwrap();
     let text = fleet(&deployment_text(ID, &compose, rule), &format!("\"{ID}\""));
-    let config = parse(text.as_bytes()).unwrap();
+    let config = parse_config(text.as_bytes()).unwrap();
     fs::write(
         compose.join(OVERRIDE_FILE),
         compose::render_override(

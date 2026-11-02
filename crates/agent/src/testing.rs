@@ -31,6 +31,11 @@ mod compose_project;
 
 pub use compose_project::ComposeProject;
 
+#[path = "../tests/support/test_nonce.rs"]
+mod test_nonce;
+
+pub use test_nonce::test_nonce;
+
 impl ComposeProject {
     /// Pulls [`TEST_IMAGE`] and [creates](Self::create) a project.
     ///

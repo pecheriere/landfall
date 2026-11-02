@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approvals - landfall</title>
+<script src="/static/landfall.js" defer></script>
+</head>
+<body data-page="approvals">
+<main>
+<h1>Waiting for approval</h1>
+<noscript><p>This page needs JavaScript to reach your passkey.</p></noscript>
+<button id="sign-out" type="button">Sign out</button>
+<p id="status" role="status"></p>
+<div id="approvals"></div>
+<p>Approving asks for your passkey each time. This page comes from the controller, which could
+show one release and ask you to sign another. Hosts verify what you signed for themselves, and
+each journals who approved what, so that can be compared with what you meant.</p>
+</main>
+</body>
+</html>

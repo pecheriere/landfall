@@ -111,6 +111,11 @@ impl World {
         write_whole(&self.file(FAILING), digest.as_ref().as_bytes());
     }
 
+    /// The checks pass on every release from now on.
+    pub fn pass_checks(&self) {
+        fs::remove_file(self.file(FAILING)).unwrap();
+    }
+
     /// `up` waits, from now on, until [`release_up`](Self::release_up).
     pub fn hold_up(&self) {
         fs::write(self.file(HOLD_UP), "").unwrap();

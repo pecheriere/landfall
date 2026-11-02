@@ -82,11 +82,14 @@ of this machine's clock".
 
 ## Running the controller and the agent
 
-The controller watches releases, verifies them and queues what its rules make
-automatic. Each host's agent asks for that work, verifies it again for itself,
-deploys, checks, rolls back and reports. Approvals, the human API and the web UI are
-still to come, so only automatic deploys run, and only for a deployment with a release
-on record.
+The controller watches releases, verifies them and queues what its rules make automatic. Each host's
+agent asks for that work, verifies it again for itself, deploys, checks, rolls back and reports.
+What a rule doesn't make automatic, a first deploy included, runs once it is asked for and an
+approver signs it with a passkey, which the host verifies against its own file. The pages for that
+are minimal, and the rest of the human API, the web UI and a `landfall` command for it are still to
+come. [The operations guide](docs/operations.md#from-nothing-to-a-first-deploy) has the steps.
+Passkeys need the controller behind HTTPS, and have only been tried with software and virtual
+authenticators so far, not on a real device or through a real proxy.
 
 ```sh
 landfall-server serve --config fleet.toml --db controller.db --listen 127.0.0.1:8080

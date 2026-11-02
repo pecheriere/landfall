@@ -5,8 +5,11 @@
 //! neither does.
 
 mod agent;
+mod auth;
+mod ceremonies;
 mod deploys;
 mod releases;
+mod requests;
 
 use std::fmt;
 use std::fs::{OpenOptions, Permissions};
@@ -27,10 +30,15 @@ use sqlx::{Row as _, SqlSafeStr as _, Sqlite, SqliteExecutor, SqlitePool, Transa
 use tokio::sync::watch;
 
 pub use self::agent::NONCE_LIFETIME_SECS;
+pub use self::ceremonies::SESSION_LIFETIME_SECS;
+pub(crate) use self::ceremonies::{NewPasskey, Redeemed};
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
     FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,
     WatchedRunning,
+};
+pub use self::requests::{
+    NewRequest, REQUEST_LIFETIME_SECS, RequestSnapshot, RequestState, StoredRequest,
 };
 use crate::audit::{AuditEvent, AuditReport, EventKind, GENESIS, MAX_DETAIL_BYTES, RowFields};
 
@@ -126,6 +134,18 @@ pub enum StoreError {
     /// edited the file, or the code and the data disagree.
     #[error("database row is not readable: {0}")]
     Corrupt(&'static str),
+    /// A deploy request holds a value the code cannot read. It names the row, for whoever
+    /// has to look at it.
+    #[error("deploy request {id} is not readable: {column}")]
+    UnreadableRequest {
+        /// Its number.
+        id: i64,
+        /// What can't be read of it.
+        column: &'static str,
+    },
+    /// There is no API token with this id.
+    #[error("there is no API token with this id")]
+    UnknownToken,
 }
 
 impl StoreError {
@@ -226,6 +246,16 @@ fn migrator() -> Migrator {
     Migrator::with_migrations(vec![
         migration(1, "init", include_str!("../migrations/0001_init.sql")),
         migration(2, "watcher", include_str!("../migrations/0002_watcher.sql")),
+        migration(
+            3,
+            "approvals",
+            include_str!("../migrations/0003_approvals.sql"),
+        ),
+        migration(
+            4,
+            "passkeys",
+            include_str!("../migrations/0004_passkeys.sql"),
+        ),
     ])
 }
 

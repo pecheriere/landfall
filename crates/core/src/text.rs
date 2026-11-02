@@ -9,7 +9,9 @@ pub fn shown(text: &str) -> String {
 }
 
 /// Quotes `text` as [`shown`] does, shortened to `max_chars` characters: for
-/// keeping untrusted text where more of it is worth the room.
+/// keeping untrusted text where more of it is worth the room. The count is taken
+/// before escaping, so the result is bounded but can be longer: a character can
+/// escape to as many as 10 bytes.
 #[must_use]
 pub fn quoted(text: &str, max_chars: usize) -> String {
     let cut: String = text.chars().take(max_chars).collect();

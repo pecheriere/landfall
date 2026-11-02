@@ -12,6 +12,16 @@ passkey approvals. Agents drive it through a typed API. Design:
 
 - `landfall-core` (`crates/core`): shared library with no I/O: validated
   identifiers, configuration types and the pure verification and rule logic.
+- `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
+  a key from local configuration, and parses an attestation, trusting none of it,
+  for its key.
+  No I/O: `cose` (COSE keys, ES256 and EdDSA only), `client_data`,
+  `authenticator_data`, `assertion`, `registration`, `config` (`parse_config`, how
+  every binary loads a configuration: core takes this crate's key check as a
+  required argument, because the check needs cryptography core doesn't link, and
+  clippy refuses a direct call to core's `parse`), and
+  `software`, a software authenticator for tests, behind the `test-support`
+  feature, which only dev-dependencies may enable, as a step in CI checks.
 - `landfall-origin` (`crates/origin`): release origin verification that needs
   the Sigstore stack or the network: build-provenance bundles and their
   Fulcio certificate identity, the TUF trust root, and the fetchers for
@@ -23,20 +33,29 @@ passkey approvals. Agents drive it through a typed API. Design:
   the audit log, serves the API and the web UI. A library plus a thin binary;
   modules: `store` (the only code that touches SQLite: migrations, transactions,
   appending to and verifying the audit log, enrolment codes, hosts, nonces,
-  deploys, running state, release decisions and holds), `audit` (audit events and
-  the hash-chain encoding), `report` (bounding a deploy report before it is
-  stored), `agent_api` (the routes agents call: signed-request extractor,
-  handlers, problem answers, rate limit), `watcher` (release discovery, origin
+  deploys, running state, release decisions and holds, API tokens, sessions, deploy
+  requests), `audit` (audit events and the hash-chain encoding), `report` (bounding
+  a deploy report before it is stored), `agent_api` (the routes agents call:
+  signed-request extractor, handlers, problem answers, rate limit, and `client_source`, who a
+  request is from, which every per-source limit and the capped log go by), `auth` (the
+  `Principal` extractor, which makes the exact-`Origin` check for a session, `can`,
+  the one place that says what a principal may do, each principal's budget for state
+  changes, secrets that are only stored hashed, and the human API's problem answers),
+  `requests` (the human API's routes: `asking` for a deploy, `approving` one and
+  `cancelling` one), `web` (the browser's side: the static pages and their one script, the
+  security headers on every answer, `registration`, `sign_in` and sign-out, and `ceremonies`,
+  the challenges and failure counts in memory), `watcher` (release discovery, origin
   verification, rule decisions and queueing, behind a `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `cli`
-  (`serve`, `enrol-code`, `backup`, `audit verify`, `audit show`, behind the thin
-  `main.rs`).
+  (`serve`, `enrol-code`, `token`, `passkey-invite`, `backup`, `audit verify`, `audit
+  show`, behind the thin `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work
   from the controller, verifies again against its local configuration,
   deploys, checks, rolls back. A library plus a thin binary; modules:
   `state` (the agent's own directory: deployed and in-progress records,
-  the previous override, reports, a per-deployment lock; `state/` has `error`,
-  `records`, `dir` and `deployment`), `safefs` (the only code that may touch a
+  the previous override, reports, a per-deployment lock, the log of used approval
+  nonces; `state/` has `error`, `records`, `dir`, `deployment` and `nonces`), `safefs`
+  (the only code that may touch a
   directory a container can write to: no-follow walking by directory
   descriptor, atomic write, snapshot, restore, prune; `safefs/` has `error`,
   `paths`, `files`, `snapshot`, `removal` and `copy`),
@@ -51,7 +70,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   (the only code that writes to stderr: syslog-prefixed JSON lines), `client`
   (the `Controller` trait and the signing HTTP client), `enrol` (the host's key
   and the enrolment request), `daemon` (`run`: one poll is `daemon::step`, which
-  judges each work item by the host's own rule and records, deploys, and keeps
+  judges each work item by the host's own rule and records, verifies an approval and
+  spends its nonce under the deployment's lock (`daemon/approval.rs`), deploys, and keeps
   reports in an outbox until acknowledged), `cli` (`status`, `recover`, `enrol`
   and `run`, behind the thin `main.rs`). `daemon::run_with` and the server's
   `cli::run_watching` take a fake verifier and source, for the end-to-end tests;
@@ -135,7 +155,15 @@ must not appear in the name of any other test.
 
 `crates/agent/tests/e2e/` runs the controller and the agent together as real
 processes, over loopback and a real SQLite file. The agent has `landfall-server` as a
-dev-dependency for it; the server depends on nothing of the agent's.
+dev-dependency for it; the server depends on nothing of the agent's. `e2e/approvals/` is a
+person's way through it, with a software passkey over the real routes, and has the controller lie by
+writing to its own database: a host's refusal is the point of those.
+
+`crates/server/tests/browser/` drives the web pages in a real browser with Chromium's virtual
+authenticator. It is `#[ignore]`d and named with a `browser_` prefix, and needs Node, `openssl`
+and Playwright, so CI doesn't run it: run it by hand after changing a page or the policy. Its
+`main.rs` says how. Playwright's version is pinned in its `package-lock.json`, by the same seven
+days as a crate.
 
 ### Linux tests on a Mac
 

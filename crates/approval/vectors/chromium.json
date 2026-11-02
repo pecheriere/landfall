@@ -1,0 +1,38 @@
+{
+  "source": "Chromium 156 virtual authenticator (CTAP2, internal transport, user verification on), through the DevTools protocol",
+  "rp_id": "landfall.example",
+  "origin": "https://landfall.example",
+  "registration_challenge": "ERERERERERERERERERERERERERERERERERERERERERE",
+  "intent": {
+    "deployment": "app/prod",
+    "tag": "v1.2.4",
+    "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expected_running": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "nonce": "0707070707070707070707070707070707070707070707070707070707070707"
+  },
+  "credentials": [
+    {
+      "algorithm": "ES256",
+      "attestation_object": "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YVikhd_NGilSZfc69WohvgtLKy4guQ0LeGS42A91ObhxEIBFAAAAAQECAwQFBgcIAQIDBAUGBwgAIFdIHhlgeuPxKiTZPBkXeeFPN6t33gwE6IKsf7BWXxxwpQECAyYgASFYIGaGdK5PRHwJD0OJPK4CSUXqtXEDFGIyyd6Jh7gYRPYiIlgg5INS0iZbXOGHQ4_W7aCX3oRxTXr8Mo_AuxPcnhvToHU",
+      "registration_client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRSIsIm9yaWdpbiI6Imh0dHBzOi8vbGFuZGZhbGwuZXhhbXBsZSIsImNyb3NzT3JpZ2luIjpmYWxzZX0",
+      "assertion": {
+        "credential_id": "V0geGWB64_EqJNk8GRd54U83q3feDATogqx_sFZfHHA",
+        "authenticator_data": "hd_NGilSZfc69WohvgtLKy4guQ0LeGS42A91ObhxEIAFAAAAAg",
+        "client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiRkZBWVVVUnBianZzMHlNS3FhZU5XVEdoMVNGVmFHWVp1bTh2VlJqMkFZQSIsIm9yaWdpbiI6Imh0dHBzOi8vbGFuZGZhbGwuZXhhbXBsZSIsImNyb3NzT3JpZ2luIjpmYWxzZSwib3RoZXJfa2V5c19jYW5fYmVfYWRkZWRfaGVyZSI6ImRvIG5vdCBjb21wYXJlIGNsaWVudERhdGFKU09OIGFnYWluc3QgYSB0ZW1wbGF0ZS4gU2VlIGh0dHBzOi8vZ29vLmdsL3lhYlBleCJ9",
+        "signature": "MEYCIQCmXmf0y04IgRuFwIXkRYGwProwodCOp7UgDTtpmrRw7wIhAJ5qllPEak4BC4hGVRSZ1dvnpTM43fYdtqIIuwQ70-nY"
+      }
+    },
+    {
+      "algorithm": "EdDSA",
+      "attestation_object": "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YViBhd_NGilSZfc69WohvgtLKy4guQ0LeGS42A91ObhxEIBFAAAAAQECAwQFBgcIAQIDBAUGBwgAIPCh2oX7U35KtPxPkZt3K6KpOCds3RYZSMwXgisV7oKTpAEBAycgBiFYIGsQTI09PV1lqS-vdxKQ_D4LfPZVaY_UC5J1-MMAPClH",
+      "registration_client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoiRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRVJFUkVSRSIsIm9yaWdpbiI6Imh0dHBzOi8vbGFuZGZhbGwuZXhhbXBsZSIsImNyb3NzT3JpZ2luIjpmYWxzZX0",
+      "assertion": {
+        "credential_id": "8KHahftTfkq0_E-Rm3croqk4J2zdFhlIzBeCKxXugpM",
+        "authenticator_data": "hd_NGilSZfc69WohvgtLKy4guQ0LeGS42A91ObhxEIAFAAAAAg",
+        "client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiRkZBWVVVUnBianZzMHlNS3FhZU5XVEdoMVNGVmFHWVp1bTh2VlJqMkFZQSIsIm9yaWdpbiI6Imh0dHBzOi8vbGFuZGZhbGwuZXhhbXBsZSIsImNyb3NzT3JpZ2luIjpmYWxzZSwib3RoZXJfa2V5c19jYW5fYmVfYWRkZWRfaGVyZSI6ImRvIG5vdCBjb21wYXJlIGNsaWVudERhdGFKU09OIGFnYWluc3QgYSB0ZW1wbGF0ZS4gU2VlIGh0dHBzOi8vZ29vLmdsL3lhYlBleCJ9",
+        "signature": "CIax0GSpit35zBrlf-7qkmgXhnDTD7ZTteimx8vf9e0CjNBpopxJQZeL6B6tYgG0UOhTuqwr5qAsu5xI4ir-Dw"
+      }
+    }
+  ]
+}

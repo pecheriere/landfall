@@ -15,8 +15,12 @@ Every table is strict: an unknown key is an error, never ignored.
 [signers]
 maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
 
+[approval]
+rp_id = "landfall.example.com"
+origin = "https://landfall.example.com"
+
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 
 [[deployment]]
 id = "app/prod"
@@ -58,9 +62,87 @@ unsupported.
 
 ## `[approvers]`
 
-A table of `name = { credential_id, public_key }`, both opaque base64url text
-(a WebAuthn credential id and its COSE public key). Names follow the same
-pattern as signers.
+A table of `name = { credential_id, public_key }`: a WebAuthn credential id and
+its COSE public key. Names follow the same pattern as signers. Copy both from
+the page that registered the passkey. Host agents take an approver's key from
+this file and nowhere else, and an approver signs in to the controller with this
+key and no other (`operations.md`, "Passkeys and signing in").
+
+Both values are unpadded base64url, and each is judged when the file is loaded,
+by every program that loads it. An error names the approver. Errors are escaped
+and bounded rather than free of key material: a public key isn't secret, and a
+message from the TOML parser may include part of one.
+
+- `credential_id` is 1 to 1023 bytes.
+- `public_key` uses ES256 (COSE algorithm -7) or EdDSA (-8), and no other
+  algorithm. It is in the one canonical encoding registration produces, so each
+  key has one spelling and one fingerprint: a key in another encoding is refused
+  rather than normalised, as is a point that is not on its curve, an Ed25519
+  point of small order, or a key with any extra parameter.
+- Two approvers can't hold the same credential id or the same key.
+
+## `[server]`
+
+Settings only the controller acts on. It can be left out. It is part of the file like the rest, so
+the hash covers it: changing it on the controller alone looks like drift to every host, which then
+refuses work until it has the same file.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `trusted_proxies` | list of addresses | `[]` | The reverse proxies in front of the controller, each one IP address: no ranges and no names. |
+
+The per-source rate limits, on agents' unauthenticated requests and on registering and signing in,
+go by the connection's peer. Behind a proxy that is the proxy, so everyone shares one allowance.
+List its address here and, only for a connection from a listed address, the source is the rightmost
+`X-Forwarded-For` entry that isn't listed. From anyone else the header is ignored. An entry that
+isn't an address, or a chain of only listed addresses, leaves the source as the proxy. The cap on
+connections per source is not affected: it counts connections, which are the proxy's.
+
+Your proxy must append to `X-Forwarded-For` (or replace it), not pass on what the client sent
+without adding to it. List every proxy between the internet and the controller, if there are
+several, and the address the controller sees for each.
+
+If it is wrong:
+
+- **Left empty behind a proxy:** everyone is one source, so anyone can keep everyone else from
+  beginning a sign-in, and any agent from getting a nonce, just by asking often enough.
+- **A listed proxy that doesn't append:** a client picks its own source each request, and so gets
+  round the limits. Sign-in challenges and failure counts still have their own bounds, but the logs
+  and audit rows name whoever the client said it was.
+- **Listing something that isn't your proxy,** an address clients can connect from directly, gives
+  them the same.
+- **A proxy that isn't listed:** the same as leaving it empty, for clients behind that one.
+
+## `[approval]`
+
+The relying party that passkeys sign for and that hosts check approvals against.
+It is required as soon as the file has a deployment, because any deployment can
+need an approval: first deploys are always manual. A file with no deployments
+may leave it out, and is judged by the same rules if it has one. Registering a
+passkey needs it too, because a passkey is created for this relying party, so set
+it in your first file even before that file has any deployments or approvers.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `origin` | string | The address of the web UI, exactly as a browser writes it. |
+| `rp_id` | string | The WebAuthn RP ID: exactly the hostname of `origin`. |
+
+Hosts compare `origin` byte for byte with what the browser reports, so a value in
+any other form could only refuse every approval. The file is refused instead,
+with nothing normalised:
+
+- It starts with `https://` in lower case. Plain `http` is refused, even for
+  `localhost`.
+- The hostname is a lower-case DNS name: labels of `a-z`, `0-9` and `-`, written
+  in `xn--` form if it isn't ASCII. An IP address is refused, as WebAuthn does
+  not allow one for an RP ID. So is a name ending in a dot.
+- A port is allowed, in plain digits, and doesn't belong in `rp_id`. Port 443 is
+  refused, since a browser leaves it out.
+- There is nothing else: no path, not even a trailing `/`, no query, fragment,
+  user name or password.
+
+`rp_id` is never a parent domain, although WebAuthn would allow one: a passkey
+scoped to `example.com` could be used by any site under it.
 
 ## `[[deployment]]`
 
@@ -94,6 +176,12 @@ host gone quiet holds the promotion back, and its time goes on from where it was
 is back. Drift clearing and a rollback start the time again for what then runs. The
 promotion is enforced by the controller only, and trusts that host: a compromised source
 host can say what it likes.
+
+**A release seen healthy for the full time has passed, for good.** It still counts after the
+source has moved on from it, and that includes the source going back to an older release:
+promotion says this release ran well there for that long, and not that the source still runs
+it or still wants it. So rolling the source back doesn't hold back its promotion. Say no to
+that one by not approving it, or cancel its request.
 
 Anything outside `auto` and `approve` (major releases by default) is manual: a
 grant holder requests it and an approver approves it.
@@ -222,6 +310,16 @@ closes.
 Several grants for the same principal combine: the principal may do each
 listed action on each listed deployment of every one of its grants.
 
+`approve` is what lets the controller show a principal the approval ceremony.
+What a host accepts is decided by that deployment's `rule.approvers` alone, so a
+grant of `approve` must be on deployments whose `rule.approvers` lists the
+principal, and the file is refused if it isn't.
+
+The reverse is allowed: a principal in `rule.approvers` with no `approve` grant
+loads, and a host accepts that person's signature. So removing a grant does not
+revoke anything at the host. To revoke an approver, remove them from
+`rule.approvers`.
+
 ## Validation rules
 
 The file is refused, with an error naming the deployment and the value, when:
@@ -242,7 +340,9 @@ The file is refused, with an error naming the deployment and the value, when:
    (the error lists the cycle, for example `app/staging -> app/prod ->
    app/staging`);
 7. a grant has an empty `deployments` or `can`, names a deployment that does
-   not exist, or gives `approve` to a principal not in `[approvers]`;
+   not exist, gives `approve` to a principal not in `[approvers]`, or gives
+   `approve` on a deployment whose `rule.approvers` doesn't list the principal
+   (the error names both);
 8. two deployments on one host use the same `compose.dir` (the agent keeps
    overrides and backups per directory, so a directory has one deployment).
 
@@ -252,3 +352,5 @@ value: relative or non-canonical paths, an `origin.workflow` outside
 `healthy_for`, an http check with a bad path, network or status, and an
 unknown or ill-formed check. Check errors name the entry, for example
 `checks[2]` (or `checks[2].network` for a bad value), and the keys found in it.
+
+`[approval]` and `[approvers]` have their own rules, in their sections above.

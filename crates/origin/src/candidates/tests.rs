@@ -3,7 +3,8 @@
 
 use std::time::Duration;
 
-use landfall_core::config::{self, Config};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::{ReleaseRun, RunCandidate, select_release_run};
 use serde_json::json;
@@ -30,8 +31,12 @@ const TAGS: &str = "/v2/dani-garcia/vaultwarden/tags/list";
 fn config(repo_id: u64) -> Config {
     let text = format!(
         r#"
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }}
+operator = {{ credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }}
 
 [[deployment]]
 id = "app/prod"
@@ -43,7 +48,7 @@ rule = {{ approvers = ["operator"] }}
 checks = ["container-healthy"]
 "#
     );
-    config::parse(text.as_bytes()).unwrap()
+    parse_config(text.as_bytes()).unwrap()
 }
 
 fn deployment() -> DeploymentId {

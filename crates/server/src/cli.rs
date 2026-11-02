@@ -14,19 +14,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use landfall_core::config::{self, Config, ConfigError};
-use landfall_core::ids::{DeploymentId, HostId};
+use landfall_core::config::{Config, ConfigError};
+use landfall_core::ids::{DeploymentId, HostId, PrincipalId};
 use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
+use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
 use crate::audit::AuditReport;
+use crate::auth::{flush_dropped, keep_flushing};
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 use crate::watcher::{self, LiveSource, ReleaseSource};
+
+mod tokens;
 
 /// How long stopping waits for the database's last connection to close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -59,6 +63,14 @@ enum Command {
     /// Print a one-time code that lets one host enrol its key, valid for an
     /// hour. Any earlier code for that host stops working.
     EnrolCode(EnrolCodeArgs),
+    /// Make and revoke API tokens.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+    /// Print a one-time link, valid for an hour, for someone to register a passkey on.
+    /// Any earlier link for them stops working.
+    PasskeyInvite(PasskeyInviteArgs),
     /// Work with the audit log.
     Audit {
         #[command(subcommand)]
@@ -210,7 +222,7 @@ pub enum CliError {
     /// The store failed.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// `enrol-code` needs the database `serve` uses, and could not open it.
+    /// A command that needs the database `serve` uses could not open it.
     #[error("cannot open database {}: {source}; run `serve` once first to create it, or check the path", .path.display())]
     NoDatabase {
         /// The file.
@@ -218,6 +230,20 @@ pub enum CliError {
         /// The failure.
         source: StoreError,
     },
+    /// The database's schema is older than this program's: `serve` brings it up to date.
+    #[error("database {} is older than this program; run `serve` from this version once to upgrade it, then try again", .path.display())]
+    OutOfDate {
+        /// The file.
+        path: PathBuf,
+    },
+    /// `token create` was given a principal the configuration doesn't name: a token for
+    /// them would not work.
+    #[error("the configuration has no principal {0}: no grant and not in [approvers]")]
+    UnknownPrincipal(PrincipalId),
+    /// `passkey-invite` needs the origin in `[approval]`, which a configuration with no
+    /// deployments can leave out.
+    #[error("the configuration has no [approval], so there is no page to invite anyone to")]
+    NoApprovalSettings,
     /// The listen address could not be bound or served.
     #[error("cannot serve on {addr}: {source}")]
     Serve {
@@ -265,7 +291,7 @@ fn load_config(path: &Path) -> Result<Config, CliError> {
         path: path.to_owned(),
         source,
     })?;
-    config::parse(&bytes).map_err(|source| CliError::Config {
+    landfall_approval::parse_config(&bytes).map_err(|source| CliError::Config {
         path: path.to_owned(),
         source,
     })
@@ -342,8 +368,12 @@ async fn serve_watching<S: ReleaseSource>(
     let listener = TcpListener::bind(args.listen).await.map_err(serve_error)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
+    // Says the real port, if it was asked for port 0, and that signals are heard from here on.
+    let listening = listener.local_addr().map_err(serve_error)?;
+    crate::agent_api::log(&format!("listening on {listening}"));
 
     let (stop_watcher, stop_watching) = watch::channel(false);
+    let stop_flushing = stop_watching.clone();
     let watching = tokio::spawn(watcher::run(
         store.clone(),
         watched,
@@ -354,7 +384,9 @@ async fn serve_watching<S: ReleaseSource>(
 
     let closing = store.clone();
     let state = ApiState::new(store, config, Limits::default());
+    let draining = state.clone();
     let app = crate::router(state.clone());
+    let flushing = tokio::spawn(keep_flushing(state.clone(), interval, stop_flushing));
     let shutdown = async move {
         tokio::select! {
             _ = terminate.recv() => {}
@@ -367,6 +399,11 @@ async fn serve_watching<S: ReleaseSource>(
     // Told to stop as the serving began to, it lets go at once. If the watcher
     // had already stopped, that was a panic and it was logged by the runtime.
     drop(watching.await);
+    drop(flushing.await);
+    // It stopped as the draining began, and a request finishing since may have counted something.
+    // A request still running past the drain can count one too late even for this.
+    flush_dropped(&draining).await;
+    crate::web::tend(&draining).await;
     // So that the main file holds everything. A request still running past the
     // drain has its connection for a while yet, and stopping does not wait for that:
     // the next start reads what is left in the write-ahead log.
@@ -379,13 +416,18 @@ async fn serve_watching<S: ReleaseSource>(
     Ok(EXIT_OK)
 }
 
-async fn enrol_code(args: EnrolCodeArgs, out: &mut impl Write) -> Result<u8, CliError> {
-    let store = Store::open_existing(&args.db)
+/// The database `serve` uses, which must exist.
+async fn opened(db: &Path) -> Result<Store, CliError> {
+    Store::open_existing(db)
         .await
         .map_err(|source| CliError::NoDatabase {
-            path: args.db.clone(),
+            path: db.to_owned(),
             source,
-        })?;
+        })
+}
+
+async fn enrol_code(args: EnrolCodeArgs, out: &mut impl Write) -> Result<u8, CliError> {
+    let store = opened(&args.db).await?;
     let code = store.issue_enrol_code(&args.host, args.replace).await?;
     store.close().await;
     writeln!(out, "{}", code.reveal()).map_err(CliError::Output)?;
@@ -522,6 +564,8 @@ async fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
     match cli.command {
         Command::Serve(args) => serve(args).await,
         Command::EnrolCode(args) => enrol_code(args, out).await,
+        Command::Token { command } => tokens::token(command, out).await,
+        Command::PasskeyInvite(args) => tokens::passkey_invite(args, out).await,
         Command::Audit {
             command: AuditCommand::Verify(args),
         } => audit_verify(args, out).await,

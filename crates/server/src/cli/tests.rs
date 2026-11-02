@@ -1,9 +1,34 @@
+mod tokens;
+
 use clap::{CommandFactory as _, Parser as _};
+
+use landfall_core::config::ConfigError;
 
 use super::{
     Cli, CliError, Command, DeploymentId, EXIT_OK, EXIT_TAMPERED, HostId, OsString, Path, PathBuf,
-    ServeArgs, ServeOptions, Store, execute, github_token, release_fetcher, trust_cache_dir,
+    ServeArgs, ServeOptions, Store, execute, github_token, load_config, release_fetcher,
+    trust_cache_dir,
 };
+
+#[test]
+fn a_key_the_verifier_would_refuse_is_refused_at_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet.toml");
+    std::fs::write(
+        &path,
+        "[approvers]\noperator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }\n",
+    )
+    .unwrap();
+    let err = load_config(&path).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            CliError::Config { source: ConfigError::InvalidApprover { approver, .. }, .. }
+                if approver.to_string() == "operator"
+        ),
+        "{err}"
+    );
+}
 
 #[test]
 fn command_line_is_well_formed() {

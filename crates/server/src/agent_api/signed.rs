@@ -64,7 +64,7 @@ async fn read_bounded(mut body: Body, limit: usize) -> Result<Bytes, ApiProblem>
 }
 
 /// Reads a body of at most `limit` bytes, for at most `timeout`.
-pub(super) async fn read_body(
+pub(crate) async fn read_body(
     body: Body,
     limit: usize,
     timeout: Duration,

@@ -6,7 +6,7 @@ use crate::harness::{AuditRow, Fleet};
 use crate::world::digest_of;
 
 /// Whether `wanted` appear in `rows`, in this order, each as a kind of row.
-fn in_order(rows: &[AuditRow], wanted: &[&str]) -> bool {
+pub fn in_order(rows: &[AuditRow], wanted: &[&str]) -> bool {
     let mut kinds = rows.iter().map(|row| row.kind.as_str());
     wanted.iter().all(|want| kinds.any(|kind| kind == *want))
 }

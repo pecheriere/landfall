@@ -2,7 +2,7 @@
 
 use ssh_key::{Algorithm, HashAlg, PublicKey};
 
-use crate::text::shown;
+use super::shown_in_config;
 
 /// A trusted tag-signing key: an `ssh-ed25519` public key in OpenSSH format,
 /// as written in a `.pub` file. Only ed25519 is supported, so a key of any
@@ -21,15 +21,19 @@ impl SignerKey {
         if key_type != "ssh-ed25519" {
             return Err(format!(
                 "key type {} is not supported; use an ssh-ed25519 public key (the contents of a .pub file)",
-                shown(key_type)
+                shown_in_config(key_type)
             ));
         }
-        let mut key = PublicKey::from_openssh(text.trim())
-            .map_err(|e| format!("not a valid OpenSSH public key: {e}"))?;
+        let mut key = PublicKey::from_openssh(text.trim()).map_err(|e| {
+            format!(
+                "not a valid OpenSSH public key: {}",
+                shown_in_config(&e.to_string())
+            )
+        })?;
         if key.algorithm() != Algorithm::Ed25519 {
             return Err(format!(
                 "key type {} is not supported; use an ssh-ed25519 public key",
-                key.algorithm()
+                shown_in_config(key.algorithm().as_ref())
             ));
         }
         key.set_comment("");

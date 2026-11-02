@@ -46,6 +46,20 @@ updates:
     commit-message:
       prefix: ci
 
+  # Playwright, for the browser test of the web pages.
+  - package-ecosystem: npm
+    directory: /crates/server/tests/browser
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    commit-message:
+      prefix: deps
+
   # The digest-pinned Rust base image in the Dockerfile.
   - package-ecosystem: docker
     directory: /

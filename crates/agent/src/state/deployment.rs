@@ -29,6 +29,8 @@ pub struct DeploymentState {
 #[derive(Debug)]
 pub struct DeployLock {
     pub(super) _file: File,
+    /// The file it locks, which says whose lock it is.
+    pub(super) path: PathBuf,
 }
 
 impl DeploymentState {
@@ -39,6 +41,12 @@ impl DeploymentState {
     /// [`StateError::Busy`] if another process holds it.
     pub fn lock(&self) -> Result<DeployLock, StateError> {
         lock_file(&self.dir.join(LOCK), || StateError::Busy(self.id.clone()))
+    }
+
+    /// Whether `lock` is this deployment's, rather than another's or the daemon's.
+    #[must_use]
+    pub fn is_locked_by(&self, lock: &DeployLock) -> bool {
+        lock.path == self.dir.join(LOCK)
     }
 
     /// The controller's deploy this deployment is working on, if any. A claim
@@ -83,6 +91,22 @@ impl DeploymentState {
         failed.push(release.clone());
         let excess = failed.len().saturating_sub(FAILED_KEPT);
         failed.drain(..excess);
+        self.write_json(FAILED_RELEASES, &failed)
+    }
+
+    /// Takes a release off the record: it has deployed since it failed. Written only if
+    /// it was on it.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError`] if the record can't be read or written.
+    pub fn remove_failed_release(&self, release: &FailedRelease) -> Result<(), StateError> {
+        let mut failed = self.failed_releases()?;
+        let before = failed.len();
+        failed.retain(|listed| listed != release);
+        if failed.len() == before {
+            return Ok(());
+        }
         self.write_json(FAILED_RELEASES, &failed)
     }
 

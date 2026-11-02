@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Register a passkey - landfall</title>
+<script src="/static/landfall.js" defer></script>
+</head>
+<body data-page="register">
+<main>
+<h1>Register a passkey</h1>
+<noscript><p>This page needs JavaScript to reach your passkey.</p></noscript>
+<p id="who" hidden></p>
+<p>This link works once. Your passkey stays on your device. This page shows its public key.</p>
+<button id="register" type="button">Create a passkey</button>
+<p id="status" role="status"></p>
+<section id="result" hidden>
+<h2>Your passkey's public key</h2>
+<p>If you will approve deploys, this line goes under <code>[approvers]</code> in the configuration
+file, by pull request, and whoever reviews it should check the fingerprint. Hosts trust a key only
+from that file. If you won't, nothing needs copying: you sign in with this passkey once the
+configuration gives you a grant.</p>
+<pre id="config-line"></pre>
+<dl>
+<dt>Principal</dt>
+<dd id="principal"></dd>
+<dt>Algorithm</dt>
+<dd id="algorithm"></dd>
+<dt>Credential id</dt>
+<dd><code id="credential-id"></code></dd>
+<dt>Public key</dt>
+<dd><code id="public-key"></code></dd>
+<dt>Fingerprint</dt>
+<dd><code id="fingerprint"></code></dd>
+</dl>
+<p>An approver signs in only with the key the file holds for them, so this one works once the
+controller has loaded it.</p>
+</section>
+</main>
+</body>
+</html>

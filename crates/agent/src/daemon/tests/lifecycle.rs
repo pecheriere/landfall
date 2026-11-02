@@ -149,13 +149,13 @@ async fn work_delivered_again_during_a_deploy_is_left_alone() {
 #[tokio::test]
 async fn held_back_reasons_are_quoted_and_said_once() {
     let f = fixture(PATCH_RULE);
-    let held = WorkResponse {
+    let held = Box::new(WorkResponse {
         work: None,
         held_back: vec![HeldBack {
             deployment: id(),
             reason: format!("hash\n<2>forged{}", "x".repeat(10_000)),
         }],
-    };
+    });
     let controller = FakeController::with([Answer::Work(held.clone()), Answer::Work(held)]);
     let verifier = FakeVerifier::passes();
     poll(&f, &controller, &verifier).await;
@@ -307,6 +307,30 @@ fn write_fleet(dir: &Path, deployments: &[(&str, &Path)]) -> PathBuf {
     let file = dir.join("fleet.toml");
     fs::write(&file, fleet(&text, &ids)).unwrap();
     file
+}
+
+#[test]
+fn a_key_the_verifier_would_refuse_refuses_to_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let file = write_fleet(tmp.path(), &[("app/prod", &real)]);
+    let bad = fs::read_to_string(&file).unwrap().replace(
+        "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea",
+        "cHVibGljLWtleQ",
+    );
+    fs::write(&file, bad).unwrap();
+    let err = start_up(&file, &"home-1".parse().unwrap(), tmp.path()).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            DaemonError::Config {
+                source: landfall_core::config::ConfigError::InvalidApprover { approver, .. },
+                ..
+            } if approver.to_string() == "operator"
+        ),
+        "{err}"
+    );
 }
 
 #[test]

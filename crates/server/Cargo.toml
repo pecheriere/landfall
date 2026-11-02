@@ -14,12 +14,14 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+landfall-approval.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
 semver.workspace = true
@@ -34,6 +36,8 @@ tower = { workspace = true, features = ["util"] }
 [dev-dependencies]
 futures-core.workspace = true
 jiff.workspace = true
+# The software authenticator. For tests only, as a dev-dependency.
+landfall-approval = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

@@ -9,7 +9,7 @@ use sqlx::Row as _;
 use super::super::SLOW_RETRY_SECS;
 use super::{
     FetchError, HOST, Harness, MakeError, PATCH_RULE, PROD, RUN_1, RUN_1_ATTEMPT_2, RUN_2,
-    ReleaseError, candidate, commit, config, config_text, digest, not_signed,
+    ReleaseError, candidate, commit, config_text, digest, not_signed, parse_config,
 };
 use crate::report::MAX_STORED_TEXT_CHARS;
 
@@ -161,7 +161,7 @@ async fn a_refusal_is_looked_at_again_when_the_configuration_changes() {
 
     h.fake.locked().verify_fails.clear();
     let changed = format!("{}\n# reviewed\n", config_text(PATCH_RULE));
-    h.config = Arc::new(config::parse(changed.as_bytes()).unwrap());
+    h.config = Arc::new(parse_config(changed.as_bytes()).unwrap());
     h.tick().await;
 
     assert_eq!(h.fake.verify_count(), 2);

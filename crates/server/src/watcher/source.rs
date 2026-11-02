@@ -208,13 +208,13 @@ mod tests {
 
     const CONFIG: &str = r#"
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 "#;
 
     fn source(cache_dir: PathBuf) -> LiveSource {
         LiveSource::new(
             Fetcher::new(Endpoints::public().unwrap()).unwrap(),
-            Arc::new(landfall_core::config::parse(CONFIG.as_bytes()).unwrap()),
+            Arc::new(landfall_approval::parse_config(CONFIG.as_bytes()).unwrap()),
             cache_dir,
         )
     }
@@ -258,8 +258,12 @@ operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
     /// One deployment of the attestation fixture's project, unsigned, with its real
     /// ids and a patch rule.
     const LIVE_CONFIG: &str = r#"
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 
 [[deployment]]
 id = "app/prod"
@@ -286,7 +290,7 @@ checks = ["container-healthy"]
         const DIGEST: &str =
             "sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055";
         let dir = tempfile::tempdir().unwrap();
-        let config = Arc::new(landfall_core::config::parse(LIVE_CONFIG.as_bytes()).unwrap());
+        let config = Arc::new(landfall_approval::parse_config(LIVE_CONFIG.as_bytes()).unwrap());
         let mut fetcher = Fetcher::new(Endpoints::public().unwrap()).unwrap();
         if let Some(token) = std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()) {
             fetcher = fetcher.with_github_token(&token).unwrap();

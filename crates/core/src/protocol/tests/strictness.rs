@@ -62,6 +62,70 @@ fn unknown_fields_are_refused() {
     assert!(serde_json::from_value::<DeployReportBody>(v).is_err());
 }
 
+/// A work item with an approval attached, as JSON.
+fn approved_work() -> Value {
+    let mut wire = serde_json::to_value(work_response()).unwrap();
+    wire["work"]["approval"] = serde_json::json!({
+        "intent": {
+            "deployment": "app/prod",
+            "tag": "v1.2.5",
+            "commit": "a".repeat(40),
+            "digest": format!("sha256:{}", "c".repeat(64)),
+            "expected_running": null,
+            "nonce": "07".repeat(32),
+        },
+        "assertion": {
+            "credential_id": "Y3JlZA",
+            "authenticator_data": "YXV0aA",
+            "client_data_json": "e30",
+            "signature": "c2ln",
+        },
+    });
+    wire
+}
+
+#[test]
+fn an_approval_is_present_even_when_null_and_strict_within() {
+    let wire = serde_json::to_value(work_response()).unwrap();
+    assert!(wire["work"]["approval"].is_null());
+    let mut omitted = wire;
+    omitted["work"].as_object_mut().unwrap().remove("approval");
+    assert!(serde_json::from_value::<WorkResponse>(omitted).is_err());
+
+    let parsed: WorkResponse = serde_json::from_value(approved_work()).unwrap();
+    let approval = parsed.work.unwrap().approval.unwrap();
+    assert_eq!(approval.intent.nonce, [7; 32]);
+    assert_eq!(approval.intent.expected_running, None);
+    assert_eq!(approval.assertion.signature, "c2ln");
+
+    let mut extra = approved_work();
+    extra["work"]["approval"]["extra"] = Value::Null;
+    assert!(serde_json::from_value::<WorkResponse>(extra).is_err());
+    let mut extra = approved_work();
+    extra["work"]["approval"]["assertion"]["extra"] = Value::Null;
+    assert!(serde_json::from_value::<WorkResponse>(extra).is_err());
+    let mut missing = approved_work();
+    missing["work"]["approval"]["intent"]
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_running");
+    assert!(serde_json::from_value::<WorkResponse>(missing).is_err());
+    let mut missing = approved_work();
+    missing["work"]["approval"]["assertion"]
+        .as_object_mut()
+        .unwrap()
+        .remove("signature");
+    assert!(serde_json::from_value::<WorkResponse>(missing).is_err());
+}
+
+#[test]
+fn an_assertions_text_is_not_judged_at_parse() {
+    // It is the host's refusal to give, and not a failed poll.
+    let mut wire = approved_work();
+    wire["work"]["approval"]["assertion"]["signature"] = Value::String("!! not base64".to_owned());
+    assert!(serde_json::from_value::<WorkResponse>(wire).is_ok());
+}
+
 #[test]
 fn hostile_values_are_refused() {
     let mut v = serde_json::to_value(work_response()).unwrap();

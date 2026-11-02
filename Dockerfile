@@ -22,6 +22,7 @@ WORKDIR /src
 # have both) for this step.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/
+COPY crates/approval/Cargo.toml crates/approval/
 COPY crates/origin/Cargo.toml crates/origin/
 COPY crates/server/Cargo.toml crates/server/
 COPY crates/agent/Cargo.toml crates/agent/
@@ -34,7 +35,7 @@ RUN case "$TARGETARCH" in \
     && for crate in server agent cli; do \
         mkdir -p "crates/$crate/src" && echo 'fn main() {}' > "crates/$crate/src/main.rs"; \
     done \
-    && for crate in core origin server agent; do \
+    && for crate in core approval origin server agent; do \
         mkdir -p "crates/$crate/src" && : > "crates/$crate/src/lib.rs"; \
     done \
     && cargo zigbuild --release --locked -p landfall-server --target "$(cat /target-triple)"
@@ -46,7 +47,7 @@ COPY crates ./crates
 # apart from what is installed here, and its HTTPS client refuses to start
 # without a CA bundle, so the base image's bundle (fixed by its digest) goes in.
 RUN target="$(cat /target-triple)" \
-    && cargo clean --release --target "$target" -p landfall-server -p landfall-core -p landfall-origin \
+    && cargo clean --release --target "$target" -p landfall-server -p landfall-core -p landfall-approval -p landfall-origin \
     && cargo zigbuild --release --locked -p landfall-server --target "$target" \
     && install -D -m 0755 "target/$target/release/landfall-server" /out/rootfs/landfall-server \
     && install -D -m 0644 /etc/ssl/certs/ca-certificates.crt /out/rootfs/etc/ssl/certs/ca-certificates.crt

@@ -117,6 +117,13 @@ pub async fn tick<S: ReleaseSource>(
     source: &Arc<S>,
     state: &Arc<WatcherState>,
 ) -> TickSummary {
+    // Before anything that needs the network, which may be away. It only costs this one
+    // thing to fail: the next tick, or the next look at the request, ends it.
+    if let Err(error) = store.settle_expired_requests().await {
+        log(&format!(
+            "watcher: ending requests past their time: {error}"
+        ));
+    }
     if let Err(reason) = source.prepare().await {
         return hold_everything(store, config, &reason).await;
     }

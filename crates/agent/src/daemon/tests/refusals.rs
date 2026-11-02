@@ -186,6 +186,26 @@ async fn the_interrupted_deploy_itself_waits_for_recover_rather_than_being_refus
     assert_eq!(state_of(&f).claim().unwrap(), Some(taken));
 }
 
+/// A `recover` writes the record and then removes the marker. Read in the other order, a
+/// `recover` ending between the two reads gives the record it replaced and no marker, and
+/// a rule decision from a version that isn't running. With both corrupt, the one that
+/// stops the read is the one read first.
+#[tokio::test]
+async fn the_marker_is_read_before_the_record() {
+    let f = fixture(PATCH_RULE);
+    fs::write(f.state_dir.join("app__prod/in-progress.json"), "{").unwrap();
+    fs::write(f.state_dir.join("app__prod/deployed.json"), "{").unwrap();
+    let controller = FakeController::with([answer(Some(work(7, "v1.2.4")))]);
+
+    let outcome = poll(&f, &controller, &FakeVerifier::passes()).await;
+
+    assert!(
+        matches!(&outcome, StepOutcome::Finished { outcome: ReportedOutcome::Deferred { reason }, .. }
+            if reason.contains("in-progress.json") && !reason.contains("deployed.json")),
+        "{outcome:?}"
+    );
+}
+
 #[tokio::test]
 async fn drift_blocks_work() {
     let f = fixture(PATCH_RULE);

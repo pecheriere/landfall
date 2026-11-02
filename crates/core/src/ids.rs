@@ -11,45 +11,59 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use crate::config::shown_in_config;
+use crate::text::shown;
+
 /// A rejected identifier, carrying the text that was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum IdError {
     /// Not `<name>/<stage>` with each part `[a-z0-9][a-z0-9-]{0,62}`.
-    #[error("invalid deployment id {0:?}: expected <name>/<stage>, each [a-z0-9][a-z0-9-]{{0,62}}")]
+    #[error(
+        "invalid deployment id {}: expected <name>/<stage>, each [a-z0-9][a-z0-9-]{{0,62}}",
+        shown_in_config(.0)
+    )]
     Deployment(String),
     /// Not `[a-z0-9][a-z0-9-]{0,62}`.
-    #[error("invalid host id {0:?}: expected [a-z0-9][a-z0-9-]{{0,62}}")]
+    #[error("invalid host id {}: expected [a-z0-9][a-z0-9-]{{0,62}}", shown_in_config(.0))]
     Host(String),
     /// Not `[a-z0-9][a-z0-9-]{0,62}`.
-    #[error("invalid principal id {0:?}: expected [a-z0-9][a-z0-9-]{{0,62}}")]
+    #[error("invalid principal id {}: expected [a-z0-9][a-z0-9-]{{0,62}}", shown_in_config(.0))]
     Principal(String),
     /// Not a GitHub `<owner>/<repo>` name.
-    #[error("invalid repository name {0:?}: expected <owner>/<repo> with GitHub naming rules")]
+    #[error(
+        "invalid repository name {}: expected <owner>/<repo> with GitHub naming rules",
+        shown_in_config(.0)
+    )]
     Repo(String),
     /// Not `sha256:` followed by 64 lowercase hex digits.
-    #[error("invalid image digest {0:?}: expected sha256: followed by 64 lowercase hex digits")]
+    #[error(
+        "invalid image digest {}: expected sha256: followed by 64 lowercase hex digits",
+        shown_in_config(.0)
+    )]
     Digest(String),
     /// Not 40 lowercase hex digits.
-    #[error("invalid commit sha {0:?}: expected 40 lowercase hex digits")]
+    #[error("invalid commit sha {}: expected 40 lowercase hex digits", shown_in_config(.0))]
     Commit(String),
     /// Not 1 to 128 bytes of `[A-Za-z0-9._/+-]` forming a valid git ref name.
     #[error(
-        "invalid release tag {0:?}: expected 1 to 128 bytes of [A-Za-z0-9._/+-], not starting with '-', \
+        "invalid release tag {}: expected 1 to 128 bytes of [A-Za-z0-9._/+-], not starting with '-', \
          no '..', no empty component (leading, trailing or doubled '/'), no component starting with '.' \
-         or ending with '.lock' (any case), not ending with '.'"
+         or ending with '.lock' (any case), not ending with '.'",
+        shown_in_config(.0)
     )]
     ReleaseTag(String),
     /// Not `<prefix>*` with prefix `[A-Za-z0-9._/-]{0,32}` that does not end
     /// with a digit or `.`.
     #[error(
-        "invalid tag pattern {0:?}: expected <prefix>*, prefix [A-Za-z0-9._/-]{{0,32}} not ending with a digit or '.'"
+        "invalid tag pattern {}: expected <prefix>*, prefix [A-Za-z0-9._/-]{{0,32}} not ending with a digit or '.'",
+        shown_in_config(.0)
     )]
     TagPattern(String),
 }
 
 /// A tag that does not match its pattern or is not strict semver.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("tag {tag:?} refused: {reason}")]
+#[error("tag {} refused: {reason}", shown(.tag))]
 pub struct TagError {
     /// The tag that was refused.
     pub tag: String,
@@ -476,6 +490,19 @@ mod tests {
             bare.parse_tag(&tag("1.2.3")).unwrap(),
             Version::new(1, 2, 3)
         );
+    }
+
+    #[test]
+    fn a_refused_tag_is_escaped_and_short() {
+        let error = TagError {
+            tag: format!("\u{1b}[31m{}", "v".repeat(10_000)),
+            reason: "not a version",
+        };
+        let text = error.to_string();
+        assert!(text.len() < 120, "{} bytes: {text}", text.len());
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(text.starts_with("tag \"\\u{1b}[31m"), "{text}");
+        assert!(text.ends_with("\"... refused: not a version"), "{text}");
     }
 
     #[test]

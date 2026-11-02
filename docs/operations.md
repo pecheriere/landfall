@@ -10,10 +10,12 @@ configuration file in [`configuration.md`](configuration.md).
 The agent has four commands: `enrol` and `run` connect it to a controller, `status` and
 `recover` work on the host alone.
 
-**The first deploy of a deployment can't be asked for yet.** Only automatic deploys run
-in this version, and a first deploy is manual: the controller records it as such and
-waits, and a host refuses it. A deployment starts to move once the agent has a release on
-record. Requests and approvals come with the approval ceremony and the human API.
+**The first deploy of a deployment is asked for and approved.** It is manual: the controller
+records it as such and waits, and a host runs it only on
+[an approval it verifies itself](#an-approval-is-verified-on-the-host). [From nothing to a first
+deploy](#from-nothing-to-a-first-deploy) has the steps. There is no web UI beyond the three
+minimal pages yet, and no `landfall` command for any of it: a program calls
+[the API](#api-tokens-requests-and-approvals).
 
 ## Running the controller
 
@@ -204,23 +206,146 @@ is what can tell later that the backup is the one you took: a backup is as easy 
 the database. Until you overwrite it with a restore, `audit verify --at <head_seq>` on the
 live database must print the same hash, or the log has been changed since.
 
-To restore, stop the agents first, letting any deploy finish, then the controller:
+To restore:
+
+1. **Stop the agents,** letting any deploy finish, **then the controller.** An agent left running
+   reports deploys the backup has never heard of under numbers it hands out again. Each report says
+   which release it is of, so one for another release can't finish the deploy under its number: it
+   is refused for good (`report_refused` on the controller, `report_rejected` on the host), and the
+   outcome then is only in the engine's copy under `<deployment>/reports/`.
+2. **Write down what was revoked since the backup, from the database you are about to replace.** A
+   token revoked since then works again once the backup is back. `audit show` has no filter of its
+   own and shows the newest rows up to `--limit`, so ask for all of them. These rows name no
+   deployment, so leave out `--deployment`:
+
+   ```sh
+   landfall-server audit show --db controller.db --limit 4294967295 \
+     | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
+   ```
+
+   An empty file with nothing printed is a good answer: nothing was revoked. **If this printed an
+   error,** the file is empty too and says nothing, so use the fallback in step 4.
+
+3. **Put the backup in place,** as the user the controller runs as, which must be able to open it.
+   Removing the other two files first matters: `SQLite` would apply a log of the old database to the
+   new.
+
+   ```sh
+   rm -f controller.db-wal controller.db-shm
+   cp /backups/controller-2026-11-01.db controller.db
+   ```
+
+4. **Revoke those tokens again, before `serve` starts,** so that they don't work in between. This
+   needs no `serve`. An id that says `there is no API token with this id` was made after the backup,
+   and is gone with it:
+
+   ```sh
+   grep '"kind":"token_revoked"' changed-since-backup.txt | sed -E 's/.*"token":([0-9]+).*/\1/' \
+     | while read -r id; do landfall-server token revoke --id "$id" --db controller.db; done
+   ```
+
+   **If the old database is lost, or you don't trust it,** you can't know what was revoked. Revoke
+   every token the restored log knows of, and make new ones afterwards:
+
+   ```sh
+   landfall-server audit show --db controller.db --limit 4294967295 \
+     | grep '"kind":"token_created"' | sed -E 's/.*"token":([0-9]+).*/\1/' \
+     | while read -r id; do landfall-server token revoke --id "$id" --db controller.db; done
+   ```
+
+   A backup from before an upgrade gets `run serve from this version once` instead. Do that on a
+   port nothing forwards to, stop it, and then revoke.
+5. **Start the controller, and then the agents.** Hosts stay enrolled as of the backup, and tell it
+   what runs on their next poll.
+6. **Someone with no key in `[approvers]` registers again,** from a new invite, if that file has a
+   `passkey_registered` row for them, as their stored key is back to the old one. With no list to go
+   by, that is all of them. **An approver with a key in the file doesn't register again:** signing
+   in and approving go by the file's key, whatever is stored, so they need nothing. And on the same
+   authenticator, registering replaces the credential the file and every host hold, so that person
+   couldn't approve until the file changed everywhere. A session signed out since the backup works
+   again too, until its 12 hours are up or, for someone with no key in the file, they register
+   again.
+7. **Keep a new head.** Whatever happened since is gone from the log, so `audit verify --at` with a
+   head kept since fails, as it should.
+
+**In its container,** these are the same steps with other commands. The image holds the one program
+and no shell, so `grep`, `rm` and the rest run on the host, on the directory mounted at `/data`.
+With `serve` stopped `docker exec` has nothing to run in, so each `landfall-server` command is a
+one-off container. The names here are those of [the run command above](#running-the-controller), and
+the backup is one made on the volume with `docker exec`:
 
 ```sh
-rm -f controller.db-wal controller.db-shm
-cp /backups/controller-2026-11-01.db controller.db
+# 1. Stop the agents, then the controller.
+docker stop landfall
+
+# 2. What was revoked since the backup. If this prints an error, the file is empty and says
+#    nothing: use the fallback below.
+docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+  audit show --db /data/controller.db --limit 4294967295 \
+  | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
+
+# 3. The backup in place. `install`, as the container runs as uid 65532: a root-owned copy
+#    can't be opened, and every command says `unable to open database file`.
+sudo rm -f /srv/landfall/controller.db-wal /srv/landfall/controller.db-shm
+sudo install -o 65532 -g 65532 -m 0600 /srv/landfall/controller-2026-11-01.db /srv/landfall/controller.db
+
+# 4. Revoke those tokens again.
+grep '"kind":"token_revoked"' changed-since-backup.txt | sed -E 's/.*"token":([0-9]+).*/\1/' \
+  | while read -r id; do
+      docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+        token revoke --id "$id" --db /data/controller.db
+    done
+
+# 5. Start it, and then the agents.
+docker start landfall
 ```
 
-Removing the other two files first matters: `SQLite` would apply a log of the old database
-to the new. Then start the controller, and then the agents. An agent left running reports
-deploys the backup has never heard of under numbers it hands out again. Each report says
-which release it is of, so one for another release can't finish the deploy under its
-number: it is refused for good (`report_refused` on the controller, `report_rejected` on
-the host), and the outcome then is only in the engine's copy under
-`<deployment>/reports/`. Hosts stay enrolled as of the backup, and tell it what runs on
-their next poll. Whatever happened since is gone from the log, so `audit verify --at`
-with a head kept since fails, as it should: keep a new head. Deploy numbers start over from
-the backup, which hosts cope with: [a number goes with its release](#a-release-that-rolled-back-isnt-retried).
+If the old database is lost or you don't trust it, step 4 goes by the restored log, and new tokens
+need the file as well:
+
+```sh
+docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+  audit show --db /data/controller.db --limit 4294967295 \
+  | grep '"kind":"token_created"' | sed -E 's/.*"token":([0-9]+).*/\1/' \
+  | while read -r id; do
+      docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
+        token revoke --id "$id" --db /data/controller.db
+    done
+docker run --rm -v /srv/landfall:/data -v /etc/landfall/fleet.toml:/fleet.toml:ro \
+  ghcr.io/pecheriere/landfall token create --principal ci --config /fleet.toml --db /data/controller.db
+```
+
+A backup from before an upgrade needs `serve` once before step 4. With no network and no published
+port, nothing can reach it meanwhile. It is ready when its log says `listening on`:
+
+```sh
+docker run -d --name landfall-upgrade --network none -v /srv/landfall:/data \
+  -v /etc/landfall/fleet.toml:/fleet.toml:ro ghcr.io/pecheriere/landfall \
+  serve --config /fleet.toml --db /data/controller.db --listen 127.0.0.1:8080
+docker logs landfall-upgrade
+docker stop landfall-upgrade
+docker rm landfall-upgrade
+```
+
+Deploy numbers start over from the backup, which hosts cope with:
+[a number goes with its release](#a-release-that-rolled-back-isnt-retried). Invites, requests and
+approvals are as of the backup too.
+
+**An approval comes through a restore safely, as the hosts keep their own count of them:**
+
+- One made since the backup is gone, and nothing runs on it. The request is open again if the backup
+  has it open, and takes a new tap. **That tap may run nothing:** if its new deploy gets a number
+  this host already finished for that release, the host answers with its report of then, with no
+  `up` and nothing spent, so the row can read `deployed` while another version runs. Check what runs
+  with `landfall-agent status`. If it didn't move and you still want it, ask again, which makes a
+  new request and a new number.
+- One the backup holds as queued, for a deploy that has since run, is delivered again under its
+  number. The host answers with its report of that deploy (`finished_work_delivered_again`), and the
+  service isn't touched.
+- Delivered under another number, it is refused at priority 2: by what the host runs, if it has
+  moved on, or by [the nonce log](#the-nonce-log), if the digest it names is running again. Deploy
+  numbers aren't per deployment, so a request reopened by a restore can honestly get another number.
+  Nothing ran. If you still want the release, ask again.
 
 ### Rebuilding a controller from nothing
 
@@ -235,7 +360,8 @@ with the key it has. On each host, in this order:
 4. Start the agent.
 
 A host's memory of what failed stays, so a release that rolled back there isn't tried
-again. Approvals and anything else only the controller knew are gone.
+again. Approvals, tokens, sessions, stored passkeys and anything else only the controller knew are
+gone: make new tokens, and anyone with grants and no key in `[approvers]` registers again.
 
 ## Upgrading
 
@@ -244,6 +370,10 @@ answer with fields or values it does not know, so a mismatched pair refuses each
 other: a newer agent's new report outcome gets `bad_request` from an older
 controller, and the deploy stays claimed until the two match. Reports are kept in the
 meanwhile, and a deploy already running finishes. landfall never deploys itself.
+
+Only `serve` upgrades the database, when it starts. So run `serve` from the new version before
+`token` or `passkey-invite`, which otherwise say the database is older than they are, and do
+nothing.
 
 ## Connections to the controller
 
@@ -261,8 +391,12 @@ Behind a TLS-terminating proxy, the proxy is the one address all agents share. S
   `--max-connections` above it. Each agent holds one connection most of the time,
   and briefly another.
 - Know what that gives up: any client that can reach the proxy can use up that
-  whole allowance, and so keep the agents out, without having a key. The limits
-  cannot tell them apart, since a forwarding header is something anyone can send.
+  whole allowance of connections, and so keep the agents out, without having a key.
+  This cap goes by the connection's peer, which is the proxy, whatever you set.
+- Set `[server] trusted_proxies` in the configuration to the proxy's address, so
+  that the rate limits, for agents and for people signing in, tell clients apart
+  by `X-Forwarded-For`. See [its section](configuration.md#server) for what goes
+  wrong if it is wrong.
 
 ## Requirements
 
@@ -460,6 +594,365 @@ The rule for `--controller` is the same on `enrol` and `run`:
 
 Redirects are not followed.
 
+## API tokens, requests and approvals
+
+Grants live in the configuration. A person signs in with a passkey, and a program holds an
+API token, which acts for a principal the configuration names, with that principal's grants.
+`approve` is never a token's, whatever the file says. On the controller, as its user:
+
+```sh
+landfall-server token create --principal ci --config fleet.toml --db /var/lib/landfall-server/controller.db
+landfall-server token revoke --id 3 --db /var/lib/landfall-server/controller.db
+landfall-server passkey-invite --principal operator --config fleet.toml --db /var/lib/landfall-server/controller.db
+```
+
+`token create` prints the token once, as JSON, with its id. Only a hash is kept, and revoking
+works from the token's next use. A token whose principal has gone from the configuration
+stops working when the controller next loads it. `passkey-invite` prints a one-time link,
+valid for an hour; another for the same person replaces it. [Passkeys and signing
+in](#passkeys-and-signing-in) says what happens next.
+
+Send a token as `Authorization: Bearer <token>`. No credentials, or a token that is malformed,
+unknown or revoked, all get the same `401 unauthenticated`. With credentials and no grant at
+all on a deployment, the answer is the same `404 not_found` as for one that doesn't exist;
+with another grant on it, `403 forbidden`. Every refusal to someone who proved who they are
+is in the audit log (`request_refused`, `approval_refused`, `cancel_refused`,
+`access_refused`), within the budget below.
+
+**To ask for a deploy,** a principal with `request` sends
+`POST /api/v1/deployments/{name}/{stage}/requests` with `{"tag": "v1.2.3"}`; a lower version
+than the running one, a manual rollback, takes `rollback` instead. The controller makes the
+intent itself, from its verified record of the release and the host's last report. The tag
+must be a release the watcher verified under this configuration and hasn't refused or put on
+hold since. So asking too soon after a new tag, or just after the configuration changed, gets
+`409 release_not_verified` until the watcher's next look. Other refusals are
+`409`s with a stable code: `request_open` (one open request a deployment), `deployment_busy`,
+`host_not_ready`, `release_refused` (what is running already, or a pre-release the rule
+doesn't take) and `promotion_pending`. A rollback doesn't wait for promotion.
+
+**To approve one,** `GET /api/v1/approvals` lists what you may see, with each intent and its
+challenge, and whether you may approve (`can_approve`) or cancel it (`can_cancel`). `POST
+/api/v1/approvals/{id}` takes the passkey's assertion, fresh each time, as `{"assertion": {...}}`. It must be by the caller's own key in `[approvers]`, for exactly
+that intent. Approving queues a deploy under a new number, which carries the assertion to the
+host. Everything that bears on it is looked at again then. What may pass by itself leaves the
+request open, and you can try again: `promotion_pending` if the release isn't healthy for long
+enough where it is promoted from any more, `release_not_verified` if the watcher has put it on
+hold or hasn't looked at it under this configuration, `host_not_ready` and `deployment_busy`.
+
+**To cancel one,** `POST /api/v1/approvals/{id}/cancel` is for whoever asked, and for anyone
+with `approve` or `rollback` on that deployment. A deployment has one open request at a time,
+so this is how to get one nobody will sign out of the way. A rollback by someone with `rollback`
+does it by itself: it takes the open request's place, which ends as `cancelled` with a reason
+naming the rollback. **Revoking a token doesn't touch a request it opened:** that stays open,
+and an approver can still sign it, until someone cancels it or it expires. If you revoke a
+token because it was stolen, look at `GET /api/v1/approvals` and cancel what it asked for.
+
+A request goes `stale` when the host reports another running digest, `409 request_stale` to
+anyone who tries it, and `expired` after 24 hours by the controller's clock, ended by the
+watcher's next tick, so that one nobody signs doesn't keep the next one out. None of `stale`,
+`expired` and `cancelled` comes back: ask again, which makes a new intent to sign. An approved
+request is never queued twice either. If the host then refuses or defers its deploy, the
+deployment is free again, and retrying takes a new request, a new assertion and a new deploy
+number.
+
+**Each credential has a budget for state changes,** so that one gone wrong can't fill the audit
+log or crowd out the agents' writes: 120 at once, refilling at one a second. Each session has its
+own, and a principal's tokens share one, so a stolen cookie can exhaust only itself: not the
+person's other sessions, their tokens, or signing in, and signing out is never refused by a budget.
+So if a session is being used up, the person can still end it. Reads don't count, and neither use
+comes near it in normal work. Over it, a call gets `429 rate_limited` with `Retry-After`, and
+writes nothing. The count of those goes in an `access_throttled` audit row, with how many were
+`dropped`, at the next call within the budget or within one watcher interval, whichever is
+first, and when the controller stops. It names the principal and whether by `token`, `session` or
+`sign_in`, and no particular token, since it can be another of the principal's that comes next: to
+find which, look at the rows around it. The count is kept in memory, so a crash loses one not yet
+written.
+
+The budget is what bounds a credential gone wrong, not a promise of a small log: one write
+transaction a second, with rows of one to two KiB from a hostile caller and two rows a call for
+a rollback that supersedes a request. That is **some 80 to 170 MB of audit log a day for each
+credential** until it is revoked. A person's sessions come to at most sixteen times that, as a
+principal keeps sixteen, **plus 120 state changes for each sign-in spent,** since each new session
+starts with a whole budget. A principal has ten sign-ins at once, with one more every five minutes:
+some 288 a day for each run of the controller, or about 35,000 more state changes, in the hands of
+someone holding that key. A restart gives the sign-ins back, as it does every budget, so each restart
+adds up to ten more. `access_throttled` and a jump in `request_refused`, `approval_refused` or
+`request_cancelled` rows are worth an alert.
+
+**Only a passkey that verifies and may sign in spends a sign-in,** so a stolen cookie, a stranger, or
+a key that is barred can't. But the budget is the principal's, so someone holding the same key can use
+it up and keep the owner from signing in for as long as they go on. Sessions already open aren't
+affected. Over it, a sign-in gets `429 rate_limited` with a `Retry-After` of the seconds until the
+next one, up to 300. If that's happening, the key has to go: for an approver, put a new key in the
+file; for anyone else, have them register again from a new invite.
+
+**A state change with a session and a bad `Origin`** is refused before it costs anything: it spends
+no budget, and writes no row of its own. `SameSite=Strict` doesn't stop a page on a sibling
+subdomain from sending the cookie, as that is the same site, so this must be free. They are counted,
+and written as one `access_refused` row each watcher interval, with how many `attempts`, when the
+first was and from where. A jump in those means someone is sending a person's cookie from another
+origin, and it may be their browser doing so at a page's bidding.
+
+**A request nothing can read** (`request_unreadable`, 500), from a hand-edited or damaged
+database, costs only itself. The controller's log names its row, it is left out of `GET
+/api/v1/approvals`, and it can't be approved or cancelled by id. It still ends by itself, and a
+rollback can still take its place, and reports from hosts are recorded whatever it holds.
+
+## Passkeys and signing in
+
+The pages are `/passkeys/register`, `/sign-in` and `/approvals`. They are served by the
+controller, and need the configuration's `[approval]`: with none, registering and signing in
+answer `503 approvals_not_configured`.
+
+### HTTPS and the RP ID
+
+**WebAuthn only works in a secure context,** and the session cookie is `Secure`, so people reach the
+controller over `https`, though it serves plain HTTP itself. Something in front of it has to
+terminate TLS. Either of these fits:
+
+- **A tailnet name, with `tailscale serve`** forwarding to the controller's `--listen` port. The
+  name is the machine's, such as `landfall.example-tailnet.ts.net`, and is reachable only on the
+  tailnet, which suits a controller that nothing outside needs.
+- **A TLS-terminating reverse proxy** of your own, with a certificate for a name you own.
+
+Whichever it is, **it must leave `Origin` as the browser sent it,** or every state change is refused
+with `bad_origin`, and it should be listed in [`trusted_proxies`](configuration.md#server) if it
+appends to `X-Forwarded-For` (see [the limits](#limits-for-what-anyone-can-send) for what
+happens if it isn't). Check for your proxy that it does both.
+
+`[approval]` then holds what the browser's address bar shows, and that hostname alone:
+
+```toml
+[approval]
+origin = "https://landfall.example-tailnet.ts.net"
+rp_id = "landfall.example-tailnet.ts.net"
+```
+
+**A passkey belongs to its RP ID,** so moving the controller to another name takes a new passkey
+from everyone and a new line in the file for each approver, since a browser won't offer the old one
+there and hosts wouldn't accept it. Pick the name you mean to keep. `origin` and `rp_id` are in the
+file hosts hash too, so changing them means every host has the new file before it gets more work.
+[The configuration](configuration.md#approval) has the exact rules.
+
+**What has and hasn't been tried.** The ceremonies have run in Chrome with its virtual
+authenticator, over a throwaway certificate on `https://localhost` with the test's own TLS
+terminator, and with a software authenticator through the real routes end to end. **They have not
+run through `tailscale serve` or any production proxy, or on a real device: no phone, no synced
+passkey, no hardware key.** Safari's rules on when a ceremony may start and how a password manager's
+extension behaves are both unknown here, so try a registration and a sign-in before you rely on
+them, and keep the way back in [Losing a passkey](#losing-a-passkey) in mind.
+
+### From nothing to a first deploy
+
+1. Start with a file that has `[approval]` and no deployments, as a deployment needs an approver,
+   who needs a key. Run `serve` with it.
+2. `landfall-server passkey-invite --principal operator --config fleet.toml --db controller.db`, and
+   open the link it prints.
+3. Create the passkey. The page shows a line for `[approvers]`. Copy it into the file, and add the
+   deployment, with `operator` in `rule.approvers`, and the grants:
+
+   ```toml
+   [approvers]
+   operator = { credential_id = "...", public_key = "..." }
+
+   [[grant]]
+   principal = "operator"
+   deployments = ["app/prod"]
+   can = ["view", "request", "approve", "rollback"]
+   ```
+
+4. Have it reviewed, comparing the fingerprint with the one the page showed, and put the same file
+   on the controller and on every host. Restart `serve`.
+5. [Enrol the host](#enrolling-a-host) and start its agent. The watcher looks at releases when it
+   starts and every five minutes after that, and records the release as `manual`. Nothing starts.
+6. Ask for the release: `landfall-server token create --principal operator ...` gives a token, which
+   goes with `POST /api/v1/deployments/app/prod/requests`. No page has a button for asking yet.
+7. Sign in at `/sign-in`, open `/approvals`, check what it shows, and approve with your passkey. A
+   token can't do this step. The host checks what you signed for itself, and runs it.
+
+Later releases go by the rule. What takes an approval waits as `needs_approval` or `manual`, and
+steps 6 and 7 are how it goes on. A lower version is [a manual
+rollback](#api-tokens-requests-and-approvals), and a release that rolled back is
+[retried](#a-release-that-rolled-back-isnt-retried), the same way.
+
+### Registering, and who signs in as whom
+
+**To register,** open the link `passkey-invite` printed and create a passkey. The code is after
+the `#`, so it reaches no access log, and the page takes it out of the address bar at once. A
+wrong, used or expired code all get the same `403 invite_refused`. Only a registration that
+succeeds spends the code, so a cancelled dialog costs nothing, and of any number at once one
+succeeds. The page shows the credential id, public key and fingerprint, and a line to copy under
+`[approvers]` by pull request. Hosts trust a key only from that file. The controller keeps its own
+copy, for signing in. No attestation is checked: what makes a key trusted is that someone reviews
+it. Compare the fingerprint in the pull request with the one the person saw. **Accepted residual
+risk (design 6.3):** a compromised controller could show its own key during registration.
+
+Registering again replaces the person's stored key and ends their sessions. The passkey must be
+discoverable, as signing in names nobody, so **a security key that can't hold a discoverable
+credential can't be used.** Registering again on the same authenticator replaces its credential
+for this controller: if the old one is in the configuration, update that too.
+
+**Whose key opens a session:**
+
+| The credential is | Signs in as | By |
+|---|---|---|
+| An `[approvers]` entry's | that approver, registered here or not | the file's key |
+| Stored here, for a principal with grants and no `[approvers]` entry | that principal | the stored key |
+| Stored here, for someone with a different `[approvers]` key | refused | |
+| Stored here, for a principal the file doesn't name | refused | |
+| Anything else | refused | |
+
+So a key that is registered and not yet reviewed can only be copied off the page, if its owner
+is or will be an approver. **An invite is only as trusted as its link:** a leaked one for someone
+with grants and no approver's key does open a session, with what those grants allow, which is why
+it lasts an hour and why every registration is in the audit log. It never gets `approve`, which
+takes a key in `[approvers]`.
+
+**A session** is 32 random bytes, kept only as a SHA-256, in a `__Host-landfall-session` cookie
+(`HttpOnly; Secure; SameSite=Strict; Path=/`, no `Domain`), for 12 hours. Each sign-in makes a new
+one, and any the browser came with ends. It has no power of its own: every use goes by the
+configuration's grants, and it stops working once the file no longer names the principal. Sixteen
+at most are kept for a principal, the oldest ending first. `POST /sign-out` ends one on the server.
+**Approving always takes a fresh assertion,** so a stolen cookie can't approve anything.
+
+**What a session outlives.** Whether a key may sign in is decided when it signs in, so a session
+goes on after that changes. If someone with a stored key is added to `[approvers]` with another key,
+a session from the stored key lives up to 12 hours more. It can do what their grants say, and still
+can't approve, since `approve` takes the file's key. The stored key also wakes up by itself: if its
+owner is later named in the file with no `[approvers]` entry, or taken out of `[approvers]` but left
+with a grant, it signs in again. If that isn't what you want, end it by registering.
+
+**To end someone's sessions:** have them register again from a new invite, which replaces the stored
+key and ends every session of theirs. To do it without them, take them out of the file: their
+sessions stop working when the controller next loads it. There is no command for one session.
+
+Every failed sign-in gets the same `403 sign_in_refused`, whether the credential is unknown, the
+signature bad, or the key one that may not sign in, and nothing before that names anyone. Each
+challenge lasts five minutes and works once, and a sign-in's can't finish a registration.
+
+### Limits, for what anyone can send
+
+Every `POST` here wants the exact `Origin`, or
+`403 bad_origin`. Each `begin`, and each `finish` that turns out bad, comes from a bucket per source:
+30 at once, refilling at two a second, apart from the agents' so that a flood leaves them their
+nonces. Over it is `429 rate_limited`. A `finish` with a live challenge and a good answer costs
+nothing and can't be refused for this, so a tap once made isn't wasted by someone else's flood.
+Sign-in challenges are in memory, 65,536 at most, each holding its place for its five minutes: a
+full table answers `503 ceremonies_busy` and keeps every challenge it has, so nobody's can be pushed
+out. Beginning writes nothing to the database. Neither limit touches anyone's budget, a session
+already signed in, or an approval.
+
+**Behind a proxy, set `[server] trusted_proxies`** ([configuration](configuration.md#server)).
+Without it the source is the connection's peer, so all clients are one source, and anyone sending
+two `begin`s a second can keep everyone from beginning a sign-in for as long as they go on. When
+sessions have expired, nobody can then approve. With it, each client has its own bucket, and it
+takes many addresses to do that. Limit these paths at the proxy too if it faces the internet.
+
+### In the audit log
+
+`passkey_registered`, `signed_in` and `signed_out`, each with its change.
+Failures are counts, since anyone who knows a credential id could cause them. One row each watcher
+interval for each principal, kind and reason, and when the controller stops, each with how many
+`attempts`, the `reason`, `first_seen`, up to eight `sources` and how many attempts came `from_others`:
+
+- **`sign_in_barred_key`: treat this as an alert.** A signature verified by a key registered here
+  that may not sign in, so someone holds that key: a leaked invite, or an old device. Nothing a
+  sender does afterwards changes this row.
+- `sign_in_refused`: a signature that didn't verify on a known credential. A credential id may be
+  public, so this says little about who sent it.
+- `registration_refused`: a good invite's code with a ceremony that didn't check out.
+
+Each also goes to the capped log as it happens, with who it came from. A crash loses a count not yet
+written. A failure naming nobody goes only to the capped log.
+
+### What a lying controller page can and can't do
+
+A person can't read a challenge. It is the hash of an intent, so a passkey signs what the page
+hands it, and the page comes from the controller. If the controller is compromised, then:
+
+**It can** show you one release and have you sign another, on any deployment whose `rule.approvers`
+lists you. That includes a lower version, so a tap can be turned into a rollback to an old release,
+and an old release may have bugs a newer one fixed. It also includes a release on this host's
+[record of failures](#a-release-that-rolled-back-isnt-retried), which an approval retries. It can do
+the same with a tap meant for signing in. It can then hold what you signed and deliver it later,
+since a host has no clock it trusts, for as long as the digest it names is running. It can show its
+own key at registration in place of yours, which is why a key is reviewed and the fingerprint
+compared. And it can say anything it likes in its own pages and its own audit log, including leaving
+your tap out or writing one that never happened.
+
+**It can't** run anything without a tap, as hosts check a signature by the key in their own file:
+
+- **Sign for you.** An approval made up with another key, or with another credential, is refused.
+- **Use your tap on anything but what it signed.** Carried to another release, the challenge doesn't
+  match, and it is refused. It covers the deployment, the tag, the commit, the digest, what must be
+  running, and a nonce.
+- **Install what doesn't verify.** The host verifies the release for itself, and a digest or commit
+  other than the one signed is refused. With `origin.signed_tags` on that means a maintainer-signed
+  release. With it off, it means whatever that workflow built for a tag.
+- **Use a tap twice,** or after the host has moved on. Only the digest it names, and only once,
+  however the database is restored and whatever number it comes under.
+- **Run what a rule refuses,** which is the version already running or a pre-release the rule
+  doesn't take.
+- **Burn your approval by asking wrongly.** A refusal spends no nonce. Only a good approval is
+  spent, just before the deploy starts, [but for two failures of the
+  disk](#an-approval-is-verified-on-the-host).
+
+**A sign-in tap is `webauthn.get` too,** the same kind as an approval. So a compromised controller
+could put a request's intent hash in a sign-in ceremony, and a person signing in would have approved
+it without knowing. It is within the residual risk of design 6.3: the ceremony runs on the
+controller's page, which can already show one thing and have another signed. The host still only
+runs a release that verifies for that deployment, which is maintainer-signed if `origin.signed_tags`
+is on, from the digest it is running. The page can't prove what it asks you to sign. Computing the
+hash on your own machine is the stronger path, and is planned as `landfall approve`, which doesn't
+exist yet.
+
+**How you'd know.** Each of these refusals leaves the service alone and goes in the host's journal
+as `controller_work_refused` at priority 2, which is the record the controller can't change, so
+alert on that, and then [read it](#reading-a-refusal-at-priority-2), as some have honest causes. The
+controller's `deploy_refused` audit row has the reason too, as long as it is honest. What the page
+can't be caught by is a good signature over something you didn't mean: compare
+`approval_about_to_be_spent` in the host's journal, which names the approver and the release, with
+what you approved. `crates/agent/tests/e2e/approvals/` shows the refusals, with the controller's
+database written to directly.
+
+### Losing a passkey
+
+**Nothing stops.** The service keeps running, automatic deploys and automatic rollbacks take no
+passkey, and a session already open goes on. What waits is whatever takes an approval by that key.
+If another approver is listed for a deployment, they can sign in the meantime. `[approvers]` holds
+one key for a name, so a second device means a second name, listed in the same `rule.approvers` and
+with an `approve` grant of its own, since the file doesn't ask for one and the controller won't let
+that name approve without it. Have one before you need it. Nothing in the controller can stand in
+for the file, so with no approver left it takes someone who can change the file on every host.
+
+**For an approver:**
+
+1. On the controller, `landfall-server passkey-invite --principal <name> ...`, and register a new
+   passkey from its link. That needs no sign-in. It replaces the stored key and ends that person's
+   sessions. The new key can't sign in yet, and trying gets `sign_in_barred_key` in the log:
+   expected, this once.
+2. Replace the person's line under `[approvers]` by pull request, comparing the fingerprint.
+3. Put the file on every host and the controller, and restart them all, as each reads it once. A
+   host with the old file gets no work until it has the new one, and the release needs the watcher's
+   next look under the new file before it can be asked for.
+4. From then on the old key is nobody. An approval it signed that hasn't reached the host yet is
+   refused there at priority 2, which is expected this once: ask again and sign with the new key.
+
+**For someone with grants and no key in `[approvers]`:** only step 1. The stored key is all there
+was.
+
+**If it may have been stolen and not lost,** do the above at once, and read back from when it went:
+the controller's `signed_in` and `request_approved` rows, and `approval_about_to_be_spent` in each
+host's journal. A thief with only the passkey can sign in and approve what's asked, with that
+person's grants. Until each host restarts with the new file, it still accepts that key's signature.
+
+**These steps can leave the thief a session.** Step 1 ends the sessions that exist, but until the
+file changes the old key can still open a new one, as the file's key decides. That session outlives
+the restart on the new file. It keeps the person's grants, so it can ask, roll back and cancel, and
+it can't approve, which takes a fresh assertion by the key now in the file. It ends after its 12
+hours, or when the person registers again, which is one more key and one more change to the file. So
+make the file change quickly after step 1.
+
 ## Running the agent
 
 `landfall-agent run` polls the controller, and on each work item decides for itself.
@@ -546,18 +1039,21 @@ nothing unless all of this holds:
 - The deployment is one of this host's.
 - It has no unfinished deploy, and no drift: what runs is what the agent deployed.
 - The deployment's rule makes the move from what the host has on record to this tag
-  `Auto`. A first deploy, a downgrade, the version already running, a pre-release the
-  rule doesn't opt in to, or a step that needs an approval: all are refused.
+  `Auto`, or an approval this host verifies itself comes with it. A first deploy, a
+  downgrade, or a step that needs an approval is refused without one. The version already
+  running, or a pre-release the rule doesn't opt in to, is refused with one too.
 - The release verifies, with this host's own trust root, and to the digest and the
   commit the controller named.
 
 What isn't so is answered in one of two ways, and nothing runs either way:
 
-- **`refused`, for good:** the rule says no, a verification result failed, or the
-  release is on this host's record of failures. It is journalled as
-  `controller_work_refused`, and the controller doesn't ask again. For a request the rule
-  or verification refuses that is priority 2, critical: **treat it as an alert**, since
-  an honest controller decides by the same rule and doesn't ask.
+- **`refused`, for good:** the rule says no, an approval isn't good, a verification result
+  failed, or the release is on this host's record of failures. It is journalled as
+  `controller_work_refused`, and the controller doesn't ask again. For a request the rule,
+  an approval or verification refuses that is priority 2, critical: **treat it as an
+  alert**, since it is how a lying controller shows. An honest controller decides by the same
+  rule and mostly doesn't ask, but it can get here in a few ways, so
+  [read it](#reading-a-refusal-at-priority-2) before you decide what it means.
 - **`deferred`, not now:** an unfinished deploy, drift, state or evidence that can't be
   read, a clock behind the release, or a wait for verification that has reached its bound.
   All of these pass. It is journalled as `controller_work_deferred`, at priority 3, error,
@@ -567,8 +1063,8 @@ What isn't so is answered in one of two ways, and nothing runs either way:
   There is no last try. A newer release doesn't wait for it, older ones do, and the host
   judges each try as it would any other.
 
-What it can do: withhold work, ask again, and see what the host reports. It can
-also make the host deploy a release that is allowed by all of the above sooner than
+What it can do: withhold work, ask again, carry an approval a person gave, and see what the
+host reports. It can also make the host deploy a release that is allowed by all of the above sooner than
 promotion rules on the controller would, which are controller-enforced only. A deployment
 with `origin.signed_tags = false` has less to go on: a release is then whatever the
 configured workflow built for a tag, so someone who can push a tag and run that workflow
@@ -579,20 +1075,206 @@ a GitHub token with no scopes. It never connects to a host, and no key it holds 
 Its audit log is its own account of events, and [the limit of that](#keeping-the-audit-head-elsewhere)
 applies. The host's journal is the record the controller can't change.
 
+### An approval is verified on the host
+
+A first deploy, a downgrade, a step the rule leaves to `approve` or to nobody, and a retry
+of a release that failed here each run only on a person's approval. The controller carries
+it and can't make one. The host checks all of this itself, and an approval that fails any of
+it is `refused` at priority 2, with the reason in full in the host's journal, up to 255
+characters of whatever origin or type the assertion claimed. **Read it there:** the report
+carries 4,096 characters of it, and the controller keeps 1,024 on the deploy and in the
+`deploy_refused` audit row, escaped.
+
+- Its deployment, tag, commit and digest are those of the work, and the commit and digest
+  are what the release verifies to here.
+- Its expected running digest is what the host's own `deployed.json` says: nothing on record
+  matches only an approval for a first deploy. It is compared again under the deployment's
+  lock, just before the deploy starts, and that lock is held from there on. A `recover`
+  holding the lock makes the work wait, with nothing spent.
+- The credential is that of an approver in this deployment's `rule.approvers`, in this
+  host's file. Another deployment's approver is nobody here.
+- The assertion is signed by that key over this intent, with the configured origin and RP ID,
+  and with user presence and verification. Each field off the wire is capped before it is
+  decoded.
+- Its nonce isn't in the [nonce log](#the-nonce-log).
+
+An approval attached to a deploy the rule makes automatic is ignored and isn't spent, even
+if its assertion is garbled: the assertion's fields are only read when the approval is. Its
+`intent` is another matter. It is parsed with the rest of the work, so an intent that doesn't
+parse, a bad nonce say, fails the whole answer, whatever the rule says of the deploy. The
+host reads that as `controller_unavailable` at priority 4, warning, and retries with its
+backoff, and nothing runs. An approval never overrides the version already running or a
+pre-release. If that automatic deploy fails and rolls back, the same unspent approval is accepted
+as the manual retry of the failed release, and is spent then, so an `approval_about_to_be_spent`
+line can come some time after the tap, with no request in between.
+
+**An approval works once, whichever way the deploy ends.** It is spent after everything
+above has passed, and before the deploy touches a file or Docker. A deploy that then fails
+or is interrupted has used it, and a crash between the two leaves it spent with the service
+as it was: the controller delivers the work again, the host refuses it as already spent, and
+it takes a new approval.
+
+**Refused or deferred on the way there, an approval is not spent,** so someone without the
+passkey can't use it up by asking wrongly. There are two exceptions, both at the moment of
+spending, and both fail safe, since nothing runs: writing the nonce running past its
+60-second deadline on a hung disk, which defers, and an error from syncing it to disk, which
+refuses. The nonce may be on disk or not after either. If it is, the approval is spent, and
+it takes a new one.
+
+**An approval has no expiry, as the host has no clock it trusts.** One that was never spent,
+held back by a controller say, stays good indefinitely. It works if it is delivered later,
+as long as what it names as running is running then, and that includes a digest that has
+gone and come back. What it can install is still only the one release it names, verified here.
+
+#### Reading a refusal at priority 2
+
+Nothing ran. Nothing was spent either, unless the reason says the nonce was spent already, or that
+the nonce log can't say, where [a failed sync](#an-approval-is-verified-on-the-host) may have left
+it on disk. The reason is in the host's journal, `journalctl -u landfall-agent.service`.
+
+**A lying controller can bring about most of these reasons too,** so a row only clears a refusal if
+its check holds, and each check is something the controller can't make so.
+
+| Reason | Honest cause | The check |
+|---|---|---|
+| `it is for a host running <A>, and this host has <B> on record` | The host moved while an approval was queued, which can't be cancelled yet ([#30](https://github.com/pecheriere/landfall/issues/30)). | [What moved it](#what-moved-the-host), below. |
+| That, `is the version already running`, or `was already spent on this host` | The controller was [restored from a backup](#backing-up-and-restoring) holding that approval. | You restored it, just before this. |
+| `no approver in this host's configuration has credential` | The approver's key was [replaced](#losing-a-passkey) while the approval was on its way. | You changed the file just before this, and the credential is the old one. Any other is an alert. |
+| `credential <id> is <name>'s, who is no approver of this deployment` | That person was taken out of `rule.approvers` while the approval was on its way. | You changed the file just before this, and that is who you took out. |
+| `clientDataJSON origin: expected <new>, found <old>` | `[approval]` changed while the approval was on its way. | You changed the file just before this, and `<old>` is what it was. |
+| `no approval came with it` | An automatic deploy was queued, and the rule or what runs changed so that it no longer is. | You changed that just before this. A controller making up work looks just like this, so without that it is an alert. |
+| `this host's nonce log can't say` | [The log](#the-nonce-log) is damaged, full, or has the wrong owner or mode. | A `nonce_log_unusable` line, and the file itself, which the controller can't reach. |
+| `was already spent on this host` | A crash just as the approval was spent. | [Telling a crash from a replay](#telling-a-crash-from-a-replay). |
+| `verification: release run: the release was attested by <N> workflow runs` | A second run for that tag came after the watcher recorded the release, as it doesn't look again at one that isn't automatic ([#30](https://github.com/pecheriere/landfall/issues/30)). | The repository's runs for that tag show a second one, which by GitHub's times started more than five minutes, one look of the watcher, after the first finished, and the rule doesn't make this move automatic, as an automatic one is looked at again. Otherwise it is an alert. A lying controller can't start a run, though it can deliver a tag someone else re-ran: **check who started the second run.** |
+| `verification: platform: the image has no <platform> platform` | The release isn't built for this host's architecture, which the watcher doesn't look at, having no platform of its own. | The list the reason gives leaves this host's out, and `landfall verify --platform` says the same. |
+
+**Every other `verification:` reason isn't explained by this table:** a tag signature, an
+attestation's identity or the digest rule says the release is not what the file allows, whatever a
+repository's runs look like.
+
+##### What moved the host
+
+`deployed.json` moves only by a deploy or a rollback of the agent's own, `recover`'s included, so
+`<B>` should have `deploy_step` and `deploy_finished` lines. A `docker compose` by hand doesn't move
+it, and shows as [drift](#drift). Those lines look the same whoever asked for them, so go by **the
+unit they are under:**
+
+- **`journalctl -u "landfall-agent-recover@$(systemd-escape app/prod).service"`:** someone ran
+  `recover` on the host, which the controller has no way to start. **This clears it only if
+  `recover` ran between your tap and this refusal,** by the host's journal time and your own memory
+  of the tap, as the audit log's times are the controller's, the agent was down in between or the
+  tap was moments before, and you can find out who ran it. Otherwise the approval was held, as the
+  agent delivers at its next poll. A `recover` before your tap can't explain it either, since the
+  intent would then have named `<B>`. Each of those is an alert.
+- **`journalctl -u landfall-agent.service`:** the controller delivered it, and **nothing here clears
+  that: treat it as an alert.** The controller chooses when to deliver and serves the page, so it
+  sees when you open it and can time a deploy to any moment around your tap, or hold an approval for
+  weeks. We know of almost no honest way: it would take an agent stopped within seconds of finishing
+  that deploy, before its next poll said what runs, with the request asked for and signed while it
+  was down, and its stop would show in the host's own journal.
+- **You can't find it:** assume the worst, and then check whether the state directory was rebuilt or
+  restored, which moves the record with no line, whether the journal is volatile or was vacuumed,
+  and whether someone ran `recover` at a shell, whose lines went to that terminal and whose report
+  is under `<deployment>/reports/`.
+
+**What to do:** if a check holds and you still want the release, ask again, which makes a new intent
+for what runs now. That doesn't help two kinds. For `attested by` and `platform`, verification gives
+the same answer each time, and each try costs a ceremony and another critical alert: that release
+can't be deployed there, and it takes a new release. For `this host's nonce log can't say`, put
+[the log](#the-nonce-log) right first, or the next one is refused too.
+
+**A reason that isn't listed, or a check that doesn't hold, is an alert to investigate.** It isn't
+proof of a lying controller, as this list may not be whole, but nothing here clears it. `the
+signature does not verify` and `clientDataJSON challenge` have no honest route we know of.
+
+#### Telling a crash from a replay
+
+Every delivery of a spent approval is refused with `was already spent on this host, and this
+delivery changed nothing on the service`, naming the nonce. The host can't tell why it came
+again, and you can, from its journal, by searching for that nonce.
+
+The journal says `approval_about_to_be_spent` just before the host tries to spend a nonce,
+naming the approver, the deployment and the release. The line doesn't prove it was spent: it
+also appears with nothing spent, when the log turned out to be unusable, something held its lock
+or another writer got there first. So if a `nonce_log_unusable` line follows it, or the nonce isn't in the log, read
+it as an attempt. Otherwise, going by what follows it:
+
+- **A crash before the deploy started:** this tag has no `deploy_step` lines after it, and the
+  agent restarted. Honest: the controller redelivered work the host had claimed. It takes a new
+  approval.
+- **A deploy that ran and was then recovered or rolled back, redelivered:** the tag has
+  `deploy_step` lines, its `deploy_finished` isn't a success, or a `recover` ended it, and the
+  agent restarted around then. This can be honest too: a controller that lost track of how the
+  deploy ended delivers it again. The agent's restart, in the host's journal, is what counts. The
+  controller's restart and what it says about that deploy count for little, as a lying one can
+  restart itself and say what it likes. If you still want the release, it takes a new approval.
+- **A replay:** the tag has `deploy_step` lines and its `deploy_finished` succeeded, the report was
+  delivered (`report_delivered`, by the deploy's number), and the controller wasn't [restored from
+  a backup](#backing-up-and-restoring), yet the approval has come again under a later number. Treat
+  that as an alert. It gets nothing from it, as the approval is spent.
+- **No such line at all, for a nonce in the log:** the log was changed by something other
+  than the agent, or the journal has lost it. Treat it as an alert.
+
+### The nonce log
+
+`approval-nonces.log` in the state directory has one line per spent nonce, 64 lowercase
+hex digits and a newline, for the whole host. A line is appended and synced to disk before
+the deploy starts. Only an approval that has verified is written, so what grows it takes a
+person with a passkey. It is full at 65,000,000 bytes, a million approvals.
+
+**A log that can't be used refuses every approval, and automatic deploys go on.** That is one
+that is torn, holds anything but those lines, is full, is a symlink or anything else but a
+regular file, belongs to another user, or is writable by group or others. The journal says
+`nonce_log_unusable` at priority 2 when the agent starts and at each approval refused for it,
+naming the file, and its `error` says which. Nothing repairs it for you:
+
+- **A torn last line** is what a crash in the middle of an append leaves, and the file's
+  size isn't a multiple of 65 bytes. The deploy it was for never started. Remove only that
+  partial last line, and leave the whole lines alone. A write that merely fails, on a full
+  disk say, takes its partial line back by itself; this is only for when that failed too.
+- **Full** is a log doing its job for a long time, not damage. To go on, move the oldest
+  lines to an archive, keeping them. See below for what that gives up. Keep the mode 0600,
+  and stop the agent while you do it, so that nothing appends to the file in between.
+- **A wrong owner or mode, or a symlink or other file in its place:** put right what it is.
+  Nothing written by the agent gets to be any of these, so find out what did it.
+- **Any other line that isn't a nonce** means something other than the agent has written
+  there. Find out what, and restore the file from a backup if you have one.
+
+**A lock held on the log makes the work wait.** Nothing but the daemon locks it, so this is a
+process you ran as the agent's user or root. After a second of trying, nothing is spent, the
+journal says `work_waiting` naming the file, and the work is tried again at the next poll, so it
+goes on once the lock is let go. This has no bound, and meanwhile the claim holds up the host's
+other deployments, so find what holds it. While it is held to read, each poll verifies the release
+again and writes `approval_about_to_be_spent` again, at the backoff, so don't count those lines as
+taps when reading for a replay.
+
+**Taking a line out of the log reopens replay for that nonce, so only archive when you accept
+that.** The agent doesn't read an archive, and the controller that delivered every approval
+has seen them all, so assume a compromised one still holds each of them. What still bounds it:
+an approval only works while the digest it names as running is the one on record, so it can
+only ever take the deployment from that same running digest to the one signed release it names.
+Older lines are less likely to name a digest that is running, which is why they are the ones to
+move, but that is a likelihood and no more: a rollback to a long-lived digest, A to B and back
+to A, can reopen an old approval that named A. Removing the whole file forgets every approval
+this way. The agent reads the file afresh for each approval, so none of this needs a restart.
+
 ### A release that rolled back isn't retried
 
 **A release that rolled back on this host isn't retried automatically; a newer release
-is.** Retrying the same one is a manual action, which comes with the approval ceremony.
-Both ends know. The controller records `rule_decision` `refused` with `it already rolled
+is.** Retrying the same one takes [an approval](#an-approval-is-verified-on-the-host), even
+when its rule would otherwise make it automatic, and a deploy of it that succeeds takes it
+off the record. Both ends know. The controller records `rule_decision` `refused` with `it already rolled
 back on its host`, and doesn't queue it again. The host goes by its own record,
 `<deployment>/failed-releases.json`, the tag and digest of the newest 1,024 releases that
 failed here, written before the report is sent; and after that by the engine's reports
-under `<deployment>/reports/`, in case a `recover` the daemon didn't see ended one. The
-record is what counts, so removing old reports doesn't forget a failure.
+under `<deployment>/reports/`, in case a `recover` the daemon didn't see ended one, unless
+a report says the release has deployed since. The record is what counts, so removing old
+reports doesn't forget a failure.
 
 **Evidence that can't be read holds up the deploy.** If the record or any of the engine's
 reports can't be read, it could be about the release at hand, or the next one, so no
-automatic deploy of that deployment goes ahead: each is deferred. The journal says
+deploy of that deployment goes ahead, with an approval or without: each is deferred, and an
+approval isn't spent. The journal says
 `failure_evidence_unreadable` at priority 3, naming the file. Read or restore the file if
 you can; removing it clears this, and forgets any failure it recorded, so a release that
 failed can then deploy again.

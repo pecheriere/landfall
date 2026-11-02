@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use landfall_core::config::{self, ConfigError};
+use landfall_core::config::{Config, ConfigError};
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::release::Platform;
 use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
@@ -128,6 +128,17 @@ pub const EXIT_REFUSED: u8 = 1;
 /// Exit status when the release could not be verified.
 pub const EXIT_UNVERIFIED: u8 = 2;
 
+fn load_config(path: &Path) -> Result<Config, VerifyError> {
+    let bytes = std::fs::read(path).map_err(|source| VerifyError::ReadConfig {
+        path: path.to_owned(),
+        source,
+    })?;
+    landfall_approval::parse_config(&bytes).map_err(|source| VerifyError::Config {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })
+}
+
 /// Runs `landfall verify`. A non-empty `GITHUB_TOKEN` in the environment is
 /// sent to the GitHub API (never to the registry) for its higher rate limit.
 ///
@@ -140,14 +151,7 @@ pub async fn run(args: VerifyArgs) -> Result<ReleaseOrigin, VerifyError> {
         Some(platform) => platform,
         None => host_platform(std::env::consts::OS, std::env::consts::ARCH)?,
     };
-    let bytes = std::fs::read(&args.config).map_err(|source| VerifyError::ReadConfig {
-        path: args.config.clone(),
-        source,
-    })?;
-    let config = config::parse(&bytes).map_err(|source| VerifyError::Config {
-        path: args.config.clone(),
-        source: Box::new(source),
-    })?;
+    let config = load_config(&args.config)?;
 
     let cache_dir = if let Some(dir) = args.cache_dir {
         dir
@@ -244,8 +248,28 @@ mod tests {
     use landfall_origin::trust::TrustError;
 
     use super::{
-        EXIT_REFUSED, EXIT_UNVERIFIED, VerifyError, default_cache_dir, github_token, host_platform,
+        ConfigError, EXIT_REFUSED, EXIT_UNVERIFIED, VerifyError, default_cache_dir, github_token,
+        host_platform, load_config,
     };
+
+    #[test]
+    fn a_key_the_verifier_would_refuse_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.toml");
+        std::fs::write(
+            &path,
+            "[approvers]\noperator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }\n",
+        )
+        .unwrap();
+        let err = load_config(&path).unwrap_err();
+        let VerifyError::Config { source, .. } = err else {
+            panic!("{err}");
+        };
+        assert!(
+            matches!(&*source, ConfigError::InvalidApprover { approver, .. } if approver.to_string() == "operator"),
+            "{source}"
+        );
+    }
 
     fn release(source: ReleaseError) -> VerifyError {
         VerifyError::Release {

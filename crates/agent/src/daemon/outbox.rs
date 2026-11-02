@@ -238,8 +238,13 @@ pub(super) enum FailureEvidence {
 
 /// Goes by the daemon's own record first, which holds what the outcome said
 /// whatever became of the report, and by the engine's reports second, which also
-/// know of a `recover` the daemon didn't see. A controller has no say in either. A
-/// report that can't be read could be of this very release.
+/// know of a `recover` the daemon didn't see. Of those, a failure counts unless the
+/// release has deployed since, as an approved retry does. Their times are all there is to
+/// go by, and a tie leaves the failure standing. A clock gone back between a success and a
+/// later failure makes the failure look older, so these reports say the release is clean.
+/// The record still says otherwise: it takes that clock and a lost `failed-releases.json`
+/// together for the failure to be forgotten, and a controller can cause neither. A report
+/// that can't be read could be of this very release.
 pub(super) fn failure_evidence(
     state: &DeploymentState,
     tag: &ReleaseTag,
@@ -270,13 +275,17 @@ pub(super) fn failure_evidence(
         }
     };
     let mut unreadable = FailureEvidence::None;
+    let (mut failed_at, mut deployed_at) = (None, None);
     for name in names {
         match state.report::<DeployReport>(&name) {
-            Ok(report) => {
-                if report.tag == *tag && report.digest == *digest && is_failure(&report.outcome) {
-                    return FailureEvidence::Failed;
+            Ok(report) if report.tag == *tag && report.digest == *digest => {
+                if is_failure(&report.outcome) {
+                    failed_at = failed_at.max(Some(report.started_at));
+                } else if report.outcome == Outcome::Deployed {
+                    deployed_at = deployed_at.max(Some(report.started_at));
                 }
             }
+            Ok(_) => {}
             Err(error) => {
                 unreadable = FailureEvidence::Unreadable {
                     file: state.report_path(&name),
@@ -284,6 +293,9 @@ pub(super) fn failure_evidence(
                 };
             }
         }
+    }
+    if failed_at.is_some() && failed_at >= deployed_at {
+        return FailureEvidence::Failed;
     }
     unreadable
 }
@@ -342,6 +354,15 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<bool, 
         "never started; the controller delivers it again"
     };
     if let Some(body) = &body {
+        if matches!(body.outcome, ReportedOutcome::Deployed {}) {
+            let release = FailedRelease {
+                tag: claim.tag.clone(),
+                digest: claim.digest.clone(),
+            };
+            if let Err(error) = state.remove_failed_release(&release) {
+                journal_not_forgotten(id, error.to_string());
+            }
+        }
         root.finished_put(&FinishedDeploy {
             deployment: id.clone(),
             tag: claim.tag.clone(),
@@ -472,6 +493,39 @@ pub(super) async fn remember_failure(state_dir: &Path, id: &DeploymentId, releas
                 error,
             },
         );
+    }
+}
+
+fn journal_not_forgotten(id: &DeploymentId, error: String) {
+    #[derive(Serialize)]
+    struct NotForgotten<'a> {
+        event: &'static str,
+        deployment: &'a DeploymentId,
+        error: String,
+    }
+    journal::emit(
+        Priority::Error,
+        &NotForgotten {
+            event: "failed_release_not_forgotten",
+            deployment: id,
+            error,
+        },
+    );
+}
+
+/// A release on the record of failures has deployed, on an approved retry, so it comes
+/// off it. If that can't be written, the worst of it is that the record goes on saying
+/// the release failed here, which takes another approval to get past.
+pub(super) async fn forget_failure(state_dir: &Path, id: &DeploymentId, release: FailedRelease) {
+    let (dir, owned) = (state_dir.to_owned(), id.clone());
+    let removed = on_thread("forget failure", move || {
+        StateDir::open(&dir)?
+            .deployment(&owned)?
+            .remove_failed_release(&release)
+    })
+    .await;
+    if let Err(error) = removed {
+        journal_not_forgotten(id, error);
     }
 }
 

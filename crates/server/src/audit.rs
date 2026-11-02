@@ -77,6 +77,45 @@ pub enum EventKind {
     /// A signed report was refused: for a deploy that is not the signer's, or
     /// one never handed out.
     ReportRefused,
+    /// An API token was made for a principal.
+    TokenCreated,
+    /// An API token was revoked.
+    TokenRevoked,
+    /// A one-time link to register a passkey was issued.
+    PasskeyInviteIssued,
+    /// Someone who proved who they are was refused before any particular action.
+    AccessRefused,
+    /// A principal asked for a deploy, and the intent for it was made.
+    DeployRequested,
+    /// A principal's request for a deploy was refused.
+    RequestRefused,
+    /// A verified assertion approved a request, and its deploy was queued.
+    RequestApproved,
+    /// A principal's approval was refused.
+    ApprovalRefused,
+    /// A request can't be approved any more: what it was made from changed.
+    RequestStale,
+    /// A request waited too long for an approver.
+    RequestExpired,
+    /// A request was cancelled, by someone or by a rollback taking its place.
+    RequestCancelled,
+    /// A principal's cancelling of a request was refused.
+    CancelRefused,
+    /// A principal came back within its budget: this many calls were refused without a row.
+    AccessThrottled,
+    /// A passkey was registered with an invite's code.
+    PasskeyRegistered,
+    /// Registering with a good code failed, this many times since the last such row.
+    RegistrationRefused,
+    /// A person signed in, and a session began.
+    SignedIn,
+    /// Signing in as a principal failed, this many times since the last such row.
+    SignInRefused,
+    /// A signature verified by a key that may not sign in, this many times since the last such
+    /// row: someone holds a key registered for this principal. Treat it as an alert.
+    SignInBarredKey,
+    /// A person signed out, and their session ended.
+    SignedOut,
 }
 
 impl EventKind {
@@ -99,6 +138,25 @@ impl EventKind {
             Self::RunningInconsistent => "running_inconsistent",
             Self::EnrolRefused => "enrol_refused",
             Self::ReportRefused => "report_refused",
+            Self::TokenCreated => "token_created",
+            Self::TokenRevoked => "token_revoked",
+            Self::PasskeyInviteIssued => "passkey_invite_issued",
+            Self::AccessRefused => "access_refused",
+            Self::DeployRequested => "deploy_requested",
+            Self::RequestRefused => "request_refused",
+            Self::RequestApproved => "request_approved",
+            Self::ApprovalRefused => "approval_refused",
+            Self::RequestStale => "request_stale",
+            Self::RequestExpired => "request_expired",
+            Self::RequestCancelled => "request_cancelled",
+            Self::CancelRefused => "cancel_refused",
+            Self::AccessThrottled => "access_throttled",
+            Self::PasskeyRegistered => "passkey_registered",
+            Self::RegistrationRefused => "registration_refused",
+            Self::SignedIn => "signed_in",
+            Self::SignInRefused => "sign_in_refused",
+            Self::SignInBarredKey => "sign_in_barred_key",
+            Self::SignedOut => "signed_out",
         }
     }
 }

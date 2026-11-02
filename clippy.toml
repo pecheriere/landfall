@@ -3,3 +3,8 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 # Product names written as words in docs; ".." keeps clippy's default list.
 doc-valid-idents = ["OpenPGP", ".."]
+# It takes the check on approver keys as an argument, so a caller could pass one that
+# accepts anything. One function supplies the real check, and everything else calls it.
+disallowed-methods = [
+    { path = "landfall_core::config::parse", reason = "load a configuration with landfall_approval::parse_config, which supplies the verifier's key check" },
+]

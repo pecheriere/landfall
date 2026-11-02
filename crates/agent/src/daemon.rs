@@ -4,7 +4,8 @@
 //! host goes by its own configuration and its own records: the
 //! deployment must be this host's, with no unfinished deploy and no drift; the
 //! deployment's rule must make the move from what
-//! [`Deployed`](crate::state::Deployed) says to the tag `Auto`; and the release
+//! [`Deployed`](crate::state::Deployed) says to the tag `Auto`, or an approval this host
+//! verifies for itself must come with it (see `daemon/approval.rs`); and the release
 //! must verify, with this host's trust root, to the digest and commit asked for.
 //! Anything else is journalled and reported, and nothing runs: as refused when that
 //! is final, and as deferred when its cause may pass.
@@ -23,7 +24,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use landfall_core::config::{self, Config, ConfigError, Deployment};
+use landfall_core::config::{Config, ConfigError, Deployment};
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
     DeployId, DeployReportBody, DeployWork, HeldBack, ReportedOutcome, SigningKey,
@@ -44,6 +45,7 @@ use crate::state::{
     StateError,
 };
 
+mod approval;
 mod control;
 mod judge;
 mod outbox;
@@ -53,7 +55,7 @@ mod verifier;
 pub use control::{Backoff, Pacing, Shutdown, ShutdownTrigger};
 pub use verifier::{OriginVerifier, Verifier, VerifyFailure};
 
-use judge::{Verdict, judge};
+use judge::{Ready, Stop, judge};
 use outbox::Keep;
 use running::{Memory, work_request};
 
@@ -211,22 +213,24 @@ async fn heartbeats<D: Docker, C: Controller>(
     }
 }
 
-/// A work item the host has said yes to.
-struct Approved<'a> {
+/// A work item the host has said yes to, on its rule or on an approval.
+struct Accepted<'a> {
     work: &'a DeployWork,
     plan: &'a DeployPlan,
     deployment: &'a Deployment,
     dir: &'a Path,
+    /// The deployment's lock, when an approval was spent under it.
+    lock: Option<DeployLock>,
 }
 
 /// The claim, the engine beside its heartbeats, and the report.
-async fn deploy_approved<D: Docker, C: Controller>(
+async fn run_deploy<D: Docker, C: Controller>(
     docker: &D,
     controller: &C,
     config: &Config,
     state_dir: &Path,
     options: &DaemonOptions,
-    approved: Approved<'_>,
+    accepted: Accepted<'_>,
 ) -> StepOutcome {
     #[derive(Serialize)]
     struct LeftBlocked<'a> {
@@ -235,12 +239,13 @@ async fn deploy_approved<D: Docker, C: Controller>(
         deploy_id: DeployId,
         error: String,
     }
-    let Approved {
+    let Accepted {
         work,
         plan,
         deployment,
         dir,
-    } = approved;
+        lock,
+    } = accepted;
     let id = deployment.id();
     let (root, owned, deploy_id, tag, digest) = (
         state_dir.to_owned(),
@@ -264,20 +269,24 @@ async fn deploy_approved<D: Docker, C: Controller>(
         Ok(state) => state,
         Err(error) => return StepOutcome::Failed { error },
     };
+    #[cfg(test)]
+    tests::at_engine_start();
     let result = tokio::select! {
         biased;
-        result = Box::pin(deploy::run(docker, &state, deployment, dir, plan, &options.engine)) => result,
+        result = Box::pin(deploy::run_holding(docker, &state, deployment, dir, plan, &options.engine, lock)) => result,
         never = heartbeats(docker, controller, config, state_dir, options, id) => match never {},
     };
     options.memory.forget_drift(id);
     let body = match result {
         Ok(report) => {
+            let release = FailedRelease {
+                tag: report.tag.clone(),
+                digest: report.digest.clone(),
+            };
             if outbox::is_failure(&report.outcome) {
-                let release = FailedRelease {
-                    tag: report.tag.clone(),
-                    digest: report.digest.clone(),
-                };
                 outbox::remember_failure(state_dir, id, release).await;
+            } else if report.outcome == deploy::Outcome::Deployed {
+                outbox::forget_failure(state_dir, id, release).await;
             }
             outbox::reported(work.deploy_id, &report)
         }
@@ -547,34 +556,41 @@ pub async fn step<D: Docker, C: Controller, V: Verifier>(
     if let Some(outcome) = answer_finished(controller, state_dir, &work).await {
         return outcome;
     }
-    match judge(docker, verifier, config, state_dir, options, &work).await {
-        // Verification can take a while, and a stop can have come meanwhile.
-        Verdict::Go { .. } if options.shutdown.requested() => StepOutcome::ShuttingDown,
-        Verdict::Go {
+    let verdict = match judge(docker, verifier, config, state_dir, options, &work).await {
+        // Verification can take a while, and a stop can have come meanwhile. It comes
+        // before an approval is spent: once it is, the deploy runs.
+        Ok(_) if options.shutdown.requested() => return StepOutcome::ShuttingDown,
+        Ok(go) => approval::commit(go, state_dir, &work).await,
+        Err(stop) => Err(stop),
+    };
+    match verdict {
+        Ok(Ready {
             plan,
             deployment,
             dir,
-        } => {
-            let approved = Approved {
+            lock,
+        }) => {
+            let accepted = Accepted {
                 work: &work,
                 plan: &plan,
                 deployment,
                 dir,
+                lock,
             };
-            Box::pin(deploy_approved(
-                docker, controller, config, state_dir, options, approved,
+            Box::pin(run_deploy(
+                docker, controller, config, state_dir, options, accepted,
             ))
             .await
         }
-        Verdict::Wait { reason } => StepOutcome::Waiting {
+        Err(Stop::Wait { reason }) => StepOutcome::Waiting {
             deploy_id: work.deploy_id,
             reason,
         },
-        Verdict::Refuse { priority, reason } => {
+        Err(Stop::Refuse { priority, reason }) => {
             let said = (priority, reason.as_str());
             answer_work(controller, state_dir, &work, Answer::Refused, said).await
         }
-        Verdict::Defer { priority, reason } => {
+        Err(Stop::Defer { priority, reason }) => {
             let said = (priority, reason.as_str());
             answer_work(controller, state_dir, &work, Answer::Deferred, said).await
         }
@@ -715,7 +731,7 @@ fn start_up(config_path: &Path, host: &HostId, state_dir: &Path) -> Result<Start
         path: config_path.to_owned(),
         source,
     })?;
-    let config = config::parse(&bytes).map_err(|source| DaemonError::Config {
+    let config = landfall_approval::parse_config(&bytes).map_err(|source| DaemonError::Config {
         path: config_path.to_owned(),
         source,
     })?;
@@ -725,6 +741,7 @@ fn start_up(config_path: &Path, host: &HostId, state_dir: &Path) -> Result<Start
     }
     let state = StateDir::open(state_dir)?;
     let lock = state.lock_daemon()?;
+    approval::journal_nonce_log(&state);
     let key = enrol::load_key(&state)?;
     Ok(Started {
         config,

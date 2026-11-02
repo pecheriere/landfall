@@ -1,0 +1,29 @@
+[package]
+name = "landfall-approval"
+description = "WebAuthn assertion verification for landfall: the check a host makes before an approved deploy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# The software authenticator. For tests only: a dev-dependency may enable this,
+# a normal dependency never.
+test-support = []
+
+[dependencies]
+aws-lc-rs.workspace = true
+base64.workspace = true
+# Only to validate an Ed25519 public key when it is parsed, which aws-lc-rs does
+# not do. Signatures are verified by aws-lc-rs.
+ed25519-dalek.workspace = true
+landfall-core.workspace = true
+minicbor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

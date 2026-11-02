@@ -2,11 +2,12 @@
 
 use std::fs::{self, DirBuilder, File};
 use std::io::Write as _;
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser as _;
@@ -17,7 +18,8 @@ use landfall_agent::daemon;
 use landfall_agent::deploy::{self, DeployPlan, EngineOptions, Outcome};
 use landfall_agent::docker::{Docker, DockerCli};
 use landfall_agent::state::{DeploymentState, StateDir};
-use landfall_core::config::{Config, parse};
+use landfall_approval::parse_config;
+use landfall_core::config::Config;
 use rustix::process::{Pid, Signal, kill_process};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -232,6 +234,12 @@ pub struct FleetOptions {
     pub checks: String,
     /// The compose directory, if not one of the fleet's own.
     pub compose: Option<PathBuf>,
+    /// The deployment's rule, as configuration.
+    pub rule: String,
+    /// The line of `operator`, the one approver, under `[approvers]`.
+    pub approver: String,
+    /// More of the file, after the deployment: its grants.
+    pub grants: String,
 }
 
 impl Default for FleetOptions {
@@ -242,6 +250,9 @@ impl Default for FleetOptions {
             origin: "origin = { workflow = \".github/workflows/release.yml\", tags = \"v*\", signed_tags = false }".to_owned(),
             checks: CHECK_COMMAND.to_owned(),
             compose: None,
+            rule: "rule = { auto = \"patch\", approvers = [\"operator\"] }".to_owned(),
+            approver: "operator = { credential_id = \"Y3JlZGVudGlhbA\", public_key = \"pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea\" }".to_owned(),
+            grants: String::new(),
         }
     }
 }
@@ -258,7 +269,9 @@ pub struct Fleet {
     pub state_dir: PathBuf,
     root: PathBuf,
     repo: String,
-    port: u16,
+    /// The controller's port: 0 until it has first started and said which it got, and the same
+    /// from then on, as an agent keeps its URL while a controller goes away and comes back.
+    port: AtomicU16,
 }
 
 impl Fleet {
@@ -285,11 +298,15 @@ impl Fleet {
             compose
         });
         let text = format!(
-            "[approvers]\noperator = {{ credential_id = \"Y3JlZGVudGlhbA\", public_key = \"cHVibGljLWtleQ\" }}\n\
+            "[approval]\nrp_id = \"landfall.example\"\norigin = \"https://landfall.example\"\n\
+             [approvers]\n{approver}\n\
              [[deployment]]\nid = \"{DEPLOYMENT}\"\n\
              repo = {{ name = \"{repo}\", id = {repo_id}, owner_id = {owner_id} }}\n\
              host = \"{HOST}\"\ncompose = {{ dir = {compose:?}, service = \"app\" }}\n\
-             {origin}\nrule = {{ auto = \"patch\", approvers = [\"operator\"] }}\n{checks}\n",
+             {origin}\n{rule}\n{checks}\n{grants}",
+            approver = options.approver,
+            rule = options.rule,
+            grants = options.grants,
             repo = options.repo,
             repo_id = options.repo_ids.0,
             owner_id = options.repo_ids.1,
@@ -299,12 +316,7 @@ impl Fleet {
         );
         let config_path = root.join("fleet.toml");
         fs::write(&config_path, &text).unwrap();
-        let config = parse(text.as_bytes()).unwrap();
-        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let config = parse_config(text.as_bytes()).unwrap();
         Self {
             world,
             db: root.join("controller.db"),
@@ -314,13 +326,20 @@ impl Fleet {
             state_dir,
             root,
             repo: options.repo,
-            port,
+            port: AtomicU16::new(0),
             _dir: dir,
         }
     }
 
+    /// The controller's port, once it has started.
+    pub fn port(&self) -> u16 {
+        let port = self.port.load(Ordering::SeqCst);
+        assert_ne!(port, 0, "the controller has not started yet");
+        port
+    }
+
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("http://127.0.0.1:{}", self.port())
     }
 
     fn log_of(&self, name: &str) -> PathBuf {
@@ -372,7 +391,7 @@ impl Fleet {
             "--db",
             self.db.to_str().unwrap(),
             "--listen",
-            &format!("127.0.0.1:{}", self.port),
+            &format!("127.0.0.1:{}", self.port.load(Ordering::SeqCst)),
         ]
         .map(str::to_owned)
         .to_vec()
@@ -381,24 +400,76 @@ impl Fleet {
     /// Starts the controller, with its watcher reading the world, and waits for it
     /// to answer.
     pub async fn controller(&self) -> Process {
-        let command = self.child(Role::ServerWatching, self.serve_args());
-        let mut process = self.spawn("controller", command);
-        self.wait_for_health(&mut process).await;
-        process
+        self.start_controller(Role::ServerWatching, &[]).await
     }
 
     /// Starts the controller as its binary would: `extra` are more arguments.
     pub async fn real_controller(&self, extra: &[&str]) -> Process {
-        let mut args = self.serve_args();
-        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-        let mut process = self.spawn("controller", self.child(Role::ServerCli, args));
-        self.wait_for_health(&mut process).await;
-        process
+        self.start_controller(Role::ServerCli, extra).await
+    }
+
+    /// Starts a controller, on the port it has, or the first time on whichever the system gives
+    /// it, so that no other process can be handed that port between choosing it and binding it.
+    /// Coming back to its port, something else can have it for a moment, such as another test's
+    /// outgoing connection, so that is tried again.
+    async fn start_controller(&self, role: Role, extra: &[&str]) -> Process {
+        let started = Instant::now();
+        loop {
+            let mut args = self.serve_args();
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            let log_so_far = fs::metadata(self.log_of("controller")).map_or(0, |log| log.len());
+            let mut process = self.spawn("controller", self.child(role, args));
+            match self.wait_for_listening(&mut process, log_so_far).await {
+                Some(address) => {
+                    self.port.store(address.port(), Ordering::SeqCst);
+                    self.wait_for_health(&mut process).await;
+                    return process;
+                }
+                None => assert!(
+                    started.elapsed() < PATIENCE,
+                    "its port stayed taken:\n{}",
+                    self.log("controller")
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Waits for what this process, whose log starts at `from`, says it listens on. `None` if it
+    /// ended because the port it was to go back to is taken.
+    async fn wait_for_listening(&self, process: &mut Process, from: u64) -> Option<SocketAddr> {
+        const SAYS: &str = "landfall-server: listening on ";
+        let started = Instant::now();
+        loop {
+            // Whether it had ended is looked at first, so that all it said is read after.
+            let ended = !process.running();
+            let log = fs::read(self.log_of("controller")).unwrap_or_default();
+            let said = usize::try_from(from).ok().and_then(|from| log.get(from..));
+            let said = String::from_utf8_lossy(said.unwrap_or_default());
+            if let Some(line) = said.lines().find_map(|line| line.strip_prefix(SAYS)) {
+                return Some(line.parse().unwrap());
+            }
+            if ended {
+                let kept = self.port.load(Ordering::SeqCst) != 0;
+                assert!(
+                    kept && said.contains("Address already in use"),
+                    "the controller ended:\n{}",
+                    self.log("controller")
+                );
+                return None;
+            }
+            assert!(
+                started.elapsed() < PATIENCE,
+                "the controller never listened:\n{}",
+                self.log("controller")
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn wait_for_health(&self, process: &mut Process) {
         let started = Instant::now();
-        while !healthy(self.port).await {
+        while !healthy(self.port()).await {
             assert!(
                 process.running(),
                 "the controller ended:\n{}",
@@ -545,7 +616,8 @@ impl Fleet {
         self.seed_on(&SimDocker(self.world.clone()), &release).await;
     }
 
-    async fn connection(&self) -> SqliteConnection {
+    /// A connection that only reads.
+    pub async fn connection(&self) -> SqliteConnection {
         let options = SqliteConnectOptions::new()
             .filename(&self.db)
             .read_only(true);

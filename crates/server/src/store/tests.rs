@@ -1,3 +1,4 @@
+mod approvals_migration;
 mod read_only;
 
 use std::fs::{self, Permissions};
@@ -468,23 +469,28 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
     assert_eq!(
         names,
         [
+            "api_tokens",
             "audit_events",
+            "deploy_requests",
             "deploy_steps",
             "deploys",
             "enrol_codes",
             "hosts",
             "nonces",
+            "passkey_invites",
+            "passkeys",
             "release_holds",
             "releases",
             "replaced_releases",
-            "running_states"
+            "running_states",
+            "sessions"
         ]
     );
     let applied: i64 = sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations")
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(applied, 2);
+    assert_eq!(applied, 4);
     assert_eq!(chain(&store).await, (2, None));
 }
 

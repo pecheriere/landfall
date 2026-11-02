@@ -3,17 +3,21 @@
 
 pub mod agent_api;
 pub mod audit;
+pub mod auth;
 pub mod cli;
 pub mod report;
+mod requests;
 pub mod serve;
 pub mod store;
 pub mod watcher;
+mod web;
 
 use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::routing::get;
 
 /// Release origin verification, which the controller runs before it decides
@@ -35,19 +39,22 @@ async fn healthz(State(store): State<Store>) -> StatusCode {
     }
 }
 
-/// The controller's HTTP routes.
+/// The controller's HTTP routes, with the same security headers on every answer.
 pub fn router(state: ApiState) -> Router {
     let health = Router::new()
         .route("/healthz", get(healthz))
         .with_state(state.store().clone());
-    health.merge(agent_api::router(state))
+    health
+        .merge(agent_api::router(state.clone()))
+        .merge(requests::router(state.clone()))
+        .merge(web::router(state))
+        .layer(middleware::map_response(web::security_headers))
 }
 
 #[cfg(test)]
 mod tests {
     use axum::body::Body;
     use axum::http::Request;
-    use landfall_core::config;
     use tower::ServiceExt as _;
 
     use super::{ApiState, Router, StatusCode, Store, router};
@@ -55,11 +62,11 @@ mod tests {
 
     const CONFIG: &str = r#"
 [approvers]
-operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYINdamAGCsQq31Uv-08lkBzoO4XLz2qYjJa8CGmj3B1Ea" }
 "#;
 
     fn app(store: Store) -> Router {
-        let config = config::parse(CONFIG.as_bytes()).unwrap();
+        let config = landfall_approval::parse_config(CONFIG.as_bytes()).unwrap();
         router(ApiState::new(store, config, Limits::default()))
     }
 

@@ -7,11 +7,13 @@
 
 use std::collections::HashMap;
 
+use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::DeployId;
 use landfall_core::text::quoted;
 use serde_json::{Value, json};
 use sqlx::Row as _;
+use sqlx::sqlite::SqliteRow;
 
 use super::deploys::{NewDeploy, observed_secs, parsed};
 use super::{Store, StoreError};
@@ -107,6 +109,12 @@ impl StoredRelease {
     pub fn has_inputs(&self, tag_object: &str, config_hash: &str) -> bool {
         self.tag_object.as_deref() == Some(tag_object)
             && self.config_hash.as_deref() == Some(config_hash)
+    }
+
+    /// Whether it was last looked at under this configuration.
+    #[must_use]
+    pub fn verified_under(&self, config_hash: &str) -> bool {
+        self.config_hash.as_deref() == Some(config_hash)
     }
 }
 
@@ -213,23 +221,7 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
-            .map(|row| {
-                let optional = |column: &'static str| row.try_get::<Option<String>, _>(column);
-                let release = StoredRelease {
-                    commit: optional("commit_sha")?
-                        .map(|_| parsed(row, "commit_sha"))
-                        .transpose()?,
-                    digest: optional("digest")?
-                        .map(|_| parsed(row, "digest"))
-                        .transpose()?,
-                    decision: ReleaseDecision::parse(&row.try_get::<String, _>("decision")?)?,
-                    origin_refused: row.try_get("origin_refused")?,
-                    reason: row.try_get("reason")?,
-                    tag_object: optional("tag_object")?,
-                    config_hash: optional("config_hash")?,
-                };
-                Ok((row.try_get("tag")?, release))
-            })
+            .map(|row| Ok((row.try_get("tag")?, stored_release(row)?)))
             .collect()
     }
 
@@ -555,14 +547,11 @@ impl Store {
     /// up to its last report before that. A host's word is all this is: silence holds
     /// it back, does not start the time again, and does not count, and the time goes on
     /// when the host is back.
-    ///
-    /// # Errors
-    /// A clock or database failure.
-    pub async fn healthy_for(
+    async fn healthy_for(
         &self,
+        connection: &mut sqlx::SqliteConnection,
         (source, host): (&DeploymentId, &HostId),
-        tag: &ReleaseTag,
-        digest: &ImageDigest,
+        (tag, digest): (&ReleaseTag, &ImageDigest),
         seconds: u64,
     ) -> Result<bool, StoreError> {
         let wanted = i64::try_from(seconds).unwrap_or(i64::MAX);
@@ -572,7 +561,7 @@ impl Store {
         )
         .bind(source.as_ref())
         .bind(host.as_ref())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *connection)
         .await?;
         if let Some(row) = row {
             let current = row.try_get::<Option<String>, _>("tag")?.as_deref() == Some(tag.as_ref())
@@ -599,14 +588,98 @@ impl Store {
         .bind(host.as_ref())
         .bind(tag.as_ref())
         .bind(digest.as_ref())
-        .fetch_optional(&self.pool)
+        .fetch_optional(connection)
         .await?;
         Ok(observed.is_some_and(|secs| secs >= wanted))
     }
+
+    /// The deployment the promotion of `tag` to `target` still waits for, if any: every
+    /// deployment that promotes to it must have had it healthy for long enough. Enforced by
+    /// the controller only.
+    ///
+    /// # Errors
+    /// A clock or database failure.
+    pub async fn promotion_waits_for<'a>(
+        &self,
+        config: &'a Config,
+        target: &DeploymentId,
+        release: (&ReleaseTag, &ImageDigest),
+    ) -> Result<Option<&'a DeploymentId>, StoreError> {
+        let mut connection = self.pool.acquire().await?;
+        self.promotion_waits_for_on(&mut connection, config, target, release)
+            .await
+    }
+
+    /// [`promotion_waits_for`](Self::promotion_waits_for), on `connection`, which can be a
+    /// transaction's, so that it holds until that commits.
+    ///
+    /// # Errors
+    /// A clock or database failure.
+    pub async fn promotion_waits_for_on<'a>(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        config: &'a Config,
+        target: &DeploymentId,
+        release: (&ReleaseTag, &ImageDigest),
+    ) -> Result<Option<&'a DeploymentId>, StoreError> {
+        for source in config.deployments() {
+            let Some(promotion) = source.promote_to() else {
+                continue;
+            };
+            if promotion.deployment() == target
+                && !self
+                    .healthy_for(
+                        connection,
+                        (source.id(), source.host()),
+                        release,
+                        promotion.healthy_for_secs(),
+                    )
+                    .await?
+            {
+                return Ok(Some(source.id()));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn stored_release(row: &SqliteRow) -> Result<StoredRelease, StoreError> {
+    let optional = |column: &'static str| row.try_get::<Option<String>, _>(column);
+    Ok(StoredRelease {
+        commit: optional("commit_sha")?
+            .map(|_| parsed(row, "commit_sha"))
+            .transpose()?,
+        digest: optional("digest")?
+            .map(|_| parsed(row, "digest"))
+            .transpose()?,
+        decision: ReleaseDecision::parse(&row.try_get::<String, _>("decision")?)?,
+        origin_refused: row.try_get("origin_refused")?,
+        reason: row.try_get("reason")?,
+        tag_object: optional("tag_object")?,
+        config_hash: optional("config_hash")?,
+    })
+}
+
+/// What is recorded of this release.
+pub(super) async fn release_of(
+    connection: &mut sqlx::SqliteConnection,
+    deployment: &DeploymentId,
+    tag: &ReleaseTag,
+) -> Result<Option<StoredRelease>, StoreError> {
+    let row = sqlx::query(
+        "SELECT tag, commit_sha, digest, decision, reason, tag_object, config_hash,
+                origin_refused
+         FROM releases WHERE deployment = ? AND tag = ?",
+    )
+    .bind(deployment.as_ref())
+    .bind(tag.as_ref())
+    .fetch_optional(connection)
+    .await?;
+    row.as_ref().map(stored_release).transpose()
 }
 
 /// What `host` last said about `deployment`, if it is that host's now.
-async fn running_of(
+pub(super) async fn running_of(
     connection: &mut sqlx::SqliteConnection,
     deployment: &DeploymentId,
     host: &HostId,

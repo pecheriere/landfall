@@ -58,6 +58,7 @@ pub(super) fn work_response() -> WorkResponse {
             tag: "v1.2.5".parse().unwrap(),
             digest: format!("sha256:{}", "c".repeat(64)).parse().unwrap(),
             commit: "a".repeat(40).parse().unwrap(),
+            approval: None,
         }),
         held_back: vec![HeldBack {
             deployment: "app/stage".parse().unwrap(),

@@ -6,6 +6,7 @@ use landfall_core::protocol::{DeployId, DeployReportBody};
 use super::{Deployed, DeploymentState, StateDir, StateError};
 
 mod ledger;
+mod nonces;
 mod outbox;
 mod records;
 

@@ -1,8 +1,9 @@
 //! Parsing and validating a fleet configuration.
 
-use super::{Config, ConfigError, parse};
+use super::{Config, ConfigError, parse_for_tests};
 use crate::ids::DeploymentId;
 
+mod approval;
 mod checks;
 mod parsing;
 mod promotion;
@@ -12,6 +13,10 @@ mod validation;
 const EXAMPLE: &str = r#"
 [signers]
 maintainer = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKM1hoe1SDmmzbmxw5ZYTs7Vl0gw0s+eR1YJtTVyV9sn"
+
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
 
 [approvers]
 operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "cHVibGljLWtleQ" }
@@ -47,7 +52,7 @@ fn id(s: &str) -> DeploymentId {
 }
 
 fn parse_str(text: &str) -> Result<Config, ConfigError> {
-    parse(text.as_bytes())
+    parse_for_tests(text.as_bytes(), |_| Ok(()))
 }
 
 fn edited(from: &str, to: &str) -> String {
