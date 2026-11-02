@@ -638,7 +638,7 @@ of a release that failed here each run only on a person's approval. The controll
 it and can't make one. The host checks all of this itself, and an approval that fails any of
 it is `refused` at priority 2, with the reason in full in the host's journal, up to 255
 characters of whatever origin or type the assertion claimed. **Read it there:** the report
-carries 4,096 characters of it, the controller keeps 1,024 on the deploy and 256 in the
+carries 4,096 characters of it, and the controller keeps 1,024 on the deploy and in the
 `deploy_refused` audit row, escaped.
 
 - Its deployment, tag, commit and digest are those of the work, and the commit and digest

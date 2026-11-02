@@ -10,8 +10,9 @@
 //! The audit row holds the short form of each text, [`shown`], and the tables the
 //! long one, up to [`MAX_STORED_TEXT_CHARS`], since a failure's cause is often
 //! past its first 64 characters. A host's refusal keeps [`REFUSAL_SHOWN_CHARS`] in the
-//! audit row too: only one of a report's reasons, so it adds under 3 KiB to the bound
-//! that [`MAX_STORED_STEPS`] gives.
+//! audit row too: only one of a report's reasons, so it adds under 12 KiB to the bound
+//! that [`MAX_STORED_STEPS`] gives, which stays under
+//! [`MAX_DETAIL_BYTES`](crate::audit::MAX_DETAIL_BYTES).
 
 use landfall_core::ids::{DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{
@@ -36,10 +37,11 @@ pub const MAX_STORED_TEXT_CHARS: usize = 1024;
 /// The most post-deploy checks stored for one deploy, across its steps.
 pub const MAX_STORED_CHECKS: usize = 128;
 
-/// The most characters of a host's refusal in the audit row. A refusal is the signal of a
-/// controller lying, and the origin, digest or nonce that tells two of them apart comes
-/// past [`shown`]'s first 64.
-pub const REFUSAL_SHOWN_CHARS: usize = 256;
+/// The most characters of an approval refusal's reason in an audit row, the same as the
+/// tables keep. A refusal is the signal of a controller lying, and the verifier's own words,
+/// the configured origin and up to 255 characters of the claimed one all come before what
+/// tells two of them apart.
+pub const REFUSAL_SHOWN_CHARS: usize = MAX_STORED_TEXT_CHARS;
 
 /// One step, ready to store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +301,14 @@ mod tests {
         // It is the size the comment on MAX_STORED_STEPS says it is, so that
         // reasoning stays honest if `shown` changes.
         assert!(detail.len() < 48 * 1024, "{}", detail.len());
+
+        // A refusal keeps far more of its reason, and that fits too.
+        let long = hostile(2 * REFUSAL_SHOWN_CHARS);
+        let steps = vec![step(&text, Some(&text), None); MAX_STORED_STEPS];
+        let refused =
+            BoundedReport::new(&report(ReportedOutcome::Refused { reason: long }, steps));
+        let detail = refused.audit_detail(&"t".repeat(128)).to_string();
+        assert!(detail.len() < MAX_DETAIL_BYTES, "{}", detail.len());
     }
 
     #[test]
@@ -340,7 +350,7 @@ mod tests {
         });
         assert!(refused.contains(tail), "{refused}");
         // Escaped as any other, and bounded.
-        let hostile_reason = hostile(1000);
+        let hostile_reason = hostile(2 * REFUSAL_SHOWN_CHARS);
         let refused = audit(ReportedOutcome::Refused {
             reason: hostile_reason,
         });

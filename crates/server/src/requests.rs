@@ -59,6 +59,7 @@ use sqlx::{Sqlite, Transaction};
 use crate::agent_api::{ApiProblem, ApiState, deadline, json as json_answer, read_body};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
+use crate::report::REFUSAL_SHOWN_CHARS;
 use crate::store::{
     NewRequest, RequestSnapshot, RequestState, StoreError, StoredRequest, WatchedRunning,
 };
@@ -80,9 +81,6 @@ const _: () = assert!(
         + 1024
         <= MAX_APPROVAL_BODY_BYTES
 );
-
-/// How much of a verifier's refusal goes in the audit row.
-const REFUSAL_CHARS: usize = 256;
 
 const NO_GRANT_TO_ASK: &str = "no grant lets this principal ask for this deployment";
 const NO_GRANT_TO_APPROVE: &str =
@@ -520,7 +518,7 @@ fn check_assertion(
 ) -> Result<(), Refused> {
     let refuse = |why: String| Refused {
         problem: HumanProblem::AssertionRefused,
-        reason: quoted(&why, REFUSAL_CHARS),
+        reason: quoted(&why, REFUSAL_SHOWN_CHARS),
     };
     let Some(settings) = config.approval() else {
         return Err(Refused {

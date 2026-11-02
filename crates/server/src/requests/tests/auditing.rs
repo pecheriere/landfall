@@ -1,10 +1,14 @@
 //! Every change and every refusal someone can be held to is in the log, with no secret.
 
 use axum::http::StatusCode;
-use landfall_core::protocol::Phase;
+use landfall_approval::{Expect, verify};
+use landfall_core::intent::DeployIntent;
+use landfall_core::protocol::{DeployReportBody, Phase, ReportedOutcome};
 use serde_json::{Value, json};
 
-use super::{APPROVALS, Harness, PROD, PROD_REQUESTS};
+use super::{APPROVALS, Harness, ORIGIN, PROD, PROD_REQUESTS, RP_ID};
+use crate::report::BoundedReport;
+use crate::store::NewDeploy;
 
 /// Every row's whole text.
 async fn all_rows(h: &Harness) -> String {
@@ -154,6 +158,86 @@ async fn refusals_by_a_principal_are_audited() {
     assert_eq!(h.request_state(id).await, "awaiting_approval");
     let report = h.store.verify_audit().await.unwrap();
     assert_eq!(report.first_bad, None);
+}
+
+/// The reason of a real `verify` refusal of an assertion claiming `origin`.
+fn verify_error(h: &Harness, intent: &DeployIntent, origin: &str) -> String {
+    let mut lying = super::ceremony(intent);
+    lying.origin = origin.to_owned();
+    let assertion = h.keys.alice.assertion(&lying).unwrap();
+    let error = verify(
+        &assertion,
+        &Expect {
+            key: &h.keys.alice.key().unwrap(),
+            credential_id: h.keys.alice.credential_id(),
+            rp_id: RP_ID,
+            origin: ORIGIN,
+            challenge: &intent.challenge(),
+        },
+    )
+    .unwrap_err();
+    format!("approval refused: {error}")
+}
+
+/// A host refuses one deploy with `reason`, and this gives the audit row's reason.
+async fn deploy_refused_row(h: &Harness, tag: &str, fill: char, reason: String) -> String {
+    h.verified(PROD, super::HOST, tag, fill).await;
+    let deploy = NewDeploy {
+        deployment: PROD.parse().unwrap(),
+        host: super::HOST.parse().unwrap(),
+        tag: tag.parse().unwrap(),
+        digest: super::digest(fill),
+        commit: fill.to_string().repeat(40).parse().unwrap(),
+    };
+    let mut tx = h.store.begin().await.unwrap();
+    let id = h.store.queue_deploy(&mut tx, &deploy).await.unwrap();
+    tx.commit().await.unwrap();
+    let host = super::HOST.parse().unwrap();
+    assert!(h.store.next_work(&host).await.unwrap().work.is_some());
+    let report = BoundedReport::new(&DeployReportBody {
+        deploy_id: id,
+        deployment: deploy.deployment,
+        tag: deploy.tag,
+        digest: deploy.digest,
+        outcome: ReportedOutcome::Refused { reason },
+        steps: Vec::new(),
+    });
+    h.store.finish_deploy(&host, &report).await.unwrap();
+    let rows = h.audited("deploy_refused").await;
+    rows.last().unwrap()["reason"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn origins_differing_late_read_differently_in_both_audit_rows() {
+    let h = Harness::new().await;
+    let (id, intent) = h.opened().await;
+    // 240 characters each, differing only in the last: as much as the verifier keeps of one
+    // is 255, and its own words and the configured origin come first.
+    let origin = |last: char| format!("https://{}{last}", "a".repeat(231));
+    let (first, second) = (origin('x'), origin('y'));
+
+    let alice = h.session("alice").await;
+    let mut seen = Vec::new();
+    for claimed in [&first, &second] {
+        let mut lying = super::ceremony(&intent);
+        lying.origin.clone_from(claimed);
+        let body = super::body_of(&h.keys.alice, &lying);
+        let answer = h.post(&format!("{APPROVALS}/{id}"), &alice, &body).await;
+        assert_eq!(answer.code(), "assertion_refused");
+        let rows = h.audited("approval_refused").await;
+        seen.push(rows.last().unwrap()["reason"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(seen[0], seen[1]);
+    assert!(seen[0].contains(first.as_str()), "{}", seen[0]);
+    assert!(seen[1].contains(second.as_str()), "{}", seen[1]);
+
+    let one = verify_error(&h, &intent, &first);
+    let other = verify_error(&h, &intent, &second);
+    let one = deploy_refused_row(&h, "v1.0.1", '2', one).await;
+    let other = deploy_refused_row(&h, "v1.0.2", '3', other).await;
+    assert_ne!(one, other);
+    assert!(one.contains(first.as_str()), "{one}");
+    assert!(other.contains(second.as_str()), "{other}");
 }
 
 #[tokio::test]
