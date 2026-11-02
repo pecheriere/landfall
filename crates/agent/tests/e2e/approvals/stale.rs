@@ -69,8 +69,10 @@ async fn a_request_goes_stale_when_the_host_moves_and_asking_again_makes_a_new_i
     controller.stop().await;
 }
 
-/// The approval is on its way when the host moves, by a deploy the controller hasn't heard of:
-/// the controller delivers it, as it can't know better, and the host has the last word.
+/// The approval is on its way when the host moves in a way the controller hasn't heard of: the
+/// controller delivers it, as it can't know better, and the host has the last word. `fleet.seed`
+/// calls the engine directly, which no operator can, and stands in for such a move, as a `recover`
+/// or a restored state directory would be.
 ///
 /// This pins issue #30, that a queued approved row can't be cancelled. Fixing that may stop the
 /// delivery, and then the refusal row, the reason and its journal line go with it. What must survive
