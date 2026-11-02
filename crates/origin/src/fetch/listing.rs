@@ -14,7 +14,9 @@ use reqwest::Url;
 use reqwest::header::{HeaderMap, HeaderValue, LINK};
 use serde::Deserialize;
 
-use super::{FetchError, Fetched, Fetcher, MANIFEST_LIMIT, check_object_id, join, parse};
+use super::github::check_object_id;
+use super::http::{Fetched, join, parse};
+use super::{FetchError, Fetcher, MANIFEST_LIMIT};
 
 /// The most tags read of one list, counting every tag it names, whether it is
 /// of interest or not. Past this the list is an error and not a shorter list: a
