@@ -6,17 +6,17 @@
 
 #![cfg(test)]
 
-use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
-use std::process::{Child, Command};
-use std::sync::Arc;
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Parser as _;
-use landfall_approval::{Ceremony, SoftwareAuthenticator};
+use landfall_approval::{Assertion, Ceremony, SoftwareAuthenticator};
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::RunCandidate;
 use landfall_origin::fetch::ListedTag;
@@ -83,6 +83,7 @@ fn child_process() {
 struct Controller {
     child: Child,
     address: SocketAddr,
+    db: PathBuf,
 }
 
 impl Controller {
@@ -95,12 +96,7 @@ impl Controller {
             URL_SAFE_NO_PAD.encode(key.key().unwrap().as_bytes()),
         );
         std::fs::write(&config, text).unwrap();
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        // Port 0, and it says which it got: no other process can take a port from under it.
         let args = json!([
             "serve",
             "--config",
@@ -108,21 +104,36 @@ impl Controller {
             "--db",
             dir.join("c.db"),
             "--listen",
-            address
+            "127.0.0.1:0"
         ]);
-        let child = Command::new(std::env::current_exe().unwrap())
+        let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_process", "--ignored", "--nocapture"])
             .env(CHILD_ARGS, args.to_string())
             .env(CHILD_INTERVAL_MS, every_ms.to_string())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        // Made before the wait, so that a panic in it still kills the child.
-        let controller = Self { child, address };
-        let started = Instant::now();
-        while TcpStream::connect(address).is_err() {
-            assert!(started.elapsed() < PATIENCE, "the controller did not start");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let said = BufReader::new(child.stderr.take().unwrap());
+        // Made before the wait, so that a panic in it still kills the child. The address comes
+        // once it is listening and hears signals.
+        let mut controller = Self {
+            child,
+            address: SocketAddr::from(([127, 0, 0, 1], 0)),
+            db: dir.join("c.db"),
+        };
+        let (found, listening) = mpsc::channel();
+        // Keeps reading to the end, so that the child's writes to stderr never block.
+        std::thread::spawn(move || {
+            for line in said.lines().map_while(Result::ok) {
+                drop(writeln!(std::io::stderr(), "{line}"));
+                if let Some(address) = line.strip_prefix("landfall-server: listening on ") {
+                    let _ = found.send(address.parse::<SocketAddr>().unwrap());
+                }
+            }
+        });
+        controller.address = listening
+            .recv_timeout(PATIENCE)
+            .expect("the controller did not start");
         controller
     }
 
@@ -172,17 +183,22 @@ impl Controller {
             .unwrap()
             .assertion(&forged)
             .unwrap();
-        let encode = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
-        json!({
-            "challenge": text,
-            "assertion": {
-                "credential_id": encode(&assertion.credential_id),
-                "authenticator_data": encode(&assertion.authenticator_data),
-                "client_data_json": encode(&assertion.client_data_json),
-                "signature": encode(&assertion.signature),
-            },
-        })
+        finish_body(text, &assertion)
     }
+}
+
+/// The body of a finish.
+fn finish_body(challenge: &str, assertion: &Assertion) -> Value {
+    let encode = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+    json!({
+        "challenge": challenge,
+        "assertion": {
+            "credential_id": encode(&assertion.credential_id),
+            "authenticator_data": encode(&assertion.authenticator_data),
+            "client_data_json": encode(&assertion.client_data_json),
+            "signature": encode(&assertion.signature),
+        },
+    })
 }
 
 impl Drop for Controller {
@@ -192,24 +208,87 @@ impl Drop for Controller {
     }
 }
 
-/// The `attempts` of every `sign_in_refused` row.
-async fn attempts(db: &Path) -> Vec<i64> {
+/// The details of every audit row of this kind.
+async fn rows(db: &Path, kind: &str) -> Vec<Value> {
     let pool = SqlitePool::connect(&format!("sqlite://{}", db.display()))
         .await
         .unwrap();
     let details: Vec<String> =
-        sqlx::query_scalar("SELECT detail FROM audit_events WHERE kind = 'sign_in_refused'")
+        sqlx::query_scalar("SELECT detail FROM audit_events WHERE kind = ? ORDER BY seq")
+            .bind(kind)
             .fetch_all(&pool)
             .await
             .unwrap();
     pool.close().await;
     details
         .iter()
-        .map(|detail| {
-            let detail: Value = serde_json::from_str(detail).unwrap();
-            detail["attempts"].as_i64().unwrap()
-        })
+        .map(|detail| serde_json::from_str(detail).unwrap())
         .collect()
+}
+
+/// The `attempts` of every `sign_in_refused` row.
+async fn attempts(db: &Path) -> Vec<i64> {
+    rows(db, "sign_in_refused")
+        .await
+        .iter()
+        .map(|detail| detail["attempts"].as_i64().unwrap())
+        .collect()
+}
+
+/// A request the server has begun on, in the middle of reading its body. `Expect: 100-continue`
+/// makes the server say so at the moment its handler first asks for the body.
+fn a_request_under_way(controller: &Controller, body: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(controller.address).unwrap();
+    stream.set_read_timeout(Some(PATIENCE)).unwrap();
+    write!(
+        stream,
+        "POST /sign-in/finish HTTP/1.1\r\nHost: {RP_ID}\r\nOrigin: {ORIGIN}\r\n\
+         Connection: close\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+        body.len(),
+    )
+    .unwrap();
+    stream.flush().unwrap();
+    let mut said = Vec::new();
+    let mut byte = [0];
+    while !said.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        said.push(byte[0]);
+    }
+    assert!(said.starts_with(b"HTTP/1.1 100"), "{said:?}");
+    stream
+}
+
+/// Stops it, and waits until the upkeep task has had its last look, which is what it does with the
+/// failure counted here. From then on, only what `serve` does after draining can write anything.
+async fn stop_and_see_the_tasks_last_look(controller: &Controller, key: &SoftwareAuthenticator) {
+    controller.fail_a_sign_in(key);
+    controller.stop();
+    let db = controller.db.clone();
+    let started = Instant::now();
+    while attempts(&db).await.is_empty() {
+        assert!(started.elapsed() < PATIENCE, "the task never wrote it");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Sends the rest of a request under way, and gives the answer.
+fn finish(mut stream: TcpStream, body: &str) -> String {
+    stream.write_all(body.as_bytes()).unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    answer
+}
+
+/// The body of a finish that `key` really signed, for a new challenge.
+fn signed_finish(controller: &Controller, key: &SoftwareAuthenticator) -> Value {
+    let (status, begun) = controller.post("/sign-in/begin", &json!({}));
+    assert_eq!(status, 200, "{begun}");
+    let text = begun["publicKey"]["challenge"].as_str().unwrap();
+    let challenge = URL_SAFE_NO_PAD.decode(text).unwrap();
+    let assertion = key
+        .assertion(&Ceremony::new(RP_ID, ORIGIN, &challenge))
+        .unwrap();
+    finish_body(text, &assertion)
 }
 
 #[tokio::test]
@@ -249,29 +328,42 @@ async fn serve_writes_down_a_failure_counted_in_the_drain() {
     let key = SoftwareAuthenticator::es256().unwrap();
     let mut controller = Controller::start(dir.path(), &key, 3_600_000);
     let body = controller.forged_finish(&key).to_string();
-    let (first, rest) = body.split_at(body.len() / 2);
+    let stream = a_request_under_way(&controller, &body);
+    stop_and_see_the_tasks_last_look(&controller, &key).await;
 
-    let mut stream = TcpStream::connect(controller.address).unwrap();
-    write!(
-        stream,
-        "POST /sign-in/finish HTTP/1.1\r\nHost: {RP_ID}\r\nOrigin: {ORIGIN}\r\n\
-         Connection: close\r\nContent-Length: {}\r\n\r\n{first}",
-        body.len(),
-    )
-    .unwrap();
-    stream.flush().unwrap();
-    // Long enough for the request to be under way and, once stopped, for the task to finish.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    controller.stop();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(attempts(&dir.path().join("c.db")).await, [] as [i64; 0]);
-
-    stream.write_all(rest.as_bytes()).unwrap();
-    let mut answer = String::new();
-    stream.read_to_string(&mut answer).unwrap();
+    let answer = finish(stream, &body);
     assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
 
     let status = controller.child.wait().unwrap();
     assert!(status.success(), "{status}");
-    assert_eq!(attempts(&dir.path().join("c.db")).await, [1]);
+    // The one the task saw, and the one it couldn't have.
+    assert_eq!(attempts(&dir.path().join("c.db")).await, [1, 1]);
+}
+
+/// The same for a call over its budget. A sign-in is the one that gets that far with its body read:
+/// it spends only after the signature is checked.
+#[tokio::test]
+async fn serve_writes_down_a_call_dropped_in_the_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SoftwareAuthenticator::es256().unwrap();
+    let mut controller = Controller::start(dir.path(), &key, 3_600_000);
+    for _ in 0..10 {
+        let body = signed_finish(&controller, &key);
+        let (status, answer) = controller.post("/sign-in/finish", &body);
+        assert_eq!(status, 200, "{answer}");
+    }
+    let body = signed_finish(&controller, &key).to_string();
+    let stream = a_request_under_way(&controller, &body);
+    stop_and_see_the_tasks_last_look(&controller, &key).await;
+    assert_eq!(rows(&controller.db, "access_throttled").await.len(), 0);
+
+    let answer = finish(stream, &body);
+    assert!(answer.starts_with("HTTP/1.1 429"), "{answer}");
+
+    let status = controller.child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    let throttled = rows(&controller.db, "access_throttled").await;
+    assert_eq!(throttled.len(), 1, "{throttled:?}");
+    assert_eq!(throttled[0]["dropped"], 1);
+    assert_eq!(throttled[0]["by"]["via"], "sign_in");
 }

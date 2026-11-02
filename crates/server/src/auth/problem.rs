@@ -57,6 +57,11 @@ pub(crate) enum HumanProblem {
     SignInRefused,
     /// Too many ceremonies are under way to begin another.
     CeremoniesBusy,
+    /// A passkey that verified, for a principal with no sign-ins left for now.
+    SignInsSpent {
+        /// How long until the next one, in seconds.
+        retry_after_secs: u32,
+    },
     /// A problem both APIs have.
     Shared(ApiProblem),
 }
@@ -154,22 +159,25 @@ impl HumanProblem {
                 "approvals_not_configured",
                 "the configuration has no [approval] settings",
             ),
+            Self::OverBudget
+            | Self::InviteRefused
+            | Self::RegistrationRefused
+            | Self::SignInRefused
+            | Self::CeremoniesBusy
+            | Self::SignInsSpent { .. }
+            | Self::Shared(_) => return self.ceremony_parts(),
+        })
+    }
+
+    /// The same, for what registering and signing in refuse, and for budgets. `None` for anything
+    /// else.
+    fn ceremony_parts(self) -> Option<(StatusCode, &'static str, &'static str)> {
+        Some(match self {
             Self::OverBudget => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limited",
                 "too many state changes by this principal",
             ),
-            Self::InviteRefused
-            | Self::RegistrationRefused
-            | Self::SignInRefused
-            | Self::CeremoniesBusy
-            | Self::Shared(_) => return self.ceremony_parts(),
-        })
-    }
-
-    /// The same, for what registering and signing in refuse. `None` for anything else.
-    fn ceremony_parts(self) -> Option<(StatusCode, &'static str, &'static str)> {
-        Some(match self {
             Self::InviteRefused => (
                 StatusCode::FORBIDDEN,
                 "invite_refused",
@@ -189,6 +197,11 @@ impl HumanProblem {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ceremonies_busy",
                 "too many sign-ins are under way; try again shortly",
+            ),
+            Self::SignInsSpent { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many sign-ins for this person; try again in a few minutes",
             ),
             _ => return None,
         })
@@ -221,6 +234,11 @@ impl IntoResponse for HumanProblem {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        if let Self::SignInsSpent { retry_after_secs } = self {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
         }
         response
     }

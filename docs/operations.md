@@ -549,10 +549,18 @@ transaction a second, with rows of one to two KiB from a hostile caller and two 
 a rollback that supersedes a request. That is **some 80 to 170 MB of audit log a day for each
 credential** until it is revoked. A person's sessions come to at most sixteen times that, as a
 principal keeps sixteen, **plus 120 state changes for each sign-in spent,** since each new session
-starts with a whole budget. Sign-ins take a verified passkey, so nobody else can spend them, and a
-principal has ten at once, with one more every five minutes: some 288 a day, or about 35,000 more
-state changes, in the hands of someone holding that key. `access_throttled` and a jump in `request_refused`, `approval_refused` or `request_cancelled` rows
-are worth an alert.
+starts with a whole budget. A principal has ten sign-ins at once, with one more every five minutes:
+some 288 a day for each run of the controller, or about 35,000 more state changes, in the hands of
+someone holding that key. A restart gives the sign-ins back, as it does every budget, so each restart
+adds up to ten more. `access_throttled` and a jump in `request_refused`, `approval_refused` or
+`request_cancelled` rows are worth an alert.
+
+**Only a passkey that verifies and may sign in spends a sign-in,** so a stolen cookie, a stranger, or
+a key that is barred can't. But the budget is the principal's, so someone holding the same key can use
+it up and keep the owner from signing in for as long as they go on. Sessions already open aren't
+affected. Over it, a sign-in gets `429 rate_limited` with a `Retry-After` of the seconds until the
+next one, up to 300. If that's happening, the key has to go: for an approver, put a new key in the
+file; for anyone else, have them register again from a new invite.
 
 **A state change with a session and a bad `Origin`** is refused before it costs anything: it spends
 no budget, and writes no row of its own. `SameSite=Strict` doesn't stop a page on a sibling

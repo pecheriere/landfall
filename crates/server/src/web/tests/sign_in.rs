@@ -175,6 +175,54 @@ async fn a_passkey_signing_in_over_and_over_is_held_to_a_budget() {
     );
 }
 
+/// A leaked invite for an approver gets a key that verifies and opens nothing. It must not be able
+/// to keep the approver out, either: this is why the budget comes after the check on the key.
+#[tokio::test]
+async fn a_barred_key_cannot_spend_its_owners_sign_ins() {
+    let h = Harness::with_limits(crate::agent_api::Limits {
+        ceremony_burst: 1000,
+        ..crate::agent_api::Limits::default()
+    })
+    .await;
+    let thief = h.registered("alice").await;
+    for _ in 0..=crate::agent_api::Limits::default().sign_in_burst {
+        assert_eq!(h.try_sign_in(&thief).await.code(), "sign_in_refused");
+    }
+    assert_eq!(h.count("sessions").await, 0);
+    assert_eq!(h.audited("access_throttled").await.len(), 0);
+
+    let owner = h.try_sign_in(&h.alice).await;
+    assert_eq!(owner.status, StatusCode::OK, "{owner:?}");
+    assert_eq!(owner.json()["principal"], "alice");
+}
+
+/// The wait is the real one, and the words say what it is about.
+#[tokio::test]
+async fn a_sign_in_over_its_budget_says_how_long_and_why() {
+    let h = Harness::new().await;
+    for _ in 0..10 {
+        h.signed_in(&h.alice).await;
+    }
+    let over = h.try_sign_in(&h.alice).await;
+    assert_eq!(over.status, StatusCode::TOO_MANY_REQUESTS, "{over:?}");
+    assert_eq!(over.code(), "rate_limited");
+    assert_eq!(over.headers[header::RETRY_AFTER], "300");
+    let title = over.json()["title"].as_str().unwrap().to_owned();
+    assert!(title.contains("sign-ins"), "{title}");
+    assert!(!title.contains("state changes"), "{title}");
+
+    h.clock.advance(120);
+    let over = h.try_sign_in(&h.alice).await;
+    assert_eq!(over.headers[header::RETRY_AFTER], "180");
+    h.clock.advance(179);
+    let over = h.try_sign_in(&h.alice).await;
+    assert_eq!(over.headers[header::RETRY_AFTER], "1");
+    h.clock.advance(1);
+    assert_eq!(h.try_sign_in(&h.alice).await.status, StatusCode::OK);
+    let over = h.try_sign_in(&h.alice).await;
+    assert_eq!(over.headers[header::RETRY_AFTER], "300");
+}
+
 /// The strongest signal there is: it can't be washed out by what the sender does next.
 #[tokio::test]
 async fn a_barred_key_that_verifies_stays_apart_from_bad_signatures() {

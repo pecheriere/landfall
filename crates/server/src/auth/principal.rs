@@ -79,10 +79,16 @@ pub(crate) async fn spend_budget(
     spender: &Spender,
 ) -> Result<(), HumanProblem> {
     let store = state.store();
-    match state.spend_budget(spender, store.now()?) {
+    let now = store.now()?;
+    match state.spend_budget(spender, now) {
         Spent::Over => {
             state.note_refusal(extensions, "a call over its budget");
-            Err(HumanProblem::OverBudget)
+            Err(match spender {
+                Spender::SignIns(principal) => HumanProblem::SignInsSpent {
+                    retry_after_secs: state.sign_in_wait(principal, now),
+                },
+                _ => HumanProblem::OverBudget,
+            })
         }
         Spent::Within { dropped: 0 } => Ok(()),
         Spent::Within { dropped } => {

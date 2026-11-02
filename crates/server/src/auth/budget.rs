@@ -153,6 +153,16 @@ impl Budget {
         }
     }
 
+    /// How long until `principal`'s next sign-in comes, in seconds, for one just refused: at least
+    /// one, and at most a whole refill.
+    pub(crate) fn sign_in_wait(&self, principal: &PrincipalId, now: i64) -> u32 {
+        let refill = self.sign_in_refill_secs;
+        let wait = self.sign_ins.get(principal).map_or(refill, |bucket| {
+            bucket.at.saturating_add(refill).saturating_sub(now)
+        });
+        u32::try_from(wait.clamp(1, refill)).unwrap_or(u32::MAX)
+    }
+
     /// Takes the cost of one call, at `now`.
     pub(crate) fn spend(&mut self, spender: &Spender, now: i64) -> Spent {
         let allowed = match spender {

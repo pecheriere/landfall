@@ -40,7 +40,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use landfall_core::config::Config;
-use landfall_core::ids::HostId;
+use landfall_core::ids::{HostId, PrincipalId};
 use tokio::sync::{oneshot, watch};
 
 use self::client_source::ClientSource;
@@ -226,6 +226,14 @@ impl ApiState {
             .lock()
             // Maps and counts, valid at every step.
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How long until `principal` has another sign-in, in seconds.
+    pub(crate) fn sign_in_wait(&self, principal: &PrincipalId, now: i64) -> u32 {
+        self.budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sign_in_wait(principal, now)
     }
 
     /// Takes the cost of one state change from a budget.

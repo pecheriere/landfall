@@ -368,6 +368,9 @@ async fn serve_watching<S: ReleaseSource>(
     let listener = TcpListener::bind(args.listen).await.map_err(serve_error)?;
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
+    // Says the real port, if it was asked for port 0, and that signals are heard from here on.
+    let listening = listener.local_addr().map_err(serve_error)?;
+    crate::agent_api::log(&format!("listening on {listening}"));
 
     let (stop_watcher, stop_watching) = watch::channel(false);
     let stop_flushing = stop_watching.clone();
