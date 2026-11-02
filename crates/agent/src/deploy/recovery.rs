@@ -30,7 +30,7 @@ use crate::state::{DeploymentState, Phase};
 ///   so only the marker is removed. The backup is not restored again: that
 ///   would discard what the previous version wrote since.
 ///
-/// The report is written and the outcome journalled as for [`run`]. A rollback
+/// The report is written and the outcome journalled as for [`run`](super::run). A rollback
 /// that fails again leaves the deploy interrupted, so this can be retried.
 ///
 /// # Errors

@@ -41,7 +41,7 @@ pub struct SnapshotStats {
 /// [`SafeFsError::Missing`] for a missing path,
 /// [`SafeFsError::SpecialFile`] for a device, socket or FIFO,
 /// [`SafeFsError::NotADirectory`] when a parent of a path is not a real
-/// directory, [`SafeFsError::TooDeep`] past [`MAX_DEPTH`],
+/// directory, [`SafeFsError::TooDeep`] past [`MAX_DEPTH`](super::MAX_DEPTH),
 /// [`SafeFsError::TooManyEntries`] past [`MAX_DIR_ENTRIES`] in a directory,
 /// [`SafeFsError::SymlinkRefused`] when an entry becomes a symlink as it is
 /// opened, [`SafeFsError::Replaced`] when a new symlink is swapped for

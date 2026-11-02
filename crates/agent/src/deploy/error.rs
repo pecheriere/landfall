@@ -48,7 +48,7 @@ pub enum FileFailure {
 /// A deploy that never started: no service was touched and no backup taken.
 /// Everything the attempt changed has been put back, other than a placeholder
 /// override where there was none, unless the error is
-/// [`DeployError::LeftBlocked`]. Anything after that is a [`DeployReport`].
+/// [`DeployError::LeftBlocked`]. Anything after that is a [`DeployReport`](super::DeployReport).
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
     /// Another process holds the deployment's lock.

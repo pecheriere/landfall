@@ -69,7 +69,7 @@ pub enum SafeFsError {
         /// The limit.
         cap: usize,
     },
-    /// A tree goes deeper than [`MAX_DEPTH`].
+    /// A tree goes deeper than [`MAX_DEPTH`](super::MAX_DEPTH).
     #[error("{} is more than {limit} levels deep", quoted(path))]
     TooDeep {
         /// The path.
@@ -77,7 +77,7 @@ pub enum SafeFsError {
         /// The limit.
         limit: usize,
     },
-    /// A directory holds more than [`MAX_DIR_ENTRIES`] entries.
+    /// A directory holds more than [`MAX_DIR_ENTRIES`](super::MAX_DIR_ENTRIES) entries.
     #[error("{} holds more than {limit} entries", quoted(path))]
     TooManyEntries {
         /// The directory.
