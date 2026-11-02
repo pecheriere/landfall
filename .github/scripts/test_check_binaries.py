@@ -357,6 +357,12 @@ class HardeningTests(DistTestCase):
         self.write("linux_amd64", "landfall-agent", elf(AMD64, (Seg(flags=PF_RWX),)))
         self.assert_one_failure("linux_amd64/landfall-agent", "writable and executable")
 
+    def test_one_writable_executable_segment_among_good_ones_is_refused(self) -> None:
+        """Every load segment counts, and a real binary has four."""
+        bad = Seg(flags=PF_RWX, filesz=0)
+        self.write("linux_amd64", "landfall-agent", elf(AMD64, (Seg(), bad)))
+        self.assert_one_failure("linux_amd64/landfall-agent", "writable and executable")
+
     def test_a_writable_segment_beside_the_code_is_fine(self) -> None:
         """Data has to live somewhere, and each real binary has two such segments."""
         data = Seg(flags=PF_RW, filesz=0)

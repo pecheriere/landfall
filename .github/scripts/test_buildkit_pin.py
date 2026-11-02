@@ -34,8 +34,8 @@ OWN_BUILDER = re.compile(
 )
 # Any mention of the image, which also holds the QEMU that CI runs the arm64 binaries under.
 IMAGE_MENTION = re.compile(r"moby/buildkit\S*", re.IGNORECASE)
-# Each would choose another builder or client than the pin.
-REFUSED_BUILDX_INPUTS = ("version", "driver", "endpoint")
+# Any other input could choose another builder or client than the pin, or not use it at all.
+ALLOWED_BUILDX_INPUTS = ("driver-opts", "cache-binary")
 STEP_START = re.compile(r"^(\s*)-\s")
 DIGEST_PINNED = re.compile(r"^moby/buildkit:v[0-9][^@\s]*@sha256:[0-9a-f]{64}$")
 
@@ -137,10 +137,12 @@ def buildx_step_problems(step: list[str], reference: str) -> list[str]:
     cache_binary = step_input(step, "cache-binary")
     if cache_binary != "false":
         found.append(f"cache-binary is {cache_binary!r}, wanted false")
+    inputs = with_block(step)
     found.extend(
-        f"{name} is set, which would not be the pinned builder"
-        for name in REFUSED_BUILDX_INPUTS
-        if step_input(step, name) is not None
+        f"{line.strip()} is set, where only {ALLOWED_BUILDX_INPUTS} may be"
+        for line in inputs
+        if indent_of(line) == indent_of(inputs[0])
+        and line.strip().split(":")[0] not in ALLOWED_BUILDX_INPUTS
     )
     return found
 
@@ -215,7 +217,10 @@ class RepositoryTests(unittest.TestCase):
         reference = pinned_reference(PIN_FILE.read_text(encoding="utf-8"))
         lines = significant((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
         self.assertIn(f"BUILDKIT: {reference}", [line.strip() for line in lines])
-        self.assertTrue(any("buildkit-qemu-aarch64" in line for line in lines))
+        qemu = next(i for i, line in enumerate(lines) if "buildkit-qemu-aarch64" in line)
+        step = "\n".join(step_at(lines, qemu))
+        self.assertIn("for binary in landfall landfall-agent;", step)
+        self.assertRegex(step, r"timeout( --\S+)* [0-9]+ docker run --rm --init ")
 
 
 class ReadingTests(unittest.TestCase):
@@ -341,8 +346,17 @@ steps:
         self.assertEqual(len(problems(text, REFERENCE)), 2)
 
     def test_inputs_that_choose_another_builder_are_refused(self) -> None:
-        """`version` would also download a client, which `cache-binary` only matters beside."""
-        for name in ("version: latest", "driver: docker", "endpoint: tcp://elsewhere:1234"):
+        """`version` would also download a client, and `use: false` leaves builds off the pin."""
+        names = (
+            "version: latest",
+            "driver: docker",
+            "endpoint: tcp://elsewhere:1234",
+            "use: false",
+            "buildkitd-flags: --debug",
+            "buildkitd-config-inline: x",
+            "append: x",
+        )
+        for name in names:
             with self.subTest(name=name):
                 text = f"""
 steps:

@@ -249,12 +249,16 @@ then copy to `Formula/landfall.rb`, commit. It says why this isn't automated, an
 9. The binaries on real arm64, and on a 16 KiB kernel if there is one (owner's step 6).
 10. The macOS binary as released, through Homebrew's staging of a raw file (`Dir["landfall-*"]` is assumed), and Gatekeeper on it (owner's step 7).
 11. The environment's tag limit refusing a non-tag ref, which no dispatch exercises as `publish` is skipped. Try it once by a temporary job, or read it from the environment's settings, and record which.
+12. The documented Linux 5.8 floor: the agent starts on a kernel that old, or the floor moves. Kernels before about 5.10 are recalled, not read, not to honour `p_align` for a static PIE, which should be harmless as nothing needs more than page alignment.
+13. ASLR on a native amd64 kernel: only arm64 has shown a changing address, as amd64 has run only under emulation, which kept a fixed one.
+
+Native arm64 at the `--version` level isn't on this list: `smoke` on `ubuntu-24.04-arm` covers it in PR B, where `docker-build` only has QEMU.
 
 Subject names being basenames is **not** on this list: read at the pin, and seen in a real bundle in Task 4.
 
 - [ ] **Step 1: Failing tests** in `test_check_environment.py`: `environment_table` (a good answer passes; no rules, only a wait timer, empty `reviewers`, `prevent_self_review` true and a null `deployment_branch_policy` are each refused by name; malformed JSON is refused). Expected: FAIL. Implement. Expected: PASS.
 - [ ] **Step 2: Write the workflow.** Resolve pins for `actions/upload-artifact` and `actions/download-artifact` (GitHub-owned, so already allowed), each at least 7 days old, with `gh api`. Use the `$/` self-reference as now. Run: `GH_TOKEN=$(gh auth token) uvx zizmor .`. Expected: no findings.
-- [ ] **Step 3: Docs.** `AGENTS.md`, "CI and supply chain": release assets, one attempt, the guard, the tag proof. `CONTRIBUTING.md`: how to cut a release, the owner's list, and what a failed run costs.
+- [ ] **Step 3: Docs.** `AGENTS.md`, "CI and supply chain": release assets, one attempt, the guard, the tag proof. `CONTRIBUTING.md`: how to cut a release, the owner's list, and what a failed run costs, including an outage at ziglang.org, which fails a cache-free build closed and costs a version number if it reaches a tag, and which `workflow_dispatch` shows just before tagging.
 - [ ] **Step 4: Gate; security review. Commit:** `feat(release): publish attested binaries through a draft`. Open PR B, listing the first-tag items as not verified.
 
 ## PR C: verify a release file (#22)

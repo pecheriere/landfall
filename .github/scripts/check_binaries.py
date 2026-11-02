@@ -12,7 +12,8 @@ and nothing else that merely starts like one:
 - mode 0755, and within its size budget.
 
 A file nobody expected, or one missing, also fails, so that a build producing nothing can't pass
-for lack of anything to check. CI runs only the amd64 files, so on arm64 this is the only gate.
+for lack of anything to check. CI runs each file's `--version`, the arm64 ones under QEMU, so this
+is the only check of their structure, and neither can see code corrupted but still able to start.
 
 The headers are read here, in the standard library, so the check doesn't depend on which
 `readelf` a machine has, and it trusts nothing they say.
