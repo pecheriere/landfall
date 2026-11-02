@@ -140,6 +140,7 @@ async fn a_session_holds_no_power_beyond_its_grants() {
     let session = h.signed_in(&gina).await;
     let request = open_request(&h, &session).await;
     assert_eq!(request["can_approve"], false);
+    assert_eq!(request["can_cancel"], true);
 
     let elsewhere = h
         .post(

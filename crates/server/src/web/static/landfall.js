@@ -193,15 +193,17 @@
       });
       card.append(approve);
     }
-    const cancel = document.createElement("button");
-    cancel.type = "button";
-    cancel.textContent = "Cancel this request";
-    onClick(cancel, async function () {
-      await post("/api/v1/approvals/" + request.id + "/cancel", {});
-      await listRequests();
-      say("Cancelled.");
-    });
-    card.append(cancel);
+    if (request.can_cancel) {
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Cancel this request";
+      onClick(cancel, async function () {
+        await post("/api/v1/approvals/" + request.id + "/cancel", {});
+        await listRequests();
+        say("Cancelled.");
+      });
+      card.append(cancel);
+    }
     return card;
   }
 

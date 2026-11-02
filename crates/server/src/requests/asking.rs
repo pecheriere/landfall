@@ -209,7 +209,8 @@ pub(super) async fn ask(
             let stored = store.insert_request(&mut tx, &request).await?;
             tx.commit().await.map_err(StoreError::from)?;
             let can_approve = can(config, &principal, d.id(), Permission::Approve);
-            let mut answer = json_answer(&view(&stored, can_approve), &no_store());
+            // Whoever asked may cancel it.
+            let mut answer = json_answer(&view(&stored, can_approve, true), &no_store());
             *answer.status_mut() = StatusCode::CREATED;
             Ok(answer)
         }

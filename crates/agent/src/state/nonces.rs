@@ -16,11 +16,19 @@
 //! Each call reads the file again rather than keeping it in memory, and takes the
 //! file's own lock for that, so two processes can't both spend one nonce. It reads one
 //! line at a time, so the size of the log takes no memory.
+//!
+//! Neither call blocks on that lock. Nothing but the daemon uses it, so only something run by
+//! hand can hold it, for as long as it likes, and a thread blocked there would hold on to the
+//! deployment's lock when it is spending. So a call tries for [`LOCK_PATIENCE`], and then says
+//! [`StateError::NonceLogBusy`], and the work waits for the next poll with nothing spent. The
+//! patience is for the agent's own children: one forked in another thread shares this descriptor,
+//! and the lock on it, until it execs, so a lock just let go can stay held for a moment.
 
-use std::fs::File;
+use std::fs::{File, TryLockError};
 use std::io::{BufReader, Read as _, Write};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
@@ -35,6 +43,12 @@ const LINE_BYTES: usize = 65;
 /// The longest the log gets: a million approvals, or 27 a day for a hundred years. At this
 /// length it refuses, and an approval is what it refuses, so no line goes past it.
 pub const MAX_NONCE_LOG_BYTES: u64 = 65_000_000;
+
+/// How long a call goes on trying for the log's lock. It is the longest a spending thread can be
+/// kept from answering by a lock it can't have.
+const LOCK_PATIENCE: Duration = Duration::from_secs(1);
+/// How long between tries.
+const LOCK_RETRY: Duration = Duration::from_millis(5);
 
 /// What [`StateDir::spend_nonce`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +97,21 @@ fn open(path: &Path, flags: OFlags) -> Result<Option<File>, StateError> {
         });
     }
     Ok(Some(file))
+}
+
+/// Tries for a lock on the log, for [`LOCK_PATIENCE`] at most.
+fn locked(attempt: impl Fn() -> Result<(), TryLockError>, path: &Path) -> Result<(), StateError> {
+    let started = Instant::now();
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(TryLockError::Error(error)) => return Err(io_err("lock", path)(error)),
+            Err(TryLockError::WouldBlock) if started.elapsed() >= LOCK_PATIENCE => {
+                return Err(StateError::NonceLogBusy(path.to_owned()));
+            }
+            Err(TryLockError::WouldBlock) => std::thread::sleep(LOCK_RETRY),
+        }
+    }
 }
 
 /// Reads the whole log from its start, refusing it if any of it isn't what the log
@@ -156,13 +185,14 @@ impl StateDir {
     ///
     /// # Errors
     ///
-    /// [`StateError`] if the log can't be read or can't be trusted.
+    /// [`StateError`] if the log can't be read or can't be trusted, and
+    /// [`StateError::NonceLogBusy`] if something holds its lock to write.
     pub fn nonce_used(&self, nonce: &[u8; 32]) -> Result<bool, StateError> {
         let path = self.nonce_log_path();
         let Some(file) = open(&path, OFlags::RDONLY)? else {
             return Ok(false);
         };
-        file.lock_shared().map_err(io_err("lock", &path))?;
+        locked(|| file.try_lock_shared(), &path)?;
         scan(&file, &path, nonce)
     }
 
@@ -183,14 +213,15 @@ impl StateDir {
     ///
     /// # Errors
     ///
-    /// [`StateError`] if the log can't be read, can't be trusted or can't be written.
+    /// [`StateError`] if the log can't be read, can't be trusted or can't be written, and
+    /// [`StateError::NonceLogBusy`] if something holds its lock, with nothing written.
     pub fn spend_nonce(&self, nonce: &[u8; 32]) -> Result<NonceSpend, StateError> {
         let path = self.nonce_log_path();
         let flags = OFlags::RDWR | OFlags::APPEND | OFlags::CREATE;
         let Some(file) = open(&path, flags)? else {
             return Err(unusable(&path, "it isn't there after creating it"));
         };
-        file.lock().map_err(io_err("lock", &path))?;
+        locked(|| file.try_lock(), &path)?;
         if scan(&file, &path, nonce)? {
             return Ok(NonceSpend::AlreadyUsed);
         }

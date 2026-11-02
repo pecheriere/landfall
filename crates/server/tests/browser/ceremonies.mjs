@@ -165,7 +165,7 @@ try {
   const hostile = '<img src=x onerror="window.injected = true">';
   const noMarkup = () =>
     page.evaluate(() => document.querySelector("img") === null && window.injected === undefined);
-  await page.route("**/api/v1/approvals", (route) =>
+  const listed = (may) => (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -187,12 +187,13 @@ try {
             requested_by: hostile,
             created_at: 0,
             expires_at: 0,
-            can_approve: true,
+            can_approve: may,
+            can_cancel: may,
           },
         ],
       }),
-    }),
-  );
+    });
+  await page.route("**/api/v1/approvals", listed(true));
   await page.route("**/api/v1/approvals/1/cancel", (route) =>
     route.fulfill({
       status: 403,
@@ -210,6 +211,20 @@ try {
     hostile,
   );
   check(await noMarkup(), "a hostile reason is shown as text, and made no element");
+  await page.unroute("**/api/v1/approvals");
+
+  // Who may do neither is offered neither.
+  await page.route("**/api/v1/approvals", listed(false));
+  await page.reload();
+  await page.waitForSelector("section");
+  check(
+    (await page.getByRole("button", { name: "Cancel this request" }).count()) === 0,
+    "someone who can't cancel isn't offered it",
+  );
+  check(
+    (await page.getByRole("button", { name: "Approve with passkey" }).count()) === 0,
+    "someone who can't approve isn't offered it",
+  );
   await page.unroute("**/api/v1/approvals");
   await page.unroute("**/api/v1/approvals/1/cancel");
 

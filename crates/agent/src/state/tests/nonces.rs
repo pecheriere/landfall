@@ -17,6 +17,16 @@ fn dir(tmp: &tempfile::TempDir) -> StateDir {
     StateDir::open(tmp.path()).unwrap()
 }
 
+/// Spends `nonce`, going round for as long as another writer has the log.
+fn until_free(root: &StateDir, nonce: &[u8; 32]) -> NonceSpend {
+    loop {
+        match root.spend_nonce(nonce) {
+            Err(StateError::NonceLogBusy(_)) => std::thread::yield_now(),
+            other => return other.unwrap(),
+        }
+    }
+}
+
 fn line(byte: u8) -> String {
     format!("{}\n", hex::encode([byte; 32]))
 }
@@ -261,10 +271,10 @@ fn of_writers_at_once_exactly_one_spends_a_nonce() {
             std::thread::spawn(move || {
                 // Each has its own descriptor, as another process would.
                 let root = StateDir::open(&path).unwrap();
-                if root.spend_nonce(&NONCE).unwrap() == NonceSpend::Recorded {
+                if until_free(&root, &NONCE) == NonceSpend::Recorded {
                     recorded.fetch_add(1, Ordering::SeqCst);
                 }
-                let _ = root.spend_nonce(&[writer; 32]).unwrap();
+                let _ = until_free(&root, &[writer; 32]);
             })
         })
         .collect();
@@ -282,4 +292,55 @@ fn of_writers_at_once_exactly_one_spends_a_nonce() {
         "the 16 writers' own nonces, one of them the same as the shared one"
     );
     root.check_nonce_log().unwrap();
+}
+
+/// A child forked in another thread holds the lock until it execs, so one just let go is no
+/// reason to send the work round again.
+#[test]
+fn a_lock_let_go_in_a_moment_is_gone_through() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dir(&tmp);
+    assert_eq!(root.spend_nonce(&NONCE).unwrap(), NonceSpend::Recorded);
+    let holder = fs::File::open(root.nonce_log_path()).unwrap();
+    holder.lock().unwrap();
+    let letting_go = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(holder);
+    });
+
+    assert_eq!(root.spend_nonce(&[8; 32]).unwrap(), NonceSpend::Recorded);
+    letting_go.join().unwrap();
+}
+
+#[test]
+fn a_lock_held_on_the_log_is_said_and_changes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dir(&tmp);
+    assert_eq!(root.spend_nonce(&NONCE).unwrap(), NonceSpend::Recorded);
+    let before = fs::read(root.nonce_log_path()).unwrap();
+    let holder = fs::File::open(root.nonce_log_path()).unwrap();
+    let busy = |result: Result<NonceSpend, StateError>| {
+        assert!(
+            matches!(result, Err(StateError::NonceLogBusy(_))),
+            "{result:?}"
+        );
+    };
+
+    // Held to read: it can still be read, and can't be written.
+    holder.lock_shared().unwrap();
+    assert!(root.nonce_used(&NONCE).unwrap());
+    busy(root.spend_nonce(&[8; 32]));
+
+    // Held to write: neither.
+    holder.unlock().unwrap();
+    holder.lock().unwrap();
+    assert!(matches!(
+        root.nonce_used(&NONCE),
+        Err(StateError::NonceLogBusy(_))
+    ));
+    busy(root.spend_nonce(&[8; 32]));
+    assert_eq!(fs::read(root.nonce_log_path()).unwrap(), before);
+
+    drop(holder);
+    assert_eq!(root.spend_nonce(&[8; 32]).unwrap(), NonceSpend::Recorded);
 }

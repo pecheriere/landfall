@@ -631,8 +631,8 @@ hold since. So asking too soon after a new tag, or just after the configuration 
 doesn't take) and `promotion_pending`. A rollback doesn't wait for promotion.
 
 **To approve one,** `GET /api/v1/approvals` lists what you may see, with each intent and its
-challenge, and `POST /api/v1/approvals/{id}` takes the passkey's assertion, fresh each time,
-as `{"assertion": {...}}`. It must be by the caller's own key in `[approvers]`, for exactly
+challenge, and whether you may approve (`can_approve`) or cancel it (`can_cancel`). `POST
+/api/v1/approvals/{id}` takes the passkey's assertion, fresh each time, as `{"assertion": {...}}`. It must be by the caller's own key in `[approvers]`, for exactly
 that intent. Approving queues a deploy under a new number, which carries the assertion to the
 host. Everything that bears on it is looked at again then. What may pass by itself leaves the
 request open, and you can try again: `promotion_pending` if the release isn't healthy for long
@@ -1104,7 +1104,9 @@ if its assertion is garbled: the assertion's fields are only read when the appro
 parse, a bad nonce say, fails the whole answer, whatever the rule says of the deploy. The
 host reads that as `controller_unavailable` at priority 4, warning, and retries with its
 backoff, and nothing runs. An approval never overrides the version already running or a
-pre-release.
+pre-release. If that automatic deploy fails and rolls back, the same unspent approval is accepted
+as the manual retry of the failed release, and is spent then, so an `approval_about_to_be_spent`
+line can come some time after the tap, with no request in between.
 
 **An approval works once, whichever way the deploy ends.** It is spent after everything
 above has passed, and before the deploy touches a file or Docker. A deploy that then fails
@@ -1193,8 +1195,8 @@ again, and you can, from its journal, by searching for that nonce.
 
 The journal says `approval_about_to_be_spent` just before the host tries to spend a nonce,
 naming the approver, the deployment and the release. The line doesn't prove it was spent: it
-also appears with nothing spent, when the log turned out to be unusable or another writer got
-there first. So if a `nonce_log_unusable` line follows it, or the nonce isn't in the log, read
+also appears with nothing spent, when the log turned out to be unusable, something held its lock
+or another writer got there first. So if a `nonce_log_unusable` line follows it, or the nonce isn't in the log, read
 it as an attempt. Otherwise, going by what follows it:
 
 - **A crash before the deploy started:** this tag has no `deploy_step` lines after it, and the
@@ -1237,6 +1239,12 @@ naming the file, and its `error` says which. Nothing repairs it for you:
   Nothing written by the agent gets to be any of these, so find out what did it.
 - **Any other line that isn't a nonce** means something other than the agent has written
   there. Find out what, and restore the file from a backup if you have one.
+
+**A lock held on the log makes the work wait.** Nothing but the daemon locks it, so this is a
+process you ran as the agent's user or root. After a second of trying, nothing is spent, the
+journal says `work_waiting` naming the file, and the work is tried again at the next poll, so it
+goes on once the lock is let go. This has no bound, and meanwhile the claim holds up the host's
+other deployments, so find what holds it.
 
 **Taking a line out of the log reopens replay for that nonce, so only archive when you accept
 that.** The agent doesn't read an archive, and the controller that delivered every approval

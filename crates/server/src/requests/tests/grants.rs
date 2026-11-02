@@ -204,7 +204,7 @@ async fn requester_without_approve_cannot_approve() {
 async fn the_list_shows_what_a_principal_may_see_and_who_may_sign() {
     let h = Harness::new().await;
     let (id, _) = h.opened().await;
-    let ids = |value: &serde_json::Value| -> Vec<(i64, bool)> {
+    let ids = |value: &serde_json::Value| -> Vec<(i64, bool, bool)> {
         value["approvals"]
             .as_array()
             .unwrap()
@@ -213,15 +213,18 @@ async fn the_list_shows_what_a_principal_may_see_and_who_may_sign() {
                 (
                     a["id"].as_i64().unwrap(),
                     a["can_approve"].as_bool().unwrap(),
+                    a["can_cancel"].as_bool().unwrap(),
                 )
             })
             .collect()
     };
     let list = async |caller| ids(&h.list(&caller).await.json());
-    assert_eq!(list(h.session("alice").await).await, [(id, true)]);
-    assert_eq!(list(h.session("bob").await).await, [(id, true)]);
-    assert_eq!(list(h.token("alice").await).await, [(id, false)]);
-    assert_eq!(list(h.token("dave").await).await, [(id, false)]);
+    assert_eq!(list(h.session("alice").await).await, [(id, true, true)]);
+    assert_eq!(list(h.session("bob").await).await, [(id, true, true)]);
+    // A token can't sign, and the one who asked can still cancel, by either credential.
+    assert_eq!(list(h.token("alice").await).await, [(id, false, true)]);
+    // Who may only look can do neither.
+    assert_eq!(list(h.token("dave").await).await, [(id, false, false)]);
     // Neither sees nor signs.
     assert_eq!(list(h.token("carol").await).await, []);
     assert_eq!(list(h.session("otto").await).await, []);

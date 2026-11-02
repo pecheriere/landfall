@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use landfall_core::intent::DeployIntent;
 use landfall_core::protocol::{DeployWork, ReportedOutcome};
@@ -301,11 +302,70 @@ async fn a_recover_holding_the_lock_leaves_the_approval_good() {
         if !matches!(outcome, StepOutcome::Waiting { .. }) {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     }
     assert_deployed(&outcome);
     assert!(spent(&f, 1));
+}
+
+/// Something run by hand holds the nonce log's lock, past any deadline. Nothing may wait for it,
+/// as a thread blocked there while spending would hold the deployment's lock until it is let go.
+async fn a_held_log_makes_the_work_wait(hold: impl Fn(&fs::File)) {
+    let (f, keys) = keyed(PATCH_RULE);
+    let root = StateDir::open(&f.state_dir).unwrap();
+    assert_eq!(root.spend_nonce(&[9; 32]).unwrap(), NonceSpend::Recorded);
+    let holder = fs::File::open(root.nonce_log_path()).unwrap();
+    hold(&holder);
+    let log_before = fs::read(root.nonce_log_path()).unwrap();
+    let unusable = capture::events("nonce_log_unusable").len();
+
+    let started = Instant::now();
+    let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "it waited for the lock: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(&outcome, StepOutcome::Waiting { reason, .. } if reason.contains("nonce log")),
+        "{outcome:?}"
+    );
+    assert_eq!(fs::read(root.nonce_log_path()).unwrap(), log_before);
+    assert_eq!(touched(&f.docker), []);
+    assert_eq!(capture::events("nonce_log_unusable").len(), unusable);
+    // With the log still held, no thread is left with the deployment's lock. A flock can outlive
+    // its holder for a moment: see `once_released` in the state tests.
+    let state = state_of(&f);
+    let mut free = state.lock();
+    for _ in 0..1000 {
+        if free.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        free = state.lock();
+    }
+    assert!(free.is_ok(), "the deployment's lock was left behind");
+    drop(free);
+
+    // Once it's let go the same approval goes through.
+    drop(holder);
+    let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
+    assert_deployed(&outcome);
+    assert!(spent(&f, 1));
+}
+
+/// Held to write, it stops the first look.
+#[tokio::test]
+async fn a_nonce_log_locked_to_write_makes_the_work_wait() {
+    a_held_log_makes_the_work_wait(|holder| holder.lock().unwrap()).await;
+}
+
+/// Held to read, the first look passes, and spending is what finds it.
+#[tokio::test]
+async fn a_nonce_log_locked_to_read_makes_the_work_wait_with_the_deployments_lock_let_go() {
+    a_held_log_makes_the_work_wait(|holder| holder.lock_shared().unwrap()).await;
 }
 
 #[tokio::test]
@@ -366,6 +426,15 @@ async fn a_nonce_log_that_cannot_be_used_is_journalled_at_start() {
     );
 
     let root = StateDir::open(&f.state_dir).unwrap();
+    // Held by something, at start: nothing known to be wrong, so nothing to say.
+    let good = root.nonce_log_path();
+    fs::write(&good, "").unwrap();
+    let holder = fs::File::open(&good).unwrap();
+    holder.lock().unwrap();
+    journal_nonce_log(&root);
+    assert_eq!(capture::events("nonce_log_unusable").len(), seen);
+    drop(holder);
+
     fs::write(root.nonce_log_path(), "torn").unwrap();
     journal_nonce_log(&root);
     let events = capture::events("nonce_log_unusable");

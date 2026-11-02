@@ -78,9 +78,10 @@ struct RequestView<'a> {
     created_at: i64,
     expires_at: i64,
     can_approve: bool,
+    can_cancel: bool,
 }
 
-fn view(request: &StoredRequest, can_approve: bool) -> RequestView<'_> {
+fn view(request: &StoredRequest, can_approve: bool, can_cancel: bool) -> RequestView<'_> {
     RequestView {
         id: request.id,
         host: &request.host,
@@ -91,6 +92,7 @@ fn view(request: &StoredRequest, can_approve: bool) -> RequestView<'_> {
         created_at: request.created_at,
         expires_at: request.expires_at,
         can_approve,
+        can_cancel,
     }
 }
 
@@ -317,7 +319,7 @@ fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
 }
 
 /// `GET /api/v1/approvals`: what this principal may see that waits for an approver, each
-/// saying whether they could sign it. Changes nothing. A request past its time is left out
+/// saying whether they could sign it or cancel it. Changes nothing. A request past its time is left out
 /// here, whether or not the next tick of the watcher has ended it yet.
 async fn list(
     State(state): State<ApiState>,
@@ -330,8 +332,13 @@ async fn list(
         .filter_map(|request| {
             let id = &request.intent.deployment;
             let approves = can(config, &principal, id, Permission::Approve);
-            (approves || can(config, &principal, id, Permission::View))
-                .then(|| view(request, approves))
+            (approves || can(config, &principal, id, Permission::View)).then(|| {
+                view(
+                    request,
+                    approves,
+                    cancelling::may_cancel(&state, &principal, request),
+                )
+            })
         })
         .collect();
     Ok(json_answer(&json!({ "approvals": views }), &no_store()))

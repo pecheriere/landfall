@@ -45,6 +45,10 @@ pub enum StateError {
     /// Another `run` or `enrol` is working in this state directory.
     #[error("state: another landfall-agent run or enrol holds {0}")]
     DaemonBusy(PathBuf),
+    /// Something holds the lock on the nonce log, so it can't be asked now. Nothing is wrong
+    /// with the log as far as this knows, and nothing was read or written.
+    #[error("state: something holds the lock on the nonce log {0}")]
+    NonceLogBusy(PathBuf),
     /// A state file exists but cannot be read as what it should hold. It is
     /// never treated as empty: that could deploy over an unknown state.
     #[error("state: {path} is corrupt: {source}")]

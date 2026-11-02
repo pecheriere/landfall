@@ -16,7 +16,9 @@
 //!    spent, and a controller can't produce one of those.
 //! 4. The engine starts with that lock still held, so nothing runs between the check of
 //!    the record and the deploy, and a `recover` by hand finds the lock taken. If the lock
-//!    is held when step 3 comes, nothing is spent, and the work waits.
+//!    is held when step 3 comes, nothing is spent, and the work waits. The same goes for the
+//!    nonce log's own lock, which is tried for a moment and never blocked on, so that no thread
+//!    is left there holding the deployment's lock.
 //!
 //! From step 3 on the approval is spent whatever comes next, a crash included: it works
 //! once, whichever way the deploy ends. The journal says so just before the append, so a
@@ -113,6 +115,7 @@ pub(super) async fn gate(
     match used {
         Ok(Ok(false)) => {}
         Ok(Ok(true)) => return Err(replayed(&work.deployment, &nonce)),
+        Ok(Err(error @ StateError::NonceLogBusy(_))) => return Err(log_held(&error)),
         Ok(Err(error)) => return Err(unusable_log(&error, state_dir)),
         Err(error) => return Err(defer(Priority::Error, error)),
     }
@@ -264,11 +267,20 @@ fn unusable_log(error: &StateError, state_dir: &Path) -> Stop {
     )
 }
 
+/// Not now: nothing has been spent, and nothing is known to be wrong with the log.
+fn log_held(error: &StateError) -> Stop {
+    Stop::Wait {
+        reason: error.to_string(),
+    }
+}
+
 /// Says in the journal if the log can't be used, so that an operator hears at start, and
 /// not only when an approval is refused for it. It stops nothing: automatic deploys don't
 /// need it.
 pub(super) fn journal_nonce_log(root: &StateDir) {
-    if let Err(error) = root.check_nonce_log() {
+    if let Err(error) = root.check_nonce_log()
+        && !matches!(error, StateError::NonceLogBusy(_))
+    {
         journal_unusable(&error, &root.nonce_log_path());
     }
 }
@@ -369,6 +381,7 @@ async fn spend(
     match spent {
         Ok((Ok(NonceSpend::Recorded), lock)) => Ok(lock),
         Ok((Ok(NonceSpend::AlreadyUsed), _)) => Err(replayed(&work.deployment, &nonce)),
+        Ok((Err(error @ StateError::NonceLogBusy(_)), _)) => Err(log_held(&error)),
         Ok((Err(error), _)) => Err(unusable_log(&error, state_dir)),
         Err(error) => Err(defer(Priority::Error, error)),
     }

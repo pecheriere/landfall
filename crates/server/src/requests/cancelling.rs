@@ -21,7 +21,7 @@ const NO_GRANT_TO_CANCEL: &str =
     "this principal did not ask for this request, and no grant lets it approve or roll back here";
 
 /// Whether `principal` may cancel `request`.
-fn may_cancel(state: &ApiState, principal: &Principal, request: &StoredRequest) -> bool {
+pub(super) fn may_cancel(state: &ApiState, principal: &Principal, request: &StoredRequest) -> bool {
     let id = &request.intent.deployment;
     request.requested_by == *principal.id()
         || can(state.config(), principal, id, Permission::Approve)
