@@ -2,8 +2,10 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::marker::PhantomData;
 
 use landfall_core::text::{quoted, shown};
+use serde::de::value::MapAccessDeserializer;
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::wire;
@@ -68,7 +70,7 @@ struct ClientData {
     origin: String,
     #[serde(default, rename = "crossOrigin", deserialize_with = "present_bool")]
     cross_origin: Option<bool>,
-    #[serde(default, rename = "tokenBinding")]
+    #[serde(default, rename = "tokenBinding", deserialize_with = "present_object")]
     token_binding: Option<TokenBinding>,
 }
 
@@ -82,17 +84,51 @@ fn present_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Erro
     bool::deserialize(d).map(Some)
 }
 
-/// Runs the client data steps of `WebAuthn` 7.1 and 7.2 in order. Nothing is
-/// decoded before it is compared: the challenge is compared as text, so one
-/// challenge has one accepted form. A leading byte order mark, which step 9's decoder
-/// would strip, is refused: 5.8.1.1 has client data start with `{"type":`.
+/// A member that is present must be an object, for the same reason.
+fn present_object<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    Object::<T>::deserialize(d).map(|object| Some(object.0))
+}
+
+/// A JSON object read as `T`. A derived struct on its own also takes an array, with its
+/// members by position, which no browser sends and other parsers read differently.
+struct Object<T>(T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(ObjectVisitor(PhantomData))
+    }
+}
+
+struct ObjectVisitor<T>(PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> Visitor<'de> for ObjectVisitor<T> {
+    type Value = Object<T>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Object<T>, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map)).map(Object)
+    }
+}
+
+/// Runs the client data steps of `WebAuthn` 7.1 and 7.2 in order. The challenge is
+/// compared as base64url text and not decoded, so padding or the other alphabet doesn't
+/// pass; JSON escapes are undone by the parser first, and the order of members isn't
+/// held to 5.8.1.1's. Neither matters, as the signature covers the bytes as sent. A
+/// leading byte order mark, which step 9's decoder would strip, is refused: 5.8.1.1
+/// leaves no room for one, so no browser sends it.
 pub(crate) fn check(
     client_data_json: &[u8],
     expected: &Expected<'_>,
 ) -> Result<(), ClientDataError> {
     let malformed = |e: serde_json::Error| ClientDataError::Malformed(quoted(&e.to_string(), 128));
     serde_json::from_slice::<NoDuplicateKeys>(client_data_json).map_err(malformed)?;
-    let data: ClientData = serde_json::from_slice(client_data_json).map_err(malformed)?;
+    let Object(data) =
+        serde_json::from_slice::<Object<ClientData>>(client_data_json).map_err(malformed)?;
 
     if data.kind != expected.kind {
         return Err(ClientDataError::Type {

@@ -114,8 +114,9 @@ impl<'a> AuthenticatorData<'a> {
     }
 
     /// `tail`, what follows attested credential data, is exactly what the ED flag
-    /// declares: nothing, or one CBOR map. A valid signature over bytes nobody
-    /// parses would still be a signature over something unknown.
+    /// declares: nothing, or one CBOR map. The map's values are never read, and the
+    /// signature covers them; this holds the layout to what 6.1 defines, so that bytes
+    /// no one declared are refused rather than signed and ignored.
     pub(crate) fn check_extensions(&self, tail: &[u8]) -> Result<(), AuthenticatorDataError> {
         if self.flags & FLAG_ED == 0 {
             return if tail.is_empty() {

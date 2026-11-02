@@ -90,6 +90,22 @@ fn curve_point_off_the_curve_is_refused() {
 }
 
 #[test]
+fn a_point_with_two_encodings_has_only_the_canonical_one() {
+    // y = 3 is on the curve, and y = 3 + p decodes to the same point.
+    let mut small_y = [0; 32];
+    small_y[0] = 3;
+    CoseKey::parse(&encode_eddsa(&small_y)).unwrap();
+
+    let mut plus_p = [0xff; 32];
+    plus_p[0] = 0xf0;
+    plus_p[31] = 0x7f;
+    assert_eq!(
+        CoseKey::parse(&encode_eddsa(&plus_p)),
+        Err(CoseError::NonCanonicalPoint)
+    );
+}
+
+#[test]
 fn small_order_ed25519_keys_are_refused() {
     let mut identity = [0; 32];
     identity[0] = 1;

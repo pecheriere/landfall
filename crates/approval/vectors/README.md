@@ -1,11 +1,11 @@
 # Real-browser vectors
 
 `chromium.json` holds one ES256 and one EdDSA credential from Chromium's virtual
-authenticator: its `none` attestation, and an assertion over the challenge of the
-intent in the file (`DeployIntent::challenge`). `real_browser_vectors_verify` checks
-them. They are what a browser actually sends, which a test authenticator written
-next to the verifier can't show: its key encoding, the extra member Chromium adds to
-`clientDataJSON`, the flags and the counter.
+authenticator: its attestation (`none`, as requested), and an assertion over the
+challenge of the intent in the file (`DeployIntent::challenge`).
+`real_browser_vectors_verify` checks them. They are what a browser actually sends,
+which a test authenticator written next to the verifier can't show: its key encoding,
+the extra member Chromium sometimes adds to `clientDataJSON`, the flags and the counter.
 
 The private keys were thrown away with the virtual authenticator, so these bytes
 can't sign anything else. Nothing in them is personal: the origin is
@@ -78,3 +78,7 @@ async (page) => {
 
 Replace `credentials` in `chromium.json` with the result, and the browser's version
 in `source`.
+
+Chromium adds the `other_keys_can_be_added_here` member to `clientDataJSON` at random,
+so a regeneration can drop it. The committed assertions both have it, and
+`other_members_are_allowed` covers extra members whatever a vector holds.

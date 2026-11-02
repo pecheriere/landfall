@@ -170,6 +170,43 @@ fn a_byte_order_mark_is_refused() {
 }
 
 #[test]
+fn client_data_must_be_an_object() {
+    // A derived struct also takes its members by position, from an array: signed
+    // bytes that no browser would produce, and that other parsers read differently.
+    let array = format!(
+        r#"["webauthn.get","{}","{ORIGIN}"]"#,
+        wire::encode(&CHALLENGE)
+    );
+    raw(array.into_bytes(), |result| {
+        assert!(matches!(
+            client_error(result),
+            ClientDataError::Malformed(_)
+        ));
+    });
+}
+
+#[test]
+fn token_binding_must_be_an_object() {
+    for value in [
+        r#"["supported"]"#,
+        r#"["present"]"#,
+        "null",
+        "\"present\"",
+        "1",
+    ] {
+        raw(
+            honest_with(&format!(r#","tokenBinding":{value}"#)),
+            |result| {
+                assert!(
+                    matches!(client_error(result), ClientDataError::Malformed(_)),
+                    "{value}"
+                );
+            },
+        );
+    }
+}
+
+#[test]
 fn invalid_utf8_in_a_member_nothing_reads_is_refused() {
     let mut json = honest_with(r#","x":"?""#);
     let at = json.iter().position(|b| *b == b'?').unwrap();
@@ -195,14 +232,20 @@ fn duplicate_json_keys_are_refused() {
         .into_bytes(),
         honest_with(r#","type":"webauthn.create""#),
         honest_with(&format!(r#","challenge":"{challenge}""#)),
-        // Identical, but spelled differently: keys are compared after unescaping.
-        honest_with(r#","origin":"https://evil.example""#),
+        // Identical, but spelled differently: keys are compared after unescaping. The
+        // backslash and the `u006f` are put together here, so that this source really
+        // holds an escape, and the assert below sees it in the bytes.
+        honest_with(&format!(r#","\{}rigin":"https://evil.example""#, "u006f")),
         // Members nothing here reads, at the top and nested in another's value.
         honest_with(r#","x":1,"x":2"#),
         honest_with(r#","x":{"y":1,"y":2}"#),
         honest_with(r#","x":[{"y":{"z":1,"z":2}}]"#),
         honest_with(r#","crossOrigin":false,"crossOrigin":true"#),
     ];
+    assert!(
+        cases[4].windows(2).any(|pair| pair == b"\\u"),
+        "the escaped case holds no escape"
+    );
     for case in cases {
         let text = String::from_utf8(case.clone()).unwrap();
         raw(case, |result| {

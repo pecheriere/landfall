@@ -7,10 +7,9 @@
 //! false accept here means a compromised controller can deploy something no person
 //! approved, so every check is required and anything unexpected is refused.
 //!
-//! [`parse_registration`] does the other half of a passkey's life: it takes a
-//! `none` attestation apart for the credential id and key the operator then copies
-//! into the configuration. No attestation chain is trusted. Only ES256 and `EdDSA`
-//! exist here.
+//! [`parse_registration`] does the other half of a passkey's life: it takes an
+//! attestation apart for the credential id and key the operator then reviews and copies
+//! into the configuration. No attestation is trusted. Only ES256 and `EdDSA` exist here.
 //!
 //! The signature counter is not checked: synced passkeys report 0, and a replay is
 //! stopped by the host's nonce log and the running digest named in the intent.

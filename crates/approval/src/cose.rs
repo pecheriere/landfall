@@ -3,7 +3,9 @@
 //! `WebAuthn` 6.5.1 says a credential key has `alg`, the parameters its key type
 //! requires, and no other optional parameter, in the CTAP2 canonical CBOR form. So
 //! exactly two shapes exist, and each key has one encoding, which is what its
-//! fingerprint is taken over. Anything else is refused rather than normalised.
+//! fingerprint is taken over. [`CoseKey::parse`], which config load uses, takes that
+//! encoding and nothing else. Only registration normalises, and only the encoding: a
+//! key with another parameter or a repeated label is refused there too.
 
 use std::fmt;
 
@@ -104,6 +106,10 @@ pub enum CoseError {
     /// An Ed25519 point of small order, for which signatures can be forged.
     #[error("COSE key is a point of small order")]
     WeakKey,
+    /// An Ed25519 point written with a `y` beyond the field's prime: the same point
+    /// has a shorter spelling, so the same key would have two fingerprints.
+    #[error("COSE key is not the canonical encoding of its point")]
+    NonCanonicalPoint,
     /// The right values, not in the CTAP2 canonical encoding.
     #[error("COSE key is not in the canonical encoding")]
     NotCanonical,
@@ -116,7 +122,7 @@ pub enum CoseError {
 #[derive(Debug, Clone)]
 pub struct CoseKey {
     algorithm: Algorithm,
-    /// The canonical encoding: the bytes this key was parsed from.
+    /// The canonical encoding, whatever this key was read from.
     encoded: Vec<u8>,
     parsed: ParsedPublicKey,
 }
@@ -137,25 +143,26 @@ impl CoseKey {
     ///
     /// Everything the module's docs say doesn't exist, as a [`CoseError`].
     pub fn parse(bytes: &[u8]) -> Result<Self, CoseError> {
-        let (key, end) = Self::parse_prefix(bytes)?;
+        let (key, end) = Self::normalise_prefix(bytes)?;
+        if bytes.get(..end) != Some(key.as_bytes()) {
+            return Err(CoseError::NotCanonical);
+        }
         match bytes.len() - end {
             0 => Ok(key),
             found => Err(CoseError::TrailingBytes(found)),
         }
     }
 
-    /// Parses the key at the start of `bytes` and says where it ends: in attested
-    /// credential data, nothing else marks that.
-    pub(crate) fn parse_prefix(bytes: &[u8]) -> Result<(Self, usize), CoseError> {
+    /// Reads the key at the start of `bytes`, however it's encoded, and says where it
+    /// ends: in attested credential data, nothing else marks that. The key that comes
+    /// out holds the canonical encoding.
+    pub(crate) fn normalise_prefix(bytes: &[u8]) -> Result<(Self, usize), CoseError> {
         let params = Parameters::scan(bytes)?;
         let (algorithm, encoded, parsed) = match params.int(LABEL_ALG, "alg")? {
             ALG_ES256 => es256(&params)?,
             ALG_EDDSA => eddsa(&params)?,
             other => return Err(CoseError::UnsupportedAlgorithm(other)),
         };
-        if bytes.get(..params.end) != Some(encoded.as_slice()) {
-            return Err(CoseError::NotCanonical);
-        }
         let key = Self {
             algorithm,
             encoded,
@@ -170,7 +177,7 @@ impl CoseKey {
         self.algorithm
     }
 
-    /// The key's canonical encoding, the bytes it was parsed from.
+    /// The key's canonical encoding: what's stored, shown and put in a configuration.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.encoded
@@ -231,6 +238,11 @@ fn eddsa(params: &Parameters<'_>) -> Result<Validated, CoseError> {
     let point = VerifyingKey::from_bytes(bytes).map_err(|_| CoseError::NotOnCurve)?;
     if point.is_weak() {
         return Err(CoseError::WeakKey);
+    }
+    // Decompressing accepts a y beyond the field's prime, which is another spelling of
+    // the point at y - p.
+    if point.to_edwards().compress().as_bytes() != bytes {
+        return Err(CoseError::NonCanonicalPoint);
     }
     let parsed = ParsedPublicKey::new(&ED25519, x).map_err(|_| CoseError::NotOnCurve)?;
     Ok((Algorithm::EdDsa, encode_eddsa(x), parsed))

@@ -11,8 +11,46 @@ use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, Ed25519
 use crate::assertion::Assertion;
 use crate::authenticator_data::{FLAG_AT, FLAG_UP, FLAG_UV};
 use crate::cose::{CoseError, CoseKey, encode_eddsa, encode_es256};
-use crate::registration::encode_attestation_object;
 use crate::wire;
+
+const MAJOR_BYTES: u8 = 2;
+const MAJOR_TEXT: u8 = 3;
+
+/// The canonical encoding of an attestation object: three keys, shortest first.
+pub(crate) fn encode_attestation_object(
+    format: &str,
+    statement: &[u8],
+    auth_data: &[u8],
+) -> Vec<u8> {
+    let mut out = vec![0xa3];
+    push_text(&mut out, "fmt");
+    push_text(&mut out, format);
+    push_text(&mut out, "attStmt");
+    out.extend_from_slice(statement);
+    push_text(&mut out, "authData");
+    push_head(&mut out, MAJOR_BYTES, auth_data.len());
+    out.extend_from_slice(auth_data);
+    out
+}
+
+fn push_text(out: &mut Vec<u8>, text: &str) {
+    push_head(out, MAJOR_TEXT, text.len());
+    out.extend_from_slice(text.as_bytes());
+}
+
+/// A CBOR head in its shortest form.
+fn push_head(out: &mut Vec<u8>, major: u8, len: usize) {
+    let be = (len as u64).to_be_bytes();
+    let (info, width) = match len {
+        0..=23 => (be[7], 0),
+        24..=0xff => (24, 1),
+        0x100..=0xffff => (25, 2),
+        0x1_0000..=0xffff_ffff => (26, 4),
+        _ => (27, 8),
+    };
+    out.push((major << 5) | info);
+    out.extend_from_slice(&be[8 - width..]);
+}
 
 /// A software authenticator couldn't do what it was asked.
 #[derive(Debug, thiserror::Error)]

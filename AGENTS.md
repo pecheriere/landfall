@@ -13,7 +13,8 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-core` (`crates/core`): shared library with no I/O: validated
   identifiers, configuration types and the pure verification and rule logic.
 - `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
-  a key from local configuration, and parses a `none` attestation for its key.
+  a key from local configuration, and parses an attestation, trusting none of it,
+  for its key.
   No I/O: `cose` (COSE keys, ES256 and EdDSA only), `client_data`,
   `authenticator_data`, `assertion`, `registration`, and `software`, a software
   authenticator for tests, behind the `test-support` feature, which only
