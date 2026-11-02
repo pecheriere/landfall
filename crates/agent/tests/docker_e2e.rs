@@ -44,6 +44,31 @@ mod compose_project;
 
 use compose_project::ComposeProject;
 
+/// How many times to look again at a lock that is taken, and how long between looks.
+const BUSY_TRIES: u32 = 100;
+const BUSY_WAIT: Duration = Duration::from_millis(50);
+
+/// Runs `work`, again if the deployment's lock is taken. Nothing else in a test holds
+/// it once a deploy has returned, but tests run in threads of one process and start
+/// children all the time: a child between `fork` and `exec` has a copy of every
+/// descriptor, the lock's included, and a `flock` lasts until the last copy closes. So
+/// the lock can seem taken for a moment after it was let go. The agent itself takes
+/// that as a reason to wait and try again.
+async fn retrying_while_busy<T>(
+    mut work: impl AsyncFnMut() -> Result<T, DeployError>,
+) -> Result<T, DeployError> {
+    let mut tries = 1;
+    loop {
+        match work().await {
+            Err(DeployError::Busy(_)) if tries < BUSY_TRIES => {
+                tries += 1;
+                tokio::time::sleep(BUSY_WAIT).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 const REPO: &str = "containerd/busybox";
 /// Tag 1.36: what a healthy version runs.
 const DIGEST_A: &str = "sha256:7b3ccabffc97de872a30dfd234fd972a66d247c8cfc69b0550f276481852627c";
@@ -163,6 +188,15 @@ impl Stack {
     }
 
     async fn attempt(
+        &self,
+        rest: &str,
+        tag: &str,
+        digest: &str,
+    ) -> Result<DeployReport, DeployError> {
+        retrying_while_busy(async || Box::pin(self.attempt_once(rest, tag, digest)).await).await
+    }
+
+    async fn attempt_once(
         &self,
         rest: &str,
         tag: &str,
@@ -904,13 +938,16 @@ async fn docker_recover_after_failed_rollback_keeps_later_writes() {
     let before = stack.running_since().await;
     stack.options = options();
     let deployment = stack.deployment(&needs_dependency);
-    let report = deploy::recover(
-        &stack.docker,
-        &stack.state,
-        &deployment,
-        &stack.dir,
-        &stack.options,
-    )
+    let report = retrying_while_busy(async || {
+        Box::pin(deploy::recover(
+            &stack.docker,
+            &stack.state,
+            &deployment,
+            &stack.dir,
+            &stack.options,
+        ))
+        .await
+    })
     .await
     .unwrap();
 
@@ -1081,13 +1118,16 @@ async fn docker_failed_rollback_up_leaves_what_runs_running() {
     fs::write(&compose_file, intact).unwrap();
     stack.options = options();
     let deployment = stack.deployment(&rest);
-    let recovered = deploy::recover(
-        &stack.docker,
-        &stack.state,
-        &deployment,
-        &stack.dir,
-        &stack.options,
-    )
+    let recovered = retrying_while_busy(async || {
+        Box::pin(deploy::recover(
+            &stack.docker,
+            &stack.state,
+            &deployment,
+            &stack.dir,
+            &stack.options,
+        ))
+        .await
+    })
     .await
     .unwrap();
     assert_rolled_back(&recovered);
