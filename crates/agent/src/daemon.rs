@@ -417,15 +417,18 @@ async fn settle_claims(state_dir: &Path, options: &DaemonOptions) {
     for id in options.dirs.keys() {
         let (root, owned) = (state_dir.to_owned(), id.clone());
         let settled = on_thread("settle claim", move || outbox::settle_claim(&root, &owned)).await;
-        if let Err(error) = settled {
-            journal::emit(
+        match settled {
+            // What `recover` left is looked at now, and not up to a minute from now.
+            Ok(true) => options.memory.forget_drift(id),
+            Ok(false) => {}
+            Err(error) => journal::emit(
                 Priority::Error,
                 &NotSettled {
                     event: "claim_not_settled",
                     deployment: id,
                     error,
                 },
-            );
+            ),
         }
     }
 }
@@ -724,6 +727,35 @@ pub async fn run(
     host: &HostId,
     state_dir: &Path,
 ) -> Result<(), DaemonError> {
+    Box::pin(run_with(
+        config_path,
+        url,
+        host,
+        state_dir,
+        &DockerCli::new(),
+        OriginVerifier::new,
+        EngineOptions::default(),
+    ))
+    .await
+}
+
+/// [`run`], with what it runs Docker and verifies releases with and the engine's
+/// timing given, for the end-to-end tests: no test repository signs real releases.
+/// `verifier` is given the directory of the trust root's cache, which exists by
+/// then. Nothing on the command line leads here with anything but what `run` gives.
+///
+/// # Errors
+///
+/// [`DaemonError`] when it can't start.
+pub async fn run_with<D: Docker, V: Verifier>(
+    config_path: &Path,
+    url: ControllerUrl,
+    host: &HostId,
+    state_dir: &Path,
+    docker: &D,
+    verifier: impl FnOnce(PathBuf) -> Result<V, DaemonError>,
+    engine: EngineOptions,
+) -> Result<(), DaemonError> {
     let started = start_up(config_path, host, state_dir)?;
     let cache_dir = state_dir.join("tuf");
     let created = std::fs::DirBuilder::new()
@@ -734,11 +766,12 @@ pub async fn run(
         source,
     })?;
     let controller = HttpController::new(url, host.clone(), started.key.clone())?;
-    let verifier = OriginVerifier::new(cache_dir)?;
+    let verifier = verifier(cache_dir)?;
     let shutdown = Shutdown::on_signals().map_err(DaemonError::Signals)?;
-    let options = DaemonOptions::new(started.dirs.clone(), started.config_hash, shutdown);
+    let mut options = DaemonOptions::new(started.dirs.clone(), started.config_hash, shutdown);
+    options.engine = engine;
     Box::pin(run_loop(
-        &DockerCli::new(),
+        docker,
         &controller,
         &verifier,
         &started.config,

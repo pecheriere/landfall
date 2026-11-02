@@ -29,6 +29,10 @@ const WORK_PATH: &str = "/agent/v1/work";
 const REPORT_PATH: &str = "/agent/v1/report";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an idle connection is kept for another request: under the ten seconds
+/// after which the controller closes one, so that a request isn't sent down a
+/// connection just as it closes, as a heartbeat every ten seconds otherwise can be.
+const IDLE_CONNECTION: Duration = Duration::from_secs(5);
 /// A plain request: a nonce, an enrolment, a report.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// `work` is held by the controller for up to 30 seconds.
@@ -217,6 +221,7 @@ pub(crate) fn http_client(url: &ControllerUrl) -> Result<Client, ControllerError
     Client::builder()
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
+        .pool_idle_timeout(IDLE_CONNECTION)
         .https_only(url.is_https())
         .redirect(redirect::Policy::none())
         .user_agent(concat!("landfall-agent/", env!("CARGO_PKG_VERSION")))

@@ -5,11 +5,13 @@
 
 use std::ffi::OsString;
 use std::fs::DirBuilder;
+use std::future::Future;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use landfall_core::config::{self, Config, ConfigError};
@@ -23,7 +25,7 @@ use tokio::sync::watch;
 use crate::agent_api::{ApiState, Limits};
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
-use crate::watcher::{self, LiveSource};
+use crate::watcher::{self, LiveSource, ReleaseSource};
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -265,8 +267,24 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let config = load_config(&args.config)?;
     let token = github_token(std::env::var_os("GITHUB_TOKEN"))?;
     let fetcher = release_fetcher(token.as_deref())?;
+    let source = |args: &ServeArgs, watched: Arc<Config>| {
+        let cache_dir = trust_cache_dir(args)?;
+        Ok(Arc::new(LiveSource::new(fetcher, watched, cache_dir)))
+    };
+    serve_watching(args, config, source, watcher::TICK_INTERVAL).await
+}
+
+/// Serves `config`, with the watcher looking at what `source` makes every
+/// `interval`. It is made once the database is open.
+async fn serve_watching<S: ReleaseSource>(
+    args: ServeArgs,
+    config: Config,
+    source: impl FnOnce(&ServeArgs, Arc<Config>) -> Result<Arc<S>, CliError>,
+    interval: Duration,
+) -> Result<u8, CliError> {
     let store = Store::open(&args.db).await?;
-    let cache_dir = trust_cache_dir(&args)?;
+    let watched = Arc::new(config.clone());
+    let source = source(&args, Arc::clone(&watched))?;
     let serve_error = |source| CliError::Serve {
         addr: args.listen,
         source,
@@ -275,14 +293,12 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(CliError::Signals)?;
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
 
-    let watched = Arc::new(config.clone());
-    let source = Arc::new(LiveSource::new(fetcher, Arc::clone(&watched), cache_dir));
     let (stop_watcher, stop_watching) = watch::channel(false);
     let watching = tokio::spawn(watcher::run(
         store.clone(),
         watched,
         source,
-        watcher::TICK_INTERVAL,
+        interval,
         stop_watching,
     ));
 
@@ -353,11 +369,29 @@ async fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
 /// Runs a parsed command line and gives the process's exit status.
 #[must_use]
 pub fn run(cli: Cli) -> u8 {
+    on_a_runtime(execute(cli, &mut io::stdout()))
+}
+
+/// [`run`], with `serve` watching `source` every `interval`, for the end-to-end
+/// tests: no test repository signs real releases. Nothing on the command line
+/// leads here.
+#[must_use]
+pub fn run_watching<S: ReleaseSource>(cli: Cli, source: Arc<S>, interval: Duration) -> u8 {
+    match cli.command {
+        Command::Serve(args) => on_a_runtime(async move {
+            let config = load_config(&args.config)?;
+            serve_watching(args, config, |_, _| Ok(source), interval).await
+        }),
+        command => run(Cli { command }),
+    }
+}
+
+fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(CliError::Runtime)
-        .and_then(|runtime| runtime.block_on(execute(cli, &mut io::stdout())));
+        .and_then(|runtime| runtime.block_on(work));
     match result {
         Ok(code) => code,
         Err(error) => {

@@ -286,8 +286,9 @@ pub(super) fn failure_evidence(
 
 /// Deals with what a crash or a `recover` left of a deploy. With its marker
 /// still there it goes on waiting for `recover`; holding the lock keeps a
-/// running `recover` out of the way.
-pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), StateError> {
+/// running `recover` out of the way. Says whether it ended a claim, as what runs
+/// may have changed then.
+pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<bool, StateError> {
     #[derive(Serialize)]
     struct Settled<'a> {
         event: &'static str,
@@ -298,15 +299,15 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), St
     let root = StateDir::open(state_dir)?;
     let state = root.deployment(id)?;
     let Some(claim) = state.claim()? else {
-        return Ok(());
+        return Ok(false);
     };
     let _lock = match state.lock() {
         Ok(lock) => lock,
-        Err(StateError::Busy(_)) => return Ok(()),
+        Err(StateError::Busy(_)) => return Ok(false),
         Err(error) => return Err(error),
     };
     if state.in_progress()?.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let body = if let Some(report) = latest_report(&state, &claim)? {
         if is_failure(&report.outcome) {
@@ -351,7 +352,8 @@ pub(super) fn settle_claim(state_dir: &Path, id: &DeploymentId) -> Result<(), St
             found,
         },
     );
-    state.clear_claim()
+    state.clear_claim()?;
+    Ok(true)
 }
 
 /// How sending one report ended.
