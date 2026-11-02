@@ -241,14 +241,14 @@ deployment. The full key reference and validation rules are in `docs/configurati
   given for. No dependence on the host clock (a Pi without RTC). So a controller database restored
   to before a deploy can deliver its approval again, and the host refuses it, leaving the service
   alone: the end-to-end tests do just that, under the same number and a new one.
-- **What the operator sees:** the ceremony runs on the controller's page, so the page could show
-  one thing while the challenge covers another. Because every deployable release is maintainer-signed,
+- **What the operator sees:** the ceremony runs on the controller's page, so the page could show one
+  thing while the challenge covers another. Because every deployable release is maintainer-signed,
   upward-only for auto, and bound to the running digest, the worst a lying controller can do with a
   tap is install a different maintainer-signed release, a lower one or one on that host's record of
-  failures included, once, on a deployment whose `rule.approvers` lists that person. Accepted for v0 and stated in the docs, along with what
-  `signed_tags = false` leaves of "maintainer-signed". `landfall approve`, planned and not yet built,
-  computes the intent hash locally and shows it next to the page's, for anyone who wants the stronger
-  path.
+  failures included, once, on a deployment whose `rule.approvers` lists that person. Accepted for v0
+  and stated in the docs, along with what `signed_tags = false` leaves of "maintainer-signed".
+  `landfall approve`, planned and not yet built, computes the intent hash locally and shows it next
+  to the page's, for anyone who wants the stronger path.
 - **Registration:** passkeys are registered on the controller's page, which shows the new
   credential's public-key fingerprint. The operator copies key and fingerprint into the config by pull
   request; the agent only trusts keys from that file. Accepted residual risk: a compromised controller
@@ -357,9 +357,10 @@ lines of a reused container do not; a replaced container's logs are not scanned.
 ## 8. Identity and grants
 
 ### 8.1 Principals
-- Humans: sign in with a passkey, for a session of 12 hours; approvals always need a fresh assertion.
-- Agents: an API token per agent (hashed at rest, shown once), which can ask but never approve. Identity
-  through a trusted reverse-proxy header is out of v0.
+- Humans: sign in with a passkey, for a session of 12 hours; approvals always need a fresh
+  assertion.
+- Agents: an API token per agent (hashed at rest, shown once), which can ask but never approve.
+  Identity through a trusted reverse-proxy header is out of v0.
 - Host agents: an Ed25519 key generated on the host; the public key is enrolled with a one-time code
   bound to that host and requests are signed. A request signs a single-use nonce from the controller,
   not the clock, as a Pi may have no RTC. A host agent can only fetch its own host's work and report on

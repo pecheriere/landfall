@@ -223,6 +223,9 @@ To restore:
      | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
    ```
 
+   An empty file with nothing printed is a good answer: nothing was revoked. **If this printed an
+   error,** the file is empty too and says nothing, so use the fallback in step 4.
+
 3. **Put the backup in place,** as the user the controller runs as, which must be able to open it.
    Removing the other two files first matters: `SQLite` would apply a log of the old database to the
    new.
@@ -232,17 +235,17 @@ To restore:
    cp /backups/controller-2026-11-01.db controller.db
    ```
 
-4. **Revoke those tokens again, before `serve` starts,** so that they don't work in between. This needs
-   no `serve`. An id that says `there is no API token with this id` was made after the backup, and is gone
-   with it:
+4. **Revoke those tokens again, before `serve` starts,** so that they don't work in between. This
+   needs no `serve`. An id that says `there is no API token with this id` was made after the backup,
+   and is gone with it:
 
    ```sh
    grep '"kind":"token_revoked"' changed-since-backup.txt | sed -E 's/.*"token":([0-9]+).*/\1/' \
      | while read -r id; do landfall-server token revoke --id "$id" --db controller.db; done
    ```
 
-   **If the old database is lost, or you don't trust it,** you can't know what was revoked. Revoke every
-   token the restored log knows of, and make new ones afterwards:
+   **If the old database is lost, or you don't trust it,** you can't know what was revoked. Revoke
+   every token the restored log knows of, and make new ones afterwards:
 
    ```sh
    landfall-server audit show --db controller.db --limit 4294967295 \
@@ -250,28 +253,33 @@ To restore:
      | while read -r id; do landfall-server token revoke --id "$id" --db controller.db; done
    ```
 
-   A backup from before an upgrade gets `run serve from this version once` instead. Do that on a port
-   nothing forwards to, stop it, and then revoke.
-5. **Start the controller, and then the agents.** Hosts stay enrolled as of the backup, and tell it what
-   runs on their next poll.
-6. **Register again whoever has a `passkey_registered` row** in that file, from a new invite: the
-   stored key is back to the old one. A session signed out since the backup works again too, until its
-   12 hours are up or that person registers again. With no list to go by, invite everyone without a key
-   in `[approvers]`.
-7. **Keep a new head.** Whatever happened since is gone from the log, so `audit verify --at` with a head
-   kept since fails, as it should.
+   A backup from before an upgrade gets `run serve from this version once` instead. Do that on a
+   port nothing forwards to, stop it, and then revoke.
+5. **Start the controller, and then the agents.** Hosts stay enrolled as of the backup, and tell it
+   what runs on their next poll.
+6. **Someone with no key in `[approvers]` registers again,** from a new invite, if that file has a
+   `passkey_registered` row for them, as their stored key is back to the old one. With no list to go
+   by, that is all of them. **An approver with a key in the file doesn't register again:** signing
+   in and approving go by the file's key, whatever is stored, so they need nothing. And on the same
+   authenticator, registering replaces the credential the file and every host hold, so that person
+   couldn't approve until the file changed everywhere. A session signed out since the backup works
+   again too, until its 12 hours are up or, for someone with no key in the file, they register
+   again.
+7. **Keep a new head.** Whatever happened since is gone from the log, so `audit verify --at` with a
+   head kept since fails, as it should.
 
-**In its container,** these are the same steps with other commands. The image holds the one program and
-no shell, so `grep`, `rm` and the rest run on the host, on the directory mounted at `/data`. With `serve`
-stopped `docker exec` has nothing to run in, so each `landfall-server` command is a one-off container. The
-names here are those of [the run command above](#running-the-controller), and the backup is one made
-on the volume with `docker exec`:
+**In its container,** these are the same steps with other commands. The image holds the one program
+and no shell, so `grep`, `rm` and the rest run on the host, on the directory mounted at `/data`.
+With `serve` stopped `docker exec` has nothing to run in, so each `landfall-server` command is a
+one-off container. The names here are those of [the run command above](#running-the-controller), and
+the backup is one made on the volume with `docker exec`:
 
 ```sh
 # 1. Stop the agents, then the controller.
 docker stop landfall
 
-# 2. What was revoked since the backup.
+# 2. What was revoked since the backup. If this prints an error, the file is empty and says
+#    nothing: use the fallback below.
 docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
   audit show --db /data/controller.db --limit 4294967295 \
   | grep -E '"kind":"(token_revoked|passkey_registered)"' > changed-since-backup.txt
@@ -292,8 +300,8 @@ grep '"kind":"token_revoked"' changed-since-backup.txt | sed -E 's/.*"token":([0
 docker start landfall
 ```
 
-If the old database is lost or you don't trust it, step 4 goes by the restored log, and new tokens need
-the file as well:
+If the old database is lost or you don't trust it, step 4 goes by the restored log, and new tokens
+need the file as well:
 
 ```sh
 docker run --rm -v /srv/landfall:/data ghcr.io/pecheriere/landfall \
@@ -307,8 +315,8 @@ docker run --rm -v /srv/landfall:/data -v /etc/landfall/fleet.toml:/fleet.toml:r
   ghcr.io/pecheriere/landfall token create --principal ci --config /fleet.toml --db /data/controller.db
 ```
 
-A backup from before an upgrade needs `serve` once before step 4. With no network and no published port,
-nothing can reach it meanwhile. It is ready when its log says `listening on`:
+A backup from before an upgrade needs `serve` once before step 4. With no network and no published
+port, nothing can reach it meanwhile. It is ready when its log says `listening on`:
 
 ```sh
 docker run -d --name landfall-upgrade --network none -v /srv/landfall:/data \
@@ -326,18 +334,18 @@ approvals are as of the backup too.
 **An approval comes through a restore safely, as the hosts keep their own count of them:**
 
 - One made since the backup is gone, and nothing runs on it. The request is open again if the backup
-  has it open, and takes a new tap. **That tap may run nothing:** if its new deploy gets a number this
-  host already finished for that release, the host answers with its report of then, with no `up` and
-  nothing spent, so the row can read `deployed` while another version runs. Check what runs with
-  `landfall-agent status`. If it didn't move and you still want it, ask again, which makes a new
-  request and a new number.
+  has it open, and takes a new tap. **That tap may run nothing:** if its new deploy gets a number
+  this host already finished for that release, the host answers with its report of then, with no
+  `up` and nothing spent, so the row can read `deployed` while another version runs. Check what runs
+  with `landfall-agent status`. If it didn't move and you still want it, ask again, which makes a
+  new request and a new number.
 - One the backup holds as queued, for a deploy that has since run, is delivered again under its
   number. The host answers with its report of that deploy (`finished_work_delivered_again`), and the
   service isn't touched.
-- Delivered under another number, it is refused at priority 2: by what the host runs, if it has moved
-  on, or by [the nonce log](#the-nonce-log), if the digest it names is running again. Deploy numbers
-  aren't per deployment, so a request reopened by a restore can honestly get another number. Nothing
-  ran. If you still want the release, ask again.
+- Delivered under another number, it is refused at priority 2: by what the host runs, if it has
+  moved on, or by [the nonce log](#the-nonce-log), if the digest it names is running again. Deploy
+  numbers aren't per deployment, so a request reopened by a restore can honestly get another number.
+  Nothing ran. If you still want the release, ask again.
 
 ### Rebuilding a controller from nothing
 
@@ -720,19 +728,19 @@ origin = "https://landfall.example-tailnet.ts.net"
 rp_id = "landfall.example-tailnet.ts.net"
 ```
 
-**A passkey belongs to its RP ID,** so moving the controller to another name takes a new passkey from
-everyone and a new line in the file for each approver, since a browser won't offer the old one there
-and hosts wouldn't accept it. Pick the name you mean to keep. `origin` and `rp_id` are in the file
-hosts hash too, so changing them means every host has the new file before it gets more work.
+**A passkey belongs to its RP ID,** so moving the controller to another name takes a new passkey
+from everyone and a new line in the file for each approver, since a browser won't offer the old one
+there and hosts wouldn't accept it. Pick the name you mean to keep. `origin` and `rp_id` are in the
+file hosts hash too, so changing them means every host has the new file before it gets more work.
 [The configuration](configuration.md#approval) has the exact rules.
 
-**What has and hasn't been tried.** The ceremonies have run in Chrome with its virtual authenticator,
-over a throwaway certificate on `https://localhost` with the test's own TLS terminator, and with a
-software authenticator through the real routes end to end. **They have not run through `tailscale
-serve` or any production proxy, or on a real device: no phone, no synced passkey, no hardware key.**
-Safari's rules on when a ceremony may start and how a password manager's extension behaves are both
-unknown here, so try a registration and a sign-in before you rely on them, and keep the way back
-in [Losing a passkey](#losing-a-passkey) in mind.
+**What has and hasn't been tried.** The ceremonies have run in Chrome with its virtual
+authenticator, over a throwaway certificate on `https://localhost` with the test's own TLS
+terminator, and with a software authenticator through the real routes end to end. **They have not
+run through `tailscale serve` or any production proxy, or on a real device: no phone, no synced
+passkey, no hardware key.** Safari's rules on when a ceremony may start and how a password manager's
+extension behaves are both unknown here, so try a registration and a sign-in before you rely on
+them, and keep the way back in [Losing a passkey](#losing-a-passkey) in mind.
 
 ### From nothing to a first deploy
 
@@ -753,8 +761,8 @@ in [Losing a passkey](#losing-a-passkey) in mind.
    can = ["view", "request", "approve", "rollback"]
    ```
 
-4. Have it reviewed, comparing the fingerprint with the one the page showed, and put the same file on
-   the controller and on every host. Restart `serve`.
+4. Have it reviewed, comparing the fingerprint with the one the page showed, and put the same file
+   on the controller and on every host. Restart `serve`.
 5. [Enrol the host](#enrolling-a-host) and start its agent. The watcher looks at releases when it
    starts and every five minutes after that, and records the release as `manual`. Nothing starts.
 6. Ask for the release: `landfall-server token create --principal operator ...` gives a token, which
@@ -762,9 +770,10 @@ in [Losing a passkey](#losing-a-passkey) in mind.
 7. Sign in at `/sign-in`, open `/approvals`, check what it shows, and approve with your passkey. A
    token can't do this step. The host checks what you signed for itself, and runs it.
 
-Later releases go by the rule. What takes an approval waits as `needs_approval` or `manual`, and steps
-6 and 7 are how it goes on. A lower version is [a manual rollback](#api-tokens-requests-and-approvals),
-and a release that rolled back is [retried](#a-release-that-rolled-back-isnt-retried), the same way.
+Later releases go by the rule. What takes an approval waits as `needs_approval` or `manual`, and
+steps 6 and 7 are how it goes on. A lower version is [a manual
+rollback](#api-tokens-requests-and-approvals), and a release that rolled back is
+[retried](#a-release-that-rolled-back-isnt-retried), the same way.
 
 ### Registering, and who signs in as whom
 
@@ -864,11 +873,12 @@ hands it, and the page comes from the controller. If the controller is compromis
 **It can** show you one release and have you sign another, on any deployment whose `rule.approvers`
 lists you. That includes a lower version, so a tap can be turned into a rollback to an old release,
 and an old release may have bugs a newer one fixed. It also includes a release on this host's
-[record of failures](#a-release-that-rolled-back-isnt-retried), which an approval retries. It can do the same with a tap meant for signing
-in. It can then hold what you signed and deliver it later, since a host has no clock it trusts, for as
-long as the digest it names is running. It can show its own key at registration in place of yours,
-which is why a key is reviewed and the fingerprint compared. And it can say anything it likes in its
-own pages and its own audit log, including leaving your tap out or writing one that never happened.
+[record of failures](#a-release-that-rolled-back-isnt-retried), which an approval retries. It can do
+the same with a tap meant for signing in. It can then hold what you signed and deliver it later,
+since a host has no clock it trusts, for as long as the digest it names is running. It can show its
+own key at registration in place of yours, which is why a key is reviewed and the fingerprint
+compared. And it can say anything it likes in its own pages and its own audit log, including leaving
+your tap out or writing one that never happened.
 
 **It can't** run anything without a tap, as hosts check a signature by the key in their own file:
 
@@ -879,29 +889,31 @@ own pages and its own audit log, including leaving your tap out or writing one t
 - **Install what doesn't verify.** The host verifies the release for itself, and a digest or commit
   other than the one signed is refused. With `origin.signed_tags` on that means a maintainer-signed
   release. With it off, it means whatever that workflow built for a tag.
-- **Use a tap twice,** or after the host has moved on. Only the digest it names, and only once, however
-  the database is restored and whatever number it comes under.
-- **Run what a rule refuses,** which is the version already running or a pre-release the rule doesn't
-  take.
-- **Burn your approval by asking wrongly.** A refusal spends no nonce. Only a good approval is spent,
-  just before the deploy starts, [but for two failures of the disk](#an-approval-is-verified-on-the-host).
+- **Use a tap twice,** or after the host has moved on. Only the digest it names, and only once,
+  however the database is restored and whatever number it comes under.
+- **Run what a rule refuses,** which is the version already running or a pre-release the rule
+  doesn't take.
+- **Burn your approval by asking wrongly.** A refusal spends no nonce. Only a good approval is
+  spent, just before the deploy starts, [but for two failures of the
+  disk](#an-approval-is-verified-on-the-host).
 
 **A sign-in tap is `webauthn.get` too,** the same kind as an approval. So a compromised controller
-could put a request's intent hash in a sign-in ceremony, and a person signing in would have
-approved it without knowing. It is within the residual risk of design 6.3: the ceremony runs on the
+could put a request's intent hash in a sign-in ceremony, and a person signing in would have approved
+it without knowing. It is within the residual risk of design 6.3: the ceremony runs on the
 controller's page, which can already show one thing and have another signed. The host still only
-runs a release that verifies for that deployment, which is maintainer-signed if `origin.signed_tags` is
-on, from the digest it is running. The page can't
-prove what it asks you to sign. Computing the hash on your own machine is the stronger path, and is
-planned as `landfall approve`, which doesn't exist yet.
+runs a release that verifies for that deployment, which is maintainer-signed if `origin.signed_tags`
+is on, from the digest it is running. The page can't prove what it asks you to sign. Computing the
+hash on your own machine is the stronger path, and is planned as `landfall approve`, which doesn't
+exist yet.
 
-**How you'd know.** Each of these refusals leaves the service alone and goes in the host's journal as
-`controller_work_refused` at priority 2, which is the record the controller can't change, so alert on
-that, and then [read it](#reading-a-refusal-at-priority-2), as some have honest causes. The controller's `deploy_refused` audit row has the reason too, as long as it is honest. What
-the page can't be caught by is a good signature over something you didn't mean: compare
-`approval_about_to_be_spent` in the host's journal, which names the approver and the release, with what
-you approved. `crates/agent/tests/e2e/approvals/` shows the refusals, with the controller's database
-written to directly.
+**How you'd know.** Each of these refusals leaves the service alone and goes in the host's journal
+as `controller_work_refused` at priority 2, which is the record the controller can't change, so
+alert on that, and then [read it](#reading-a-refusal-at-priority-2), as some have honest causes. The
+controller's `deploy_refused` audit row has the reason too, as long as it is honest. What the page
+can't be caught by is a good signature over something you didn't mean: compare
+`approval_about_to_be_spent` in the host's journal, which names the approver and the release, with
+what you approved. `crates/agent/tests/e2e/approvals/` shows the refusals, with the controller's
+database written to directly.
 
 ### Losing a passkey
 
@@ -910,35 +922,36 @@ passkey, and a session already open goes on. What waits is whatever takes an app
 If another approver is listed for a deployment, they can sign in the meantime. `[approvers]` holds
 one key for a name, so a second device means a second name, listed in the same `rule.approvers` and
 with an `approve` grant of its own, since the file doesn't ask for one and the controller won't let
-that name approve without it. Have one before you need it. Nothing in the controller can stand in for the file, so with no approver left
-it takes someone who can change the file on every host.
+that name approve without it. Have one before you need it. Nothing in the controller can stand in
+for the file, so with no approver left it takes someone who can change the file on every host.
 
 **For an approver:**
 
 1. On the controller, `landfall-server passkey-invite --principal <name> ...`, and register a new
    passkey from its link. That needs no sign-in. It replaces the stored key and ends that person's
-   sessions. The new key can't sign in yet, and trying gets `sign_in_barred_key` in the log: expected,
-   this once.
+   sessions. The new key can't sign in yet, and trying gets `sign_in_barred_key` in the log:
+   expected, this once.
 2. Replace the person's line under `[approvers]` by pull request, comparing the fingerprint.
-3. Put the file on every host and the controller, and restart them all, as each reads it once. A host
-   with the old file gets no work until it has the new one, and the release needs the watcher's next
-   look under the new file before it can be asked for.
+3. Put the file on every host and the controller, and restart them all, as each reads it once. A
+   host with the old file gets no work until it has the new one, and the release needs the watcher's
+   next look under the new file before it can be asked for.
 4. From then on the old key is nobody. An approval it signed that hasn't reached the host yet is
    refused there at priority 2, which is expected this once: ask again and sign with the new key.
 
-**For someone with grants and no key in `[approvers]`:** only step 1. The stored key is all there was.
+**For someone with grants and no key in `[approvers]`:** only step 1. The stored key is all there
+was.
 
-**If it may have been stolen and not lost,** do the above at once, and read back from when it went: the
-controller's `signed_in` and `request_approved` rows, and `approval_about_to_be_spent` in each host's
-journal. A thief with only the passkey can sign in and approve what's asked, with that person's grants.
-Until each host restarts with the new file, it still accepts that key's signature.
+**If it may have been stolen and not lost,** do the above at once, and read back from when it went:
+the controller's `signed_in` and `request_approved` rows, and `approval_about_to_be_spent` in each
+host's journal. A thief with only the passkey can sign in and approve what's asked, with that
+person's grants. Until each host restarts with the new file, it still accepts that key's signature.
 
-**These steps can leave the thief a session.** Step 1 ends the sessions that exist, but until the file
-changes the old key can still open a new one, as the file's key decides. That session outlives the
-restart on the new file. It keeps the person's grants, so it can ask, roll back and cancel, and it can't
-approve, which takes a fresh assertion by the key now in the file. It ends after its 12 hours, or when
-the person registers again, which is one more key and one more change to the file. So make the file
-change quickly after step 1.
+**These steps can leave the thief a session.** Step 1 ends the sessions that exist, but until the
+file changes the old key can still open a new one, as the file's key decides. That session outlives
+the restart on the new file. It keeps the person's grants, so it can ask, roll back and cancel, and
+it can't approve, which takes a fresh assertion by the key now in the file. It ends after its 12
+hours, or when the person registers again, which is one more key and one more change to the file. So
+make the file change quickly after step 1.
 
 ## Running the agent
 
@@ -1113,22 +1126,54 @@ gone and come back. What it can install is still only the one release it names, 
 
 #### Reading a refusal at priority 2
 
-Nothing ran, and nothing was spent unless the reason says it was spent already. The reason is in the
-host's journal. These are the honest ways to get one, each with what would show it:
+Nothing ran. Nothing was spent either, unless the reason says the nonce was spent already, or that
+the nonce log can't say, where [a failed sync](#an-approval-is-verified-on-the-host) may have left
+it on disk. The reason is in the host's journal, `journalctl -u landfall-agent.service`.
 
-| Reason | Honest cause | What shows it |
+**A lying controller can bring about most of these reasons too,** so a row only clears a refusal if
+its check holds, and each check is something the controller can't make so.
+
+| Reason | Honest cause | The check |
 |---|---|---|
-| `it is for a host running <A>, and this host has <B> on record` | The host moved while an approval was queued: a `recover`, or a deploy by hand. A queued approval can't be cancelled yet ([#30](https://github.com/pecheriere/landfall/issues/30)) and the controller delivers it. | The host's journal has `deploy_step` and `deploy_finished` lines that took it to `<B>`, after the approval. |
-| The same, or `was already spent on this host` | The controller was [restored from a backup](#backing-up-and-restoring) holding that approval. | You restored it, just before this. |
-| `no approver in this host's configuration has credential` | The approver's key was [replaced](#losing-a-passkey) while the approval was on its way. | You changed the file just before this, and the credential is the old one. |
+| `it is for a host running <A>, and this host has <B> on record` | The host moved while an approval was queued, which can't be cancelled yet ([#30](https://github.com/pecheriere/landfall/issues/30)). | [What moved it](#what-moved-the-host), below. |
+| That, `is the version already running`, or `was already spent on this host` | The controller was [restored from a backup](#backing-up-and-restoring) holding that approval. | You restored it, just before this. |
+| `no approver in this host's configuration has credential` | The approver's key was [replaced](#losing-a-passkey) while the approval was on its way. | You changed the file just before this, and the credential is the old one. Any other is an alert. |
+| `credential <id> is <name>'s, who is no approver of this deployment` | That person was taken out of `rule.approvers` while the approval was on its way. | You changed the file just before this, and that is who you took out. |
+| `clientDataJSON origin: expected <new>, found <old>` | `[approval]` changed while the approval was on its way. | You changed the file just before this, and `<old>` is what it was. |
+| `no approval came with it` | An automatic deploy was queued, and the rule or what runs changed so that it no longer is. | You changed that just before this. A controller making up work looks just like this, so without that it is an alert. |
+| `this host's nonce log can't say` | [The log](#the-nonce-log) is damaged, full, or has the wrong owner or mode. | A `nonce_log_unusable` line, and the file itself, which the controller can't reach. |
 | `was already spent on this host` | A crash just as the approval was spent. | [Telling a crash from a replay](#telling-a-crash-from-a-replay). |
-| `verification: ...` | A second run appeared for a tag after the watcher recorded it, which it doesn't look at again for a release that isn't automatic (also [#30](https://github.com/pecheriere/landfall/issues/30)). | The repository's runs for that tag. |
+| `verification: release run: the release was attested by <N> workflow runs` | A second run for that tag came after the watcher recorded the release, as it doesn't look again at one that isn't automatic ([#30](https://github.com/pecheriere/landfall/issues/30)). | The repository's runs for that tag show it. That rules out a lying controller, whose token has no scopes, and not someone who can run the workflow: **check who started the second run.** |
+| `verification: platform: the image has no <platform> platform` | The release isn't built for this host's architecture, which the watcher doesn't look at, having no platform of its own. | The list the reason gives leaves this host's out, and `landfall verify --platform` says the same. |
 
-**What to do:** look in that host's journal for what moved it, and if it explains the refusal and you
-still want the release, ask again, which makes a new intent for what runs now. **If none of these
-explains it, treat it as a controller lying:** nothing honest makes a move that the host's journal has
-no line for, and a signature that doesn't verify (`the signature does not verify`) or a challenge that
-doesn't match (`clientDataJSON challenge`) has no honest route here at all.
+**Every other `verification:` reason isn't explained by this table:** a tag signature, an
+attestation's identity or the digest rule says the release is not what the file allows, whatever a
+repository's runs look like.
+
+##### What moved the host
+
+`deployed.json` moves only by a deploy or a rollback of the agent's own, `recover`'s included, so
+`<B>` should have `deploy_step` and `deploy_finished` lines. A `docker compose` by hand doesn't move
+it, and shows as [drift](#drift). Those lines look the same whoever asked for them, so go by **the
+unit they are under:**
+
+- **`journalctl -u "landfall-agent-recover@$(systemd-escape app/prod).service"`:** someone ran
+  `recover` on the host, which the controller has no way to start. Honest, if you can find out who.
+- **`journalctl -u landfall-agent.service`:** the controller delivered it. It keeps one deploy at a
+  time for a deployment, and refuses an approval while one is active, so this can only be honest if
+  it finished seconds before your tap, in the gap before the host's next poll reports it. Go by when
+  you tapped, as the audit log's times are the controller's. **Otherwise treat it as an alert:**
+  this is what it looks like to deliver something else first, or an approval held for weeks.
+- **You can't find it:** assume the worst, and then check whether the state directory was rebuilt or
+  restored, which moves the record with no line, whether the journal is volatile or was vacuumed,
+  and whether someone ran `recover` at a shell, whose lines went to that terminal and whose report
+  is under `<deployment>/reports/`.
+
+**What to do:** if a check holds and you still want the release, ask again, which makes a new intent
+for what runs now. **A reason that isn't listed, or a check that doesn't hold, is an alert to
+investigate.** It isn't proof of a lying controller, as this list may not be whole, but nothing here
+clears it. `the signature does not verify` and `clientDataJSON challenge` have no honest route we
+know of.
 
 #### Telling a crash from a replay
 
@@ -1150,10 +1195,10 @@ it as an attempt. Otherwise, going by what follows it:
   agent or the controller restarted around then. This can be honest too: a controller that
   lost track of how the deploy ended delivers it again. Look at what the controller says about
   that deploy, and if you still want the release, it takes a new approval.
-- **A replay:** the tag has `deploy_step` lines and its `deploy_finished` succeeded, the report
-  was delivered (`report_delivered`, by the deploy's number), nothing restarted, and the controller
-  wasn't [restored from a backup](#backing-up-and-restoring), yet the approval has come again under a
-  later number. Treat that as an alert. It gets nothing from it, as the approval is spent.
+- **A replay:** the tag has `deploy_step` lines and its `deploy_finished` succeeded, the report was
+  delivered (`report_delivered`, by the deploy's number), nothing restarted, and the controller
+  wasn't [restored from a backup](#backing-up-and-restoring), yet the approval has come again under
+  a later number. Treat that as an alert. It gets nothing from it, as the approval is spent.
 - **No such line at all, for a nonce in the log:** the log was changed by something other
   than the agent, or the journal has lost it. Treat it as an alert.
 
