@@ -108,6 +108,28 @@ cargo deny check
 - The Dockerfile pins the Rust base image by digest (the version in
   `rust-toolchain.toml`) and its build tools by version, each a release at
   least 7 days old; Dependabot proposes base image updates.
+- BuildKit, which every binary is built inside, is pinned by digest in each
+  `docker/setup-buildx-action` step (`driver-opts`, with `cache-binary: false`).
+  Dependabot can't read that, so `.github/buildkit/Dockerfile` holds the same
+  reference and is never built. To bump it, take Dependabot's pull request and put
+  the same line in the workflows: `test_buildkit_pin.py` fails until they agree.
+- The Dockerfile's `binaries` stage holds static `landfall-agent`, `landfall` and
+  `landfall-server`, from the image's own builder. `docker-build` builds it on
+  every PR (`docker buildx build --target binaries --platform
+  linux/arm64,linux/amd64 --provenance=false --sbom=false --output
+  type=local,dest=dist .`) and publishes nothing. `check_binaries.py` then wants
+  each to be a static PIE (`ET_DYN`, `DF_1_PIE`, no `PT_INTERP`, `DT_NEEDED` or text
+  relocations) for its directory's architecture, whole, with arm64 load segments
+  that suit a kernel with 16 KiB pages, mode 0755, and a size within its
+  `MAX_BYTES` budget. PIE comes from `RUSTFLAGS` in the Dockerfile's builder, as
+  `.cargo/` stays out of the build and a profile can't set it.
+- zig, which is the C compiler and linker, is upstream's tarball, by `ADD --checksum`
+  for each platform a build runs on, so no package repository can change it. Dependabot
+  can't bump it: take the hashes from `index.json` at ziglang.org and verify each file's
+  `.minisig` against the key published there. CI also runs the arm64 binaries' `--version`
+  under the QEMU in the pinned BuildKit image, which is a third copy of that reference.
+- `macos.yml` tests and builds the CLI on an arm64 Mac, only when a change can
+  reach it. It is filtered by path, so it can't be a required check, and isn't.
 - `crate-age` refuses `Cargo.lock` versions younger than 7 days (README,
   "Dependency age"). Pin an older version with
   `cargo update -p <crate> --precise <version>`; allow-list entries are only
