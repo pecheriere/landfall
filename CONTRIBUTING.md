@@ -43,11 +43,9 @@ wants its own releases does each of these for itself, with its own key.
    - **Required reviewers:** at least one, such as yourself.
    - **Prevent self-review:** off (`prevent_self_review`), or a sole maintainer can't approve.
    - **Allow administrators to bypass:** off (`can_admins_bypass`). It defaults to on, and left
-     on, an admin could publish with no reviewer. **Check that the environment's settings page
-     offers this switch,** as GitHub may not offer it on a repository a user owns. If it doesn't,
-     the guard stays red with `can_admins_bypass is not off, so an admin could publish with no
-     reviewer`, and no release can happen until the rule in `check_environment.py` is changed, in
-     a reviewed pull request. A `workflow_dispatch` run shows this before any tag.
+     on, an admin could publish with no reviewer, and the guard stays red with `can_admins_bypass
+     is not off, so an admin could publish with no reviewer`. A repository a user owns offers
+     this switch too.
    - **Deployment branches and tags:** "Selected branches and tags" (`custom_branch_policies`
      on, `protected_branches` off), with exactly one rule: the **tag** rule `v[0-9]*`. A branch
      rule, another pattern, or "Protected branches only" would refuse the tag at `publish`, or
@@ -67,9 +65,11 @@ wants its own releases does each of these for itself, with its own key.
 4. **Supply the tag-signing public key:** the `ssh-ed25519` key you sign tags with, as other
    types are refused. It goes in `crates/cli/assets/release-signers`, one
    `ssh-ed25519 <base64>` line with no comment, and its fingerprint in `SECURITY.md`, by pull
-   request. **That file holds no key until then, and the release preflight refuses every
-   tag.** That is correct too. In that file only `\n` ends a line, a carriage return
-   anywhere is refused, and a line is skipped only if it is empty or starts with `#`.
+   request. **A file with no key makes the release preflight refuse every tag.** That is correct
+   too. In that file only `\n` ends a line, a carriage return anywhere is refused, and a line is
+   skipped only if it is empty or starts with `#`. Keep this key apart from the one that signs
+   your commits, somewhere that asks you before each signature: anything running as you can use
+   a key file on disk with no prompt, and this one decides what hosts install as root.
 
 To rotate the key, let two overlap: release N carries both and is signed by the old one, and
 release N+1 is signed by the new one.
@@ -86,7 +86,8 @@ release N+1 is signed by the new one.
    environment's settings, and it skips `publish`, so it attests nothing and writes nothing to
    the transparency log. It skips `preflight` too, since there's no tag to prove.
 3. Check immutable releases once more, with the `gh api` call above: this is the one setting that
-   goes red only after publishing. Then `git tag -s v<version>` on that commit, and push the tag.
+   goes red only after publishing. Then `git tag -s v<version>` on that commit, naming the release
+   key with `-c user.signingkey=...` if it isn't git's default, and push the tag.
 4. Approve the `publish` job when it asks, **within 7 days**: the build jobs' artifacts expire
    after that, and a later approval fails at the download and spends the version.
 5. If there's a Homebrew tap, and this isn't a release candidate, which shouldn't reach
