@@ -30,6 +30,7 @@ pub(super) const UNIT_PATH: &str = "/etc/systemd/system/landfall-agent.service";
 const AGENT_DIR: &str = "/usr/local/bin";
 const AGENT_NEW: &str = "/usr/local/bin/.landfall-agent.new";
 const CONFIG_DIR: &str = "/etc/landfall";
+const UNIT_DIR: &str = "/etc/systemd/system";
 const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
 const CONFIG_NEW: &str = "/etc/landfall/.fleet.toml.new";
 const UNIT_NEW: &str = "/etc/systemd/system/.landfall-agent.service.new";
@@ -49,6 +50,10 @@ const AGENT_MODE: &str = "755";
 
 /// What an installed configuration's or unit's mode is, as `stat` says it.
 const FILE_MODE: &str = "644";
+
+/// What `check_installed` adds for a file that a run can simply write again. Not for the agent:
+/// a different one goes through `host upgrade`, however this one came to be missing.
+const OR_REMOVE: &str = ", or remove it to have it written again";
 
 const TAMPERED_AGENT: &str = "the uploaded agent doesn't have the verified SHA-256";
 const TAMPERED_CONFIG: &str = "the uploaded configuration doesn't have the SHA-256 this was given";
@@ -195,19 +200,25 @@ esac
          upload_is {UPLOAD_CONFIG} {config_sha256} || refuse {tampered_config}"
     );
 
+    let or_remove = quote(OR_REMOVE);
+    let _ = writeln!(
+        shell,
+        "check_dir {AGENT_DIR}\ncheck_dir {CONFIG_DIR}\ncheck_dir {UNIT_DIR}"
+    );
+
     let refusal = quote(&format!(
         "another landfall-agent is installed, and this would install {}: use landfall host upgrade",
         request.version
     ));
     let _ = writeln!(
         shell,
-        "check_installed {AGENT_PATH} {AGENT_MODE}\n\
+        "check_installed {AGENT_PATH} {AGENT_MODE} ''\n\
          if [ -e {AGENT_PATH} ] && ! file_is {AGENT_PATH} {sha256}; then\n  refuse {refusal}\nfi"
     );
 
     let _ = writeln!(
         shell,
-        "check_installed {CONFIG_PATH} {FILE_MODE}\n\
+        "check_installed {CONFIG_PATH} {FILE_MODE} {or_remove}\n\
          if [ -e {CONFIG_PATH} ] && ! file_is {CONFIG_PATH} {config_sha256}; then\n  read_upload {UPLOAD_CONFIG} | diff -u {CONFIG_PATH} - || true"
     );
     if !request.replace_config {
@@ -221,7 +232,7 @@ esac
     for (path, text) in [(UNIT_PATH, "$agent_unit"), (RECOVER_PATH, "$recover_unit")] {
         let _ = writeln!(
             shell,
-            "check_installed {path} {FILE_MODE}\n\
+            "check_installed {path} {FILE_MODE} {or_remove}\n\
              if [ -e {path} ] && ! text_is {path} \"{text}\"; then\n  printf '%s' \"{text}\" | diff -u {path} - || true"
         );
         if !request.replace_unit {
@@ -232,6 +243,17 @@ esac
         }
         shell.push_str("fi\n");
     }
+
+    // A first install puts the agent in place before the units, so this isn't one interrupted.
+    // An agent was taken away, and one may still be running from it: another version mustn't
+    // come in this way, past the refusal above.
+    let refusal = quote(&format!(
+        "{UNIT_PATH} is there and {AGENT_PATH} isn't, so an agent may still be running from what was removed: use landfall host upgrade, or stop the unit and remove it to install from nothing"
+    ));
+    let _ = writeln!(
+        shell,
+        "if [ ! -e {AGENT_PATH} ] && [ -e {UNIT_PATH} ]; then\n  refuse {refusal}\nfi"
+    );
     shell
 }
 
@@ -305,7 +327,8 @@ fi
     )
 }
 
-/// It stays private to root until root has compared its hash with the verified one.
+/// It stays private to root until root has compared its hash with the verified one. A rewrite
+/// marks a restart like any other change: what is running isn't what's now on disk.
 fn binary(request: &InstallRequest<'_>) -> String {
     let sha256 = quote(request.sha256);
     let refusal = quote(TAMPERED_AGENT);
@@ -319,6 +342,7 @@ fn binary(request: &InstallRequest<'_>) -> String {
   read_upload {UPLOAD_AGENT} > {AGENT_NEW}
   file_is {AGENT_NEW} {sha256} || refuse {refusal}
   chmod 0755 {AGENT_NEW}
+  mark_restart
   mv -f {AGENT_NEW} {AGENT_PATH}
 fi
 "
@@ -377,7 +401,8 @@ rm -f {CODE_PATH}
 
 /// `--no-block` throughout, as a stop waits for a deploy in flight, for up to three hours, and
 /// [`WAIT_HEALTHY`] says what became of it. The marker goes once the unit has been seen healthy,
-/// so an agent still stopping keeps it, and the next run looks at what replaced it.
+/// so with an agent still stopping there is one, whether or not anything changed, and the next
+/// run looks at what replaced it.
 fn start() -> String {
     format!(
         r#"previous_id=$(unit_show InvocationID)
@@ -385,12 +410,12 @@ if systemctl is-active --quiet landfall-agent; then
   if [ -e {MARKER} ]; then
     systemctl restart --no-block landfall-agent
     wait_healthy "$previous_id"
-    [ -n "$health_unseen" ] || rm -f {MARKER}
+    settle_marker
   fi
 else
   systemctl enable --now --no-block landfall-agent
   wait_healthy "$previous_id"
-  [ -n "$health_unseen" ] || rm -f {MARKER}
+  settle_marker
 fi
 "#
     )
@@ -481,14 +506,22 @@ upload_is() {{
   upload_sum=$(read_upload "$1" | sha256sum) || return 1
   [ "${{upload_sum%% *}}" = "$2" ]
 }}
+check_dir() {{
+  [ -d "$1" ] || return 0
+  dir_as=$(stat -L -c %u:%a -- "$1") || refuse "$1 couldn't be looked at"
+  case "$dir_as" in
+    0:*[!2367]) ;;
+    *) refuse "$1 has owner and mode $dir_as: whoever else can write there can put a file in place of what this installs. Make it root's, and not writable by others" ;;
+  esac
+}}
 check_installed() {{
   [ -e "$1" ] || [ -L "$1" ] || return 0
   if [ -L "$1" ] || [ ! -f "$1" ]; then
-    refuse "$1 isn't a regular file, and this writes it as one: look at what it is, and remove it to have it written again"
+    refuse "$1 isn't a regular file, and this writes it as one: look at what it is$3"
   fi
   installed_as=$(stat -c %u:%g:%a -- "$1") || refuse "$1 couldn't be looked at"
   if [ "$installed_as" != "0:0:$2" ]; then
-    refuse "$1 has owner, group and mode $installed_as, and root trusts what it says: make it 0:0:$2, or remove it to have it written again"
+    refuse "$1 has owner, group and mode $installed_as, and this wants exactly 0:0:$2, so that only root can change it and the agent can read it. Make it that$3"
   fi
 }}
 text_is() {{
@@ -497,6 +530,13 @@ text_is() {{
 mark_restart() {{
   [ -d {CONFIG_DIR} ] || install -d -o root -g root -m 0755 {CONFIG_DIR}
   : > {MARKER}
+}}
+settle_marker() {{
+  if [ -n "$health_unseen" ]; then
+    mark_restart
+  else
+    rm -f {MARKER}
+  fi
 }}
 keep_previous() {{
   [ -e "$1" ] || return 0

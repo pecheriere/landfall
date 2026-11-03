@@ -2,7 +2,7 @@
 //! moments a kill could land, seen from stubs that look at that moment.
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::plan::{
     AGENT, AGENT_PATH, CODE_PATH, CONFIG, CONFIG_PATH, Fixture, KEY_PATH, MARKER, RECOVER,
@@ -174,6 +174,7 @@ fn the_live_file_stays_while_the_previous_one_is_kept() {
     let fixture = Fixture::new();
     let sandbox = sandbox();
     sandbox.set_agent_user(999, "landfall-agent docker");
+    place(&sandbox, AGENT_PATH, AGENT, 0o755);
     for path in [CONFIG_PATH, UNIT_PATH, RECOVER_PATH] {
         place(&sandbox, path, "# old\n", 0o644);
     }
@@ -331,6 +332,13 @@ fn right_bytes_with_the_wrong_mode_or_owner_are_refused() {
             assert_stopped_at_preflight(&sandbox, &ran);
             assert!(stderr(&ran).contains("owner, group and mode"), "{path}");
             assert_eq!(read(&sandbox, path), text);
+            // Removing the agent wouldn't get a different one past `host upgrade`.
+            assert_eq!(
+                stderr(&ran).contains("remove it"),
+                path != AGENT_PATH,
+                "{}",
+                stderr(&ran)
+            );
         }
         for owner in ["1000:0", "0:1000"] {
             let sandbox = sandbox();
@@ -343,6 +351,97 @@ fn right_bytes_with_the_wrong_mode_or_owner_are_refused() {
             assert!(stderr(&ran).contains(owner), "{}", stderr(&ran));
         }
     }
+}
+
+#[test]
+fn a_directory_others_can_write_to_is_refused() {
+    let fixture = Fixture::new();
+    for dir in ["/usr/local/bin", "/etc/landfall", "/etc/systemd/system"] {
+        for wrong_mode in [0o777, 0o757, 0o1777, 0o753] {
+            let sandbox = sandbox();
+            fs::set_permissions(sandbox.path(dir), fs::Permissions::from_mode(wrong_mode)).unwrap();
+
+            let ran = sandbox.run(&full_script(&fixture.request()));
+
+            assert_stopped_at_preflight(&sandbox, &ran);
+            assert!(stderr(&ran).contains("not writable by others"), "{dir}");
+        }
+
+        let sandbox = sandbox();
+        sandbox.set_owner(dir, "1000:0");
+        let ran = sandbox.run(&full_script(&fixture.request()));
+        assert_stopped_at_preflight(&sandbox, &ran);
+        assert!(stderr(&ran).contains("1000:755"), "{}", stderr(&ran));
+
+        // As Debian's `root:staff` has had `/usr/local/bin`.
+        let sandbox = self::sandbox();
+        fs::set_permissions(sandbox.path(dir), fs::Permissions::from_mode(0o775)).unwrap();
+        sandbox.set_owner(dir, "0:50");
+        let steps = install_steps(&fixture.request());
+        let ran = sandbox.run(&render(&[step(&steps, "preflight").clone()]));
+        assert_status(&ran, 0);
+    }
+}
+
+/// An agent can be running from what was removed, and a different version mustn't come in as if
+/// there had never been one.
+#[test]
+fn a_removed_agent_with_its_unit_there_is_refused_naming_upgrade() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    place(&sandbox, UNIT_PATH, UNIT, 0o644);
+    place(&sandbox, RECOVER_PATH, RECOVER, 0o644);
+
+    let ran = sandbox.run(&full_script(&fixture.request()));
+
+    assert_stopped_at_preflight(&sandbox, &ran);
+    assert!(stderr(&ran).contains("host upgrade"), "{}", stderr(&ran));
+    assert!(!exists(&sandbox, AGENT_PATH));
+}
+
+/// With no unit file to say so, as when one came from elsewhere: what runs isn't what's on disk.
+#[test]
+fn a_rewritten_agent_restarts_a_running_unit() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    sandbox.set_states(&[("active", "old", 0), ("active", "new", 0)]);
+    fs::write(sandbox.path(KEY_PATH), "the key").unwrap();
+
+    let ran = sandbox.run(&script_of(&fixture.without_code(), &["binary", "start"]));
+
+    assert_status(&ran, 0);
+    assert_eq!(read(&sandbox, AGENT_PATH), AGENT);
+    assert!(
+        sandbox
+            .log()
+            .contains("systemctl restart --no-block landfall-agent"),
+        "{}",
+        sandbox.log()
+    );
+    assert!(!exists(&sandbox, MARKER));
+}
+
+/// A kill just before the rename: the next run finds the agent in place, and only the marker
+/// says that what runs isn't it.
+#[test]
+fn the_agents_marker_is_there_before_its_rename() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    sandbox.stub(
+        "mv",
+        &format!(
+            r#"for last in "$@"; do :; done
+if [ -e {marker} ]; then echo marked > {seen}; fi
+exec /bin/mv "$@""#,
+            marker = sandbox.path(MARKER).display(),
+            seen = sandbox.path("/seen").display()
+        ),
+    );
+
+    let ran = sandbox.run(&script_of(&fixture.request(), &["binary"]));
+
+    assert_status(&ran, 0);
+    assert!(exists(&sandbox, "/seen"));
 }
 
 #[test]
@@ -391,7 +490,7 @@ fn an_agent_user_unlike_the_guides_is_refused() {
             "999",
             None,
             "/usr/sbin/nologin",
-            "someone:x:999:999::/home/someone:/bin/sh\n",
+            "someone:x:999:1000::/home/someone:/bin/sh\n",
             "shared",
         ),
     ] {
@@ -438,6 +537,43 @@ fn an_agent_user_with_any_shell_that_cannot_log_in_is_allowed() {
 
 /// A directory service may not list its users, and then no uid can be seen to be shared. That
 /// says nothing against this one.
+/// The uid is the third field, whatever the group is.
+#[test]
+fn the_agents_uid_is_read_from_its_own_field() {
+    let fixture = Fixture::new();
+    let entry = |sandbox: &Sandbox, uid: &str, gid: &str| {
+        sandbox.set_agent_user(999, "landfall-agent docker");
+        sandbox.set_passwd(&format!(
+            "landfall-agent:x:{uid}:{gid}::{}:/usr/sbin/nologin\n",
+            sandbox.path(STATE_DIR).display()
+        ));
+    };
+
+    let sandbox = sandbox();
+    entry(&sandbox, "0", "999");
+    let ran = sandbox.run(&script_of(&fixture.request(), &["user"]));
+    assert_status(&ran, 1);
+    assert!(stderr(&ran).contains("uid 0"), "{}", stderr(&ran));
+
+    let sandbox = self::sandbox();
+    entry(&sandbox, "999", "0");
+    assert_status(&sandbox.run(&script_of(&fixture.request(), &["user"])), 0);
+}
+
+/// Another user's uid that only starts the same isn't this one.
+#[test]
+fn a_uid_that_only_looks_like_the_agents_is_not_shared() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    sandbox.set_agent_user(999, "landfall-agent docker");
+    sandbox.set_passwd(&format!(
+        "landfall-agent:x:999:999::{}:/usr/sbin/nologin\nsomeone:x:9990:9990::/home/someone:/bin/sh\nanother:x:1999:1999::/home/another:/bin/sh\ngrouped:x:1000:999::/home/grouped:/bin/sh\n",
+        sandbox.path(STATE_DIR).display()
+    ));
+
+    assert_status(&sandbox.run(&script_of(&fixture.request(), &["user"])), 0);
+}
+
 #[test]
 fn a_host_that_does_not_list_its_users_is_not_taken_for_a_shared_uid() {
     let fixture = Fixture::new();
@@ -485,6 +621,22 @@ fn a_state_directory_that_is_a_file_is_refused() {
         "{}",
         stderr(&ran)
     );
+}
+
+/// With nothing changed there was no marker, and without one the next run would look at nothing,
+/// which isn't what the run's message says.
+#[test]
+fn an_agent_still_stopping_has_a_marker_even_with_nothing_changed() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    fs::write(sandbox.path(KEY_PATH), "the key").unwrap();
+    sandbox.set_states(&[("deactivating", "old", 0)]);
+
+    let ran = sandbox.run(&script_of(&fixture.without_code(), &["start"]));
+
+    assert_status(&ran, 0);
+    assert!(stdout(&ran).contains("Run this again"));
+    assert!(exists(&sandbox, MARKER));
 }
 
 /// A run that left an agent still stopping hasn't seen what replaced it, which could be broken.

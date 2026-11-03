@@ -49,6 +49,9 @@ impl Sandbox {
         ] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
+        for path in ["usr/local/bin", "etc/landfall", "etc/systemd/system"] {
+            fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fs::create_dir_all(&stubs).unwrap();
         let sandbox = Self {
             root,
@@ -168,15 +171,20 @@ esac"#
             ),
         );
         // Files here can't belong to root, so all do but the one `set_owner` names. The mode is
-        // the file's own.
+        // the file's own, and the answer goes by the format, as the real one's does.
         self.stub(
             "stat",
             &format!(
-                r#"for path in "$@"; do :; done
+                r#"format=
+while [ "$#" -gt 1 ]; do
+  if [ "$1" = -c ]; then format=$2; fi
+  shift
+done
+path=$1
 owner=0:0
 if [ "$path" = "$(cat {ctl}/owned_path 2>/dev/null)" ]; then owner=$(cat {ctl}/owner); fi
-mode=$(/usr/bin/stat -c %a "$path" 2>/dev/null || /usr/bin/stat -f %Mp%Lp "$path") || exit
-echo "$owner:${{mode#0}}""#
+mode=$(/usr/bin/stat -L -c %a "$path" 2>/dev/null || /usr/bin/stat -L -f %Mp%Lp "$path") || exit
+printf '%s\n' "$format" | sed "s/%u/${{owner%:*}}/;s/%g/${{owner#*:}}/;s/%a/${{mode#0}}/""#
             ),
         );
         self.stub(

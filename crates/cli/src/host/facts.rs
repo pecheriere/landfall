@@ -243,7 +243,7 @@ pub enum Refusal {
     OldDocker(String),
     /// No compose v2.
     #[error(
-        "the target has no `docker compose` v2 (it said {}): install the docker-compose-plugin package",
+        "the target's `docker compose version` gave no v2 within its time limit (it said {}): install the docker-compose-plugin package if it isn't there",
         shown(.0)
     )]
     NoCompose(String),

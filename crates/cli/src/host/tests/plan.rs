@@ -510,6 +510,9 @@ fn a_replacement_keeps_the_old_file_and_restarts() {
         read(&sandbox, &format!("{RECOVER_PATH}.previous")),
         "old recover\n"
     );
+    // As it was, as `umask 077` would otherwise have it, and restoring it would then be refused.
+    assert_eq!(mode(&sandbox, &format!("{CONFIG_PATH}.previous")), 0o644);
+    assert_eq!(mode(&sandbox, &format!("{UNIT_PATH}.previous")), 0o644);
     let log = sandbox.log();
     assert!(
         log.contains("systemctl restart --no-block landfall-agent"),
@@ -545,6 +548,7 @@ fn an_interrupted_replacement_still_restarts() {
 fn an_interrupted_unit_change_still_reloads() {
     let fixture = Fixture::new();
     let sandbox = sandbox();
+    place(&sandbox, AGENT_PATH, AGENT, 0o755);
     place(&sandbox, UNIT_PATH, UNIT, 0o644);
     place(&sandbox, RECOVER_PATH, RECOVER, 0o644);
     fs::write(sandbox.path(MARKER), "").unwrap();
