@@ -2,8 +2,8 @@
 //!
 //! Everything here that touches the Sigstore stack or the network lives in
 //! this crate, so `landfall-core` stays free of I/O. [`attestation`] verifies
-//! a GitHub build-provenance bundle for an image digest and matches its
-//! Fulcio certificate identity against a deployment's configuration. [`trust`]
+//! a GitHub build-provenance bundle for an image digest or a named release file
+//! and matches its Fulcio certificate identity against what is expected. [`trust`]
 //! builds the Sigstore trust root they are verified against, through TUF.
 //! [`fetch`] gets the material to verify: signed tag objects from the GitHub
 //! API, image index digests and Sigstore bundles from the registry.

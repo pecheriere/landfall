@@ -11,6 +11,10 @@ use thiserror::Error;
 
 use crate::trust::TrustRoot;
 
+mod file;
+
+pub use file::{FileSubject, verify_file_bundle};
+
 #[cfg(test)]
 mod tests;
 
@@ -35,7 +39,8 @@ pub struct Expected<'a> {
 /// The facts a verified bundle establishes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifiedAttestation {
-    /// The image index digest the bundle attests.
+    /// The image index digest the bundle attests; for [`verify_file_bundle`], the
+    /// digest of the first file asked for.
     pub digest: ImageDigest,
     /// The certificate's SAN.
     pub san: String,
@@ -94,6 +99,7 @@ struct CertificateIdentity {
 
 /// Why a bundle was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum AttestationError {
     /// Not a parseable build-provenance bundle.
     #[error("malformed bundle: {0}")]
@@ -122,6 +128,22 @@ pub enum AttestationError {
         /// The digests the bundle names.
         found: String,
     },
+    /// The statement has no subject with this file's name and digest together, as
+    /// when another attested file's digest is asked for under this name.
+    #[error(
+        "bundle does not attest a file named {name:?} with digest {expected}: it names {found}"
+    )]
+    FileSubject {
+        /// The name asked for.
+        name: String,
+        /// The digest asked for.
+        expected: String,
+        /// The names the statement has, quoted, and cut short if there are many.
+        found: String,
+    },
+    /// [`verify_file_bundle`] was asked about no file at all, which would prove nothing.
+    #[error("no file was named to verify against the bundle")]
+    NoFileSubjects,
     /// A certificate claim differs from the configuration.
     #[error("certificate {field} is {found:?}, expected {expected:?}")]
     Identity {
@@ -137,8 +159,9 @@ pub enum AttestationError {
 /// The OIDC issuer of GitHub Actions workflow identities.
 pub const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
-/// The largest bundle accepted, in bytes, by [`verify_bundle`] and by the
-/// fetcher. A GitHub build-provenance bundle is around 10 KiB.
+/// The largest bundle accepted, in bytes, by [`verify_bundle`],
+/// [`verify_file_bundle`] and the fetcher. A GitHub build-provenance bundle is
+/// around 10 KiB.
 pub const MAX_BUNDLE_BYTES: usize = 4 * 1024 * 1024;
 
 /// The in-toto predicate type of a SLSA build provenance attestation.
@@ -185,7 +208,19 @@ pub fn verify_bundle(
 ) -> Result<VerifiedAttestation, AttestationError> {
     let bundle = parse_bundle(bundle_json)?;
     check_statement(&bundle, digest)?;
-    let rekor_log_index = single_log_index(&bundle)?;
+    verify_parsed(&bundle, digest, root, expected)
+}
+
+/// Everything [`verify_bundle`] checks after the statement: the transparency log
+/// entry, the Sigstore verification for `digest` and the certificate's identity.
+/// The caller has checked what the statement says.
+fn verify_parsed(
+    bundle: &Bundle,
+    digest: &ImageDigest,
+    root: &TrustRoot,
+    expected: &Expected<'_>,
+) -> Result<VerifiedAttestation, AttestationError> {
+    let rekor_log_index = single_log_index(bundle)?;
 
     let hex = digest
         .as_ref()
@@ -208,8 +243,8 @@ pub fn verify_bundle(
     // past this one too.
     let before = jiff::Timestamp::now();
     let result = verifier
-        .verify(artifact, &bundle, &VerificationPolicy::any_identity())
-        .map_err(|e| refused_verification(&e, &bundle, before))?;
+        .verify(artifact, bundle, &VerificationPolicy::any_identity())
+        .map_err(|e| refused_verification(&e, bundle, before))?;
     if !(result.certificate_verified() && result.sct_verified() && result.tlog_verified()) {
         return Err(AttestationError::Signature(
             "certificate chain, certificate timestamp or transparency log not verified".to_owned(),
@@ -435,24 +470,7 @@ fn parse_bundle(bundle_json: &[u8]) -> Result<Bundle, AttestationError> {
 /// verification checks the subject binding again, and checking first lets
 /// the refusal say which predicate type or digests it found.
 fn check_statement(bundle: &Bundle, digest: &ImageDigest) -> Result<(), AttestationError> {
-    let SignatureContent::DsseEnvelope(envelope) = &bundle.content else {
-        return Err(AttestationError::Bundle(
-            "not a DSSE attestation".to_owned(),
-        ));
-    };
-    if envelope.payload_type != IN_TOTO_PAYLOAD_TYPE {
-        return Err(AttestationError::Bundle(format!(
-            "payload type is not {IN_TOTO_PAYLOAD_TYPE}"
-        )));
-    }
-    let statement: Statement = serde_json::from_slice(envelope.payload.as_bytes())
-        .map_err(|e| AttestationError::Bundle(format!("in-toto statement: {e}")))?;
-    if statement.predicate_type != SLSA_PROVENANCE {
-        return Err(AttestationError::PredicateType {
-            expected: SLSA_PROVENANCE.to_owned(),
-            found: statement.predicate_type,
-        });
-    }
+    let statement = provenance_statement(bundle)?;
     let named: Vec<String> = statement
         .subject
         .iter()
@@ -471,6 +489,31 @@ fn check_statement(bundle: &Bundle, digest: &ImageDigest) -> Result<(), Attestat
             },
         })
     }
+}
+
+/// The bundle's in-toto statement, which must be a SLSA build provenance
+/// attestation. It is the DSSE payload: nothing has verified its signature yet,
+/// so it is only to be relied on once the Sigstore verification has passed.
+fn provenance_statement(bundle: &Bundle) -> Result<Statement, AttestationError> {
+    let SignatureContent::DsseEnvelope(envelope) = &bundle.content else {
+        return Err(AttestationError::Bundle(
+            "not a DSSE attestation".to_owned(),
+        ));
+    };
+    if envelope.payload_type != IN_TOTO_PAYLOAD_TYPE {
+        return Err(AttestationError::Bundle(format!(
+            "payload type is not {IN_TOTO_PAYLOAD_TYPE}"
+        )));
+    }
+    let statement: Statement = serde_json::from_slice(envelope.payload.as_bytes())
+        .map_err(|e| AttestationError::Bundle(format!("in-toto statement: {e}")))?;
+    if statement.predicate_type != SLSA_PROVENANCE {
+        return Err(AttestationError::PredicateType {
+            expected: SLSA_PROVENANCE.to_owned(),
+            found: statement.predicate_type,
+        });
+    }
+    Ok(statement)
 }
 
 /// The Rekor log index of the bundle's only transparency log entry, which

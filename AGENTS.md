@@ -23,8 +23,10 @@ passkey approvals. Agents drive it through a typed API. Design:
   `software`, a software authenticator for tests, behind the `test-support`
   feature, which only dev-dependencies may enable, as a step in CI checks.
 - `landfall-origin` (`crates/origin`): release origin verification that needs
-  the Sigstore stack or the network: build-provenance bundles and their
-  Fulcio certificate identity, the TUF trust root, and the fetchers for
+  the Sigstore stack or the network: build-provenance bundles, for an image digest
+  or a named release file (`attestation/file.rs`, the name and digest checked
+  together), and their Fulcio certificate identity, the TUF trust root, and the
+  fetchers for
   signed tag objects, a repository's tags (GitHub API), image indexes, bundles
   and referrer tags (GHCR), `verify_release`, which composes them for one
   release, and `candidates`, which finds every digest attested for it.
