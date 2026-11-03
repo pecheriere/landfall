@@ -205,7 +205,7 @@ esac
     let or_remove = quote(OR_REMOVE);
     let _ = writeln!(
         shell,
-        "check_dir {AGENT_DIR}\ncheck_dir {CONFIG_DIR}\ncheck_dir {UNIT_DIR}"
+        "check_dir {AGENT_DIR}\ncheck_closed_dir {CONFIG_DIR}\ncheck_dir {UNIT_DIR}"
     );
 
     let refusal = quote(&format!(
@@ -475,7 +475,7 @@ stable_secs={stable_secs}
 give_up_secs={give_up_secs}
 [ -e {UNIT_PATH} ] || refuse {no_unit}
 check_dir {AGENT_DIR}
-check_dir {CONFIG_DIR}
+check_closed_dir {CONFIG_DIR}
 check_installed {AGENT_PATH} {AGENT_MODE} ''
 {none_there}upload_is {UPLOAD_AGENT} {sha256} || refuse {tampered}
 if [ -e {MARKER} ]; then had_marker=1; else had_marker=; fi
@@ -527,7 +527,7 @@ fn upgrade_restart() -> String {
   systemctl restart --no-block landfall-agent
   if ! wait_healthy "$previous_id"; then
     if [ -e {AGENT_PREVIOUS} ]; then
-      printf '%s\n' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && rm -f {MARKER} && systemctl restart landfall-agent' >&2
+      printf '%s\n' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && systemctl restart landfall-agent && rm -f {MARKER}' >&2
     else
       printf '%s\n' {no_previous} >&2
     fi
@@ -618,6 +618,14 @@ check_dir() {{
   case "$dir_as" in
     0:*[!2367]) ;;
     *) refuse "$1 has owner and mode $dir_as: whoever else can write there can put a file in place of what this installs. Make it root's, and not writable by others" ;;
+  esac
+}}
+check_closed_dir() {{
+  [ -d "$1" ] || return 0
+  dir_as=$(stat -L -c %u:%a -- "$1") || refuse "$1 couldn't be looked at"
+  case "$dir_as" in
+    0:*[!2367][!2367]) ;;
+    *) refuse "$1 has owner and mode $dir_as: whoever else can write there can put a file in place of what this installs, or have root write through a link. Make it root's, and not writable by others or a group" ;;
   esac
 }}
 check_installed() {{

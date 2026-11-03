@@ -243,6 +243,45 @@ fn docker_going_back_then_a_good_one_keeps_the_way_back() {
     goes_back_to_the_real_agent(&target, &ran);
 }
 
+/// With Docker down, going back can't get the agent running, and a run after Docker's back must
+/// still see that it has a restart to do, and not say it's on that version already.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_going_back_that_cannot_restart_is_finished_by_a_later_run() {
+    let target = Target::start();
+    target.installed();
+    target.sh_ok(
+        "mkdir -p /etc/systemd/system/docker.service.d \
+         && printf '[Service]\\nExecStart=\\nExecStart=/bin/false\\n' \
+            > /etc/systemd/system/docker.service.d/down.conf \
+         && systemctl daemon-reload && systemctl stop docker.service",
+    );
+    let ran = upgrade(&target, quickly(), &broken("99.0.0"));
+    assert_eq!(ran.status(), 1, "{}", ran.out);
+    let restore = ran
+        .out
+        .lines()
+        .find_map(|line| line.strip_prefix("landfall: to go back, as root: "))
+        .unwrap_or_else(|| panic!("no way back in {}", ran.out));
+
+    let restored = target.sh(restore);
+
+    assert!(!restored.status.success(), "{restored:?}");
+    assert_eq!(agent_hash(&target), sha256_hex(&real_agent()));
+    assert!(target.exists(MARKER));
+    target.sh_ok(
+        "rm -r /etc/systemd/system/docker.service.d && systemctl daemon-reload \
+         && systemctl start docker.service",
+    );
+
+    let ran = upgrade(&target, quickly(), &FixedSource::real());
+
+    ran.assert_ok();
+    assert_eq!(ran.result.unwrap(), Outcome::Installed);
+    assert_eq!(target.unit_state(), "active");
+    assert!(!target.exists(MARKER));
+}
+
 /// Killed in the middle of keeping the old one: the rerun keeps it again, whatever it comes to.
 #[test]
 #[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]

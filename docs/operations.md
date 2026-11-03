@@ -671,7 +671,7 @@ in its row.
 | No code and no `agent.key` | Give a code |
 | A code, with the agent not stopped | `systemctl stop landfall-agent`, as `enrol` needs the lock it holds. The existing key is kept, and a code for a host already enrolled needs `enrol-code --replace` |
 | An installed file that's a link, or isn't exactly owner, group and mode `0:0:755` for the agent and `0:0:644` for the configuration and units | Make it that, so that only root can change it and the agent can read it. That's stricter than safety alone needs, and it's one rule. Configuration and units can also be removed, to be written again |
-| `/usr/local/bin`, `/etc/landfall` or `/etc/systemd/system` not root's, or writable by others | Fix it. Writable by a group is left alone, as Debian's `root:staff` has it, **so that group is trusted:** a link left there isn't followed, but one planted at the right moment could be, and whoever can replace the agent is as good as root anyway |
+| `/usr/local/bin`, `/etc/landfall` or `/etc/systemd/system` not root's, or writable by others, or `/etc/landfall` writable by a group | Fix it. In the other two, writable by a group is left alone, as Debian's `root:staff` has `/usr/local/bin`, **so that group is trusted:** a link left there isn't followed, but one planted at the right moment could be, and whoever can replace the agent or a unit is as good as root anyway |
 | A link at `/var/lib/landfall-agent`, or a file | Move it |
 | The agent's user can't reach Docker, checked as that user | Look at the daemon and the `docker` group, and run it again. The configuration and the binary are in place by then, which a rerun takes as they are |
 | A `landfall-agent` user with a login shell, another home, uid 0 or a uid another user has | See the next section for what it must be |
@@ -734,11 +734,12 @@ when you mean to start it.
 
 The old binary is kept as `/usr/local/bin/landfall-agent.previous`, unless a restart was still due from
 before and one is kept already, as a failed upgrade or one still waiting on a deploy isn't kept over it.
-So it's the last one known to have run, which can be one older than you expect. It doesn't go back by
+So it's the last one known to have run, which can be one older than you expect. The exception is a host
+with no binary at all to begin with, where it can be an earlier failed attempt. It doesn't go back by
 itself. If the new one doesn't hold still you get the last journal lines, exit 1, and the command:
 
 ```text
-landfall: to go back, as root: mv -f /usr/local/bin/landfall-agent.previous /usr/local/bin/landfall-agent && rm -f /etc/landfall/.restart-pending && systemctl restart landfall-agent
+landfall: to go back, as root: mv -f /usr/local/bin/landfall-agent.previous /usr/local/bin/landfall-agent && systemctl restart landfall-agent && rm -f /etc/landfall/.restart-pending
 ```
 
 **Read the journal lines before you run it.** The new agent may not be at fault: with Docker down, say,
