@@ -34,6 +34,45 @@ file is documented in [`docs/configuration.md`](docs/configuration.md).
 | `landfall-agent` | every target host (systemd service) | verifies, deploys, checks, rolls back |
 | `landfall` | anywhere | command-line client |
 
+## Installing
+
+landfall has no release yet, so none of this has anything to fetch until the first tag. Then:
+
+```sh
+# Needs the tap, which the owner creates: packaging/homebrew-tap/README.md.
+brew install pecheriere/landfall/landfall
+# Or a release's file, for Linux on arm64 or amd64, or macOS on arm64.
+gh release download <tag> --repo pecheriere/landfall --pattern 'landfall-*-darwin-arm64'
+```
+
+**The first `landfall` is the one that needs care,** as it's what checks everything after it:
+
+- `gh attestation verify <file> --repo pecheriere/landfall --signer-workflow
+  pecheriere/landfall/.github/workflows/release.yml --source-ref refs/tags/<tag>
+  --deny-self-hosted-runners` checks that these exact bytes were built by this repository's release
+  workflow, on a GitHub-hosted runner, from that tag. **It does not check that the maintainer signed the
+  tag:** someone holding the owner's GitHub token could pass it with a release of their own.
+- To check that too, clone the repository, run `git -c gpg.ssh.allowedSignersFile=<file> verify-tag <tag>`
+  with the key whose fingerprint is in [`SECURITY.md`](SECURITY.md), and compare `SECURITY.md` with a copy
+  you got some other way. Then add `--source-digest` with the tag's commit.
+- `brew install` checks only the SHA-256 in the tap's formula, so it trusts the tap, whose formula the
+  owner verified that way and copied by hand. Homebrew itself verifies neither the attestation nor the tag.
+- `landfall host install` checks the tag's signature, the attestation and the sums every time, against
+  what the installed `landfall` holds.
+- A browser download on macOS is quarantined: [the guide](docs/operations.md#first-trust) says what that
+  means. A release's file is a raw executable, so `chmod +x` it.
+
+Then, from your machine, over your own `ssh`, with a script as root that it shows you first:
+
+```sh
+landfall host install user@host.example --host home-1 --config fleet.toml \
+  --controller https://controller.example --code-file code --dry-run
+landfall host upgrade user@host.example --dry-run
+```
+
+[The guide](docs/operations.md#installing-an-agent-with-landfall-host-install) has what it needs, what it
+checks and what it refuses.
+
 ## Verifying a release
 
 `landfall verify` runs the origin checks a host runs before deploying, against

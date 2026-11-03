@@ -13,7 +13,7 @@ use clap::Subcommand;
 use landfall_core::config::ConfigError;
 use landfall_core::controller_url::UrlError;
 use landfall_core::ids::HostId;
-use landfall_core::text::quoted;
+use landfall_core::text::{quoted, shown};
 use landfall_origin::trust::Refresh;
 use thiserror::Error;
 use tokio::runtime::Runtime;
@@ -27,6 +27,7 @@ pub mod plan;
 pub mod shell;
 pub mod ssh;
 pub mod unit;
+pub mod upgrade;
 
 #[cfg(test)]
 mod tests;
@@ -40,6 +41,21 @@ Exit status:
   2  could not try or finish: configuration, usage, network, SSH connection or
      host key, a connection lost during the script, a failed upload such as a
      full disk, or the release could not be fetched
+
+Environment:
+  GITHUB_TOKEN  never sent to the target, and removed from what ssh is given";
+
+/// The exit statuses of `landfall host upgrade`, shown in its `--help`.
+const UPGRADE_EXIT_STATUS: &str = "\
+Exit status:
+  0  the agent is upgraded, it was on that version already, --dry-run showed what
+     would run, or a deploy is finishing and the new agent starts after it
+  1  refused or stopped: the release failed verification, no agent is installed,
+     going back needs --allow-downgrade, sudo can't be used, you declined, the
+     script stopped, or the new agent isn't healthy
+  2  could not try or finish: usage, network, SSH connection or host key, a
+     connection lost during the script, a failed upload such as a full disk, or
+     the release could not be fetched
 
 Environment:
   GITHUB_TOKEN  never sent to the target, and removed from what ssh is given";
@@ -58,6 +74,10 @@ pub enum HostCommand {
     /// given a code, and start it. It shows what will run as root first.
     #[command(after_help = INSTALL_EXIT_STATUS)]
     Install(install::InstallArgs),
+    /// Replace an installed agent's binary with a verified one, over SSH, and restart it. It
+    /// touches nothing else, keeps the old binary, and shows what will run as root first.
+    #[command(after_help = UPGRADE_EXIT_STATUS)]
+    Upgrade(upgrade::UpgradeArgs),
 }
 
 /// Why a `landfall host` command failed.
@@ -134,6 +154,45 @@ pub enum HostError {
     /// The target can't take an agent.
     #[error("{}", refusals(.0))]
     Refused(Vec<facts::Refusal>),
+    /// `host upgrade` on a host with nothing installed.
+    #[error(
+        "the target has no agent unit, so there's nothing to upgrade: use landfall host install"
+    )]
+    NoUnit,
+    /// Going back, without being told to.
+    #[error(
+        "the target has {running}, and this is {wanted}, which is older: --allow-downgrade goes back"
+    )]
+    OlderVersion {
+        /// What's there.
+        running: semver::Version,
+        /// What this would put there.
+        wanted: semver::Version,
+    },
+    /// The same version, with other bytes, which could be a hand-built or a tampered binary.
+    #[error(
+        "the target has {version} with SHA-256 {}, and this release's {version} has {wanted_sha256}: it may be a hand-built or a tampered binary. --allow-downgrade replaces it",
+        shown(.running_sha256)
+    )]
+    OtherBytes {
+        /// The version both say they are.
+        version: semver::Version,
+        /// What's there. Hostile, so it's quoted.
+        running_sha256: String,
+        /// What this would put there.
+        wanted_sha256: String,
+    },
+    /// Nothing can be said of what's there.
+    #[error(
+        "the target's agent says {}, which isn't a version, and this is {wanted}: --allow-downgrade replaces it",
+        shown(.running)
+    )]
+    UnknownVersion {
+        /// What it said. Hostile, so it's quoted.
+        running: String,
+        /// What this would put there.
+        wanted: semver::Version,
+    },
     /// No terminal to ask on, and not told to go ahead.
     #[error("there is no terminal to ask on: read what --dry-run shows, and pass --yes")]
     NoTerminal,
@@ -175,6 +234,10 @@ impl HostError {
             Self::Release(error) if error.is_refusal() => EXIT_REFUSED,
             Self::Probe { .. }
             | Self::Refused(_)
+            | Self::NoUnit
+            | Self::OlderVersion { .. }
+            | Self::OtherBytes { .. }
+            | Self::UnknownVersion { .. }
             | Self::NoTerminal
             | Self::NoSudo
             | Self::Declined
@@ -239,20 +302,22 @@ impl install::Confirm for TerminalConfirm {
     }
 }
 
-fn source_for(args: &install::InstallArgs) -> GitHubReleases {
-    GitHubReleases::new(args.cache_dir.clone(), Refresh::Online)
+fn source_for(cache_dir: Option<&PathBuf>) -> GitHubReleases {
+    GitHubReleases::new(cache_dir.cloned(), Refresh::Online)
 }
 
-fn remote_for(args: &install::InstallArgs) -> Result<ssh::OpenSsh, HostError> {
-    let dest = ssh::Destination::parse(&args.dest)?;
-    Ok(ssh::OpenSsh::new(dest, args.ssh_config.clone())?)
+fn remote_for(dest: &str, ssh_config: Option<&PathBuf>) -> Result<ssh::OpenSsh, HostError> {
+    let dest = ssh::Destination::parse(dest)?;
+    Ok(ssh::OpenSsh::new(dest, ssh_config.cloned())?)
 }
 
 /// The process's result: a person saying no isn't success for whatever runs this.
 fn finished(outcome: install::Outcome) -> Result<(), HostError> {
     match outcome {
         install::Outcome::Declined => Err(HostError::Declined),
-        install::Outcome::Installed | install::Outcome::DryRun => Ok(()),
+        install::Outcome::Installed | install::Outcome::DryRun | install::Outcome::Nothing => {
+            Ok(())
+        }
     }
 }
 
@@ -264,9 +329,21 @@ fn finished(outcome: install::Outcome) -> Result<(), HostError> {
 pub fn run(command: HostCommand, runtime: &Runtime, out: &mut dyn Write) -> Result<(), HostError> {
     match command {
         HostCommand::Install(args) => {
-            let source = source_for(&args);
-            let remote = remote_for(&args)?;
+            let source = source_for(args.cache_dir.as_ref());
+            let remote = remote_for(&args.dest, args.ssh_config.as_ref())?;
             finished(install::run_with(
+                &args,
+                &source,
+                &remote,
+                runtime,
+                out,
+                &mut TerminalConfirm,
+            )?)
+        }
+        HostCommand::Upgrade(args) => {
+            let source = source_for(args.cache_dir.as_ref());
+            let remote = remote_for(&args.dest, args.ssh_config.as_ref())?;
+            finished(upgrade::run_with(
                 &args,
                 &source,
                 &remote,

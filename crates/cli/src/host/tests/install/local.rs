@@ -224,14 +224,14 @@ fn what_a_real_run_uses_is_what_was_asked() {
         cache_dir: Some(files.path("the-cache")),
         ..files.args()
     };
-    let remote = remote_for(&args).unwrap();
+    let remote = remote_for(&args.dest, args.ssh_config.as_ref()).unwrap();
     assert_eq!(
         remote.config(),
         Some(files.path("the-ssh-config").as_path())
     );
     assert!(
-        format!("{:?}", source_for(&args)).contains("the-cache"),
+        format!("{:?}", source_for(args.cache_dir.as_ref())).contains("the-cache"),
         "{:?}",
-        source_for(&args)
+        source_for(args.cache_dir.as_ref())
     );
 }

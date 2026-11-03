@@ -421,3 +421,17 @@ async fn live_project_ids_are_this_repository() {
     assert_eq!(repository["owner"]["id"], OWNER_ID, "{repository}");
     assert_eq!(repository["full_name"], REPO, "{repository}");
 }
+
+/// Each key this build trusts is published, as the way to compare one by some other route. An
+/// empty file, where a fork starts, has nothing to publish.
+#[test]
+fn published_fingerprints_match_the_signers() {
+    let security = include_str!("../../../../SECURITY.md");
+    for (_, key) in parse_signers(SIGNERS).unwrap() {
+        let fingerprint = key.fingerprint();
+        assert!(
+            security.contains(&fingerprint),
+            "{fingerprint} isn't in SECURITY.md"
+        );
+    }
+}

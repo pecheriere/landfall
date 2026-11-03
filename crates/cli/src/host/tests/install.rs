@@ -53,31 +53,31 @@ checks = ["container-healthy"]
 "#;
 
 const CODE: &str = "c0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0dec0de";
-const AGENT_BYTES: &[u8] = b"the agent's bytes";
+pub(super) const AGENT_BYTES: &[u8] = b"the agent's bytes";
 const DEST: &str = "user@host.example";
 
 /// What's said of a fake agent, in the output.
 const SUMMARY: &str = "where the agent came from";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Call {
+pub(super) enum Call {
     Run { command: String, stdin: Vec<u8> },
     Privileged { script: String, interactive: bool },
 }
 
-struct FakeRemote {
-    calls: RefCell<Vec<Call>>,
-    probe: String,
-    connects: bool,
-    sudo: i32,
-    script: Result<i32, ()>,
-    fail_upload_of: Option<&'static str>,
-    mkdir_fails: bool,
-    probe_stderr: &'static str,
+pub(super) struct FakeRemote {
+    pub(super) calls: RefCell<Vec<Call>>,
+    pub(super) probe: String,
+    pub(super) connects: bool,
+    pub(super) sudo: i32,
+    pub(super) script: Result<i32, ()>,
+    pub(super) fail_upload_of: Option<&'static str>,
+    pub(super) mkdir_fails: bool,
+    pub(super) probe_stderr: &'static str,
 }
 
 impl FakeRemote {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             calls: RefCell::new(Vec::new()),
             probe: fit_probe(&[]),
@@ -90,11 +90,11 @@ impl FakeRemote {
         }
     }
 
-    fn calls(&self) -> Vec<Call> {
+    pub(super) fn calls(&self) -> Vec<Call> {
         self.calls.borrow().clone()
     }
 
-    fn commands(&self) -> Vec<String> {
+    pub(super) fn commands(&self) -> Vec<String> {
         self.calls()
             .into_iter()
             .filter_map(|call| match call {
@@ -104,7 +104,7 @@ impl FakeRemote {
             .collect()
     }
 
-    fn script(&self) -> Option<String> {
+    pub(super) fn script(&self) -> Option<String> {
         self.calls().into_iter().find_map(|call| match call {
             Call::Privileged { script, .. } => Some(script),
             Call::Run { .. } => None,
@@ -112,7 +112,7 @@ impl FakeRemote {
     }
 
     /// Only the probe.
-    fn assert_only_probed(&self) {
+    pub(super) fn assert_only_probed(&self) {
         let calls = self.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(self.commands()[0].contains("landfall-probe-begin"));
@@ -165,7 +165,7 @@ impl Remote for FakeRemote {
 }
 
 /// What a fit host's probe prints, with the clock right, and `overrides`.
-fn fit_probe(overrides: &[(&str, &str)]) -> String {
+pub(super) fn fit_probe(overrides: &[(&str, &str)]) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -183,20 +183,20 @@ fn fit_probe(overrides: &[(&str, &str)]) -> String {
     probe_output(&rows)
 }
 
-enum Fetch {
+pub(super) enum Fetch {
     Good,
     Refused,
     OutOfReach,
 }
 
-struct FakeSource {
-    not_ready: bool,
-    fetch: Fetch,
-    asked_for: Cell<Option<Arch>>,
+pub(super) struct FakeSource {
+    pub(super) not_ready: bool,
+    pub(super) fetch: Fetch,
+    pub(super) asked_for: Cell<Option<Arch>>,
 }
 
 impl FakeSource {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             not_ready: false,
             fetch: Fetch::Good,
@@ -242,14 +242,14 @@ impl AgentSource for FakeSource {
     }
 }
 
-struct FakeConfirm {
-    terminal: bool,
-    answer: bool,
-    asked: Vec<String>,
+pub(super) struct FakeConfirm {
+    pub(super) terminal: bool,
+    pub(super) answer: bool,
+    pub(super) asked: Vec<String>,
 }
 
 impl FakeConfirm {
-    fn at_a_terminal(answer: bool) -> Self {
+    pub(super) fn at_a_terminal(answer: bool) -> Self {
         Self {
             terminal: true,
             answer,
@@ -257,7 +257,7 @@ impl FakeConfirm {
         }
     }
 
-    fn no_terminal() -> Self {
+    pub(super) fn no_terminal() -> Self {
         Self {
             terminal: false,
             answer: false,
@@ -321,7 +321,7 @@ struct Ran {
     out: String,
 }
 
-fn runtime() -> Runtime {
+pub(super) fn runtime() -> Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

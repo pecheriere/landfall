@@ -29,6 +29,8 @@ pub(super) const UNIT_PATH: &str = "/etc/systemd/system/landfall-agent.service";
 
 const AGENT_DIR: &str = "/usr/local/bin";
 const AGENT_NEW: &str = "/usr/local/bin/.landfall-agent.new";
+const AGENT_PREVIOUS: &str = "/usr/local/bin/landfall-agent.previous";
+const AGENT_PREVIOUS_NEW: &str = "/usr/local/bin/.landfall-agent.previous.new";
 const CONFIG_DIR: &str = "/etc/landfall";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
@@ -39,7 +41,7 @@ const RECOVER_NEW: &str = "/etc/systemd/system/.landfall-agent-recover@.service.
 
 /// Says a change of configuration, unit or group has yet to take effect. It is written before
 /// the change and removed after the restart, so an interrupted run still restarts on the next.
-const MARKER: &str = "/etc/landfall/.restart-pending";
+pub(super) const MARKER: &str = "/etc/landfall/.restart-pending";
 
 const STATE_DIR: &str = "/var/lib/landfall-agent";
 const CODE_PATH: &str = "/var/lib/landfall-agent/.enrol-code";
@@ -422,6 +424,101 @@ fi
     )
 }
 
+/// What one upgrade is to do.
+#[derive(Debug, Clone, Copy)]
+pub struct UpgradeRequest<'a> {
+    /// The verified agent's SHA-256, in hex.
+    pub sha256: &'a str,
+    /// The upload directory.
+    pub upload: &'a str,
+    /// How long a started agent is watched.
+    pub timing: Timing,
+}
+
+/// An upgrade's steps, in order. It never touches the configuration, the units or the key. Its
+/// first step sets what the script's cleanup and health check go by. It leaves out the units'
+/// text, which is only an install's to compare, and the upload holds only the agent.
+#[must_use]
+pub fn upgrade_steps(request: &UpgradeRequest<'_>) -> Vec<Step> {
+    vec![
+        step("preflight", upgrade_preflight(request)),
+        step("binary", upgrade_binary(request)),
+        step("restart", upgrade_restart()),
+    ]
+}
+
+fn upgrade_preflight(request: &UpgradeRequest<'_>) -> String {
+    let upload = quote(request.upload);
+    let Timing {
+        stable_secs,
+        give_up_secs,
+    } = request.timing;
+    let no_unit = quote(&format!(
+        "{UNIT_PATH} isn't there, so nothing has been installed to upgrade: use landfall host install"
+    ));
+    let sha256 = quote(request.sha256);
+    let tampered = quote(TAMPERED_AGENT);
+    format!(
+        "upload={upload}
+stable_secs={stable_secs}
+give_up_secs={give_up_secs}
+[ -e {UNIT_PATH} ] || refuse {no_unit}
+check_dir {AGENT_DIR}
+check_installed {AGENT_PATH} {AGENT_MODE} ''
+upload_is {UPLOAD_AGENT} {sha256} || refuse {tampered}
+"
+    )
+}
+
+/// As an install's, but for keeping what was there. The marker comes first, so that a run stopped
+/// after the rename still restarts on the next: what runs isn't what's on disk.
+fn upgrade_binary(request: &UpgradeRequest<'_>) -> String {
+    let sha256 = quote(request.sha256);
+    let refusal = quote(TAMPERED_AGENT);
+    format!(
+        "if ! file_is {AGENT_PATH} {sha256}; then
+  rm -f {AGENT_NEW}
+  : > {AGENT_NEW}
+  chown root:root {AGENT_NEW}
+  chmod 0700 {AGENT_NEW}
+  read_upload {UPLOAD_AGENT} > {AGENT_NEW}
+  file_is {AGENT_NEW} {sha256} || refuse {refusal}
+  chmod 0755 {AGENT_NEW}
+  mark_restart
+  if [ -e {AGENT_PATH} ]; then
+    cp -p -- {AGENT_PATH} {AGENT_PREVIOUS_NEW}
+    mv -f -- {AGENT_PREVIOUS_NEW} {AGENT_PREVIOUS}
+  fi
+  mv -f {AGENT_NEW} {AGENT_PATH}
+fi
+"
+    )
+}
+
+/// `--no-block`, as a stop waits for a deploy in flight. It doesn't go back by itself: the
+/// operator is told how.
+fn upgrade_restart() -> String {
+    let no_previous = quote(
+        "landfall: there is no earlier agent here to go back to: use landfall host upgrade with another --tag",
+    );
+    format!(
+        r#"previous_id=$(unit_show InvocationID)
+systemctl restart --no-block landfall-agent
+if ! wait_healthy "$previous_id"; then
+  if [ -e {AGENT_PREVIOUS} ]; then
+    printf '%s
+' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && systemctl restart landfall-agent' >&2
+  else
+    printf '%s
+' {no_previous} >&2
+  fi
+  exit 1
+fi
+settle_marker
+"#
+    )
+}
+
 /// `wait_healthy <the invocation id before the start>`. The unit has `Restart=always`, so a
 /// broken agent never reads `failed`: it cycles. So healthy is a new id, active, with the same
 /// id and restart count `stable_secs` later. Reads `stable_secs` and `give_up_secs`, and sets
@@ -470,24 +567,10 @@ wait_healthy() {
 }
 "#;
 
-/// The script that runs `steps`, each announced as it starts.
-///
-/// `cleanup` runs on every way out it can catch, and a signal stops the script rather than
-/// letting it go on to the next step with its files gone. A signal is taken once the command
-/// in hand ends, as a shell does.
-#[must_use]
-pub fn render(steps: &[Step]) -> String {
-    let leftovers = [AGENT_NEW, CONFIG_NEW, UNIT_NEW, RECOVER_NEW].join(" ");
-    let previous_news = [CONFIG_PATH, UNIT_PATH, RECOVER_PATH]
-        .map(|path| format!("{path}.previous.new"))
-        .join(" ");
-    let mut script = format!(
-        r#"set -eu
-umask 077
-PATH={SYSTEM_PATH}
-export PATH
-cd /
-refuse() {{
+/// What the steps call on.
+fn shell_functions() -> String {
+    format!(
+        r#"refuse() {{
   printf 'landfall: refused: %s\n' "$1" >&2
   exit 1
 }}
@@ -552,7 +635,25 @@ put_text() {{
   keep_previous "$1"
   mv -f -- "$2" "$1"
 }}
-{WAIT_HEALTHY}cleanup() {{
+"#
+    )
+}
+
+/// `cleanup`, and what has it run.
+fn cleanup_and_traps() -> String {
+    let leftovers = [
+        AGENT_NEW,
+        AGENT_PREVIOUS_NEW,
+        CONFIG_NEW,
+        UNIT_NEW,
+        RECOVER_NEW,
+    ]
+    .join(" ");
+    let previous_news = [CONFIG_PATH, UNIT_PATH, RECOVER_PATH]
+        .map(|path| format!("{path}.previous.new"))
+        .join(" ");
+    format!(
+        r#"cleanup() {{
   cleanup_status=$?
   trap '' HUP INT TERM PIPE
   set +e
@@ -567,6 +668,25 @@ put_text() {{
 trap cleanup EXIT
 trap 'exit 129' HUP INT TERM PIPE
 "#
+    )
+}
+
+/// The script that runs `steps`, each announced as it starts.
+///
+/// `cleanup` runs on every way out it can catch, and a signal stops the script rather than
+/// letting it go on to the next step with its files gone. A signal is taken once the command
+/// in hand ends, as a shell does.
+#[must_use]
+pub fn render(steps: &[Step]) -> String {
+    let mut script = format!(
+        "set -eu
+umask 077
+PATH={SYSTEM_PATH}
+export PATH
+cd /
+{functions}{WAIT_HEALTHY}{cleanup}",
+        functions = shell_functions(),
+        cleanup = cleanup_and_traps(),
     );
     for (index, step) in steps.iter().enumerate() {
         let number = index + 1;

@@ -8,3 +8,4 @@ mod connection;
 mod harness;
 mod install;
 mod interrupts;
+mod upgrade;

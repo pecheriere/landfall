@@ -46,6 +46,7 @@ pub(super) fn good() -> Vec<(String, String)> {
         ("agent_version", ""),
         ("agent_sha256", ""),
         ("unit_present", "0"),
+        ("restart_pending", "0"),
         ("quote_check", quote_check.as_str()),
         ("dir_exists:0", "1"),
         ("dir_exists:1", "1"),
@@ -152,6 +153,14 @@ fn probe_output_parses() {
         check(&facts, NOW, &dirs, &https()),
         Err(vec![Refusal::MissingComposeDir(dirs[1].to_owned())])
     );
+}
+
+#[test]
+fn the_probe_sees_a_restart_pending() {
+    let sandbox = fit_sandbox();
+    assert!(!probed(&sandbox, &[]).restart_pending());
+    fs::write(sandbox.path("/etc/landfall/.restart-pending"), "").unwrap();
+    assert!(probed(&sandbox, &[]).restart_pending());
 }
 
 #[test]
