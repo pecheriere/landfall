@@ -21,13 +21,16 @@ async fn impatient() -> (TempDir, Harness, Store) {
 /// A write transaction holds the lock from its first moment, so it never finds,
 /// after reading, that another writer has moved on: which would fail it with
 /// `busy` where it could have waited. See the note on the enrolment race.
+///
+/// These tests roll back rather than drop: a dropped transaction only queues its
+/// rollback, so the lock can still be held when the next line wants it.
 #[tokio::test]
 async fn a_transaction_takes_the_write_lock_at_once() {
     let (_dir, h, writer) = impatient().await;
     let lock = writer.begin().await.unwrap();
     let error = h.store.begin().await.err().unwrap();
     assert!(error.is_busy(), "{error}");
-    drop(lock);
+    lock.rollback().await.unwrap();
     h.store.begin().await.unwrap();
 }
 
@@ -41,7 +44,7 @@ async fn a_busy_database_is_a_retryable_answer_and_not_a_failure() {
     assert_eq!(answer.code(), "busy");
     assert!(answer.headers.contains_key("retry-after"));
 
-    drop(lock);
+    lock.rollback().await.unwrap();
     assert_eq!(h.get_nonce().await.status, StatusCode::OK);
 }
 
@@ -65,5 +68,5 @@ async fn an_unknown_nonce_does_not_take_the_write_lock() {
     // Had it wanted the lock this would be `busy`.
     assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
     assert_eq!(answer.code(), "bad_nonce");
-    drop(lock);
+    lock.rollback().await.unwrap();
 }
