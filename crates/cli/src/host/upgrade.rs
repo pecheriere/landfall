@@ -11,7 +11,7 @@ use semver::Version;
 use tokio::runtime::Runtime;
 
 use super::HostError;
-use super::facts::{check_for_upgrade, shown_version};
+use super::facts::{Refusal, check_for_upgrade, shown_version};
 use super::install::{
     Confirm, Outcome, Upload, deliver_and_run, permission, print_plan, read_facts, unix_now,
 };
@@ -156,7 +156,9 @@ pub fn run_with<S: AgentSource, R: Remote>(
     if !facts.unit_present() {
         return Err(HostError::NoUnit);
     }
-    let arch = facts.arch().ok_or(HostError::NoUnit)?;
+    let arch = facts
+        .arch()
+        .ok_or_else(|| HostError::Refused(vec![Refusal::UnknownArch(String::new())]))?;
 
     let agent = runtime
         .block_on(source.agent(&tag, arch))
@@ -171,8 +173,9 @@ pub fn run_with<S: AgentSource, R: Remote>(
         shown_version(running_sha256),
         agent.version(),
     ))?;
-    // A run that was stopped with the file in place and no restart looks the same, but for this.
-    if decision == Decision::Nothing && !facts.restart_pending() {
+    // A run that failed, or was stopped, with the file in place and no restart since looks the
+    // same but for this. Where the login can't look, root's script does.
+    if decision == Decision::Nothing && facts.restart_pending() == Some(false) {
         output(writeln!(out, "landfall: it's on that version already"))?;
         return Ok(Outcome::Nothing);
     }
@@ -182,6 +185,7 @@ pub fn run_with<S: AgentSource, R: Remote>(
         sha256: agent.sha256(),
         upload: &upload,
         timing: args.timing,
+        only_if_none_there: running_sha256.is_empty() && !args.allow_downgrade,
     });
     let script = render(&steps);
     let script_sha256 = sha256_hex(script.as_bytes());

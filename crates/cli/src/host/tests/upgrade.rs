@@ -1,7 +1,7 @@
 //! `host upgrade`: what it decides, what it does with fakes, and its script in the sandbox.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use landfall_core::ids::ReleaseTag;
 use semver::Version;
@@ -11,7 +11,7 @@ use super::install::{
 };
 use super::plan::{
     AGENT, AGENT_PATH, CONFIG_PATH, KEY_PATH, MARKER, RECOVER_PATH, UNIT_PATH, UPLOAD,
-    assert_status, exists, place, read, sandbox,
+    assert_status, exists, place, put_upload, read, sandbox,
 };
 use super::{Sandbox, stderr, stdout};
 use crate::agent_release::{Arch, VerifiedAgent, sha256_hex as hash};
@@ -234,6 +234,109 @@ fn an_absent_binary_is_an_upgrade() {
     assert!(ran.out.contains("the target has nothing"), "{}", ran.out);
 }
 
+/// A version and no hash isn't an agent that's absent, and mustn't pass a downgrade.
+#[test]
+fn a_version_with_no_hash_is_compared_like_any_other() {
+    let error = decide("landfall-agent 2.0.0", "", &wanted(), false).unwrap_err();
+    assert!(matches!(error, HostError::OlderVersion { .. }), "{error:?}");
+    assert_eq!(
+        decide("landfall-agent 1.2.2", "", &wanted(), false).unwrap(),
+        Decision::Upgrade
+    );
+}
+
+/// With a failed upgrade behind it, on a host where the login can't look, and the unit cycling:
+/// that isn't "on that version already". Root's script looks.
+#[test]
+fn the_same_bytes_where_the_login_cannot_look_run_the_script() {
+    let sha256 = hash(AGENT_BYTES);
+    for pending in ["unknown", ""] {
+        let remote = remote_with(&[
+            ("agent_version", "landfall-agent 1.2.3"),
+            ("agent_sha256", &sha256),
+            ("restart_pending", pending),
+        ]);
+
+        let ran = plainly(&args(), &remote);
+
+        assert_eq!(ran.result.unwrap(), Outcome::Installed, "{pending:?}");
+        assert!(remote.script().is_some(), "{pending:?}");
+    }
+}
+
+/// Seen, and absent to the login: it must be absent to root as well.
+#[test]
+fn an_agent_the_login_saw_nothing_of_must_not_be_there_for_root() {
+    let script_of = |overrides: &[(&str, &str)], allow_downgrade| {
+        let remote = remote_with(overrides);
+        let asked = UpgradeArgs {
+            allow_downgrade,
+            ..args()
+        };
+        let _ = plainly(&asked, &remote);
+        remote.script().unwrap()
+    };
+    let refusal = "see it, so what version";
+    let absent = [("agent_version", ""), ("agent_sha256", "")];
+    assert!(script_of(&absent, false).contains(refusal));
+    assert!(!script_of(&absent, true).contains(refusal));
+    assert!(!script_of(&[], false).contains(refusal));
+
+    let sandbox = installed();
+    let sha256 = hash(AGENT.as_bytes());
+    let script = render(&upgrade_steps(&UpgradeRequest {
+        sha256: &sha256,
+        upload: UPLOAD,
+        timing: Timing::default(),
+        only_if_none_there: true,
+    }));
+    let ran = sandbox.run(&script);
+    assert_status(&ran, 1);
+    assert!(stderr(&ran).contains(refusal), "{}", stderr(&ran));
+    assert_eq!(read(&sandbox, AGENT_PATH), "the old agent");
+
+    fs::remove_file(sandbox.path(AGENT_PATH)).unwrap();
+    put_upload(&sandbox);
+    sandbox.set_states(&[("active", "old", 0), ("active", "new", 0)]);
+    assert_status(&sandbox.run(&script), 0);
+    assert_eq!(read(&sandbox, AGENT_PATH), AGENT);
+}
+
+#[test]
+fn a_clock_off_is_said() {
+    let remote = remote_with(&[("clock", "1000")]);
+    let ran = plainly(&args(), &remote);
+    assert!(
+        ran.out.contains("warning: the target's clock"),
+        "{}",
+        ran.out
+    );
+}
+
+/// The tag is this build's, whichever version that is. A development build won't guess.
+#[test]
+fn the_tag_defaults_to_this_builds_own() {
+    let remote = remote_with(&[]);
+    let source = FakeSource::new();
+    let asked = UpgradeArgs {
+        tag: None,
+        ..args()
+    };
+
+    let ran = upgrade(&asked, &source, &remote, &mut FakeConfirm::no_terminal());
+
+    let version = env!("CARGO_PKG_VERSION");
+    if version == "0.0.0" {
+        let error = ran.result.unwrap_err();
+        assert!(error.to_string().contains("--tag"), "{error}");
+        assert_eq!(remote.calls(), Vec::new());
+    } else {
+        assert_eq!(ran.result.unwrap(), Outcome::Installed);
+        let tag = source.asked_tag.borrow().clone().unwrap();
+        assert_eq!(tag.as_ref(), format!("v{version}"));
+    }
+}
+
 #[test]
 fn no_unit_is_refused_naming_install() {
     let remote = remote_with(&[("unit_present", "0")]);
@@ -417,6 +520,7 @@ fn script_for(sha256: &str) -> String {
             stable_secs: 1,
             give_up_secs: 3,
         },
+        only_if_none_there: false,
     }))
 }
 
@@ -441,6 +545,7 @@ fn an_upload_changed_after_preflight_is_refused_at_its_step() {
         sha256: &sha256,
         upload: UPLOAD,
         timing: Timing::default(),
+        only_if_none_there: false,
     });
     let script = render(&[
         steps[0].clone(),
@@ -459,6 +564,97 @@ fn an_upload_changed_after_preflight_is_refused_at_its_step() {
     assert!(!exists(&sandbox, MARKER));
 }
 
+/// What's still the old id isn't the new agent, whatever state it's in.
+#[test]
+fn the_same_invocation_is_not_a_new_agent() {
+    let sandbox = installed();
+    sandbox.set_states(&[("active", "old", 0)]);
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 1);
+    assert!(stderr(&ran).contains("isn't healthy"), "{}", stderr(&ran));
+    assert!(exists(&sandbox, MARKER));
+}
+
+/// A kill while it's being kept must not leave a torn `.previous` for the way back to install.
+#[test]
+fn the_old_agent_is_kept_by_rename() {
+    let sandbox = installed();
+    let previous = sandbox.path(AGENT_PREVIOUS);
+    sandbox.stub(
+        "mv",
+        &format!(
+            r#"for last in "$@"; do :; done
+if [ "$last" = {} ]; then exit 9; fi
+exec /bin/mv "$@""#,
+            previous.display()
+        ),
+    );
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 9);
+    assert!(!previous.exists());
+    assert_eq!(read(&sandbox, AGENT_PATH), "the old agent");
+}
+
+/// Written through otherwise, as root.
+#[test]
+fn a_link_at_the_new_file_is_not_followed() {
+    let sandbox = installed();
+    let victim = sandbox.path("/victim");
+    fs::write(&victim, "theirs").unwrap();
+    symlink(&victim, sandbox.path("/usr/local/bin/.landfall-agent.new")).unwrap();
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 0);
+    assert_eq!(fs::read_to_string(victim).unwrap(), "theirs");
+}
+
+/// A marker there before this run says what's on disk was never seen healthy, so the one kept
+/// from before is the better way back.
+#[test]
+fn a_failed_upgrade_is_not_kept_as_the_way_back() {
+    let sandbox = installed();
+    place(&sandbox, AGENT_PREVIOUS, "the good agent", 0o755);
+    fs::write(sandbox.path(MARKER), "").unwrap();
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 0);
+    assert_eq!(read(&sandbox, AGENT_PATH), AGENT);
+    assert_eq!(read(&sandbox, AGENT_PREVIOUS), "the good agent");
+}
+
+/// It may be an install's, stopped with its units written and no reload.
+#[test]
+fn a_marker_from_before_this_run_is_reloaded_for() {
+    let sandbox = installed();
+    place(&sandbox, AGENT_PATH, AGENT, 0o755);
+    fs::write(sandbox.path(MARKER), "").unwrap();
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 0);
+    let log = sandbox.log();
+    let (reload, restart) = (log.find("daemon-reload"), log.find("restart --no-block"));
+    assert!(reload.is_some() && reload < restart, "{log}");
+}
+
+/// Root's script looks for itself: nothing to do is nothing done.
+#[test]
+fn with_the_right_file_and_no_marker_nothing_restarts() {
+    let sandbox = installed();
+    place(&sandbox, AGENT_PATH, AGENT, 0o755);
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 0);
+    assert!(!sandbox.log().contains("restart"), "{}", sandbox.log());
+}
+
 #[test]
 fn upgrade_never_mentions_the_key_config_or_units() {
     let sha256 = hash(AGENT.as_bytes());
@@ -466,6 +662,7 @@ fn upgrade_never_mentions_the_key_config_or_units() {
         sha256: &sha256,
         upload: UPLOAD,
         timing: Timing::default(),
+        only_if_none_there: false,
     }) {
         for word in ["agent.key", "fleet.toml", "enrol", "agent_unit", "recover"] {
             assert!(!step.shell.contains(word), "{word} in {}", step.shell);
@@ -651,16 +848,21 @@ fn what_is_refused_is_refused_before_any_change() {
     let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
     assert_status(&ran, 1);
 
-    // A directory others can write to.
-    let sandbox = installed();
-    fs::set_permissions(
-        sandbox.path("/usr/local/bin"),
-        fs::Permissions::from_mode(0o777),
-    )
-    .unwrap();
-    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
-    assert_status(&ran, 1);
-    assert!(!sandbox.log().contains("restart"));
+    // A directory others can write to: where it goes, and where the marker goes.
+    for dir in ["/usr/local/bin", "/etc/landfall"] {
+        let sandbox = installed();
+        fs::set_permissions(sandbox.path(dir), fs::Permissions::from_mode(0o777)).unwrap();
+        let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+        assert_status(&ran, 1);
+        assert!(!sandbox.log().contains("restart"), "{dir}");
+        assert_eq!(read(&sandbox, AGENT_PATH), "the old agent", "{dir}");
+
+        let sandbox = installed();
+        sandbox.set_owner(dir, "1000:0");
+        let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+        assert_status(&ran, 1);
+        assert!(!exists(&sandbox, MARKER), "{dir}");
+    }
 }
 
 #[test]

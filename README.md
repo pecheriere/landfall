@@ -52,9 +52,10 @@ gh release download <tag> --repo pecheriere/landfall --pattern 'landfall-*-darwi
   --deny-self-hosted-runners` checks that these exact bytes were built by this repository's release
   workflow, on a GitHub-hosted runner, from that tag. **It does not check that the maintainer signed the
   tag:** someone holding the owner's GitHub token could pass it with a release of their own.
-- To check that too, clone the repository, run `git -c gpg.ssh.allowedSignersFile=<file> verify-tag <tag>`
-  with the key whose fingerprint is in [`SECURITY.md`](SECURITY.md), and compare `SECURITY.md` with a copy
-  you got some other way. Then add `--source-digest` with the tag's commit.
+- To check that too, clone the repository and run `git verify-tag` with the key whose fingerprint is in
+  [`SECURITY.md`](SECURITY.md), compare `SECURITY.md` with a copy you got some other way, and add
+  `--source-digest` with the tag's commit. [The guide's first trust](docs/operations.md#first-trust) has
+  the commands, as the key's file and the digest each need a particular form.
 - `brew install` checks only the SHA-256 in the tap's formula, so it trusts the tap, whose formula the
   owner verified that way and copied by hand. Homebrew itself verifies neither the attestation nor the tag.
 - `landfall host install` checks the tag's signature, the attestation and the sums every time, against

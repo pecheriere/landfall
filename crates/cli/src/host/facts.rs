@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use landfall_core::controller_url::ControllerUrl;
 use landfall_core::text::shown;
 
-use super::plan::{AGENT_PATH, MARKER, UNIT_PATH};
+use super::plan::{AGENT_PATH, CONFIG_DIR, MARKER, UNIT_PATH};
 use super::shell::{QUOTE_CHECK, SYSTEM_PATH, quote};
 use crate::agent_release::Arch;
 
@@ -175,11 +175,16 @@ impl HostFacts {
         self.yes("unit_present")
     }
 
-    /// Whether a change is waiting for a restart: an upgrade stopped after its rename, for one.
-    /// It reads as no if the login can't look, in a directory closed to it.
+    /// Whether a change is waiting for a restart: an upgrade stopped after its rename, or one
+    /// that failed, for two. `None` if the login can't look, in a directory closed to it, or the
+    /// probe didn't say.
     #[must_use]
-    pub fn restart_pending(&self) -> bool {
-        self.yes("restart_pending")
+    pub fn restart_pending(&self) -> Option<bool> {
+        match self.value("restart_pending") {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
     }
 
     /// What the installed agent's `--version` said, if there is one.
@@ -333,7 +338,7 @@ else
   fact agent_sha256 ''
 fi
 if [ -e {UNIT_PATH} ]; then fact unit_present 1; else fact unit_present 0; fi
-if [ -e {MARKER} ]; then fact restart_pending 1; else fact restart_pending 0; fi
+if [ -e {MARKER} ]; then fact restart_pending 1; elif [ -d {CONFIG_DIR} ] && [ ! -x {CONFIG_DIR} ]; then fact restart_pending unknown; else fact restart_pending 0; fi
 fact quote_check "$(printf %s {check} | od -An -tx1 | tr -d ' \n')"
 "#
     );

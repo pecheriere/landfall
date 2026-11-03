@@ -193,6 +193,7 @@ pub(super) struct FakeSource {
     pub(super) not_ready: bool,
     pub(super) fetch: Fetch,
     pub(super) asked_for: Cell<Option<Arch>>,
+    pub(super) asked_tag: RefCell<Option<ReleaseTag>>,
 }
 
 impl FakeSource {
@@ -201,6 +202,7 @@ impl FakeSource {
             not_ready: false,
             fetch: Fetch::Good,
             asked_for: Cell::new(None),
+            asked_tag: RefCell::new(None),
         }
     }
 }
@@ -220,6 +222,7 @@ impl AgentSource for FakeSource {
         arch: Arch,
     ) -> impl Future<Output = Result<VerifiedAgent, AgentReleaseError>> {
         self.asked_for.set(Some(arch));
+        *self.asked_tag.borrow_mut() = Some(tag.clone());
         std::future::ready(match self.fetch {
             Fetch::Good => Ok(VerifiedAgent::new(
                 tag.clone(),

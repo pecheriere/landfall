@@ -182,13 +182,16 @@ fn docker_upgrade_that_cannot_start_says_how_to_go_back() {
     assert_eq!(target.unit_state(), "active");
 }
 
-/// A wrapper that ignores `TERM` for longer than the limit is what a deploy in flight looks like
+/// A wrapper that takes longer than the limit to end, from `TERM`, is what a deploy in flight looks like
 /// from outside. The new binary is seen starting once it ends, by a file only it writes.
 #[test]
 #[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
 fn docker_upgrade_during_a_deploy_says_it_is_finishing() {
     let target = Target::start();
-    let busy = wrapped_running("98.0.0", "trap '' TERM; sleep 15; exit 0");
+    let busy = wrapped_running(
+        "98.0.0",
+        "trap 'sleep 15; exit 0' TERM; while :; do sleep 1; done",
+    );
     let args_with_busy = target.args();
     target.install_captured(&args_with_busy, &busy).assert_ok();
     let new_ran = format!("{STATE_DIR}/the-new-one-ran");
@@ -255,6 +258,7 @@ fn docker_interrupted_upgrade_still_restarts() {
         sha256: &hash,
         upload: UPLOAD,
         timing: TIMING,
+        only_if_none_there: false,
     });
     let remote = target.remote_as("operator");
     upload_agent(&remote, UPLOAD, &source.bytes);
@@ -272,4 +276,57 @@ fn docker_interrupted_upgrade_still_restarts() {
     assert_eq!(ran.result.unwrap(), Outcome::Installed);
     assert_ne!(invocation(&target), id);
     assert!(!target.exists("/etc/landfall/.restart-pending"));
+}
+
+/// A login that owns `/etc/landfall` has planted a link where root would write the marker.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_upgrade_writes_nothing_through_a_link_in_a_directory_not_roots() {
+    let target = Target::start();
+    target.installed();
+    target.sh_ok("printf 12345678 > /etc/victim; chown operator /etc/landfall");
+    target.sh_ok("runuser -u operator -- ln -s /etc/victim /etc/landfall/.restart-pending");
+    let before = agent_hash(&target);
+
+    let ran = upgrade(&target, args(), &wrapped("99.0.0"));
+
+    assert_eq!(ran.status(), 1, "{}\n{}", ran.error_text(), ran.out);
+    assert!(ran.out.contains("/etc/landfall has owner"), "{}", ran.out);
+    assert_eq!(target.sh_ok("cat /etc/victim"), "12345678");
+    assert_eq!(agent_hash(&target), before);
+}
+
+/// With a broken agent cycling, and the login unable to see the marker that says so, a rerun must
+/// not call that being on the version already.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_a_failed_upgrade_behind_a_closed_directory_is_not_success() {
+    let target = Target::start();
+    target.installed();
+    target.sh_ok("chgrp staff /etc/landfall; chmod 2750 /etc/landfall");
+    let broken = wrapped_running("99.0.0", "exit 2");
+    let ran = upgrade(&target, args(), &broken);
+    assert_eq!(ran.status(), 1, "{}\n{}", ran.error_text(), ran.out);
+
+    let ran = upgrade(&target, args(), &broken);
+
+    assert_eq!(ran.status(), 1, "{}\n{}", ran.error_text(), ran.out);
+    assert!(ran.out.contains("isn't healthy"), "{}", ran.out);
+    assert!(target.exists("/etc/landfall/.restart-pending"));
+}
+
+/// What the login can't see reads as nothing there, and root's script knows better.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_an_agent_the_login_cannot_see_is_not_taken_for_none() {
+    let target = Target::start();
+    target.installed();
+    target.sh_ok("chgrp staff /usr/local/bin; chmod 2750 /usr/local/bin");
+    let before = agent_hash(&target);
+
+    let ran = upgrade(&target, args(), &wrapped("99.0.0"));
+
+    assert_eq!(ran.status(), 1, "{}\n{}", ran.error_text(), ran.out);
+    assert!(ran.out.contains("can't see it"), "{}", ran.out);
+    assert_eq!(agent_hash(&target), before);
 }

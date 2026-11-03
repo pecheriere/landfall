@@ -721,21 +721,30 @@ touched. **Upgrade the agents and the controller together:** see [upgrading](#up
 | On the target | What it does |
 |---|---|
 | An older version | Upgrades |
-| This version, with these bytes | Nothing, and says so, unless an earlier run was stopped before its restart: then it restarts |
+| This version, with these bytes | Nothing, and says so, unless an earlier run failed or was stopped before its restart: then it restarts, and watches |
 | A newer version | Refuses, without `--allow-downgrade` |
 | This version, with other bytes | Refuses, showing both hashes, without `--allow-downgrade`: it may be a hand-built or a tampered binary |
 | What doesn't say a version | Refuses, without `--allow-downgrade` |
-| No binary, with the unit there | Puts it in place, and restarts |
+| No binary, with the unit there | Puts it in place, and restarts. If the binary is there and only the login can't see it, it refuses, without `--allow-downgrade` |
 | No unit | Refuses: use `host install` |
 
-The old binary is kept as `/usr/local/bin/landfall-agent.previous`, one step back. It doesn't go back by
+It restarts the unit whatever state it's in, so **it starts an agent you had stopped,** though it doesn't
+enable it. If you've stopped an agent to keep deploys off a host, upgrade it when you mean to start it.
+
+The old binary is kept as `/usr/local/bin/landfall-agent.previous`, one step back from the last one seen
+healthy: a failed upgrade, or one still waiting on a deploy, isn't kept over it. It doesn't go back by
 itself. If the new one doesn't hold still you get the last journal lines, exit 1, and the command:
 
 ```text
 landfall: to go back, as root: mv -f /usr/local/bin/landfall-agent.previous /usr/local/bin/landfall-agent && systemctl restart landfall-agent
 ```
 
-Deployed services aren't touched either way. During a deploy it says a deploy is finishing and exits 0,
+**Read the journal lines before you run it.** The new agent may not be at fault: with Docker down, say,
+no agent can start, and going back doesn't help. Going back with `--tag <good> --allow-downgrade` works
+too. Deployed services aren't touched either way. An older agent may refuse state a newer one wrote, as
+its records allow no field it doesn't know: there's been only one format so far, so this hasn't come up.
+
+During a deploy it says a deploy is finishing and exits 0,
 and the new agent starts when the deploy ends. Run it again after that to see it healthy.
 
 ### First trust
@@ -756,17 +765,36 @@ each way of getting it does and doesn't check:
   GitHub-hosted runner, from that tag. **It does not check that the maintainer signed the tag:** someone
   holding the owner's GitHub token could pass it with a release of their own.
 
-- **To check that too:** clone the repository, and run `git -c gpg.ssh.allowedSignersFile=<file>
-  verify-tag <tag>` with a file allowing the key whose fingerprint is in `SECURITY.md`. Compare
-  `SECURITY.md` with a copy you got some other way, as a stolen token can change the repository too. Then
-  add `--source-digest <the tag's commit>` to the command above.
+- **To check that too,** with `tag` set to the tag you're after:
+
+  ```sh
+  git clone https://github.com/pecheriere/landfall
+  ssh-keygen -lf landfall/crates/cli/assets/release-signers
+  sed -n 's/^ssh-ed25519 /landfall-release ssh-ed25519 /p' \
+    landfall/crates/cli/assets/release-signers > allowed-signers
+  git -C landfall -c gpg.ssh.allowedSignersFile="$PWD/allowed-signers" verify-tag "$tag"
+  ```
+
+  Compare what `ssh-keygen -lf` prints with `SECURITY.md`, and with a copy of it you got some other way,
+  as a stolen token can change the repository too. Keep `allowed-signers` outside the clone. It needs a
+  name in front of each key, as `sed` puts there: `ssh-keygen` calls a bare line from
+  `release-signers` an invalid key. Then tie the attestation to the commit that tag names, by adding this
+  to the `gh attestation verify` above:
+
+  ```sh
+  --source-digest "$(git -C landfall rev-parse --verify --quiet "$tag^{commit}")"
+  ```
+
+  `git rev-parse "$tag"` alone gives the tag object, which that flag refuses. The format of
+  `allowed-signers` has been checked with `ssh-keygen -Y` and a throwaway key. `verify-tag` itself hasn't
+  been run on one of landfall's tags, as there are none yet.
 
 - **`brew install`** checks only the SHA-256 in the tap's formula, so you're trusting the tap, whose
   formula the owner verified that way and copied by hand. Homebrew itself verifies neither the
   attestation nor the tag.
 
 - **A browser download on macOS** is quarantined, and these binaries aren't notarised, so Gatekeeper
-  will stop it. Verify it as above first. Then `xattr -d com.apple.quarantine <file>` lets it run. `gh
+  should stop it, which hasn't been tried on a real release yet. Verify it as above first. Then `xattr -d com.apple.quarantine <file>` lets it run. `gh
   release download` and Homebrew don't set that flag. A file you download is a raw executable, so
   `chmod +x` it.
 

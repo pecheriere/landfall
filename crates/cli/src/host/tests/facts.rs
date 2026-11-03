@@ -2,6 +2,8 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use std::process::Command;
 
 use landfall_core::controller_url::ControllerUrl;
 
@@ -158,9 +160,25 @@ fn probe_output_parses() {
 #[test]
 fn the_probe_sees_a_restart_pending() {
     let sandbox = fit_sandbox();
-    assert!(!probed(&sandbox, &[]).restart_pending());
+    assert_eq!(probed(&sandbox, &[]).restart_pending(), Some(false));
     fs::write(sandbox.path("/etc/landfall/.restart-pending"), "").unwrap();
-    assert!(probed(&sandbox, &[]).restart_pending());
+    assert_eq!(probed(&sandbox, &[]).restart_pending(), Some(true));
+}
+
+/// Root can search any directory, so that's for a test run as anyone else to see.
+#[test]
+fn the_probe_says_when_it_cannot_look_for_a_restart_pending() {
+    let root = Command::new("id").arg("-u").output().unwrap().stdout == b"0\n";
+    if root {
+        return;
+    }
+    let sandbox = fit_sandbox();
+    let closed = sandbox.path("/etc/landfall");
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+    let facts = probed(&sandbox, &[]);
+    // Or the temp directory's removal would fail.
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(facts.restart_pending(), None);
 }
 
 #[test]

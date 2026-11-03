@@ -146,8 +146,8 @@ Nothing here is needed before PR A to E merge. Until step 1, a `workflow_dispatc
 3. **Supply the tag-signing public key:** the `ssh-ed25519` key you sign tags with (other types are refused). An agent puts it in `crates/cli/assets/release-signers`, with no comment, and its fingerprint in `SECURITY.md`, by PR.
 4. **Choose the first version,** preferably a release candidate. An agent bumps `workspace.package.version` and the `landfall-*` path dependency versions by PR. Then run the `Release` workflow by `workflow_dispatch` on main and check it's green.
 5. **Tag and approve:** `git tag -s v<version>`, push the tag, approve the `publish` job. **Never re-run a failed run:** abandon its draft, have an agent bump the version by PR, and tag again. A flake anywhere costs this too.
-6. **After the first release,** go through the first-tag list in Task 3, including a real `landfall host install --dry-run` on a host of your choice and a real install on a spare one, which covers what the container can't: a real sudo password prompt, real Docker, `GitHubReleases` end to end and, if you have one, a 16 KiB-page kernel. Then an agent can do PR F.
-7. **Homebrew:** create `homebrew-landfall` as a public repo under the same baseline, and copy `landfall.rb` by the recipe in `packaging/homebrew-tap/README.md`, once per release. Then `brew install` and `landfall --version`.
+6. **After the first release,** go through the first-tag list in Task 3, including a real `landfall host install --dry-run` on a host of your choice and a real install on a spare one, which covers what the container can't: a real sudo password prompt, real Docker, `GitHubReleases` end to end and, if you have one, a 16 KiB-page kernel. Once there's a second release, a real `landfall host upgrade` on that host. Then an agent can do PR F.
+7. **Homebrew, from the first real release, as a release candidate isn't copied to the tap:** create `homebrew-landfall` as a public repo under the same baseline, and copy `landfall.rb` by the recipe in `packaging/homebrew-tap/README.md`, once per release. Then `brew install` and `landfall --version`.
 
 ---
 
@@ -248,10 +248,12 @@ then copy to `Formula/landfall.rb`, commit. It says why this isn't automated, an
 7. A real download of our own assets, through the API's redirect and storage host, by `GitHubReleases`.
 8. `live_agent_release_verifies` goes from nothing to do to a real pass that night, and `GitHubReleases` then `run_with` on a real host, since Task 8 uses a fixed source (owner's step 6).
 9. The binaries on real arm64, and on a 16 KiB kernel if there is one (owner's step 6).
-10. The macOS binary as released, through Homebrew's staging of a raw file (`Dir["landfall-*"]` is assumed), and Gatekeeper on it (owner's step 7).
+10. The macOS binary as released, and Gatekeeper on it from a browser download. **Through Homebrew's staging of a raw file (`Dir["landfall-*"]` is assumed) this waits for the real release,** as `CONTRIBUTING.md` keeps a release candidate out of the tap, so that it doesn't reach `brew upgrade` (owner's step 7).
 11. The environment's tag limit refusing a non-tag ref, whose setting the guard reads but which no dispatch exercises as `publish` is skipped. Try it once by a temporary job, or read it from the environment's settings, and record which.
 12. The documented Linux 5.8 floor: the agent starts on a kernel that old, or the floor moves. Kernels before about 5.10 are recalled, not read, not to honour `p_align` for a static PIE, which should be harmless as nothing needs more than page alignment.
 13. ASLR on a native amd64 kernel: only arm64 has shown a changing address, as amd64 has run only under emulation, which kept a fixed one.
+14. A real `landfall host upgrade`, which **needs a second release:** from the release candidate to the next one, or to the real release if there's only one candidate (owner's step 6). So this one can come after the real tag.
+15. The guide's first trust on a real tag, as `git verify-tag` with its `allowed-signers` and `--source-digest` have been shown only in parts: the signers' format by `ssh-keygen -Y` and a throwaway key, and the digest on another project's release.
 
 Native arm64 at the `--version` level isn't on this list: `smoke` on `ubuntu-24.04-arm` covers it in PR B, where `docker-build` only has QEMU.
 

@@ -174,21 +174,31 @@ fn a_bad_destination_or_configuration_is_refused_without_connecting() {
     assert_eq!(remote.calls(), Vec::new());
 }
 
-/// With a tag not given, it's this build's: a development build won't guess.
+/// With a tag not given, it's this build's, whichever version that is. A development build won't
+/// guess.
 #[test]
-fn a_development_build_asks_for_a_tag() {
+fn the_tag_defaults_to_this_builds_own() {
     let files = Files::new();
     let remote = FakeRemote::new();
+    let source = FakeSource::new();
     let args = InstallArgs {
         tag: None,
         ..files.args()
     };
 
-    let error = error_of(run_plainly(&args, &remote));
+    let ran = run(&args, &source, &remote, &mut FakeConfirm::no_terminal());
 
-    assert!(error.to_string().contains("--tag"), "{error}");
-    assert_eq!(error.exit_code(), 2);
-    assert_eq!(remote.calls(), Vec::new());
+    let version = env!("CARGO_PKG_VERSION");
+    if version == "0.0.0" {
+        let error = error_of(ran);
+        assert!(error.to_string().contains("--tag"), "{error}");
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(remote.calls(), Vec::new());
+    } else {
+        assert!(ran.result.is_ok());
+        let tag = source.asked_tag.borrow().clone().unwrap();
+        assert_eq!(tag.as_ref(), format!("v{version}"));
+    }
 }
 
 /// It's cut off at what a code could be, with the code past that.

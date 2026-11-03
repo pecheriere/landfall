@@ -31,7 +31,7 @@ const AGENT_DIR: &str = "/usr/local/bin";
 const AGENT_NEW: &str = "/usr/local/bin/.landfall-agent.new";
 const AGENT_PREVIOUS: &str = "/usr/local/bin/landfall-agent.previous";
 const AGENT_PREVIOUS_NEW: &str = "/usr/local/bin/.landfall-agent.previous.new";
-const CONFIG_DIR: &str = "/etc/landfall";
+pub(super) const CONFIG_DIR: &str = "/etc/landfall";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
 const CONFIG_NEW: &str = "/etc/landfall/.fleet.toml.new";
@@ -433,6 +433,9 @@ pub struct UpgradeRequest<'a> {
     pub upload: &'a str,
     /// How long a started agent is watched.
     pub timing: Timing,
+    /// That the login saw no agent, and that going ahead on that is all right only if root sees
+    /// none either: a binary in a directory closed to the login could be any version.
+    pub only_if_none_there: bool,
 }
 
 /// An upgrade's steps, in order. It never touches the configuration, the units or the key. Its
@@ -458,20 +461,32 @@ fn upgrade_preflight(request: &UpgradeRequest<'_>) -> String {
     ));
     let sha256 = quote(request.sha256);
     let tampered = quote(TAMPERED_AGENT);
+    let hidden = quote(&format!(
+        "{AGENT_PATH} is there, and this login can't see it, so what version it is can't be said: open its directory to the login, or --allow-downgrade replaces it"
+    ));
+    let none_there = if request.only_if_none_there {
+        format!("if [ -e {AGENT_PATH} ]; then\n  refuse {hidden}\nfi\n")
+    } else {
+        String::new()
+    };
     format!(
         "upload={upload}
 stable_secs={stable_secs}
 give_up_secs={give_up_secs}
 [ -e {UNIT_PATH} ] || refuse {no_unit}
 check_dir {AGENT_DIR}
+check_dir {CONFIG_DIR}
 check_installed {AGENT_PATH} {AGENT_MODE} ''
-upload_is {UPLOAD_AGENT} {sha256} || refuse {tampered}
+{none_there}upload_is {UPLOAD_AGENT} {sha256} || refuse {tampered}
+if [ -e {MARKER} ]; then had_marker=1; else had_marker=; fi
 "
     )
 }
 
-/// As an install's, but for keeping what was there. The marker comes first, so that a run stopped
-/// after the rename still restarts on the next: what runs isn't what's on disk.
+/// As an install's, but for keeping what was there, unless a marker was there already: then
+/// what's on disk was never seen healthy, and the one kept is a better way back. The marker comes
+/// before the rename, so that a run stopped after it still restarts on the next: what runs isn't
+/// what's on disk.
 fn upgrade_binary(request: &UpgradeRequest<'_>) -> String {
     let sha256 = quote(request.sha256);
     let refusal = quote(TAMPERED_AGENT);
@@ -485,7 +500,7 @@ fn upgrade_binary(request: &UpgradeRequest<'_>) -> String {
   file_is {AGENT_NEW} {sha256} || refuse {refusal}
   chmod 0755 {AGENT_NEW}
   mark_restart
-  if [ -e {AGENT_PATH} ]; then
+  if [ -e {AGENT_PATH} ] && [ -z \"$had_marker\" ]; then
     cp -p -- {AGENT_PATH} {AGENT_PREVIOUS_NEW}
     mv -f -- {AGENT_PREVIOUS_NEW} {AGENT_PREVIOUS}
   fi
@@ -495,6 +510,8 @@ fi
     )
 }
 
+/// Only with something to restart for, which root can always see. A marker from before this run
+/// may be an install's, stopped with its units written, so that's reloaded for too.
 /// `--no-block`, as a stop waits for a deploy in flight. It doesn't go back by itself: the
 /// operator is told how.
 fn upgrade_restart() -> String {
@@ -502,19 +519,20 @@ fn upgrade_restart() -> String {
         "landfall: there is no earlier agent here to go back to: use landfall host upgrade with another --tag",
     );
     format!(
-        r#"previous_id=$(unit_show InvocationID)
-systemctl restart --no-block landfall-agent
-if ! wait_healthy "$previous_id"; then
-  if [ -e {AGENT_PREVIOUS} ]; then
-    printf '%s
-' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && systemctl restart landfall-agent' >&2
-  else
-    printf '%s
-' {no_previous} >&2
+        r#"if [ -e {MARKER} ]; then
+  [ -z "$had_marker" ] || systemctl daemon-reload
+  previous_id=$(unit_show InvocationID)
+  systemctl restart --no-block landfall-agent
+  if ! wait_healthy "$previous_id"; then
+    if [ -e {AGENT_PREVIOUS} ]; then
+      printf '%s\n' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && systemctl restart landfall-agent' >&2
+    else
+      printf '%s\n' {no_previous} >&2
+    fi
+    exit 1
   fi
-  exit 1
+  settle_marker
 fi
-settle_marker
 "#
     )
 }
