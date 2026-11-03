@@ -26,7 +26,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -43,6 +43,13 @@ API = "https://crates.io/api/v1/crates"
 REQUEST_INTERVAL = 1.0
 TIMEOUT = 30
 MAX_RESPONSE_BYTES = 1 << 20
+# A tag's run has one attempt and makes a lookup per locked crate, so a brief failure is tried
+# again.
+MAX_ATTEMPTS = 5
+FIRST_RETRY_WAIT = 2.0
+MAX_RETRY_WAIT = 60.0
+TOO_MANY_REQUESTS = 429
+FIRST_SERVER_ERROR = 500
 NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
 # A RustSec id, or a GitHub advisory id (GHSA-xxxx-xxxx-xxxx in its own base32
 # alphabet) for advisories RustSec does not carry.
@@ -153,7 +160,18 @@ def check(
     lookup: Lookup,
     now: datetime,
 ) -> list[str]:
-    """Return one error per problem; an empty list means the PR passes.
+    """Return one error per problem; an empty list means the PR passes."""
+    return list(problems(base_lock, head_lock, allow_text, lookup, now))
+
+
+def problems(
+    base_lock: str | None,
+    head_lock: str,
+    allow_text: str,
+    lookup: Lookup,
+    now: datetime,
+) -> Iterator[str]:
+    """Yield each error as it is found, so that an outage can't outlast the job's only message.
 
     `base_lock` is None when the base has no Cargo.lock, so every version is new.
     """
@@ -161,33 +179,42 @@ def check(
     base = registry_crates(base_lock) if base_lock is not None else set()
     allowed = load_allow_list(allow_text)
 
-    errors: list[str] = []
     for crate in sorted(head - base):
         if crate in allowed:
             continue
         try:
             published = lookup(crate)
         except PublishDateError as err:
-            errors.append(
+            yield (
                 f"{crate}: could not get its publish date from crates.io, so the check "
-                f"fails rather than pass it unchecked ({err}). Re-run the job.",
+                f"fails rather than pass it unchecked ({err}). On a pull request, re-run the "
+                "job. On a tag's run a re-run is refused, so this costs a version number."
             )
             continue
         if now - published < MIN_AGE:
-            errors.append(
+            yield (
                 f"{crate} was published on {published:%Y-%m-%d}, less than "
                 f"{MIN_AGE.days} days ago. Wait until {published + MIN_AGE:%Y-%m-%d} or, "
                 "for the oldest release fixing a security advisory, add an exception to "
-                ".github/crate-age-allow.toml (see the README).",
+                ".github/crate-age-allow.toml (see the README)."
             )
-    errors.extend(
-        f"allow-list entry {crate} is stale: that version is not in {LOCKFILE}. Remove it."
-        for crate in sorted(set(allowed) - head)
-    )
-    return errors
+    for crate in sorted(set(allowed) - head):
+        yield f"allow-list entry {crate} is stale: that version is not in {LOCKFILE}. Remove it."
 
 
 Opener = Callable[..., IO[bytes]]
+
+
+def _retry_wait(err: urllib.error.HTTPError, backoff: float) -> float | None:
+    """Return how long to wait before trying again after this status, or None not to.
+
+    Only a 429 or a 5xx can change. A `Retry-After` in seconds is honoured up to a cap, and its
+    other form, a date, isn't read, so that the backoff applies.
+    """
+    if err.code != TOO_MANY_REQUESTS and err.code < FIRST_SERVER_ERROR:
+        return None
+    asked = err.headers.get("Retry-After", "") if err.headers else ""
+    return max(backoff, min(float(asked), MAX_RETRY_WAIT)) if asked.isdecimal() else backoff
 
 
 class CratesIo:
@@ -210,10 +237,6 @@ class CratesIo:
 
     def __call__(self, crate: Crate) -> datetime:
         """Return when `crate` was published."""
-        if self._last is not None:
-            wait = self._last + REQUEST_INTERVAL - self._clock()
-            if wait > 0:
-                self._sleep(wait)
         name = urllib.parse.quote(crate.name, safe="")
         version = urllib.parse.quote(crate.version, safe="")
         # The URL is always the https crates.io API; only the escaped path varies.
@@ -221,18 +244,42 @@ class CratesIo:
             f"{API}/{name}/{version}",
             headers={"User-Agent": self._user_agent, "Accept": "application/json"},
         )
-        try:
-            with self._opener(request, timeout=TIMEOUT) as reply:
-                body = reply.read(MAX_RESPONSE_BYTES + 1)
-        except (OSError, http.client.HTTPException) as err:
-            msg = f"request failed: {err!r}"
-            raise PublishDateError(msg) from err
-        finally:
-            self._last = self._clock()
+        body = self._read(request)
         if len(body) > MAX_RESPONSE_BYTES:
             msg = f"response larger than {MAX_RESPONSE_BYTES} bytes"
             raise PublishDateError(msg)
         return _published(body, crate)
+
+    def _read(self, request: urllib.request.Request) -> bytes:
+        """Return a response's body, trying again after a 429, a 5xx or a network error."""
+        backoff = FIRST_RETRY_WAIT
+        attempt = 1
+        while True:
+            self._keep_to_the_interval()
+            try:
+                with self._opener(request, timeout=TIMEOUT) as reply:
+                    return reply.read(MAX_RESPONSE_BYTES + 1)
+            except urllib.error.HTTPError as err:
+                failure: Exception = err
+                wait = _retry_wait(err, backoff)
+            except (OSError, http.client.HTTPException) as err:
+                failure = err
+                wait = backoff
+            finally:
+                self._last = self._clock()
+            if wait is None or attempt == MAX_ATTEMPTS:
+                msg = f"request failed: {failure!r}"
+                raise PublishDateError(msg) from failure
+            self._sleep(wait)
+            backoff *= 2
+            attempt += 1
+
+    def _keep_to_the_interval(self) -> None:
+        """Wait until a second has passed since the last request, which may have failed."""
+        if self._last is not None:
+            wait = self._last + REQUEST_INTERVAL - self._clock()
+            if wait > 0:
+                self._sleep(wait)
 
 
 def _published(body: bytes, crate: Crate) -> datetime:
@@ -330,16 +377,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head", help="git revision to check (default: the working tree)")
     args = parser.parse_args(argv)
 
+    failed = False
     try:
         base = None if args.no_base else file_at(args.base, LOCKFILE)
         head, allow_text = head_files(args.head)
-        errors = check(base, head, allow_text, CratesIo(user_agent()), datetime.now(UTC))
+        for error in problems(base, head, allow_text, CratesIo(user_agent()), datetime.now(UTC)):
+            failed = True
+            # At once, as a pipe would otherwise hold it past a job killed at its limit.
+            print(annotation(error), flush=True)
     except (ValueError, TypeError, OSError) as err:
-        errors = [str(err)]
-
-    for error in errors:
-        print(annotation(error))
-    if errors:
+        print(annotation(str(err)))
+        return 1
+    if failed:
         return 1
     print(f"Every new or changed crate version is at least {MIN_AGE.days} days old or allowed.")
     return 0

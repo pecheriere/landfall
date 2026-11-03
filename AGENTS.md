@@ -134,9 +134,49 @@ cargo deny check
   "Dependency age"). Pin an older version with
   `cargo update -p <crate> --precise <version>`; allow-list entries are only
   for security fixes and must name a RUSTSEC or GHSA id.
-- Releases come from signed `v*` tags on main (`git tag -s`). The release
-  workflow reruns CI and crate-age, then publishes a multi-arch image to
-  GHCR with a build-provenance attestation.
+- Releases come from signed `v*` tags on main (`git tag -s`). `release.yml` reruns
+  CI and crate-age, builds with no cache, and publishes in one job, `publish`, in
+  the `release` environment. A `workflow_dispatch` run skips `preflight`, as it has no
+  tag, and `publish`, so it attests nothing. `CONTRIBUTING.md` has the procedure, and
+  `test_release_workflow.py` holds what the workflow must keep doing: edit the two
+  together.
+- `smoke` and `publish` download by artifact id, which can't be rebound as a name can,
+  and `publish` reruns `check_binaries.py`. macOS has no such check: `smoke` running
+  those same bytes there is what stands in for it.
+- **Release assets,** with these exact names, which the attestation and the CLI
+  rely on: `landfall-agent-<v>-linux-{arm64,amd64}`,
+  `landfall-<v>-linux-{arm64,amd64}`, `landfall-<v>-darwin-arm64`, `SHA256SUMS`,
+  `landfall.rb`, `LICENSE-MIT` and `LICENSE-APACHE`, written by
+  `assemble_release.py`, all subjects of one attestation, and
+  `landfall-<v>.sigstore.json`, the attestation itself. The binaries are raw
+  executables, so the hash a host checks is the attested one. The attest step stays
+  in `release.yml`, as the verifier refuses a reusable workflow's identity.
+- **The tag proof:** `release_preflight.py` reads the tag object through the API
+  and has `ssh-keygen` check it against `crates/cli/assets/release-signers` at the
+  tagged commit, before anyone is asked to approve. This is what landfall's CLI
+  trusts about its own binaries, and has nothing to do with a deployment's optional
+  `origin.signed_tags`. A signers file with no key refuses every tag.
+- **One attempt:** `preflight` and `publish` fail at once if `GITHUB_RUN_ATTEMPT` isn't 1, as
+  hosts refuse a release attested by two attempts and a tag can't be moved. The way
+  out of any failed run is a version bump and a new tag.
+- **The guard:** GitHub silently creates a missing environment with no protection,
+  so `environment-guard` reads `release` and its `deployment-branch-policies` with
+  `check_environment.py`, and `publish` needs it. It wants required reviewers,
+  `prevent_self_review` off, `can_admins_bypass` off, custom policies on and protected
+  branches off, and one policy, a tag policy for `v[0-9]*`. The owner's steps in
+  `CONTRIBUTING.md` must name exactly those settings. Red until the owner creates
+  the environment, which is correct.
+- The last step of `publish` sends the tag with `draft=false`, as the API can otherwise
+  publish with no tag, and reads the release back: not a draft, this tag, immutable. A
+  failure there may mean a public release, so it's checked by hand. The draft is found by
+  the URL `gh` printed, polling for about 2 minutes, as the listing can lag.
+- `crate_age.py` tries a lookup up to 5 times on a 429, a 5xx or a network error, honouring
+  `Retry-After` up to a minute, and not on a 404.
+- `check-bundle` reads a bundle's shape only: `gh attestation verify` checks the
+  signature and identity, in `publish`, on every file, before the draft exists. These
+  scripts run under `python3 -I`, so they can't import each other, and tests keep
+  what they share equal. CI sets `LANDFALL_TEST_REQUIRE_RUBY`, so the formula's
+  `ruby -c` test can't skip there.
 - Run `GH_TOKEN=$(gh auth token) uvx zizmor .` before pushing; it must report
   no findings.
 - Fix, don't exempt: a failing advisory, lint or zizmor finding is fixed, not

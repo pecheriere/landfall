@@ -74,8 +74,8 @@ jobs:
   crate-age:
     # Compares Cargo.lock with the PR's base, so it only runs on pull requests.
     # Nothing stops a push straight to main from skipping it, so a release
-    # workflow must run the same check against the previous release tag before
-    # it publishes anything (release.yml does).
+    # workflow must run the same check on the whole lock file before it publishes
+    # anything (release.yml does).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # About 5 minutes.
@@ -87,6 +87,9 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
       - name: Lint and test the CI scripts
+        env:
+          # Without this, the test that parses the Homebrew formula skips where there's no ruby.
+          LANDFALL_TEST_REQUIRE_RUBY: "1"
         run: |
           python3 -m venv "$RUNNER_TEMP/lint"
           "$RUNNER_TEMP/lint/bin/pip" install --quiet --require-hashes --only-binary :all: \

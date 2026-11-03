@@ -10,8 +10,8 @@ ignore = [
   "CPY001", # the project's license is in LICENSE-APACHE and LICENSE-MIT, not per-file headers
   "INP001", # .github/scripts holds standalone CI scripts, not an importable package
   "T201",   # print() is how a CI script emits GitHub annotations (::error)
-  "S603",   # subprocess is only called with a fixed `git` argv, never a shell
-  "S607",   # `git` is resolved from PATH on purpose (the runner's git)
+  "S603",   # subprocess is only called with an argv list of checked values, never a shell
+  "S607",   # `git`, `gh` and `ssh-keygen` are resolved from PATH on purpose (the runner's)
   "PT009",  # the tests use the standard library's unittest, not pytest
   "PT027",  # the tests use the standard library's unittest, not pytest
 ]

@@ -136,9 +136,9 @@ be noticed and yanked. On each pull request,
 crate version that is new or changed, and fails the build for one younger than
 7 days. Unchanged versions are never looked up, so a pull request that leaves
 `Cargo.lock` alone makes no request to crates.io; a lookup that fails fails the
-check rather than skipping the crate. The release workflow runs the same check
-against the previous release tag, so a tag never ships a version that skipped
-it, even one pushed straight to `main`.
+check rather than skipping the crate, after a few tries for a failure that can
+pass. The release workflow runs the same check on the whole lock file, so a tag
+never ships a version that skipped it, even one pushed straight to `main`.
 
 The one exception is the oldest release that fixes a security advisory. List it
 in [`.github/crate-age-allow.toml`](.github/crate-age-allow.toml), one entry per

@@ -297,6 +297,14 @@ def version_body(name: str, num: str, created_at: str) -> dict[str, object]:
     return {"version": {"crate": name, "num": num, "created_at": created_at}}
 
 
+def http_error(status: int, retry_after: str | None = None) -> urllib.error.HTTPError:
+    """Return what `urlopen` raises for this status."""
+    headers = Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError("u", status, "reason", headers, None)
+
+
 class CratesIoTest(unittest.TestCase):
     """The crates.io lookup, with the HTTP opener, clock and sleep injected."""
 
@@ -348,12 +356,9 @@ class CratesIoTest(unittest.TestCase):
 
     def test_failures_raise_publish_date_errors(self) -> None:
         """Not found, network errors and unexpected bodies all fail closed."""
-        not_found = urllib.error.HTTPError("u", 404, "Not Found", Message(), None)
         cases: dict[str, io.BytesIO | Exception] = {
-            "not found": not_found,
-            "network": urllib.error.URLError("connection refused"),
-            "timeout": TimeoutError("timed out"),
-            "incomplete read": BrokenReply(),
+            "not found": http_error(404),
+            "forbidden": http_error(403),
             "not json": io.BytesIO(b"<html>"),
             "deeply nested json": io.BytesIO(b"[" * 200_000 + b"]" * 200_000),
             "no version": response({"errors": []}),
@@ -366,6 +371,102 @@ class CratesIoTest(unittest.TestCase):
             self.replies.append(reply)
             with self.subTest(case=case), self.assertRaises(PublishDateError):
                 self.client()(Crate("serde", "1.0.1"))
+
+    def test_a_transient_failure_is_tried_again(self) -> None:
+        """A tag's run has one attempt, and this makes hundreds of lookups."""
+        good = version_body("serde", "1.0.1", "2026-01-01T00:00:00Z")
+        for name, failure in {
+            "too many requests": http_error(429),
+            "server error": http_error(500),
+            "bad gateway": http_error(502),
+            "unavailable": http_error(503),
+            "network": urllib.error.URLError("connection refused"),
+            "timeout": TimeoutError("timed out"),
+            "incomplete read": BrokenReply(),
+        }.items():
+            with self.subTest(name=name):
+                self.requests.clear()
+                self.sleeps.clear()
+                self.replies[:] = [failure, response(good)]
+                published = self.client()(Crate("serde", "1.0.1"))
+                self.assertEqual(published.year, 2026)
+                self.assertEqual(len(self.requests), 2)
+                self.assertEqual(self.sleeps, [2.0])
+
+    def test_what_will_not_change_is_not_tried_again(self) -> None:
+        """A 404 is an answer: the version isn't on crates.io, and it says so once."""
+        for status in (400, 401, 403, 404, 410):
+            with self.subTest(status=status):
+                self.requests.clear()
+                self.sleeps.clear()
+                self.replies[:] = [http_error(status)]
+                with self.assertRaisesRegex(PublishDateError, str(status)):
+                    self.client()(Crate("serde", "1.0.1"))
+                self.assertEqual(len(self.requests), 1)
+                self.assertEqual(self.sleeps, [])
+
+    def test_a_body_that_is_wrong_is_not_tried_again(self) -> None:
+        """It arrived, and a retry isn't how to make it right."""
+        self.replies.append(io.BytesIO(b"<html>"))
+        with self.assertRaises(PublishDateError):
+            self.client()(Crate("serde", "1.0.1"))
+        self.assertEqual(len(self.requests), 1)
+
+    def test_retries_are_bounded_and_back_off(self) -> None:
+        """Five tries in all, doubling the wait, and then it fails closed with the last reason."""
+        self.replies[:] = [http_error(503) for _ in range(5)]
+        with self.assertRaisesRegex(PublishDateError, "503"):
+            self.client()(Crate("serde", "1.0.1"))
+        self.assertEqual(len(self.requests), 5)
+        self.assertEqual(self.sleeps, [2.0, 4.0, 8.0, 16.0])
+
+    def test_network_retries_are_bounded_too(self) -> None:
+        """The same limit, whatever kept failing."""
+        self.replies[:] = [TimeoutError("timed out") for _ in range(5)]
+        with self.assertRaisesRegex(PublishDateError, "request failed"):
+            self.client()(Crate("serde", "1.0.1"))
+        self.assertEqual(len(self.requests), 5)
+
+    def test_retry_after_is_honoured_within_a_cap(self) -> None:
+        """crates.io's own wait when it's longer than ours, and never more than a minute."""
+        good = version_body("serde", "1.0.1", "2026-01-01T00:00:00Z")
+        for name, header, wait in (
+            ("longer than the backoff", "30", 30.0),
+            ("shorter than the backoff", "1", 2.0),
+            ("over the cap", "99999", 60.0),
+            ("an HTTP date, which isn't read", "Wed, 21 Oct 2026 07:28:00 GMT", 2.0),
+            ("negative", "-5", 2.0),
+            ("nonsense", "soon", 2.0),
+        ):
+            with self.subTest(name=name):
+                self.sleeps.clear()
+                self.replies[:] = [http_error(429, retry_after=header), response(good)]
+                self.client()(Crate("serde", "1.0.1"))
+                self.assertEqual(self.sleeps, [wait])
+
+    def test_a_retry_still_keeps_to_one_request_a_second(self) -> None:
+        """Each request counts, including one that failed."""
+        good = version_body("a", "1.0.0", "2026-01-01T00:00:00Z")
+        client = self.client()
+        self.replies[:] = [response(good)]
+        client(Crate("a", "1.0.0"))
+        self.assertEqual(self.sleeps, [])
+        self.replies[:] = [http_error(500), response(good)]
+        client(Crate("a", "1.0.0"))
+        self.assertEqual(self.sleeps, [1.0, 2.0])
+
+    def test_a_failed_lookup_says_what_a_rerun_costs_on_a_tag(self) -> None:
+        """Re-running the job is right on a pull request, and spends a version on a tag."""
+
+        def failing(_crate: Crate) -> datetime:
+            message = "boom"
+            raise PublishDateError(message)
+
+        lock = lockfile(("serde", "1.0.1", CRATES_IO))
+        errors = crate_age.check(None, lock, "", failing, datetime(2026, 11, 2, tzinfo=UTC))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("pull request", errors[0])
+        self.assertIn("costs a version", errors[0])
 
     def test_too_large_a_body_fails(self) -> None:
         """A response is read up to a limit; anything larger is refused."""
@@ -487,6 +588,28 @@ class GitRepoTest(unittest.TestCase):
         rev = self.commit({"README.md": "hello"})
         with self.assertRaisesRegex(ValueError, "has no Cargo.lock"):
             crate_age.head_files(rev)
+
+    def test_main_prints_each_error_as_it_is_found(self) -> None:
+        """A job killed at its limit by an outage must already have said why."""
+        lock = lockfile(("aaa", "1.0.0", CRATES_IO), ("bbb", "1.0.0", CRATES_IO))
+        self.write({"Cargo.lock": lock, crate_age.ALLOW_LIST: ""})
+        printed = io.StringIO()
+        seen_at_second: list[str] = []
+
+        def lookup(crate: Crate) -> datetime:
+            if crate.name == "bbb":
+                seen_at_second.append(printed.getvalue())
+            message = "down"
+            raise PublishDateError(message)
+
+        with (
+            mock.patch.object(crate_age, "CratesIo", return_value=lookup),
+            contextlib.redirect_stdout(printed),
+        ):
+            status = crate_age.main(["--no-base"])
+        self.assertEqual(status, 1)
+        self.assertIn("aaa 1.0.0", seen_at_second[0])
+        self.assertEqual(printed.getvalue().count("::error"), 2)
 
     def test_main_with_no_base_checks_every_version(self) -> None:
         """--no-base looks up versions that are in the lockfile already."""
