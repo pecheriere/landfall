@@ -1,4 +1,4 @@
-//! The controller URL, what is signed, and what a refusal is.
+//! What is signed, and what a refusal is.
 
 use landfall_core::protocol::PROBLEM_CONTENT_TYPE;
 use landfall_core::protocol::{Nonce, RequestSignature, verify};
@@ -6,76 +6,8 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::super::{Controller, ControllerError, ControllerUrl, UrlError};
+use super::super::{Controller, ControllerError};
 use super::{NONCE, client, key, problem, report, request, serve_nonce};
-
-#[test]
-fn http_controller_needs_the_flag() {
-    for (text, flag, want) in [
-        ("https://controller.example", false, Ok(())),
-        ("https://controller.example", true, Ok(())),
-        ("https://controller.example:8443/", false, Ok(())),
-        ("http://controller.example", false, Err(UrlError::NeedsFlag)),
-        ("http://127.0.0.1:8080", false, Err(UrlError::NeedsFlag)),
-        ("http://localhost:8080", false, Err(UrlError::NeedsFlag)),
-        (
-            "http://controller.tail1234.ts.net",
-            false,
-            Err(UrlError::NeedsFlag),
-        ),
-        ("http://127.0.0.1:8080", true, Ok(())),
-        ("http://[::1]:8080", true, Ok(())),
-        ("http://localhost:8080", true, Ok(())),
-        ("http://controller.tail1234.ts.net:8080", true, Ok(())),
-        // The flag covers loopback and tailnet names, and nothing else.
-        ("http://controller.example", true, Err(UrlError::NotPrivate)),
-        ("http://192.0.2.1", true, Err(UrlError::NotPrivate)),
-        ("http://100.100.100.100", true, Err(UrlError::NotPrivate)),
-        ("http://ts.net", true, Err(UrlError::NotPrivate)),
-        ("http://evil-ts.net", true, Err(UrlError::NotPrivate)),
-        (
-            "http://controller.ts.net.example",
-            true,
-            Err(UrlError::NotPrivate),
-        ),
-        ("http://localhost.example", true, Err(UrlError::NotPrivate)),
-        ("ftp://controller.example", true, Err(UrlError::Scheme)),
-        ("file:///etc/passwd", true, Err(UrlError::Scheme)),
-        ("controller.example", true, Err(UrlError::NotAUrl)),
-        (
-            "https://user:pw@controller.example",
-            false,
-            Err(UrlError::NotABase),
-        ),
-        (
-            "https://controller.example/prefix",
-            false,
-            Err(UrlError::NotABase),
-        ),
-        (
-            "https://controller.example/?a=1",
-            false,
-            Err(UrlError::NotABase),
-        ),
-        (
-            "https://controller.example/#a",
-            false,
-            Err(UrlError::NotABase),
-        ),
-    ] {
-        assert_eq!(
-            ControllerUrl::parse(text, flag).map(|_| ()),
-            want,
-            "{text} with flag {flag}"
-        );
-    }
-}
-
-#[test]
-fn a_refused_url_is_not_repeated() {
-    let err = ControllerUrl::parse("http://user:secret@controller.example", false).unwrap_err();
-    assert!(!err.to_string().contains("secret"), "{err}");
-}
 
 #[tokio::test]
 async fn work_is_signed_as_sent_and_the_answer_is_parsed() {

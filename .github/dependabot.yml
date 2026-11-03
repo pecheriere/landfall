@@ -74,6 +74,20 @@ updates:
     commit-message:
       prefix: build
 
+  # The digest-pinned Debian of the image that `host install` is tested in.
+  - package-ecosystem: docker
+    directory: /crates/cli/tests/docker_host_install
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      docker-host-install:
+        applies-to: version-updates
+        update-types: [minor, patch]
+    commit-message:
+      prefix: test
+
   # The BuildKit that CI and the release build in. The file is only Dependabot's
   # copy of the pin: its pull request fails test_buildkit_pin.py until the same
   # reference goes in the workflows. On its own, so that this can't hold up a

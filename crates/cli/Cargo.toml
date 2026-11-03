@@ -14,19 +14,20 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+getrandom.workspace = true
 landfall-approval.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
 semver.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 base64.workspace = true
 reqwest.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

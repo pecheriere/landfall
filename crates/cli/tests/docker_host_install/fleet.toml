@@ -1,0 +1,17 @@
+# What the controller and the agent both read in these tests, with nothing to deploy. The
+# approver's key is a COSE key, Ed25519's base point.
+[approval]
+rp_id = "landfall.example"
+origin = "https://landfall.example"
+
+[approvers]
+operator = { credential_id = "Y3JlZGVudGlhbA", public_key = "pAEBAycgBiFYIFhmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZm" }
+
+[[deployment]]
+id = "app/prod"
+repo = { name = "example/app", id = 1, owner_id = 2 }
+host = "home-1"
+compose = { dir = "/srv/compose/app", service = "app" }
+origin = { workflow = ".github/workflows/release.yml", tags = "v*", signed_tags = false }
+rule = { auto = "patch", approvers = ["operator"] }
+checks = ["container-healthy"]

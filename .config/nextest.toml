@@ -4,7 +4,7 @@
 slow-timeout = { period = "10s", terminate-after = 3 }
 
 # Real-Docker and live tests pull images, wait out check windows and start real
-# binaries; the slowest takes about 60 s.
+# binaries; the slowest takes about 80 s.
 [[profile.default.overrides]]
 filter = "test(docker_) | test(live_)"
 slow-timeout = { period = "60s", terminate-after = 3 }

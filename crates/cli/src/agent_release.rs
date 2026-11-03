@@ -334,7 +334,7 @@ fn file_names(version: &Version, arch: Arch) -> (String, String) {
 }
 
 /// The SHA-256 of `bytes`, as 64 lowercase hex digits.
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .fold(String::with_capacity(64), |mut text, byte| {

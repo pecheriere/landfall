@@ -221,6 +221,14 @@ which is how CI selects them:
 skip without it, unless `LANDFALL_TEST_REQUIRE_ROOT` is set, as it is in CI, which
 makes that a failure.
 
+`crates/cli/tests/docker_host_install/` runs `host install` over the real `ssh`, against a real
+`sshd`, systemd, `sudo` and the real agent and controller, in a throwaway container with no host
+mounts. Those are `#[ignore]`d and named `docker_` too, and don't run in the normal suite: CI's
+`host-install` job runs them, and so should you by hand after changing `crates/cli/src/host/`. They
+need Docker, `ssh`, `ssh-keygen`, `pgrep`, `nc`, the image `landfall-test-sshd`, and the binaries for this
+machine's platform in `LANDFALL_TEST_DIST`, and panic saying what to run if one is missing. The
+`README.md` there has the commands, why each container flag, and what they can't show.
+
 Tests against the real GitHub, GHCR and Sigstore are `#[ignore]`d and named with a
 `live_` prefix, which is how the nightly job in `advisories.yml` selects them: `live_`
 must not appear in the name of any other test.
