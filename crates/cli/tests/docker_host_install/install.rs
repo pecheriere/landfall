@@ -402,6 +402,7 @@ fn docker_agent_that_crashes_after_starting_is_reported() {
     let source = FixedSource {
         bytes: b"#!/bin/sh\ncase \"$1\" in\n  run)\n    /usr/local/lib/landfall/landfall-agent \"$@\" &\n    sleep 1\n    exit 2\n    ;;\n  *) exec /usr/local/lib/landfall/landfall-agent \"$@\" ;;\nesac\n"
             .to_vec(),
+        version: "1.2.3".parse().unwrap(),
     };
     let args = target.args();
 

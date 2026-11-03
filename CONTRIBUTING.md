@@ -71,6 +71,10 @@ wants its own releases does each of these for itself, with its own key.
    your commits, somewhere that asks you before each signature: anything running as you can use
    a key file on disk with no prompt, and this one decides what hosts install as root.
 
+5. **Add `host-install` to the `main` ruleset's required checks,** once the job has run on `main`. A
+   required check that doesn't exist yet leaves every pull request pending for ever. Never filter
+   that job by path while it's required, as one that doesn't run blocks a merge too.
+
 To rotate the key, let two overlap: release N carries both and is signed by the old one, and
 release N+1 is signed by the new one.
 
@@ -96,7 +100,9 @@ release N+1 is signed by the new one.
    [`packaging/homebrew-tap/README.md`](packaging/homebrew-tap/README.md).
 6. After a first release candidate, before the real tag, go through "The first-tag list" in
    [the plan that added this workflow](docs/superpowers/plans/2026-11-02-landfall-06-release-binaries-and-host-install.md):
-   what only a real tag can show, such as the approval, a real bundle, and a real download.
+   what only a real tag can show, such as the approval, a real bundle, and a real download. Two
+   wait for later: Homebrew for the real release, as above, and a real `landfall host upgrade` for
+   a second release.
 
 ### What a failed run costs
 

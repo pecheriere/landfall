@@ -29,7 +29,9 @@ pub(super) const UNIT_PATH: &str = "/etc/systemd/system/landfall-agent.service";
 
 const AGENT_DIR: &str = "/usr/local/bin";
 const AGENT_NEW: &str = "/usr/local/bin/.landfall-agent.new";
-const CONFIG_DIR: &str = "/etc/landfall";
+const AGENT_PREVIOUS: &str = "/usr/local/bin/landfall-agent.previous";
+const AGENT_PREVIOUS_NEW: &str = "/usr/local/bin/.landfall-agent.previous.new";
+pub(super) const CONFIG_DIR: &str = "/etc/landfall";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
 const CONFIG_NEW: &str = "/etc/landfall/.fleet.toml.new";
@@ -39,7 +41,7 @@ const RECOVER_NEW: &str = "/etc/systemd/system/.landfall-agent-recover@.service.
 
 /// Says a change of configuration, unit or group has yet to take effect. It is written before
 /// the change and removed after the restart, so an interrupted run still restarts on the next.
-const MARKER: &str = "/etc/landfall/.restart-pending";
+pub(super) const MARKER: &str = "/etc/landfall/.restart-pending";
 
 const STATE_DIR: &str = "/var/lib/landfall-agent";
 const CODE_PATH: &str = "/var/lib/landfall-agent/.enrol-code";
@@ -203,7 +205,7 @@ esac
     let or_remove = quote(OR_REMOVE);
     let _ = writeln!(
         shell,
-        "check_dir {AGENT_DIR}\ncheck_dir {CONFIG_DIR}\ncheck_dir {UNIT_DIR}"
+        "check_dir {AGENT_DIR}\ncheck_closed_dir {CONFIG_DIR}\ncheck_dir {UNIT_DIR}"
     );
 
     let refusal = quote(&format!(
@@ -422,6 +424,123 @@ fi
     )
 }
 
+/// What one upgrade is to do.
+#[derive(Debug, Clone, Copy)]
+pub struct UpgradeRequest<'a> {
+    /// The verified agent's SHA-256, in hex.
+    pub sha256: &'a str,
+    /// The upload directory.
+    pub upload: &'a str,
+    /// How long a started agent is watched.
+    pub timing: Timing,
+    /// That the login saw no agent, and that going ahead on that is all right only if root sees
+    /// none either: a binary in a directory closed to the login could be any version.
+    pub only_if_none_there: bool,
+}
+
+/// An upgrade's steps, in order. It never touches the configuration, the units or the key. Its
+/// first step sets what the script's cleanup and health check go by. It leaves out the units'
+/// text, which is only an install's to compare, and the upload holds only the agent.
+#[must_use]
+pub fn upgrade_steps(request: &UpgradeRequest<'_>) -> Vec<Step> {
+    vec![
+        step("preflight", upgrade_preflight(request)),
+        step("binary", upgrade_binary(request)),
+        step("restart", upgrade_restart()),
+    ]
+}
+
+fn upgrade_preflight(request: &UpgradeRequest<'_>) -> String {
+    let upload = quote(request.upload);
+    let Timing {
+        stable_secs,
+        give_up_secs,
+    } = request.timing;
+    let no_unit = quote(&format!(
+        "{UNIT_PATH} isn't there, so nothing has been installed to upgrade: use landfall host install"
+    ));
+    let sha256 = quote(request.sha256);
+    let tampered = quote(TAMPERED_AGENT);
+    let hidden = quote(&format!(
+        "{AGENT_PATH} is there, and this login can't see it, so what version it is can't be said: open its directory to the login, or --allow-downgrade replaces it"
+    ));
+    let none_there = if request.only_if_none_there {
+        format!("if [ -e {AGENT_PATH} ]; then\n  refuse {hidden}\nfi\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "upload={upload}
+stable_secs={stable_secs}
+give_up_secs={give_up_secs}
+[ -e {UNIT_PATH} ] || refuse {no_unit}
+check_dir {AGENT_DIR}
+check_closed_dir {CONFIG_DIR}
+check_installed {AGENT_PATH} {AGENT_MODE} ''
+{none_there}upload_is {UPLOAD_AGENT} {sha256} || refuse {tampered}
+if [ -e {MARKER} ]; then had_marker=1; else had_marker=; fi
+"
+    )
+}
+
+/// As an install's, but for keeping what was there. With a marker already there, what's on disk
+/// may never have been seen healthy, so a `.previous` that's there is the better way back. With none
+/// there, this is: something to go back to is better than nothing. The marker comes after that, so
+/// that a run stopped in the middle of it has changed nothing, and right before the rename, so that
+/// one stopped after it still restarts on the next: what runs isn't what's on disk.
+fn upgrade_binary(request: &UpgradeRequest<'_>) -> String {
+    let sha256 = quote(request.sha256);
+    let refusal = quote(TAMPERED_AGENT);
+    format!(
+        "if ! file_is {AGENT_PATH} {sha256}; then
+  rm -f {AGENT_NEW}
+  : > {AGENT_NEW}
+  chown root:root {AGENT_NEW}
+  chmod 0700 {AGENT_NEW}
+  read_upload {UPLOAD_AGENT} > {AGENT_NEW}
+  file_is {AGENT_NEW} {sha256} || refuse {refusal}
+  chmod 0755 {AGENT_NEW}
+  if [ -e {AGENT_PATH} ] && {{ [ -z \"$had_marker\" ] || [ ! -e {AGENT_PREVIOUS} ]; }}; then
+    rm -f {AGENT_PREVIOUS_NEW}
+    cp -p -- {AGENT_PATH} {AGENT_PREVIOUS_NEW}
+    mv -f -- {AGENT_PREVIOUS_NEW} {AGENT_PREVIOUS}
+  fi
+  mark_restart
+  mv -f {AGENT_NEW} {AGENT_PATH}
+fi
+"
+    )
+}
+
+/// Only with something to restart for, which root can always see. A marker from before this run
+/// may be an install's, stopped with its units written, so that's reloaded for too.
+/// `--no-block`, as a stop waits for a deploy in flight. It doesn't go back by itself: the
+/// operator is told how.
+fn upgrade_restart() -> String {
+    let no_previous = quote(
+        "landfall: there is no earlier agent here to go back to: use landfall host upgrade with another --tag",
+    );
+    format!(
+        r#"if [ -e {MARKER} ]; then
+  [ -z "$had_marker" ] || systemctl daemon-reload
+  previous_id=$(unit_show InvocationID)
+  systemctl restart --no-block landfall-agent
+  if ! wait_healthy "$previous_id"; then
+    if [ -e {AGENT_PREVIOUS} ]; then
+      printf '%s\n' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && systemctl restart landfall-agent && rm -f {MARKER}' >&2
+    else
+      printf '%s\n' {no_previous} >&2
+    fi
+    exit 1
+  fi
+  settle_marker
+else
+  echo 'landfall: nothing is waiting for a restart'
+fi
+"#
+    )
+}
+
 /// `wait_healthy <the invocation id before the start>`. The unit has `Restart=always`, so a
 /// broken agent never reads `failed`: it cycles. So healthy is a new id, active, with the same
 /// id and restart count `stable_secs` later. Reads `stable_secs` and `give_up_secs`, and sets
@@ -470,24 +589,10 @@ wait_healthy() {
 }
 "#;
 
-/// The script that runs `steps`, each announced as it starts.
-///
-/// `cleanup` runs on every way out it can catch, and a signal stops the script rather than
-/// letting it go on to the next step with its files gone. A signal is taken once the command
-/// in hand ends, as a shell does.
-#[must_use]
-pub fn render(steps: &[Step]) -> String {
-    let leftovers = [AGENT_NEW, CONFIG_NEW, UNIT_NEW, RECOVER_NEW].join(" ");
-    let previous_news = [CONFIG_PATH, UNIT_PATH, RECOVER_PATH]
-        .map(|path| format!("{path}.previous.new"))
-        .join(" ");
-    let mut script = format!(
-        r#"set -eu
-umask 077
-PATH={SYSTEM_PATH}
-export PATH
-cd /
-refuse() {{
+/// What the steps call on.
+fn shell_functions() -> String {
+    format!(
+        r#"refuse() {{
   printf 'landfall: refused: %s\n' "$1" >&2
   exit 1
 }}
@@ -515,6 +620,14 @@ check_dir() {{
     *) refuse "$1 has owner and mode $dir_as: whoever else can write there can put a file in place of what this installs. Make it root's, and not writable by others" ;;
   esac
 }}
+check_closed_dir() {{
+  [ -d "$1" ] || return 0
+  dir_as=$(stat -L -c %u:%a -- "$1") || refuse "$1 couldn't be looked at"
+  case "$dir_as" in
+    0:*[!2367][!2367]) ;;
+    *) refuse "$1 has owner and mode $dir_as: whoever else can write there can put a file in place of what this installs, or have root write through a link. Make it root's, and not writable by others or a group" ;;
+  esac
+}}
 check_installed() {{
   [ -e "$1" ] || [ -L "$1" ] || return 0
   if [ -L "$1" ] || [ ! -f "$1" ]; then
@@ -530,6 +643,7 @@ text_is() {{
 }}
 mark_restart() {{
   [ -d {CONFIG_DIR} ] || install -d -o root -g root -m 0755 {CONFIG_DIR}
+  rm -f {MARKER}
   : > {MARKER}
 }}
 settle_marker() {{
@@ -541,6 +655,7 @@ settle_marker() {{
 }}
 keep_previous() {{
   [ -e "$1" ] || return 0
+  rm -f -- "$1.previous.new"
   cp -p -- "$1" "$1.previous.new"
   mv -f -- "$1.previous.new" "$1.previous"
 }}
@@ -552,7 +667,25 @@ put_text() {{
   keep_previous "$1"
   mv -f -- "$2" "$1"
 }}
-{WAIT_HEALTHY}cleanup() {{
+"#
+    )
+}
+
+/// `cleanup`, and what has it run.
+fn cleanup_and_traps() -> String {
+    let leftovers = [
+        AGENT_NEW,
+        AGENT_PREVIOUS_NEW,
+        CONFIG_NEW,
+        UNIT_NEW,
+        RECOVER_NEW,
+    ]
+    .join(" ");
+    let previous_news = [CONFIG_PATH, UNIT_PATH, RECOVER_PATH]
+        .map(|path| format!("{path}.previous.new"))
+        .join(" ");
+    format!(
+        r#"cleanup() {{
   cleanup_status=$?
   trap '' HUP INT TERM PIPE
   set +e
@@ -567,6 +700,25 @@ put_text() {{
 trap cleanup EXIT
 trap 'exit 129' HUP INT TERM PIPE
 "#
+    )
+}
+
+/// The script that runs `steps`, each announced as it starts.
+///
+/// `cleanup` runs on every way out it can catch, and a signal stops the script rather than
+/// letting it go on to the next step with its files gone. A signal is taken once the command
+/// in hand ends, as a shell does.
+#[must_use]
+pub fn render(steps: &[Step]) -> String {
+    let mut script = format!(
+        "set -eu
+umask 077
+PATH={SYSTEM_PATH}
+export PATH
+cd /
+{functions}{WAIT_HEALTHY}{cleanup}",
+        functions = shell_functions(),
+        cleanup = cleanup_and_traps(),
     );
     for (index, step) in steps.iter().enumerate() {
         let number = index + 1;
