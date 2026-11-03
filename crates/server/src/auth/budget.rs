@@ -23,7 +23,8 @@
 //!
 //! Going over writes nothing. The count is kept here, and whichever comes first writes it to
 //! the log: the next call within the budget, the flush each watcher interval, or stopping.
-//! So nothing is lost in silence, even if the spender goes quiet. A principal's tokens' count
+//! So nothing is lost in silence, even if the spender goes quiet or the call writing it is
+//! cut off, as it goes back unless it was written. A principal's tokens' count
 //! names no token, as another of them may be the one to write it. It lives in memory: a crash
 //! loses a count not yet written, and a restart gives every budget back.
 

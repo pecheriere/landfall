@@ -69,6 +69,25 @@ impl Principal {
     }
 }
 
+/// A count taken from the table to be written down. It goes back when dropped unless it was, which
+/// covers a write that fails and a handler dropped while waiting for one: by a deadline, a client
+/// that left or stopping. So a count can't be lost that way. If the handler is dropped just as the
+/// write commits, the count is written twice, which says more calls were refused than were.
+struct CountBeingWritten<'a> {
+    state: &'a ApiState,
+    spender: &'a Spender,
+    dropped: u64,
+    written: bool,
+}
+
+impl Drop for CountBeingWritten<'_> {
+    fn drop(&mut self) {
+        if !self.written {
+            self.state.keep_dropped(self.spender.clone(), self.dropped);
+        }
+    }
+}
+
 /// Takes the cost of a state change from a budget. Over it, the call is refused before it can
 /// write anything. The first call back within it writes down how many were, or is refused
 /// itself and keeps the count. Call this only for someone who has proved who they are: anyone
@@ -92,11 +111,14 @@ pub(crate) async fn spend_budget(
         }
         Spent::Within { dropped: 0 } => Ok(()),
         Spent::Within { dropped } => {
-            let event = throttled_event(spender, dropped);
-            if let Err(error) = store.record(&event).await {
-                state.keep_dropped(spender.clone(), dropped);
-                return Err(error.into());
-            }
+            let mut count = CountBeingWritten {
+                state,
+                spender,
+                dropped,
+                written: false,
+            };
+            store.record(&throttled_event(spender, dropped)).await?;
+            count.written = true;
             Ok(())
         }
     }
