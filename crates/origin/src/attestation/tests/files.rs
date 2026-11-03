@@ -243,7 +243,7 @@ fn another_files_digest_is_refused_under_this_name() {
             assert_eq!(expected, intel.to_string());
             assert!(found.contains("\"act_Linux_arm64.tar.gz\""), "{found}");
         }
-        other => panic!("expected a file subject refusal, got {other:?}"),
+        other => panic!("expected a file subject refusal, got {:?}", other.err()),
     }
 }
 
@@ -519,7 +519,7 @@ fn another_payload_type_is_refused() {
     }];
     let result = verify(&edited, &asked, &config());
     let Err(AttestationError::Bundle(message)) = result else {
-        panic!("expected a malformed bundle, got {result:?}");
+        panic!("expected a malformed bundle, got {:?}", result.err());
     };
     assert!(message.contains("payload type"), "{message}");
 }
@@ -634,7 +634,7 @@ fn oversized_bundle_is_refused() {
     }];
     let result = verify(&padded, &asked, &config());
     let Err(AttestationError::Bundle(message)) = result else {
-        panic!("expected a malformed bundle, got {result:?}");
+        panic!("expected a malformed bundle, got {:?}", result.err());
     };
     assert!(message.contains("more than"), "{message}");
 }
