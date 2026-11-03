@@ -524,9 +524,9 @@ impl OpenSsh {
         })
     }
 
-    /// With what's said to the operator going to `say`, for a test.
-    #[cfg(test)]
-    pub(super) fn saying(mut self, say: impl Fn(&str) + 'static) -> Self {
+    /// With what's said to the operator going to `say`, rather than stderr.
+    #[must_use]
+    pub fn saying(mut self, say: impl Fn(&str) + 'static) -> Self {
         self.say = Box::new(say);
         self
     }

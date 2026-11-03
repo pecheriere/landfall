@@ -1,11 +1,13 @@
 //! The connection: which keys it takes, what a configuration can't do to it, and how many there
 //! are, seen from the target's own log and from what really comes back.
 
+use std::cell::RefCell;
 use std::process::Command;
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use landfall_cli::host::install::InstallArgs;
-use landfall_cli::host::ssh::Remote;
+use landfall_cli::host::ssh::{OpenSsh, Remote};
 
 use crate::harness::{FixedSource, SlowYes, Target, install_through, wait_until};
 
@@ -128,22 +130,37 @@ fn masters_of(target: &Target) -> Vec<String> {
         .collect()
 }
 
+/// What `OpenSsh` says to the operator, kept, for counting.
+fn saying_kept(target: &Target) -> (OpenSsh, Rc<RefCell<Vec<String>>>) {
+    let said = Rc::new(RefCell::new(Vec::new()));
+    let kept = Rc::clone(&said);
+    let ssh = target
+        .remote_as("operator")
+        .saying(move |text| kept.borrow_mut().push(text.to_owned()));
+    (ssh, said)
+}
+
+fn signal(signal: &str, pid: &str) {
+    let sent = Command::new("kill")
+        .args([format!("-{signal}"), pid.to_owned()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+}
+
 /// `kill -9` of the master, which is this test's own and leaves its socket file. One more login
-/// for all that follows, and nothing logged in left behind.
+/// for all that follows, said beforehand, and nothing logged in left behind.
 #[test]
 #[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
 fn docker_a_master_killed_leaves_nothing_behind() {
     let target = Target::start();
-    let ssh = target.remote_as("operator");
+    let (ssh, said) = saying_kept(&target);
     assert_eq!(ssh.run("exit 3", b"").unwrap().status, 3);
     assert_eq!(target.logins(), 1);
+    assert_eq!(said.borrow().len(), 1);
     let masters = masters_of(&target);
     assert_eq!(masters.len(), 1, "{masters:?}");
-    let killed = Command::new("kill")
-        .args(["-9", &masters[0]])
-        .status()
-        .unwrap();
-    assert!(killed.success());
+    signal("KILL", &masters[0]);
 
     for status in [4, 5, 6] {
         let command = format!("exit {status}");
@@ -152,10 +169,41 @@ fn docker_a_master_killed_leaves_nothing_behind() {
     assert_eq!(ssh.run_privileged("exit 7", false).unwrap(), 7);
 
     assert_eq!(target.logins(), 2);
+    assert_eq!(said.borrow().len(), 2, "{:?}", said.borrow());
+    assert!(said.borrow()[1].contains("approve it if your key or agent asks"));
     let masters = masters_of(&target);
     assert_eq!(masters.len(), 1, "{masters:?}");
     drop(ssh);
     wait_until("the connection to end", || masters_of(&target).is_empty());
+}
+
+/// A master alive and not answering, which `-O check` waits on until its limit: the install goes
+/// on over a new one, and the old one goes as soon as it can hear that it should.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_a_master_that_stalls_holds_nothing_up() {
+    let target = Target::start();
+    let (ssh, said) = saying_kept(&target);
+    assert_eq!(ssh.run("exit 3", b"").unwrap().status, 3);
+    let masters = masters_of(&target);
+    assert_eq!(masters.len(), 1, "{masters:?}");
+    let stalled = masters[0].clone();
+    signal("STOP", &stalled);
+
+    let start = Instant::now();
+    let status = ssh.run("exit 4", b"").map(|output| output.status);
+    let took = start.elapsed();
+    // Before anything is asserted, so that a failure doesn't leave it stopped.
+    signal("CONT", &stalled);
+
+    assert_eq!(status.unwrap(), 4);
+    assert!(took < Duration::from_secs(60), "{took:?}");
+    assert_eq!(ssh.run("exit 5", b"").unwrap().status, 5);
+    assert_eq!(target.logins(), 2);
+    assert_eq!(said.borrow().len(), 2, "{:?}", said.borrow());
+    drop(ssh);
+    // Told to exit while stopped, or by `ControlPersist` at the latest.
+    wait_until("both connections to end", || masters_of(&target).is_empty());
 }
 
 #[test]
