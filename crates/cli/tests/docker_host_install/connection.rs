@@ -206,7 +206,8 @@ fn docker_a_master_killed_leaves_nothing_behind() {
 }
 
 /// A master alive and not answering, which `-O check` waits on until its limit: the install goes
-/// on over a new one, and the old one goes as soon as it can hear that it should.
+/// on over a new one. Asking it to exit waits out its limit too, and that client is killed, so
+/// the old one goes by `ControlPersist`, 60 s after it can run again, which is most of this test.
 #[test]
 #[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
 fn docker_a_master_that_stalls_holds_nothing_up() {
@@ -230,7 +231,7 @@ fn docker_a_master_that_stalls_holds_nothing_up() {
     assert_logins(&target, 2, 3, &said.borrow());
     assert!(said.borrow().len() >= 2, "{:?}", said.borrow());
     drop(ssh);
-    // Told to exit while stopped, or by `ControlPersist` at the latest.
+    // The old one by `ControlPersist`, 60 s after `SIGCONT`, within the wait's 90.
     wait_until("both connections to end", || masters_of(&target).is_empty());
 }
 
@@ -244,7 +245,7 @@ fn docker_a_slow_answer_costs_one_more_connection() {
         yes: false,
         ..target.args()
     };
-    let remote = target.remote_as("operator");
+    let (remote, said) = saying_kept(&target);
     let mut slow = SlowYes {
         pause: Duration::from_secs(70),
     };
@@ -254,5 +255,5 @@ fn docker_a_slow_answer_costs_one_more_connection() {
     ran.assert_ok();
     assert_eq!(target.unit_state(), "active");
     drop(remote);
-    assert_logins(&target, 2, 3, &[]);
+    assert_logins(&target, 2, 3, &said.borrow());
 }

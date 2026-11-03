@@ -18,8 +18,8 @@ LANDFALL_TEST_DIST=<scratch dir>/dist cargo test -p landfall-cli --locked -- --i
 ```
 
 Rebuild `dist` after changing the agent or the controller: the script and the CLI's own code come
-from the test's build, and these two from `dist`. They take about 80 s on a 10-core Mac, of which
-70 s is one test waiting out `ControlPersist`. A test that's killed outright leaves its container:
+from the test's build, and these two from `dist`. They take about 85 s on a 10-core Mac, of which
+about 80 s is two tests, running side by side, waiting out `ControlPersist`. A test that's killed outright leaves its container:
 `docker rm -f -v $(docker ps -aq --filter label=landfall-test-sshd)`.
 
 ## The container
