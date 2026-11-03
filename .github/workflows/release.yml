@@ -345,16 +345,22 @@ jobs:
           create-storage-record: false
       # With immutable releases on, the files are locked from here. The tag is sent as `gh release
       # edit` sends it, because the API can otherwise publish with no tag, which a host couldn't find.
-      # So the result is read back, with a short wait as that can lag. If the read-back fails, the
-      # release may already be public: check it by hand before doing anything else.
+      # A few tries, as a repeat with the same values should be harmless, and a failed try may have
+      # been applied. What decides is reading the result back, with a short wait as that can lag. If
+      # either fails, the release may already be public: check it by hand before doing anything else.
       - name: Publish the draft, and read it back
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ steps.draft.outputs.id }}
         run: |
-          gh api --method PATCH --silent "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
-            -f tag_name="$GITHUB_REF_NAME" -F draft=false
+          for _ in {1..5}; do
+            if gh api --method PATCH --silent "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              -f tag_name="$GITHUB_REF_NAME" -F draft=false; then
+              break
+            fi
+            sleep 5
+          done
           for _ in {1..12}; do
             if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" |
               jq -e --arg tag "$GITHUB_REF_NAME" \
@@ -363,5 +369,5 @@ jobs:
             fi
             sleep 5
           done
-          echo "::error title=Release::The release at $GITHUB_REF_NAME doesn't read back as public, with this tag, and immutable. It may already be public: check it by hand."
+          echo "::error title=Release::Publishing the draft failed, or the release at $GITHUB_REF_NAME doesn't read back as public, with this tag, and immutable. It may already be public: check it by hand."
           exit 1

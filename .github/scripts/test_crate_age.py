@@ -589,6 +589,28 @@ class GitRepoTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "has no Cargo.lock"):
             crate_age.head_files(rev)
 
+    def test_main_prints_each_error_as_it_is_found(self) -> None:
+        """A job killed at its limit by an outage must already have said why."""
+        lock = lockfile(("aaa", "1.0.0", CRATES_IO), ("bbb", "1.0.0", CRATES_IO))
+        self.write({"Cargo.lock": lock, crate_age.ALLOW_LIST: ""})
+        printed = io.StringIO()
+        seen_at_second: list[str] = []
+
+        def lookup(crate: Crate) -> datetime:
+            if crate.name == "bbb":
+                seen_at_second.append(printed.getvalue())
+            message = "down"
+            raise PublishDateError(message)
+
+        with (
+            mock.patch.object(crate_age, "CratesIo", return_value=lookup),
+            contextlib.redirect_stdout(printed),
+        ):
+            status = crate_age.main(["--no-base"])
+        self.assertEqual(status, 1)
+        self.assertIn("aaa 1.0.0", seen_at_second[0])
+        self.assertEqual(printed.getvalue().count("::error"), 2)
+
     def test_main_with_no_base_checks_every_version(self) -> None:
         """--no-base looks up versions that are in the lockfile already."""
         self.commit({"Cargo.lock": YOUNG_LOCK, crate_age.ALLOW_LIST: ""})

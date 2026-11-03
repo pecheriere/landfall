@@ -26,7 +26,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -160,7 +160,18 @@ def check(
     lookup: Lookup,
     now: datetime,
 ) -> list[str]:
-    """Return one error per problem; an empty list means the PR passes.
+    """Return one error per problem; an empty list means the PR passes."""
+    return list(problems(base_lock, head_lock, allow_text, lookup, now))
+
+
+def problems(
+    base_lock: str | None,
+    head_lock: str,
+    allow_text: str,
+    lookup: Lookup,
+    now: datetime,
+) -> Iterator[str]:
+    """Yield each error as it is found, so that an outage can't outlast the job's only message.
 
     `base_lock` is None when the base has no Cargo.lock, so every version is new.
     """
@@ -168,31 +179,27 @@ def check(
     base = registry_crates(base_lock) if base_lock is not None else set()
     allowed = load_allow_list(allow_text)
 
-    errors: list[str] = []
     for crate in sorted(head - base):
         if crate in allowed:
             continue
         try:
             published = lookup(crate)
         except PublishDateError as err:
-            errors.append(
+            yield (
                 f"{crate}: could not get its publish date from crates.io, so the check "
                 f"fails rather than pass it unchecked ({err}). On a pull request, re-run the "
-                "job. On a tag's run a re-run is refused, so this costs a version number.",
+                "job. On a tag's run a re-run is refused, so this costs a version number."
             )
             continue
         if now - published < MIN_AGE:
-            errors.append(
+            yield (
                 f"{crate} was published on {published:%Y-%m-%d}, less than "
                 f"{MIN_AGE.days} days ago. Wait until {published + MIN_AGE:%Y-%m-%d} or, "
                 "for the oldest release fixing a security advisory, add an exception to "
-                ".github/crate-age-allow.toml (see the README).",
+                ".github/crate-age-allow.toml (see the README)."
             )
-    errors.extend(
-        f"allow-list entry {crate} is stale: that version is not in {LOCKFILE}. Remove it."
-        for crate in sorted(set(allowed) - head)
-    )
-    return errors
+    for crate in sorted(set(allowed) - head):
+        yield f"allow-list entry {crate} is stale: that version is not in {LOCKFILE}. Remove it."
 
 
 Opener = Callable[..., IO[bytes]]
@@ -370,16 +377,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head", help="git revision to check (default: the working tree)")
     args = parser.parse_args(argv)
 
+    failed = False
     try:
         base = None if args.no_base else file_at(args.base, LOCKFILE)
         head, allow_text = head_files(args.head)
-        errors = check(base, head, allow_text, CratesIo(user_agent()), datetime.now(UTC))
+        for error in problems(base, head, allow_text, CratesIo(user_agent()), datetime.now(UTC)):
+            failed = True
+            # At once, as a pipe would otherwise hold it past a job killed at its limit.
+            print(annotation(error), flush=True)
     except (ValueError, TypeError, OSError) as err:
-        errors = [str(err)]
-
-    for error in errors:
-        print(annotation(error))
-    if errors:
+        print(annotation(str(err)))
+        return 1
+    if failed:
         return 1
     print(f"Every new or changed crate version is at least {MIN_AGE.days} days old or allowed.")
     return 0

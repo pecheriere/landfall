@@ -5,6 +5,9 @@ show green there: this holds those properties instead. The standard library has 
 jobs and steps are read by their indentation, as in `test_buildkit_pin.py`, and anything that isn't
 the expected shape fails. It reads the workflow's text, so it holds what's written here and can't
 say what GitHub will do with it.
+
+A text test can't be complete: someone can always write something it didn't think of. A person
+reading a diff of `release.yml` is the last line, and this doesn't replace them.
 """
 
 import re
@@ -33,6 +36,51 @@ RUN = re.compile(r"\s*(?:- )?run:")
 CONDITION = re.compile(r"\s*(?:- )?if:")
 WRITE = re.compile(r":\s*write\b|write-all")
 JOBS = PUBLISH_NEEDS | {"publish"}
+FORBIDDEN_KEY = re.compile(r"\s*(?:- )?(?:ref|repository|run-id|digest-mismatch|defaults):")
+USES = re.compile(r"\s*(?:- )?uses: ([^@\s]+)")
+NAME = re.compile(r"\s*(?:- )?name: (.+)")
+LOGIN_LINE = "          password: ${{ secrets.GITHUB_TOKEN }}"
+CHECKOUT = "actions/checkout"
+DOWNLOAD = "actions/download-artifact"
+UPLOAD = "actions/upload-artifact"
+BUILDX = "docker/setup-buildx-action"
+BUILD = "docker/build-push-action"
+ATTEST = "actions/attest-build-provenance"
+SECOND_ATTEMPT = "Refuse a second attempt"
+# Each job's steps, by action without its pin or by name, so that a step added anywhere fails.
+JOB_STEPS = {
+    "on-main": [CHECKOUT, "Require the tagged commit to be on main"],
+    "crate-age": [CHECKOUT, "Refuse crate versions published less than 7 days ago"],
+    "preflight": [SECOND_ATTEMPT, CHECKOUT, "Prove the tag"],
+    "environment-guard": [CHECKOUT, "Refuse an environment that holds nothing back"],
+    "build-linux": [CHECKOUT, BUILDX, BUILD, "Check the static binaries", UPLOAD],
+    "build-macos": [
+        CHECKOUT,
+        "dtolnay/rust-toolchain",
+        "cargo build --release --locked -p landfall-cli --target aarch64-apple-darwin",
+        UPLOAD,
+    ],
+    "smoke": [DOWNLOAD, "Run each native binary, and on a tag compare its version with the tag"],
+    "publish": [
+        SECOND_ATTEMPT,
+        CHECKOUT,
+        DOWNLOAD,
+        DOWNLOAD,
+        "Check the static binaries again",
+        "Assemble the release's files",
+        ATTEST,
+        "Check the attestation's shape against the files",
+        "Verify every file against that attestation",
+        "Upload the files as a draft release",
+        BUILDX,
+        "docker/login-action",
+        "Name the image after this repository",
+        "docker/metadata-action",
+        BUILD,
+        ATTEST,
+        "Publish the draft, and read it back",
+    ],
+}
 PUBLISH_WRITES = (
     "contents: write",
     "packages: write",
@@ -92,6 +140,16 @@ def block(job_lines: list[str], key: str) -> list[str]:
             break
         found.append(line.strip())
     return found
+
+
+def step_label(step: list[str]) -> str:
+    """Return what a step is: its action without the pin, its name, or else its command."""
+    for pattern in (USES, NAME):
+        for line in step:
+            found = pattern.match(line)
+            if found:
+                return found.group(1)
+    return step[0].strip().removeprefix("- run: ")
 
 
 def step_index(step_list: list[list[str]], piece: str) -> int:
@@ -284,7 +342,11 @@ class PublishOrderTests(WorkflowCase):
             "'.draft == false and .tag_name == $tag and .immutable == true'",
             final,
         )
+        self.assertIn("for _ in {1..5}; do", final)
         self.assertIn("for _ in {1..12}; do", final)
+        self.assertLess(final.index("{1..5}"), final.index("draft=false"))
+        self.assertLess(final.index("draft=false"), final.index("{1..12}"))
+        self.assertIn("It may already be public: check it by hand.", final)
         self.assertLess(final.index("draft=false"), final.index("releases/tags/"))
         self.assertEqual(final.count("exit 0"), 1)
         self.assertTrue(final.endswith("exit 1"), final)
@@ -545,6 +607,80 @@ class WholeFileTests(WorkflowCase):
         }.items():
             with self.subTest(job=name):
                 self.assertEqual(steps(job(self.lines, name))[-1], expected)
+
+    def test_the_guard_and_the_verify_step_are_held_whole(self) -> None:
+        """The two gates a text test can most cheaply protect, against an early `exit 0`."""
+        self.assertEqual(
+            steps(job(self.lines, "environment-guard"))[-1],
+            [
+                "      - name: Refuse an environment that holds nothing back",
+                "        shell: bash",
+                "        env:",
+                "          GH_TOKEN: ${{ github.token }}",
+                "        run: |",
+                (
+                    '          gh api "repos/$GITHUB_REPOSITORY/environments/release" '
+                    '> "$RUNNER_TEMP/environment.json"'
+                ),
+                (
+                    '          gh api "repos/$GITHUB_REPOSITORY/environments/release/'
+                    'deployment-branch-policies" \\'
+                ),
+                '            > "$RUNNER_TEMP/policies.json" || true',
+                (
+                    "          python3 -I .github/scripts/check_environment.py "
+                    '"$RUNNER_TEMP/environment.json" \\'
+                ),
+                '            "$RUNNER_TEMP/policies.json"',
+            ],
+        )
+        self.assertEqual(
+            self.publish_steps[step_index(self.publish_steps, "gh attestation verify")],
+            [
+                "      - name: Verify every file against that attestation",
+                "        shell: bash",
+                "        env:",
+                "          BUNDLE: ${{ steps.attest.outputs.bundle-path }}",
+                "          GH_TOKEN: ${{ github.token }}",
+                "        run: |",
+                "          for file in out/*; do",
+                '            gh attestation verify "$file" --bundle "$BUNDLE" \\',
+                '              --repo "$GITHUB_REPOSITORY" \\',
+                (
+                    '              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/'
+                    'release.yml" \\'
+                ),
+                '              --source-ref "refs/tags/$GITHUB_REF_NAME" \\',
+                '              --source-digest "$GITHUB_SHA" \\',
+                "              --deny-self-hosted-runners",
+                "          done",
+                '          cp "$BUNDLE" "out/landfall-${GITHUB_REF_NAME#v}.sigstore.json"',
+            ],
+        )
+
+    def test_each_job_has_exactly_its_steps(self) -> None:
+        """A step added before the attest or the upload could overwrite what's been checked."""
+        for name, expected in JOB_STEPS.items():
+            with self.subTest(job=name):
+                self.assertEqual([step_label(s) for s in steps(job(self.lines, name))], expected)
+
+    def test_nothing_chooses_other_bytes_or_other_rules(self) -> None:
+        """Another commit, another repository, another run, an ignored digest or a shell's `-e`."""
+        self.assertEqual([line for line in self.lines if FORBIDDEN_KEY.match(line)], [])
+
+    def test_the_only_secret_is_the_runs_own_token_for_the_login(self) -> None:
+        """A personal token in this job would outlive the run and reach further than it."""
+        self.assertEqual([line for line in self.lines if "secrets." in line], [LOGIN_LINE])
+
+    def test_every_shell_is_plain_bash(self) -> None:
+        """Which GitHub runs with `-e` and `pipefail`. `bash {0}` would drop both."""
+        shells = {line.strip() for line in self.lines if line.strip().startswith("shell:")}
+        self.assertEqual(shells, {"shell: bash"})
+
+    def test_the_builds_run_where_they_should(self) -> None:
+        """A self-hosted build wouldn't be noticed: the attestation sees only `publish`'s runner."""
+        self.assertIn("    runs-on: ubuntu-latest", job(self.lines, "build-linux"))
+        self.assertIn("    runs-on: macos-26", job(self.lines, "build-macos"))
 
     def test_the_builds_are_held_exactly(self) -> None:
         """Locked, from the pinned toolchain, with nothing but the files coming out."""
