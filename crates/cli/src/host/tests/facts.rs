@@ -22,7 +22,7 @@ fn hex(text: &str) -> String {
 }
 
 /// What a host fit for an agent prints, as `(key, value)`.
-fn good() -> Vec<(String, String)> {
+pub(super) fn good() -> Vec<(String, String)> {
     let quote_check = hex(QUOTE_CHECK);
     let clock = NOW.to_string();
     [
@@ -55,7 +55,7 @@ fn good() -> Vec<(String, String)> {
     .collect()
 }
 
-fn output(rows: &[(String, String)]) -> String {
+pub(super) fn output(rows: &[(String, String)]) -> String {
     let body = rows
         .iter()
         .map(|(key, value)| format!("{key}={value}\n"))

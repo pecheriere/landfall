@@ -7,7 +7,7 @@ use std::io::Write;
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
-use crate::verify;
+use crate::{host, verify};
 
 #[cfg(test)]
 mod tests;
@@ -40,6 +40,12 @@ pub enum Command {
     /// platform. Prints where it came from as JSON.
     #[command(after_help = VERIFY_EXIT_STATUS)]
     Verify(verify::VerifyArgs),
+    /// Install an agent on a host, over SSH.
+    Host {
+        /// What to do.
+        #[command(subcommand)]
+        command: host::HostCommand,
+    },
 }
 
 /// Why the command failed.
@@ -52,6 +58,9 @@ pub enum CliError {
     /// `landfall verify` refused the release or could not verify it.
     #[error(transparent)]
     Verify(#[from] verify::VerifyError),
+    /// A `landfall host` command refused or couldn't go on.
+    #[error(transparent)]
+    Host(#[from] host::HostError),
     /// The result could not be written to stdout.
     #[error("cannot write the result")]
     Output(#[source] std::io::Error),
@@ -61,6 +70,7 @@ impl CliError {
     fn exit_code(&self) -> u8 {
         match self {
             Self::Verify(error) => error.exit_code(),
+            Self::Host(error) => error.exit_code(),
             Self::Runtime(_) | Self::Output(_) => verify::EXIT_UNVERIFIED,
         }
     }
@@ -93,6 +103,9 @@ fn run_command(cli: Cli) -> Result<(), CliError> {
                 .map_err(|e| CliError::Output(e.into()))?;
             writeln!(stdout).map_err(CliError::Output)?;
             stdout.flush().map_err(CliError::Output)?;
+        }
+        Command::Host { command } => {
+            host::run(command, &runtime, &mut std::io::stdout().lock())?;
         }
     }
     Ok(())

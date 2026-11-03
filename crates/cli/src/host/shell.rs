@@ -21,3 +21,14 @@ pub fn quote(text: &str) -> String {
 pub fn remote_command(script: &str) -> String {
     format!("exec sh -c {}", quote(script))
 }
+
+/// The command that has a login shell run `script` as root: through `sudo` unless it already is,
+/// and with no terminal behind it, through a `sudo` that won't ask. `script` goes as an argument,
+/// so that no file a login can write is run as root.
+#[must_use]
+pub fn privileged_command(script: &str, interactive: bool) -> String {
+    let sudo = if interactive { "sudo" } else { "sudo -n" };
+    let wrapper =
+        format!(r#"if [ "$(id -u)" = 0 ]; then exec sh -c "$1"; fi; exec {sudo} sh -c "$1""#);
+    format!("exec sh -c {} sh {}", quote(&wrapper), quote(script))
+}

@@ -13,9 +13,11 @@ use super::shell::{SYSTEM_PATH, quote};
 
 mod facts;
 mod guards;
+mod install;
 mod plan;
 mod script;
 mod shell;
+mod ssh;
 mod unit;
 
 /// What's mapped into the sandbox, wherever a script says it. With no trailing slash, as a
