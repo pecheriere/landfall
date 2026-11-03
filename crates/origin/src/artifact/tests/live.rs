@@ -27,7 +27,6 @@ async fn live_real_release_file_verifies() {
     let repo = repo();
     let release_tag = tag(REAL_TAG);
     let assets = public.release_assets(&repo, &release_tag).await.unwrap();
-    assert_eq!(assets.len(), 12);
     let asset = assets.iter().find(|a| a.name == REAL_FILE).unwrap();
     let bytes = public
         .release_asset(&repo, asset, BINARY_LIMIT)

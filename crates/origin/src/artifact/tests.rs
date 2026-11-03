@@ -407,6 +407,80 @@ async fn verify_release_file_needs_every_check() {
     }
 }
 
+/// A file's listed size just over its kind's cap: refused at that cap and for that file, so
+/// the sums and the bundle can't be as large as a binary.
+#[tokio::test]
+async fn each_kind_of_file_has_its_own_cap() {
+    for (index, name, cap) in [
+        (0, FILE, 67_108_864),
+        (1, SUMS, 65_536),
+        (2, BUNDLE, 4_194_304),
+    ] {
+        let mut release = Release::good(TAG, REAL_COMMIT);
+        release.assets[index].1 = cap + 1;
+        let error = run(&release, TAG, &signer_key(), accepts())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                FileError::Download {
+                    name: found,
+                    source: FetchError::TooLarge { limit, .. },
+                } if found == name && *limit == cap
+            ),
+            "{name}: {error:?}"
+        );
+        assert!(!error.is_refusal());
+    }
+}
+
+/// The sums must be attested too. The file here is, as it is the fixture's real
+/// `checksums.txt`, and the sums that vouch for it aren't, as they are made up. No fake:
+/// [`verify_release_file`] must ask about both.
+#[tokio::test]
+async fn unattested_sums_are_refused_though_the_file_is_attested() {
+    let (github, registry) = (MockServer::start().await, MockServer::start().await);
+    let sums = format!("{}  {REAL_SUMS_NAME}\n", hex_of(REAL_SUMS)).into_bytes();
+    let release = Release {
+        tag_object: Some(TestSigner::new(SIGNER_SEED).tag_object(REAL_TAG, REAL_COMMIT)),
+        assets: vec![
+            (REAL_SUMS_NAME, REAL_SUMS.len(), REAL_SUMS.to_vec()),
+            (SUMS, sums.len(), sums),
+            (BUNDLE, REAL_BUNDLE.len(), REAL_BUNDLE.to_vec()),
+        ],
+    };
+    release.serve(&github, REAL_TAG).await;
+    let repo = repo();
+    let key = signer_key();
+    let signers = [(principal(), &key)];
+    let identity = ReleaseIdentity {
+        repo: &repo,
+        repo_id: REPO_ID,
+        owner_id: OWNER_ID,
+        workflow: WORKFLOW,
+        signers: &signers,
+    };
+    let error = verify_release_file(
+        &fetcher(&github, &registry),
+        &root(),
+        &identity,
+        &tag(REAL_TAG),
+        &ReleaseFileNames {
+            file: REAL_SUMS_NAME,
+            sums: SUMS,
+            bundle: BUNDLE,
+        },
+    )
+    .await
+    .unwrap_err();
+    let FileError::Attestation(AttestationError::FileSubject { name, .. }) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(name, SUMS);
+    assert!(error.is_refusal());
+}
+
 #[tokio::test]
 async fn an_unknown_signer_names_the_trusted_fingerprints() {
     let release = Release {

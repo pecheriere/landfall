@@ -170,10 +170,12 @@ pub enum FileError {
 }
 
 impl FileError {
-    /// Whether the release itself was refused: a verification result, which holds until
-    /// the release changes. `false` for what a bad answer from a server can cause, and for
-    /// what says nothing of the release, as [`ReleaseError::is_refusal`] has it: a file
-    /// that could not be listed or fetched, or a bundle that does not parse.
+    /// Whether the release was refused for what it is: its tag's signature, its signer, its
+    /// checksums, its attempt, or what the attestation says. `false` for what says nothing of
+    /// the release, as [`ReleaseError::is_refusal`] has it: a file that could not be listed or
+    /// fetched, or a bundle that does not parse. The checksums are an unverified download, so
+    /// a bad answer can cause that refusal too, and nothing keeps a refusal: asking again asks
+    /// again.
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         match self {

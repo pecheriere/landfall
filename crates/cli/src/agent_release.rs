@@ -266,40 +266,71 @@ impl AgentSource for GitHubReleases {
         tag: &ReleaseTag,
         arch: Arch,
     ) -> Result<VerifiedAgent, AgentReleaseError> {
-        let keys = project::signers()?;
-        let signers: Vec<(PrincipalId, &SignerKey)> =
-            keys.iter().map(|(id, key)| (id.clone(), key)).collect();
-        let version = release_version(tag)?;
-        let repo: RepoName = project::REPO
-            .parse()
-            .map_err(|source| AgentReleaseError::Build {
-                what: "repository",
-                source,
-            })?;
-        let identity = ReleaseIdentity {
-            repo: &repo,
-            repo_id: project::REPO_ID,
-            owner_id: project::OWNER_ID,
-            workflow: project::WORKFLOW,
-            signers: &signers,
-        };
-        let (file, bundle) = (agent_asset(&version, arch), bundle_asset(&version));
-        let names = ReleaseFileNames {
-            file: &file,
-            sums: SUMS_ASSET,
-            bundle: &bundle,
-        };
-
-        let root = trust_root(self.cache_dir.clone(), self.refresh).await?;
-        let fetcher = public_fetcher()?;
-        let verified = verify_release_file(&fetcher, &root, &identity, tag, &names)
-            .await
-            .map_err(|source| AgentReleaseError::File {
-                tag: tag.clone(),
-                source: Box::new(source),
-            })?;
-        Ok(from_verified(verified, tag.clone(), version, arch))
+        agent_verified_by(tag, arch, async |identity, names| {
+            let root = trust_root(self.cache_dir.clone(), self.refresh).await?;
+            let fetcher = public_fetcher()?;
+            verify_release_file(&fetcher, &root, identity, tag, names)
+                .await
+                .map_err(|source| AgentReleaseError::File {
+                    tag: tag.clone(),
+                    source: Box::new(source),
+                })
+        })
+        .await
     }
+}
+
+/// The agent of release `tag` for `arch`: what to ask of the release is decided here, and
+/// `verify` is what asks it, so a test can see what is asked without a real release.
+async fn agent_verified_by(
+    tag: &ReleaseTag,
+    arch: Arch,
+    verify: impl AsyncFnOnce(
+        &ReleaseIdentity<'_>,
+        &ReleaseFileNames<'_>,
+    ) -> Result<VerifiedFile, AgentReleaseError>,
+) -> Result<VerifiedAgent, AgentReleaseError> {
+    let keys = project::signers()?;
+    let signers = signer_refs(&keys);
+    let version = release_version(tag)?;
+    let repo: RepoName = project::REPO
+        .parse()
+        .map_err(|source| AgentReleaseError::Build {
+            what: "repository",
+            source,
+        })?;
+    let identity = project_identity(&repo, &signers);
+    let (file, bundle) = file_names(&version, arch);
+    let names = ReleaseFileNames {
+        file: &file,
+        sums: SUMS_ASSET,
+        bundle: &bundle,
+    };
+    let verified = verify(&identity, &names).await?;
+    Ok(from_verified(verified, tag.clone(), version, arch))
+}
+
+fn signer_refs(keys: &[(PrincipalId, SignerKey)]) -> Vec<(PrincipalId, &SignerKey)> {
+    keys.iter().map(|(id, key)| (id.clone(), key)).collect()
+}
+
+/// What a release of this project must prove it came from.
+fn project_identity<'a>(
+    repo: &'a RepoName,
+    signers: &'a [(PrincipalId, &'a SignerKey)],
+) -> ReleaseIdentity<'a> {
+    ReleaseIdentity {
+        repo,
+        repo_id: project::REPO_ID,
+        owner_id: project::OWNER_ID,
+        workflow: project::WORKFLOW,
+        signers,
+    }
+}
+
+/// The names of the agent's file for `arch`, and of the attestation, in release `version`.
+fn file_names(version: &Version, arch: Arch) -> (String, String) {
+    (agent_asset(version, arch), bundle_asset(version))
 }
 
 /// The SHA-256 of `bytes`, as 64 lowercase hex digits.
