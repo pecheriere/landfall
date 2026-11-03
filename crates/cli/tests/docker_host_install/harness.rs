@@ -60,7 +60,7 @@ fn docker(args: &[&str]) -> Output {
     Command::new("docker").args(args).output().unwrap()
 }
 
-fn text(bytes: &[u8]) -> String {
+pub(crate) fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
@@ -103,12 +103,14 @@ pub(crate) fn real_agent() -> Vec<u8> {
 /// Hands out the same bytes whatever is asked, as a real release can't be had here.
 pub(crate) struct FixedSource {
     pub(crate) bytes: Vec<u8>,
+    pub(crate) version: Version,
 }
 
 impl FixedSource {
     pub(crate) fn real() -> Self {
         Self {
             bytes: real_agent(),
+            version: Version::new(1, 2, 3),
         }
     }
 }
@@ -125,7 +127,7 @@ impl AgentSource for FixedSource {
     ) -> impl Future<Output = Result<VerifiedAgent, AgentReleaseError>> {
         std::future::ready(Ok(VerifiedAgent::new(
             tag.clone(),
-            Version::new(1, 2, 3),
+            self.version.clone(),
             arch,
             self.bytes.clone(),
             "a test's own build".to_owned(),
@@ -230,7 +232,7 @@ fn chain(error: &HostError) -> String {
     text
 }
 
-fn runtime() -> tokio::runtime::Runtime {
+pub(crate) fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -719,6 +721,27 @@ pub(crate) fn steps(upload: &str, code: bool, replace_config: bool) -> Vec<Step>
 /// Puts what a script reads in `upload`, as the command does.
 pub(crate) fn upload<R: Remote>(remote: &R, upload: &str, code: Option<&Path>) {
     upload_files(remote, upload, FLEET.as_bytes(), code);
+}
+
+/// Only the agent, as an upgrade sends.
+pub(crate) fn upload_agent<R: Remote>(remote: &R, upload: &str, agent: &[u8]) {
+    let sent = remote
+        .run(
+            &remote_command(&format!("umask 077 && mkdir -m 700 -- {}", quote(upload))),
+            b"",
+        )
+        .unwrap();
+    assert_eq!(sent.status, 0);
+    let sent = remote
+        .run(
+            &remote_command(&format!(
+                "umask 077 && cat > {}",
+                quote(&format!("{upload}/{UPLOAD_AGENT}"))
+            )),
+            agent,
+        )
+        .unwrap();
+    assert_eq!(sent.status, 0);
 }
 
 /// The same, with another configuration.

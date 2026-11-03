@@ -90,6 +90,8 @@ pub enum Outcome {
     DryRun,
     /// The operator said no: nothing was sent.
     Declined,
+    /// `host upgrade`: it's on that version already, and nothing ran.
+    Nothing,
 }
 
 /// Asks the operator.
@@ -190,7 +192,7 @@ fn read_code(path: &Path) -> Result<(EnrolCode, bool), HostError> {
     Ok((code, opened.mode() & 0o077 != 0))
 }
 
-fn read_facts<R: Remote>(remote: &R, dirs: &[&str]) -> Result<HostFacts, HostError> {
+pub(super) fn read_facts<R: Remote>(remote: &R, dirs: &[&str]) -> Result<HostFacts, HostError> {
     let output = remote.run(&remote_command(&probe(dirs)), b"")?;
     HostFacts::parse(&String::from_utf8_lossy(&output.stdout)).map_err(|source| HostError::Probe {
         source,
@@ -237,7 +239,7 @@ fn script(args: &InstallArgs, local: &Local, agent: &VerifiedAgent, upload: &str
     })
 }
 
-fn print_plan(
+pub(super) fn print_plan(
     out: &mut dyn Write,
     dest: &Destination,
     agent: &VerifiedAgent,
@@ -294,49 +296,38 @@ fn succeeded(output: &Output, what: &'static str) -> Result<(), HostError> {
     }
 }
 
-/// Sends what the script reads, with the code last, as close to the script as it can be, by
-/// input and never in a command.
-fn send<R: Remote>(
-    remote: &R,
-    upload: &str,
-    agent: &VerifiedAgent,
-    config: &[u8],
-    code: Option<&EnrolCode>,
-) -> Result<(), HostError> {
-    let file = |name| write_upload(upload, name);
-    succeeded(
-        &remote.run(&file(UPLOAD_AGENT), agent.bytes())?,
-        "the agent",
-    )?;
-    succeeded(
-        &remote.run(&file(UPLOAD_CONFIG), config)?,
-        "the configuration",
-    )?;
-    if let Some(code) = code {
-        let hex = code.to_hex();
-        succeeded(
-            &remote.run(&file(UPLOAD_CODE), hex.as_bytes())?,
-            "the enrolment code",
-        )?;
-    }
-    Ok(())
+/// A file for the upload directory.
+pub(super) struct Upload<'a> {
+    /// Its name there.
+    pub(super) name: &'a str,
+    /// What to call it in an error.
+    pub(super) what: &'static str,
+    /// Its bytes, which go by input and never in a command.
+    pub(super) bytes: &'a [u8],
 }
 
-/// The upload, then the script. Whatever comes of either, nothing of the upload is left that
-/// this can remove: the script removes it itself on its way out, or this does when it didn't run.
-fn deliver_and_run<R: Remote>(
+/// The upload, in the order given, then the script. Whatever comes of either, nothing of the upload
+/// is left that this can remove: the script removes it itself on its way out, or this does when it
+/// didn't run.
+pub(super) fn deliver_and_run<R: Remote>(
     remote: &R,
     upload: &str,
     script: &str,
     interactive: bool,
-    agent: &VerifiedAgent,
-    local: &Local,
+    files: &[Upload<'_>],
     out: &mut dyn Write,
 ) -> Result<(), HostError> {
     // Whether anything was there to remove doesn't matter, and a lost connection will show next.
     let _ = remote.run(&remove_stale(), b"")?;
     succeeded(&remote.run(&make_upload(upload), b"")?, "a directory")?;
-    let ran = send(remote, upload, agent, &local.config, local.code.as_ref()).and_then(|()| {
+    let send = || {
+        for file in files {
+            let output = remote.run(&write_upload(upload, file.name), file.bytes)?;
+            succeeded(&output, file.what)?;
+        }
+        Ok::<(), HostError>(())
+    };
+    let ran = send().and_then(|()| {
         out.flush().map_err(HostError::Output)?;
         match remote.run_privileged(script, interactive)? {
             0 => Ok(()),
@@ -348,6 +339,36 @@ fn deliver_and_run<R: Remote>(
         let _ = remote.run(&remove_upload(upload), b"");
     }
     ran
+}
+
+/// Whether to go ahead, having shown the script with this hash: what's `interactive`, or `None` if
+/// the operator said no. With nobody to answer `sudo`, its prompt would only be found out after
+/// the upload, so that's tried first.
+pub(super) fn permission<R: Remote>(
+    yes: bool,
+    facts: &HostFacts,
+    script_sha256: &str,
+    remote: &R,
+    confirm: &mut dyn Confirm,
+    out: &mut dyn Write,
+) -> Result<Option<bool>, HostError> {
+    let interactive = confirm.is_terminal();
+    if !yes {
+        if !interactive {
+            return Err(HostError::NoTerminal);
+        }
+        out.flush().map_err(HostError::Output)?;
+        if !confirm.ask(script_sha256).map_err(HostError::Output)? {
+            return Ok(None);
+        }
+    }
+    if !interactive && !facts.is_root() {
+        let sudo = remote.run(&remote_command("sudo -n true"), b"")?;
+        if sudo.status != 0 {
+            return Err(HostError::NoSudo);
+        }
+    }
+    Ok(Some(interactive))
 }
 
 /// Runs `landfall host install` with what reaches the outside world passed in, so that a test can
@@ -405,28 +426,36 @@ pub fn run_with<S: AgentSource, R: Remote>(
         return Ok(Outcome::DryRun);
     }
 
-    let interactive = confirm.is_terminal();
-    if !args.yes {
-        if !interactive {
-            return Err(HostError::NoTerminal);
-        }
-        output(out.flush())?;
-        if !confirm.ask(&script_sha256).map_err(HostError::Output)? {
-            return Ok(Outcome::Declined);
-        }
+    let Some(interactive) = permission(args.yes, &facts, &script_sha256, remote, confirm, out)?
+    else {
+        return Ok(Outcome::Declined);
+    };
+    // The code last, as close to the script as it can be.
+    let code = local.code.as_ref().map(EnrolCode::to_hex);
+    let mut files = vec![
+        Upload {
+            name: UPLOAD_AGENT,
+            what: "the agent",
+            bytes: agent.bytes(),
+        },
+        Upload {
+            name: UPLOAD_CONFIG,
+            what: "the configuration",
+            bytes: &local.config,
+        },
+    ];
+    if let Some(code) = &code {
+        files.push(Upload {
+            name: UPLOAD_CODE,
+            what: "the enrolment code",
+            bytes: code.as_bytes(),
+        });
     }
-    // With nobody to answer it, a prompt would only be found out after the upload.
-    if !interactive && !facts.is_root() {
-        let sudo = remote.run(&remote_command("sudo -n true"), b"")?;
-        if sudo.status != 0 {
-            return Err(HostError::NoSudo);
-        }
-    }
-    deliver_and_run(remote, &upload, &script, interactive, &agent, &local, out)?;
+    deliver_and_run(remote, &upload, &script, interactive, &files, out)?;
     Ok(Outcome::Installed)
 }
 
-fn unix_now() -> i64 {
+pub(super) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

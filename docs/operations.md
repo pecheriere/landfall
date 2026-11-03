@@ -15,7 +15,8 @@ records it as such and waits, and a host runs it only on
 [an approval it verifies itself](#an-approval-is-verified-on-the-host). [From nothing to a first
 deploy](#from-nothing-to-a-first-deploy) has the steps. There is no web UI beyond the three
 minimal pages yet, and no `landfall` command for any of it: a program calls
-[the API](#api-tokens-requests-and-approvals).
+[the API](#api-tokens-requests-and-approvals). The `landfall` command does put an agent on a host, and
+upgrade it: see [`landfall host install`](#installing-an-agent-with-landfall-host-install).
 
 ## Running the controller
 
@@ -371,6 +372,9 @@ other: a newer agent's new report outcome gets `bad_request` from an older
 controller, and the deploy stays claimed until the two match. Reports are kept in the
 meanwhile, and a deploy already running finishes. landfall never deploys itself.
 
+For an agent, [`landfall host upgrade`](#upgrading-an-agent-landfall-host-upgrade) does it, by a person's
+hand and verified as an install is.
+
 Only `serve` upgrades the database, when it starts. So run `serve` from the new version before
 `token` or `passkey-invite`, which otherwise say the database is older than they are, and do
 nothing.
@@ -485,8 +489,325 @@ Other image updaters must not manage a service landfall manages.
 cannot make a backup incomplete by deleting a file. On a first deploy the outcome
 is `failed_no_previous`, and the service was not started.
 
+## Installing an agent with `landfall host install`
+
+`landfall host install` does what [the next section](#running-it-under-systemd) and
+[enrolling a host](#enrolling-a-host) do by hand, from your own machine, over your own `ssh`. It
+makes the user and the state directory, puts the configuration, a verified agent and the units in
+place, enrols the host if you give it a code, and starts the agent. Those manual steps still work,
+for anyone who won't run a script as root.
+
+**landfall has no release yet,** so there's nothing for this to fetch until the first tag. So far it
+has run over a real `ssh`, against a real `sshd`, systemd and `sudo` in a container, with a stand-in
+for Docker and for a release. The list of what that can't show is in
+`crates/cli/tests/docker_host_install/README.md`.
+
+### What you need
+
+**On your machine:** `landfall` itself, which [first trust](#first-trust) is about, and `ssh`. You
+need to have connected to the target once by hand, as an unknown host is refused:
+
+```sh
+ssh user@host.example true
+```
+
+Compare the fingerprint `ssh` shows with the one on the host, from `ssh-keygen -lf
+/etc/ssh/ssh_host_ed25519_key.pub` run there, before you say yes. landfall never accepts a key
+itself, and never runs `ssh-keyscan`.
+
+**On the target,** which a read-only probe checks before anything is sent, and says all of what's
+missing at once:
+
+- Linux 5.8 and systemd 235 or later, on arm64 or amd64.
+- Docker Engine: a client of 20.10 or later, the compose v2 plugin, a `docker`
+  group and a `docker.service`. Snap's Docker has another service name. A host with no D-Bus also
+  reads as having no `docker.service`, as a login's `systemctl cat` needs the system bus, and so is
+  told the same thing: install `dbus`.
+- `sha256sum`, `runuser`, `diff` and `timeout`, which `coreutils`, `util-linux` and `diffutils` hold.
+- CA certificates, for an `https://` controller.
+- Each deployment's compose directory, which is never created.
+- A login that's root or has `sudo`, whose shell is a POSIX one. Fish and csh are refused, as what
+  they ran could differ from what was shown. Password logins are refused too: `BatchMode` is forced,
+  so use a key.
+
+**And a code,** if the host isn't enrolled yet. On the controller, as in
+[enrolling a host](#enrolling-a-host):
+
+```sh
+landfall-server enrol-code --host home-1 --db /var/lib/landfall-server/controller.db
+```
+
+Put it in a file on your machine that only you can read. A code is good for an hour, and for one
+host.
+
+### Running it
+
+Look first. `--dry-run` connects, probes, fetches and verifies the agent, and shows you the script.
+It changes nothing on the target:
+
+```sh
+landfall host install user@host.example --host home-1 --config fleet.toml \
+  --controller https://controller.example --code-file code --dry-run
+```
+
+`--config` is the fleet file, the same one every host and the controller have, and it goes to the
+target as it is. `--host` is this host's id in it, and it must have a deployment there. An `http://`
+controller needs `--allow-insecure-controller`, by [the same rule as `enrol`](#enrolling-a-host).
+
+Then run the same without `--dry-run`. For a release other than the one matching your `landfall`,
+add `--tag v1.2.3`. You'll see, in this order:
+
+```text
+landfall: connecting to user@host.example
+landfall: opening an SSH connection to user@host.example: approve it if your key or agent asks
+landfall: the agent is v1.2.3, signed by SHA256:..., commit ..., built by https://github.com/..., SHA-256 ...
+landfall: the steps are preflight, user, state, config, binary, docker, units, enrol, start
+landfall: this is what runs as root on user@host.example:
+<the whole script>
+landfall: the script's SHA-256 is ...
+landfall: run the script with SHA-256 ... as root? [y/N]
+```
+
+Read the script: it's what you're agreeing to, and it holds no secret. Its hash differs from a dry
+run's, as the upload directory's name is drawn afresh each run, and that one `upload=` line is the
+only difference. Saying anything but yes changes nothing. `--yes` skips the question, and without a
+terminal you need it.
+
+Next comes `sudo`'s own prompt, if it wants a password. It goes straight to `sudo` over the
+connection, and landfall doesn't see it. Then a line for each step as it starts: `landfall: step 1:
+preflight`, and so on. **What the target prints during this step reaches your terminal as it is,**
+as `sudo`'s prompt needs that, so it's the one place where a hostile host can put text in front of
+you.
+
+The last step waits for the agent to hold still with the same invocation and no restarts for 10 s.
+Then it exits 0. Check it with:
+
+```sh
+ssh user@host.example systemctl status landfall-agent
+```
+
+**Remove the code file now.** It's been used, and landfall warned you if others could read it. Next
+comes [from nothing to a first deploy](#from-nothing-to-a-first-deploy). The units are the ones shown
+below, but for `EnvironmentFile=-/etc/landfall/agent.env`: to give the agent [a token](#github_token),
+that's the file to fill, by hand, as root. This never sends one.
+`landfall host install --help` has what each exit status means: in short, 0 is done, 1 is refused or
+stopped, and 2 couldn't try or finish.
+
+### What's verified, and against what
+
+The agent is fetched by your `landfall` and checked three ways before anything is sent: the release's
+tag must be signed by a key your `landfall` holds, in `crates/cli/assets/release-signers`, whose
+fingerprints are in `SECURITY.md`; the build-provenance attestation must vouch for this repository's
+release workflow, on that tag's commit, and for this exact file under this exact name; and the
+release's `SHA256SUMS` must agree. There's no flag for another identity. The script then has root
+hash what arrived, against the verified hash written in it, before making it executable.
+
+**This signed tag has nothing to do with a deployment's `origin.signed_tags`.** That's a host's rule
+about the releases it deploys, read from its own configuration. This is what the CLI trusts about
+landfall's own binaries, and it reads no configuration. A deployment with `signed_tags = false` isn't
+affected.
+
+**A rotation** overlaps: one release's `landfall` holds both the old key and the new one and is signed
+by the old, and the next is signed by the new. A `landfall` too old to know the signer refuses, says
+which fingerprints it trusts, and says that a newer build may trust that key. So get a newer one, by
+[first trust](#first-trust) again.
+
+**A build with no key** refuses before connecting, `--dry-run` too. That's a fork, until it changes
+`crates/cli/src/project.rs` (its repository and both ids), `crates/cli/assets/release-signers` and
+`repository` in the root `Cargo.toml`. It also takes on the environment, immutable releases and
+signed tags in `CONTRIBUTING.md`, and publishing its own fingerprint in its `SECURITY.md`.
+
+### What SSH does here
+
+It's the system's `ssh`, so it uses your agent, your `ProxyJump` and your keys, and no key material
+comes near landfall. A hardware key, and an agent that asks you to approve each connection, haven't
+been tried. Every call forces options ahead of your configuration, so that it can't
+weaken them or change what comes back:
+
+- Host keys are checked, and never accepted or updated: `StrictHostKeyChecking=yes`,
+  `NoHostAuthenticationForLocalhost=no`, `NoHostAuthenticationForProxyCommand=no`, `VerifyHostKeyDNS=no`,
+  `UpdateHostKeys=no`, and `FingerprintHash=sha256`.
+- No prompts: `BatchMode=yes`.
+- Nothing is forwarded or added to your agent, and no local command runs: `ForwardAgent`, `ForwardX11`,
+  `GSSAPIDelegateCredentials`, `AddKeysToAgent`, `Tunnel` and `PermitLocalCommand` are off,
+  `ClearAllForwardings=yes`, `RemoteCommand=none`, `EscapeChar=none`.
+- A status is the command's own: `ForkAfterAuthentication=no`, `StdinNull=no`, `SessionType=default`,
+  `ChannelTimeout=none`.
+- `LogLevel=ERROR`, as `QUIET` would hide why it refused, and `ConnectTimeout=30`.
+- `ServerAliveInterval=15` and `ServerAliveCountMax=4`, so a connection that has gone away ends within
+  about a minute, during the script as well.
+
+Those a build of `ssh` doesn't have are left out, having been asked first, as your configuration can't
+set them there either. So your `IgnoreUnknown` still works.
+
+**What you set is still yours:** `ProxyCommand`, `ProxyJump`, `KnownHostsCommand`, `UserKnownHostsFile`,
+`Hostname`, `User`, `Port`, `IdentityFile` and `IdentityAgent`, and `--ssh-config` picks another file.
+`UserKnownHostsFile /dev/null` makes every host unknown, and so refused. `GITHUB_TOKEN` is never sent:
+it's removed from what `ssh` is given, so that `SendEnv` can't send it.
+
+**One connection** carries all of it, so a key or an agent asks once. It lasts 60 s idle, so if you read
+the script for longer than that, the next step opens another, with the same line first, and it asks
+once more. Take that line as your cue, as `ssh` itself may say nothing of a key waiting for a touch
+here. The connection's socket is in a private directory in `/tmp`, which goes when `landfall` ends. If
+`landfall` was killed that directory stays, with nothing in it worth keeping, and the connection ends
+by itself within 60 s.
+
+**`sudo`:** all of it runs as one `sudo sh -c '<script>'`, with the script as an argument, so that no
+file a login can write is run as root. Already root, it runs without `sudo`. At a terminal `sudo` may
+ask for your password, and without one it runs `sudo -n true` before anything is sent, and refuses if
+that fails. So **a sudoers file has to allow that login `sh`, and `true` too, with `NOPASSWD` if there's
+no terminal.** One that allows only named commands can't use this: use the manual steps below.
+
+### What it refuses
+
+Each refusal says what to do. All of these come before anything is changed, but for one, which is said
+in its row.
+
+| What it finds | What to do |
+|---|---|
+| `fleet.toml` or a unit that differs from what it would write | It shows a `diff`. `--replace-config` or `--replace-unit` replaces it, keeping the old file as `<file>.previous`, and restarts the agent |
+| Another `landfall-agent` binary | `landfall host upgrade` |
+| The unit there and no binary | An agent may still be running from what was removed. `landfall host upgrade`, or stop the unit and remove it to install from nothing |
+| No code and no `agent.key` | Give a code |
+| A code, with the agent not stopped | `systemctl stop landfall-agent`, as `enrol` needs the lock it holds. The existing key is kept, and a code for a host already enrolled needs `enrol-code --replace` |
+| An installed file that's a link, or isn't exactly owner, group and mode `0:0:755` for the agent and `0:0:644` for the configuration and units | Make it that, so that only root can change it and the agent can read it. That's stricter than safety alone needs, and it's one rule. Configuration and units can also be removed, to be written again |
+| `/usr/local/bin`, `/etc/landfall` or `/etc/systemd/system` not root's, or writable by others, or `/etc/landfall` writable by a group | Fix it. In the other two, writable by a group is left alone, as Debian's `root:staff` has `/usr/local/bin`, **so that group is trusted:** a link left there isn't followed, but one planted at the right moment could be, and whoever can replace the agent or a unit is as good as root anyway |
+| A link at `/var/lib/landfall-agent`, or a file | Move it |
+| The agent's user can't reach Docker, checked as that user | Look at the daemon and the `docker` group, and run it again. The configuration and the binary are in place by then, which a rerun takes as they are |
+| A `landfall-agent` user with a login shell, another home, uid 0 or a uid another user has | See the next section for what it must be |
+| Uploaded bytes that don't match their hash | Look for why. **Two installs at once by one login do this,** as each removes the other's upload: run one at a time |
+
+Without `--replace-*` nothing of yours is replaced: replacing the host's own rules silently would be the
+one way this could loosen them.
+
+**A replacement takes effect, or it says it hasn't.** The agent reads its configuration once, so a
+changed one or a changed unit restarts it. A stop waits for a deploy in flight, so if the unit is still
+stopping after two minutes the command says a deploy is finishing, and that what it ran with stays in
+force until that deploy ends. It exits 0, as nothing's wrong. Run it again after that, to see the new
+one healthy. That restarts it once more, and nothing else.
+
+### What happens to the code
+
+It goes over `ssh`'s input into a private directory the login owns, last, right before the script. It's
+never on a command line, in the script, or in what's printed. The script reads it as the login, so a link
+planted there gains nothing, and the agent's user writes it into `/var/lib/landfall-agent/.enrol-code`,
+mode 0600, for `enrol`. It's removed on every way out the script can catch, and if the script fails or
+never starts, `landfall` removes the upload too.
+
+**What's left if the connection is cut, or the script is killed outright:** the code stays in that
+private directory, or in `.enrol-code`, for what's left of its hour. The next run removes both, and
+another login's old upload goes after an hour. A cut connection isn't noticed on the target until the
+script next prints, so what's running goes on until then.
+
+### An interrupted run
+
+Run it again. Each step looks first and changes only what differs, and each file arrives by rename.
+`agent.key` is only ever written by `landfall-agent enrol`, which never overwrites it. If a code was used
+before the interruption, the rerun needs none, and if it wasn't, the same one still works, within its
+hour. A change that was made and not yet restarted for is held in `/etc/landfall/.restart-pending`, so a
+rerun that sees no difference still restarts.
+
+### Upgrading an agent: `landfall host upgrade`
+
+```sh
+landfall host upgrade user@host.example --dry-run
+landfall host upgrade user@host.example
+```
+
+Same verification, the same way of showing and running a script, the same `--tag`, `--yes` and
+`--ssh-config`. It replaces only the binary and restarts: the configuration, the units and the key aren't
+touched. **Upgrade the agents and the controller together:** see [upgrading](#upgrading).
+
+| On the target | What it does |
+|---|---|
+| An older version | Upgrades |
+| This version, with these bytes | Nothing, and says so, unless an earlier run failed or was stopped before its restart: then it restarts, and watches |
+| A newer version | Refuses, without `--allow-downgrade` |
+| This version, with other bytes | Refuses, showing both hashes, without `--allow-downgrade`: it may be a hand-built or a tampered binary |
+| What doesn't say a version | Refuses, without `--allow-downgrade` |
+| No binary, with the unit there | Puts it in place, and restarts. If the binary is there and only the login can't see it, it refuses, without `--allow-downgrade` |
+| No unit | Refuses: use `host install` |
+
+When it changes the binary it restarts the unit whatever state it's in, so **it starts an agent you had
+stopped,** though it doesn't enable it. If you've stopped an agent to keep deploys off a host, upgrade it
+when you mean to start it.
+
+The old binary is kept as `/usr/local/bin/landfall-agent.previous`, unless a restart was still due from
+before and one is kept already, as a failed upgrade or one still waiting on a deploy isn't kept over it.
+So it's the last one known to have run, which can be one older than you expect. The exception is a host
+with no binary at all to begin with, where it can be an earlier failed attempt. It doesn't go back by
+itself. If the new one doesn't hold still you get the last journal lines, exit 1, and the command:
+
+```text
+landfall: to go back, as root: mv -f /usr/local/bin/landfall-agent.previous /usr/local/bin/landfall-agent && systemctl restart landfall-agent && rm -f /etc/landfall/.restart-pending
+```
+
+**Read the journal lines before you run it.** The new agent may not be at fault: with Docker down, say,
+no agent can start, and going back doesn't help. Going back with `--tag <good> --allow-downgrade` works
+too. Deployed services aren't touched either way. An older agent may refuse state a newer one wrote, as
+its records allow no field it doesn't know: there's been only one format so far, so this hasn't come up.
+
+During a deploy it says a deploy is finishing and exits 0,
+and the new agent starts when the deploy ends. Run it again after that to see it healthy.
+
+### First trust
+
+`landfall host install` checks a tag's signature, the attestation and the sums every time, against what
+the `landfall` you run holds. So **the first `landfall` you get is the one that needs this care.** What
+each way of getting it does and doesn't check:
+
+- **`gh attestation verify`,** without `--bundle`:
+
+  ```sh
+  gh attestation verify <file> --repo pecheriere/landfall \
+    --signer-workflow pecheriere/landfall/.github/workflows/release.yml \
+    --source-ref refs/tags/<tag> --deny-self-hosted-runners
+  ```
+
+  This checks that these exact bytes were built by this repository's release workflow, on a
+  GitHub-hosted runner, from that tag. **It does not check that the maintainer signed the tag:** someone
+  holding the owner's GitHub token could pass it with a release of their own.
+
+- **To check that too,** with `tag` set to the tag you're after:
+
+  ```sh
+  git clone https://github.com/pecheriere/landfall
+  ssh-keygen -lf landfall/crates/cli/assets/release-signers
+  sed -n 's/^ssh-ed25519 /landfall-release ssh-ed25519 /p' \
+    landfall/crates/cli/assets/release-signers > allowed-signers
+  git -C landfall -c gpg.ssh.allowedSignersFile="$PWD/allowed-signers" verify-tag "$tag"
+  ```
+
+  Compare what `ssh-keygen -lf` prints with `SECURITY.md`, and with a copy of it you got some other way,
+  as a stolen token can change the repository too. Keep `allowed-signers` outside the clone. It needs a
+  name in front of each key, as `sed` puts there: `ssh-keygen` says `missing key` of a bare line from
+  `release-signers`. Then tie the attestation to the commit that tag names:
+
+  ```sh
+  commit=$(git -C landfall rev-parse --verify "$tag^{commit}")
+  echo "$commit"
+  ```
+
+  **Stop if that printed no commit,** as an empty `--source-digest` checks nothing, and passes. Otherwise
+  add `--source-digest "$commit"` to the `gh attestation verify` above. `git rev-parse "$tag"` alone gives
+  the tag object, which that flag refuses.
+
+  How much of this has run: the format of `allowed-signers` with `ssh-keygen -Y` and a throwaway key, and
+  `--source-digest` on another project's release. `git verify-tag` with that file hasn't run at all, on
+  any tag, and there are no tags of landfall's yet.
+
+- **`brew install`** checks only the SHA-256 in the tap's formula, so you're trusting the tap, whose
+  formula the owner verified that way and copied by hand. Homebrew itself verifies neither the
+  attestation nor the tag.
+
+- **A browser download on macOS** is quarantined, and these binaries aren't notarised, so Gatekeeper
+  should stop it, which hasn't been tried on a real release yet. Verify it as above first. Then `xattr -d com.apple.quarantine <file>` lets it run. `gh
+  release download` and Homebrew don't set that flag. A file you download is a raw executable, so
+  `chmod +x` it.
+
 ## Running it under systemd
 
+This is by hand what [`landfall host install`](#installing-an-agent-with-landfall-host-install) does.
 Run the agent as a dedicated user in the `docker` group, with its home in its
 state directory:
 
