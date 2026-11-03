@@ -122,6 +122,9 @@ pull request, and tag again. A flake anywhere costs this too.
 - **crates.io failing** past the few tries each lookup gets fails `crate-age`, which looks up
   every locked crate on a release, and so costs a version number. A pull request's check can
   simply be re-run.
+- **`host-install` failing** on a release's `ci` costs a version number, as a re-run is a second
+  attempt: a flake there, a Debian mirror with the image's cache cold, or Docker Hub. Accepted, as
+  this job is what shows a release's script works, and the `workflow_dispatch` run shows most of it.
 - **An outage at ziglang.org** fails a build with no cache closed, as the Dockerfile fetches
   zig from there by checksum. If it reaches a tag, it costs a version number. The
   `workflow_dispatch` run shows it, which is one reason to do that just before tagging.

@@ -71,6 +71,58 @@ jobs:
           arguments: --all-features --locked
           command: check
 
+  # `host install` against a real sshd and systemd, in a container. Apart from `check`, so as not
+  # to slow it. A release's `ci` runs this too, and a failure there costs a version number, which
+  # CONTRIBUTING.md says.
+  host-install:
+    runs-on: ubuntu-latest
+    # About 3 times a run with the binaries to build cold, as `docker-build`'s limit has it. The
+    # tests themselves take a couple of minutes.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No rust-cache: beside a Docker build, zizmor reads one as a way to poison what's built, and
+      # the test build is only a few minutes without.
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          # The same reference as .github/buildkit/Dockerfile, which a test checks.
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+          cache-binary: false
+      # The binaries `docker-build` builds, by its cache. It writes that cache, and this only
+      # reads it, so a pull request's run here adds nothing to it.
+      - name: Build the static binaries
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: binaries
+          platforms: linux/amd64
+          outputs: type=local,dest=dist
+          provenance: false
+          sbom: false
+          push: false
+          cache-from: type=gha,scope=docker-build
+      # Cached on its own, so that an apt mirror's bad minute doesn't fail the job.
+      - name: Build the test image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: crates/cli/tests/docker_host_install
+          load: true
+          tags: landfall-test-sshd
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=host-install-image
+          cache-to: type=gha,mode=max,scope=host-install-image
+      # A filter matching nothing would pass, hence the count: at least the tests written.
+      - name: Host install against a real sshd
+        shell: bash
+        run: |
+          LANDFALL_TEST_DIST="$PWD/dist" cargo test -p landfall-cli --locked -- --ignored docker_ \
+            | tee "$RUNNER_TEMP/host-install.txt"
+          test "$(grep -Ec '^test .*docker_.* \.\.\. ok$' "$RUNNER_TEMP/host-install.txt")" -ge 24
+
   crate-age:
     # Compares Cargo.lock with the PR's base, so it only runs on pull requests.
     # Nothing stops a push straight to main from skipping it, so a release

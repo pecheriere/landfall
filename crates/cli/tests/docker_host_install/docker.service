@@ -1,0 +1,11 @@
+# The guide's unit has `Requires=docker.service`, and the probe looks for it.
+[Unit]
+Description=A stand-in for Docker
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target

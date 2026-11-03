@@ -52,6 +52,17 @@ fn script_sets_its_own_path() {
     assert!(position("umask 077") < position("PATH="));
 }
 
+/// `sudo` keeps the login's directory, which the agent's user may not be able to enter.
+#[test]
+fn a_script_runs_from_the_root_directory() {
+    let steps = [Step {
+        title: "where".to_owned(),
+        shell: "pwd\n".to_owned(),
+    }];
+    let ran = Sandbox::new().run(&render(&steps));
+    assert_eq!(stdout(&ran), "landfall: step 1: where\n/\n");
+}
+
 #[test]
 fn a_failing_step_keeps_its_status_and_cleans_up() {
     let sandbox = Sandbox::new();

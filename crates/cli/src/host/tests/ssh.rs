@@ -19,6 +19,8 @@ use crate::host::ssh::{
     options,
 };
 
+mod streams;
+
 const HOSTILE_CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/host/tests/hostile_ssh_config"
@@ -758,17 +760,6 @@ fn the_privileged_step_goes_as_one_command_with_a_terminal_if_there_is_one() {
             "{log:?}"
         );
     }
-}
-
-/// In a loop over hosts, what's piped in is the next host. It only shows when run with something
-/// on stdin, as a test runner gives none.
-#[test]
-fn an_unattended_script_is_given_no_input() {
-    let fake = Fake::new("");
-    let got = fake.dir.path().join("got");
-    fake.set_remote(&format!("cat > {}\nexit 0", got.display()));
-    assert_eq!(fake.open().run_privileged("the script", false).unwrap(), 0);
-    assert_eq!(fs::read(got).unwrap(), b"");
 }
 
 #[test]
