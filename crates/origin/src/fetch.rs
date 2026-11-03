@@ -8,9 +8,10 @@
 //! elsewhere: [`landfall_core::tag`] and [`crate::attestation`].
 //!
 //! Requests go over HTTPS only, with a connect timeout of 10 s and a total
-//! timeout of 30 s, or 10 minutes for a release's file. Bodies are never
-//! decompressed (no compression feature is enabled in the HTTP client), so a cap
-//! applies to the bytes on the wire.
+//! timeout for each request, a redirect being another request, of 30 s, or 10
+//! minutes for a release's file. Bodies are never decompressed (no compression
+//! feature is enabled in the HTTP client), so a cap applies to the bytes on the
+//! wire.
 //!
 //! The client follows no redirect. `Fetcher::get` does, and a credential goes no
 //! further than the host it is for, on any hop.

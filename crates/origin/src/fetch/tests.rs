@@ -10,6 +10,7 @@ use crate::test_support::sha256;
 mod assets;
 mod bundles;
 mod errors;
+mod redirects;
 mod tags_and_indexes;
 mod validation;
 

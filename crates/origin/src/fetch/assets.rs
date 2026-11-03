@@ -16,7 +16,8 @@ pub const BINARY_LIMIT: usize = 64 * 1024 * 1024;
 /// Cap on a release's file of checksums.
 pub const SUMS_LIMIT: usize = 64 * 1024;
 
-/// Total timeout for downloading one file: the client's 30 s doesn't suit a binary.
+/// Total timeout for each request of a file's download, a redirect being another request:
+/// the client's 30 s doesn't suit a binary.
 pub(super) const ASSET_TIMEOUT: Duration = Duration::from_secs(600);
 
 const OCTET_STREAM: &str = "application/octet-stream";

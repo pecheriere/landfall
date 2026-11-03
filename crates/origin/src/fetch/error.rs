@@ -248,8 +248,9 @@ pub enum FetchError {
 impl FetchError {
     /// Whether the material could not be obtained at all: a bad endpoint or
     /// token, a transport failure, a redirect that isn't followed, a 404, a rate
-    /// limit, another HTTP status, or no provenance bundle yet (attestation is pushed after the image,
-    /// so a release still being published has none). `false` when it was
+    /// limit, another HTTP status, or no provenance bundle yet (attestation is
+    /// pushed after the image, so a release still being published has none).
+    /// `false` when it was
     /// served and refused by a check here (size, media type, digest, object
     /// id, shape, several provenance bundles).
     #[must_use]

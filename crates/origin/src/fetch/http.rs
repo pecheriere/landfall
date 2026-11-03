@@ -78,7 +78,7 @@ impl Fetcher {
                 return self.follow(next, url, transfer, used + 1).await;
             }
             if same_host == SameHost::Refused {
-                return Err(redirect_refused(url, "it stays on the host with the token"));
+                return Err(redirect_refused(url, "it stays on the host asked"));
             }
             current = next;
         }
@@ -104,10 +104,7 @@ impl Fetcher {
                 return read(response, transfer, asked).await;
             };
             if on_same_host(&next, asked) {
-                return Err(redirect_refused(
-                    asked,
-                    "it comes back to the host with the token",
-                ));
+                return Err(redirect_refused(asked, "it comes back to the host asked"));
             }
             current = next;
         }

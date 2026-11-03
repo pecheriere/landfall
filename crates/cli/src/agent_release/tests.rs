@@ -224,11 +224,23 @@ async fn an_agent_comes_of_nothing_else() {
     assert!(matches!(error, AgentReleaseError::Version(_)), "{error:?}");
 
     let error = agent_verified_by(&tag("v1.2.3"), Arch::Amd64, async |_, _| {
-        Err(AgentReleaseError::NeedsTag)
+        Err(AgentReleaseError::File {
+            tag: tag("v9.9.9"),
+            source: Box::new(FileError::NotInSums {
+                name: "what it said".to_owned(),
+            }),
+        })
     })
     .await
     .unwrap_err();
-    assert!(matches!(error, AgentReleaseError::NeedsTag), "{error:?}");
+    let AgentReleaseError::File { tag: said, source } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(said, &tag("v9.9.9"));
+    assert!(
+        matches!(&**source, FileError::NotInSums { name } if name == "what it said"),
+        "{error:?}"
+    );
 }
 
 /// Task 7's exit status rests on this, and its message on what it says.
@@ -255,7 +267,7 @@ fn a_file_error_says_whether_the_release_was_refused() {
 }
 
 #[test]
-fn ready_says_what_the_embedded_keys_say() {
+fn ready_is_content_with_the_embedded_keys() {
     GitHubReleases::new(None, Refresh::Offline).ready().unwrap();
 }
 
