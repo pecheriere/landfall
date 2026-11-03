@@ -3,10 +3,11 @@
 use std::time::Duration;
 
 use landfall_core::ids::{ReleaseTag, RepoName};
+use landfall_core::text::shown;
 use reqwest::Url;
 use serde::Deserialize;
 
-use super::http::{join, parse, send};
+use super::http::{SameHost, Transfer, join, parse};
 use super::{FetchError, Fetcher, MANIFEST_LIMIT, Service};
 
 /// Cap on a release's binary.
@@ -16,7 +17,7 @@ pub const BINARY_LIMIT: usize = 64 * 1024 * 1024;
 pub const SUMS_LIMIT: usize = 64 * 1024;
 
 /// Total timeout for downloading one file: the client's 30 s doesn't suit a binary.
-const ASSET_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const ASSET_TIMEOUT: Duration = Duration::from_secs(600);
 
 const OCTET_STREAM: &str = "application/octet-stream";
 
@@ -62,15 +63,16 @@ impl Fetcher {
         if release.tag_name != tag.as_ref() as &str {
             return Err(FetchError::Malformed {
                 url: url.to_string(),
-                reason: format!("asked for release {tag}, got {:?}", release.tag_name),
+                reason: format!("asked for release {tag}, got {}", shown(&release.tag_name)),
             });
         }
         Ok(release.assets)
     }
 
     /// The bytes of `asset`: `GET /repos/<repo>/releases/assets/<id>`, which redirects
-    /// to a storage host. The token goes to the API and not there, as the HTTP client
-    /// drops it on a redirect to another host.
+    /// to a storage host. The token goes on that one request and no other: a redirect back
+    /// to the API's host is refused, and a storage host's redirects carry none. No host
+    /// is singled out for trust, as what a file is, is verified whoever serves it.
     ///
     /// Refused before reading if `asset` says it is over `limit`, and cut off while
     /// streaming at what it says it is, so the listing's size is the cap.
@@ -78,7 +80,8 @@ impl Fetcher {
     /// # Errors
     ///
     /// [`FetchError::TooLarge`] when it is over either, [`FetchError::Malformed`] when
-    /// it is shorter than the listing says, and the transport errors.
+    /// it is shorter than the listing says, [`FetchError::Redirect`] for a redirect that
+    /// is refused, and the transport errors.
     pub async fn release_asset(
         &self,
         repo: &RepoName,
@@ -93,10 +96,21 @@ impl Fetcher {
                 url: url.to_string(),
                 limit,
             })?;
-        let request = self
-            .github_request(&url, OCTET_STREAM)
-            .timeout(ASSET_TIMEOUT);
-        let body = send(request, Service::GitHubApi, &url, size).await?.body;
+        let transfer = Transfer {
+            accept: OCTET_STREAM,
+            service: Service::GitHubApi,
+            limit: size,
+            timeout: Some(self.asset_timeout),
+        };
+        let body = self
+            .get(
+                &url,
+                transfer,
+                self.github_token.as_ref(),
+                SameHost::Refused,
+            )
+            .await?
+            .body;
         if body.len() != size {
             return Err(FetchError::Malformed {
                 url: url.to_string(),

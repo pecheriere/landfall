@@ -1,17 +1,13 @@
 //! Signed tag objects and commits, from the GitHub API.
 
 use landfall_core::ids::{CommitSha, ReleaseTag, RepoName};
-use reqwest::header::{ACCEPT, AUTHORIZATION};
-use reqwest::{RequestBuilder, Url};
+use reqwest::Url;
 use serde::Deserialize;
 use sha1_checked::Digest as _;
 use sha1_checked::Sha1;
 
-use super::http::{Fetched, join, parse, send};
-use super::{
-    FetchError, Fetcher, GITHUB_ACCEPT, GITHUB_API_VERSION, MAX_TAG_DEPTH, Service,
-    TAG_OBJECT_LIMIT, hex,
-};
+use super::http::{Fetched, SameHost, Transfer, join, parse};
+use super::{FetchError, Fetcher, GITHUB_ACCEPT, MAX_TAG_DEPTH, Service, TAG_OBJECT_LIMIT, hex};
 
 impl Fetcher {
     /// The raw signed tag object for `tag`: the bytes `git cat-file tag`
@@ -151,21 +147,19 @@ impl Fetcher {
         url: &Url,
         limit: usize,
     ) -> Result<Fetched, FetchError> {
-        let request = self.github_request(url, GITHUB_ACCEPT);
-        send(request, Service::GitHubApi, url, limit).await
-    }
-
-    /// A GET to the GitHub API asking for `accept`, with the token when there is one.
-    pub(super) fn github_request(&self, url: &Url, accept: &str) -> RequestBuilder {
-        let mut request = self
-            .client
-            .get(url.clone())
-            .header(ACCEPT, accept)
-            .header("x-github-api-version", GITHUB_API_VERSION);
-        if let Some(token) = &self.github_token {
-            request = request.header(AUTHORIZATION, token.clone());
-        }
-        request
+        let transfer = Transfer {
+            accept: GITHUB_ACCEPT,
+            service: Service::GitHubApi,
+            limit,
+            timeout: None,
+        };
+        self.get(
+            url,
+            transfer,
+            self.github_token.as_ref(),
+            SameHost::KeepsCredential,
+        )
+        .await
     }
 }
 

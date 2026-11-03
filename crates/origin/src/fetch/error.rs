@@ -62,6 +62,7 @@ impl fmt::Display for RateLimitReset {
 
 /// Why release material could not be fetched, or was refused.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FetchError {
     /// A base URL is not acceptable.
     #[error("invalid endpoint {url}: {reason}")]
@@ -83,7 +84,7 @@ pub enum FetchError {
     /// The HTTP client could not be built.
     #[error("HTTP client")]
     Client(#[source] reqwest::Error),
-    /// The request failed: connection, TLS, timeout, redirect or body read.
+    /// The request failed: connection, TLS, timeout or body read.
     #[error("request to {url} failed")]
     Request {
         /// The URL requested.
@@ -91,6 +92,15 @@ pub enum FetchError {
         /// The transport error.
         #[source]
         source: reqwest::Error,
+    },
+    /// An answer redirected somewhere that isn't followed. This names the URL asked
+    /// for and not the target, whose query may be a credential.
+    #[error("{url} redirected, and that is refused: {reason}")]
+    Redirect {
+        /// The URL requested.
+        url: String,
+        /// Why it is refused.
+        reason: &'static str,
     },
     /// The server answered 404.
     #[error("{url} returned 404 not found")]
@@ -237,8 +247,8 @@ pub enum FetchError {
 
 impl FetchError {
     /// Whether the material could not be obtained at all: a bad endpoint or
-    /// token, a transport failure, a 404, a rate limit, another HTTP status,
-    /// or no provenance bundle yet (attestation is pushed after the image,
+    /// token, a transport failure, a redirect that isn't followed, a 404, a rate
+    /// limit, another HTTP status, or no provenance bundle yet (attestation is pushed after the image,
     /// so a release still being published has none). `false` when it was
     /// served and refused by a check here (size, media type, digest, object
     /// id, shape, several provenance bundles).
@@ -250,6 +260,7 @@ impl FetchError {
                 | Self::Token
                 | Self::Client(_)
                 | Self::Request { .. }
+                | Self::Redirect { .. }
                 | Self::NotFound { .. }
                 | Self::RateLimited { .. }
                 | Self::Status { .. }
