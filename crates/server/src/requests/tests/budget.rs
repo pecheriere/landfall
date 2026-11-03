@@ -1,9 +1,9 @@
 //! What a principal's state changes cost, and that going over says so afterwards.
 
-use axum::http::{Method, StatusCode, header};
+use axum::http::{Extensions, Method, StatusCode, header};
 
 use super::{Harness, PROD_REQUESTS};
-use crate::auth::{flush_dropped, keep_flushing};
+use crate::auth::{Spender, flush_dropped, keep_flushing, spend_budget};
 
 /// How many of `count` calls refused for want of a grant got which answer.
 async fn refused_calls(h: &Harness, name: &str, count: usize) -> (usize, usize) {
@@ -264,4 +264,53 @@ async fn a_row_that_cannot_be_written_keeps_its_count() {
     let rows = h.audited("access_throttled").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["dropped"], 7);
+}
+
+/// Goes over a principal's sign-ins by 5, and gives what's needed for the next call to be back
+/// within them, with those 5 to write down.
+async fn five_refused_and_back_within_budget(h: &Harness) -> Spender {
+    let spender = Spender::SignIns("otto".parse().unwrap());
+    for _ in 0..15 {
+        let _ = spend_budget(&h.state, &Extensions::new(), &spender).await;
+    }
+    h.clock.advance(300);
+    spender
+}
+
+/// By a deadline, a client that left or a server stopping, it's all the same to the count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handler_cut_off_writing_a_count_leaves_it_to_be_written() {
+    let h = Harness::new().await;
+    let spender = five_refused_and_back_within_budget(&h).await;
+    // The write can't start yet, as with any other writer in the way.
+    let busy = h.store.begin().await.unwrap();
+    let extensions = Extensions::new();
+    let cut_off = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        spend_budget(&h.state, &extensions, &spender),
+    )
+    .await;
+    assert!(cut_off.is_err(), "it was meant to be waiting");
+    drop(busy);
+
+    flush_dropped(&h.state).await;
+
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["dropped"], 5);
+}
+
+#[tokio::test]
+async fn a_count_written_by_the_call_back_within_budget_is_written_once() {
+    let h = Harness::new().await;
+    let spender = five_refused_and_back_within_budget(&h).await;
+
+    spend_budget(&h.state, &Extensions::new(), &spender)
+        .await
+        .unwrap();
+    flush_dropped(&h.state).await;
+
+    let rows = h.audited("access_throttled").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["dropped"], 5);
 }

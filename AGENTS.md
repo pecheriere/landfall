@@ -78,8 +78,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   spends its nonce under the deployment's lock (`daemon/approval.rs`), deploys, and keeps
   reports in an outbox until acknowledged), `cli` (`status`, `recover`, `enrol`
   and `run`, behind the thin `main.rs`). `daemon::run_with` and the server's
-  `cli::run_watching` take a fake verifier and source, for the end-to-end tests;
-  nothing on a command line leads to them.
+  `cli::run_watching` and `run_watching_within` take a fake verifier and source, for the
+  end-to-end tests; nothing on a command line leads to them.
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents. A library plus a thin binary; modules: `cli` (the command line, exit
   statuses), `verify` (`landfall verify`), `access` (the trust root's cache and the

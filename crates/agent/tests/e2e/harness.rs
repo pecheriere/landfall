@@ -718,20 +718,16 @@ impl Fleet {
         .await;
     }
 
-    /// Waits for the deploy of `tag` to have been reported, and gives it.
+    /// Waits for a deploy of `tag` to have been reported, and gives the latest that has. A release
+    /// put off is queued again under a new number by the next look, so the latest row for the tag
+    /// needn't be the one that finished.
     pub async fn wait_finished(&self, tag: &str) -> DeployRow {
+        let finished = |deploy: &DeployRow| deploy.tag == tag && deploy.state == "finished";
         self.wait_until(&format!("{tag} finished"), async || {
-            self.deploys()
-                .await
-                .iter()
-                .any(|deploy| deploy.tag == tag && deploy.state == "finished")
+            self.deploys().await.iter().any(finished)
         })
         .await;
-        let deploys = self.deploys().await;
-        deploys
-            .into_iter()
-            .rfind(|deploy| deploy.tag == tag)
-            .unwrap()
+        self.deploys().await.into_iter().rfind(finished).unwrap()
     }
 
     /// Waits for the agent to have reached a held `up`.

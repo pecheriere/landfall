@@ -1,15 +1,17 @@
 //! That `serve` itself writes down counted failures: each interval, and when it stops. Failures
 //! go in the audit log by this and nothing else, so a test of the task alone wouldn't show it.
 //!
-//! The controller is this test binary run again as `cli::run_watching`, as in the agent's
-//! end-to-end tests: `main` but for the watcher's source.
+//! The controller is this test binary run again as `cli::run_watching_within`, as in the agent's
+//! end-to-end tests: `main` but for the watcher's source, and for the clocks a request runs
+//! against, as these tests hold one open for as long as a loaded machine makes them. The real
+//! values have a test of their own, in `cli`.
 
 #![cfg(test)]
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -21,15 +23,21 @@ use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::RunCandidate;
 use landfall_origin::fetch::ListedTag;
 use landfall_origin::release::{ReleaseError, ReleaseOrigin};
+use landfall_server::agent_api::Limits;
 use landfall_server::cli::{self, Cli};
+use landfall_server::serve::ServeOptions;
 use landfall_server::watcher::ReleaseSource;
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
 const CHILD_ARGS: &str = "LANDFALL_UPKEEP_CHILD";
 const CHILD_INTERVAL_MS: &str = "LANDFALL_UPKEEP_INTERVAL_MS";
-/// Shorter than nextest's limit, so that a failure says what it was waiting for.
-const PATIENCE: Duration = Duration::from_secs(20);
+/// A stuck wait ends here, saying what it was waiting for. On a starved machine, starting or
+/// stopping a process has been seen to take over a minute. It's long so that a slow machine can't
+/// fail these, and only a hung test ever waits it out.
+const PATIENCE: Duration = Duration::from_mins(5);
+/// What a request's clocks are set to here, as nothing in these tests is about running them out.
+const NO_HURRY: Duration = Duration::from_mins(10);
 const RP_ID: &str = "landfall.example";
 const ORIGIN: &str = "https://landfall.example";
 
@@ -75,7 +83,13 @@ fn child_process() {
         let args: Vec<String> = serde_json::from_str(&args).unwrap();
         let every: u64 = std::env::var(CHILD_INTERVAL_MS).unwrap().parse().unwrap();
         let cli = Cli::parse_from(std::iter::once("landfall-server".to_owned()).chain(args));
-        let code = cli::run_watching(cli, Arc::new(NoReleases), Duration::from_millis(every));
+        let limits = Limits {
+            body_timeout: NO_HURRY,
+            request_timeout: NO_HURRY,
+            ..Limits::default()
+        };
+        let every = Duration::from_millis(every);
+        let code = cli::run_watching_within(cli, Arc::new(NoReleases), every, limits, NO_HURRY);
         std::process::exit(code.into());
     }
 }
@@ -144,6 +158,18 @@ impl Controller {
             .status()
             .unwrap();
         assert!(stopped.success());
+    }
+
+    /// Waits for it to end, or fails saying so, rather than holding up the whole run.
+    fn exit_status(&mut self) -> ExitStatus {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(started.elapsed() < PATIENCE, "it did not stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A POST from the configured origin. Gives the status and the body.
@@ -315,7 +341,7 @@ async fn serve_writes_failures_down_when_it_stops() {
     assert_eq!(attempts(&dir.path().join("c.db")).await, [] as [i64; 0]);
 
     controller.stop();
-    let status = controller.child.wait().unwrap();
+    let status = controller.exit_status();
     assert!(status.success(), "{status}");
     assert_eq!(attempts(&dir.path().join("c.db")).await, [2]);
 }
@@ -334,7 +360,7 @@ async fn serve_writes_down_a_failure_counted_in_the_drain() {
     let answer = finish(stream, &body);
     assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
 
-    let status = controller.child.wait().unwrap();
+    let status = controller.exit_status();
     assert!(status.success(), "{status}");
     // The one the task saw, and the one it couldn't have.
     assert_eq!(attempts(&dir.path().join("c.db")).await, [1, 1]);
@@ -360,10 +386,27 @@ async fn serve_writes_down_a_call_dropped_in_the_drain() {
     let answer = finish(stream, &body);
     assert!(answer.starts_with("HTTP/1.1 429"), "{answer}");
 
-    let status = controller.child.wait().unwrap();
+    let status = controller.exit_status();
     assert!(status.success(), "{status}");
     let throttled = rows(&controller.db, "access_throttled").await;
     assert_eq!(throttled.len(), 1, "{throttled:?}");
     assert_eq!(throttled[0]["dropped"], 1);
     assert_eq!(throttled[0]["by"]["via"], "sign_in");
+}
+
+/// A drain it's given is the one it keeps: a request is answered past the one it would have had.
+#[tokio::test]
+async fn serve_gives_a_request_the_drain_it_is_told() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = SoftwareAuthenticator::es256().unwrap();
+    let mut controller = Controller::start(dir.path(), &key, 3_600_000);
+    let body = controller.forged_finish(&key).to_string();
+    let stream = a_request_under_way(&controller, &body);
+
+    controller.stop();
+    std::thread::sleep(ServeOptions::default().drain_timeout + Duration::from_secs(1));
+
+    let answer = finish(stream, &body);
+    assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
+    assert!(controller.exit_status().success());
 }

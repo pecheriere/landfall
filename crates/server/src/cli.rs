@@ -20,7 +20,8 @@ use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 
 use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
@@ -34,6 +35,14 @@ mod tokens;
 
 /// How long stopping waits for the database's last connection to close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long stopping waits for the watcher and the flushing to let go. `docs/operations.md` adds up
+/// what stopping can take, against `TimeoutStopSec=30`.
+const TASKS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long stopping waits for each of its last lines to be taken by stderr.
+const SAY_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the runtime gets for its threads to end, once the work is done. Without a limit, a task
+/// blocking its thread would keep the process until something killed it.
+const LET_GO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -339,6 +348,11 @@ fn trust_cache_dir(args: &ServeArgs) -> Result<PathBuf, CliError> {
     Ok(path)
 }
 
+/// What a request runs against in the real `serve`, and how long it has when stopping begins.
+fn real_limits() -> (Limits, Duration) {
+    (Limits::default(), ServeOptions::default().drain_timeout)
+}
+
 async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let config = load_config(&args.config)?;
     let token = github_token(std::env::var_os("GITHUB_TOKEN"))?;
@@ -347,7 +361,8 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
         let cache_dir = trust_cache_dir(args)?;
         Ok(Arc::new(LiveSource::new(fetcher, watched, cache_dir)))
     };
-    serve_watching(args, config, source, watcher::TICK_INTERVAL).await
+    let (limits, drain) = real_limits();
+    serve_watching(args, config, source, watcher::TICK_INTERVAL, limits, drain).await
 }
 
 /// Serves `config`, with the watcher looking at what `source` makes every
@@ -357,6 +372,8 @@ async fn serve_watching<S: ReleaseSource>(
     config: Config,
     source: impl FnOnce(&ServeArgs, Arc<Config>) -> Result<Arc<S>, CliError>,
     interval: Duration,
+    limits: Limits,
+    drain_timeout: Duration,
 ) -> Result<u8, CliError> {
     let store = Store::open(&args.db).await?;
     let watched = Arc::new(config.clone());
@@ -383,7 +400,7 @@ async fn serve_watching<S: ReleaseSource>(
     ));
 
     let closing = store.clone();
-    let state = ApiState::new(store, config, Limits::default());
+    let state = ApiState::new(store, config, limits);
     let draining = state.clone();
     let app = crate::router(state.clone());
     let flushing = tokio::spawn(keep_flushing(state.clone(), interval, stop_flushing));
@@ -395,25 +412,74 @@ async fn serve_watching<S: ReleaseSource>(
         state.begin_shutdown();
         stop_watcher.send_replace(true);
     };
-    crate::serve::run(listener, app, args.serve_options(), shutdown).await;
-    // Told to stop as the serving began to, it lets go at once. If the watcher
-    // had already stopped, that was a panic and it was logged by the runtime.
-    drop(watching.await);
-    drop(flushing.await);
+    let options = ServeOptions {
+        drain_timeout,
+        ..args.serve_options()
+    };
+    let left_running = crate::serve::run(listener, app, options, shutdown).await;
+    wait_for_tasks(watching, flushing, TASKS_TIMEOUT).await;
+    finish_stopping(&draining, &closing, left_running, crate::agent_api::log).await;
+    Ok(EXIT_OK)
+}
+
+/// Waits for the watcher and the flushing, told to stop as the serving began to. They let go at
+/// once, and the limit is so that what comes after runs whatever holds them up. If the watcher had
+/// already stopped, that was a panic and it was logged by the runtime.
+async fn wait_for_tasks<A, B>(watching: JoinHandle<A>, flushing: JoinHandle<B>, limit: Duration) {
+    drop(tokio::time::timeout(limit, async { tokio::join!(watching, flushing) }).await);
+}
+
+/// The last of stopping: writes the counts down, closes the database, and says what went wrong.
+async fn finish_stopping(
+    state: &ApiState,
+    store: &Store,
+    left_running: usize,
+    say: impl Fn(&str) + Clone + Send + 'static,
+) {
     // It stopped as the draining began, and a request finishing since may have counted something.
-    // A request still running past the drain can count one too late even for this.
-    flush_dropped(&draining).await;
-    crate::web::tend(&draining).await;
-    // So that the main file holds everything. A request still running past the
-    // drain has its connection for a while yet, and stopping does not wait for that:
-    // the next start reads what is left in the write-ahead log.
-    if tokio::time::timeout(CLOSE_TIMEOUT, closing.close())
+    // No request is running now, so nothing can count anything after this, but for what `run` said
+    // was left, whose count is lost if it goes on to make one.
+    flush_dropped(state).await;
+    crate::web::tend(state).await;
+    // So that the main file holds everything. If it can't in time, the next start reads what is
+    // left in the write-ahead log.
+    if tokio::time::timeout(CLOSE_TIMEOUT, store.close())
         .await
         .is_err()
     {
-        crate::agent_api::log("the database did not close in time; it stays whole, with its -wal");
+        let line = "the database did not close in time; it stays whole, with its -wal";
+        say_in_time(say.clone(), line.to_owned()).await;
     }
-    Ok(EXIT_OK)
+    if let Some(line) = left_running_line(left_running) {
+        say_in_time(say, line).await;
+    }
+}
+
+/// What the operator is told of requests that couldn't be stopped, if any.
+fn left_running_line(left_running: usize) -> Option<String> {
+    let requests = match left_running {
+        0 => return None,
+        1 => "1 request".to_owned(),
+        many => format!("{many} requests"),
+    };
+    Some(format!(
+        "stopped with {requests} still running, each blocking its thread: anything counted from \
+         here on isn't written down. If this repeats, look at what reads this log, as a stuck \
+         stderr is what can block one"
+    ))
+}
+
+/// Says `line` on a thread of its own, without waiting long: what can leave a request running is a
+/// stderr that doesn't take what it's given, and that mustn't keep the process from ending.
+async fn say_in_time(say: impl FnOnce(&str) + Send + 'static, line: String) {
+    let (said, has_said) = oneshot::channel::<()>();
+    let saying = std::thread::Builder::new().spawn(move || {
+        say(&line);
+        let _ = said.send(());
+    });
+    if saying.is_ok() {
+        drop(tokio::time::timeout(SAY_TIMEOUT, has_said).await);
+    }
 }
 
 /// The database `serve` uses, which must exist.
@@ -587,10 +653,26 @@ pub fn run(cli: Cli) -> u8 {
 /// leads here.
 #[must_use]
 pub fn run_watching<S: ReleaseSource>(cli: Cli, source: Arc<S>, interval: Duration) -> u8 {
+    let (limits, drain) = real_limits();
+    run_watching_within(cli, source, interval, limits, drain)
+}
+
+/// [`run_watching`], with `limits` on requests and `drain_timeout` for those in flight when it
+/// stops, for a test holding one of them open, which on a loaded machine can take longer than the
+/// real ones allow. Nothing on the command line leads here either.
+#[must_use]
+pub fn run_watching_within<S: ReleaseSource>(
+    cli: Cli,
+    source: Arc<S>,
+    interval: Duration,
+    limits: Limits,
+    drain_timeout: Duration,
+) -> u8 {
     match cli.command {
         Command::Serve(args) => on_a_runtime(async move {
             let config = load_config(&args.config)?;
-            serve_watching(args, config, |_, _| Ok(source), interval).await
+            let source = |_: &ServeArgs, _| Ok(source);
+            serve_watching(args, config, source, interval, limits, drain_timeout).await
         }),
         command => run(Cli { command }),
     }
@@ -601,7 +683,11 @@ fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
         .enable_all()
         .build()
         .map_err(CliError::Runtime)
-        .and_then(|runtime| runtime.block_on(work));
+        .and_then(|runtime| {
+            let result = runtime.block_on(work);
+            runtime.shutdown_timeout(LET_GO_TIMEOUT);
+            result
+        });
     match result {
         Ok(code) => code,
         Err(error) => {
