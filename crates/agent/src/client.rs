@@ -9,9 +9,9 @@
 use std::error::Error;
 use std::fmt::Write as _;
 use std::future::Future;
-use std::net::IpAddr;
 use std::time::Duration;
 
+pub use landfall_core::controller_url::{ControllerUrl, UrlError};
 use landfall_core::ids::HostId;
 use landfall_core::protocol::{
     DeployReportBody, Disposition, HOST_HEADER, MAX_BODY_BYTES, NONCE_HEADER, Nonce, NonceResponse,
@@ -130,97 +130,9 @@ pub(crate) fn error_chain(error: &dyn Error) -> String {
     text
 }
 
-/// Why a `--controller` URL is refused. The URL itself is not repeated: it may
-/// hold credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum UrlError {
-    /// It does not parse.
-    #[error("--controller is not a URL")]
-    NotAUrl,
-    /// A scheme other than `https` or `http`.
-    #[error("--controller must be https://")]
-    Scheme,
-    /// It is `http://` and the flag was not given.
-    #[error(
-        "--controller is http://: requests are signed but work contents are visible, so this needs --allow-insecure-controller, and a loopback or tailnet (*.ts.net) name"
-    )]
-    NeedsFlag,
-    /// It is `http://` to a host that is neither loopback nor on a tailnet.
-    #[error(
-        "--controller is http:// to a host that is not loopback or a tailnet (*.ts.net) name, which --allow-insecure-controller does not cover"
-    )]
-    NotPrivate,
-    /// It carries credentials, a path, a query or a fragment.
-    #[error("--controller must be only a scheme, a host and a port")]
-    NotABase,
-}
-
-/// A controller URL the transport rule allows.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControllerUrl(Url);
-
-impl ControllerUrl {
-    /// Checks `text` against the transport rule: `https://`, or with
-    /// `allow_insecure` also `http://` to a loopback address, `localhost` or a
-    /// tailnet name (`*.ts.net`). A tailnet's addresses are not accepted: from
-    /// an address alone, `100.64.0.0/10` can't be told from any other carrier's
-    /// shared space.
-    ///
-    /// # Errors
-    ///
-    /// [`UrlError`] saying which part of the rule it breaks.
-    pub fn parse(text: &str, allow_insecure: bool) -> Result<Self, UrlError> {
-        let url = Url::parse(text).map_err(|_| UrlError::NotAUrl)?;
-        match url.scheme() {
-            "https" => {}
-            "http" if !allow_insecure => return Err(UrlError::NeedsFlag),
-            "http" => {
-                if !host_is_private(&url) {
-                    return Err(UrlError::NotPrivate);
-                }
-            }
-            _ => return Err(UrlError::Scheme),
-        }
-        let is_base = url.username().is_empty()
-            && url.password().is_none()
-            && url.host_str().is_some()
-            && url.path() == "/"
-            && url.query().is_none()
-            && url.fragment().is_none();
-        if !is_base {
-            return Err(UrlError::NotABase);
-        }
-        Ok(Self(url))
-    }
-
-    fn join(&self, path: &str) -> Url {
-        let mut url = self.0.clone();
-        url.set_path(path);
-        url
-    }
-
-    /// Where an enrolment goes.
-    pub(crate) fn enrol_url(&self) -> Url {
-        self.join(ENROL_PATH)
-    }
-
-    fn is_https(&self) -> bool {
-        self.0.scheme() == "https"
-    }
-}
-
-/// The URL's parser has normalised the host: lowercase, an IPv4 address in its
-/// dotted form whatever way it was written, an IPv6 address in brackets.
-fn host_is_private(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = bare.parse::<IpAddr>() {
-        return ip.is_loopback();
-    }
-    host == "localhost" || host.ends_with(".ts.net")
+/// Where an enrolment goes.
+pub(crate) fn enrol_url(url: &ControllerUrl) -> Url {
+    url.join(ENROL_PATH)
 }
 
 /// The HTTP client for a controller: no redirects, a connect timeout, and with

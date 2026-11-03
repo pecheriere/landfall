@@ -43,6 +43,8 @@ ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zero
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 toml = "1.1.8"
+# The controller's address, by the parser reqwest already brings into the tree.
+url = "2.5.8"
 serde_json = "1.0.154"
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 # Sigstore bundle verification. Only the aws-lc-rs crypto backend: no TUF

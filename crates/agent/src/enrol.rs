@@ -244,7 +244,7 @@ pub async fn enrol(
     let body = serde_json::to_vec(&request)
         .map_err(|error| ControllerError::Serialise(error.to_string()))?;
     let response = http
-        .post(url.enrol_url())
+        .post(client::enrol_url(url))
         .timeout(client::REQUEST_TIMEOUT)
         .header(CONTENT_TYPE, "application/json")
         .body(body)

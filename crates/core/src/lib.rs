@@ -3,6 +3,7 @@
 //! This crate performs no I/O, reads no clock and draws no randomness.
 
 pub mod config;
+pub mod controller_url;
 mod hex;
 pub mod ids;
 pub mod intent;

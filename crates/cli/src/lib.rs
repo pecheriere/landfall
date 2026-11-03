@@ -4,6 +4,7 @@
 mod access;
 pub mod agent_release;
 pub mod cli;
+pub mod host;
 pub mod project;
 pub mod verify;
 
