@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "landfall-agent"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "landfall-approval"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "landfall-cli"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "landfall-core"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek 3.0.0",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "landfall-origin"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "base64 0.23.1",
  "futures-util",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "landfall-server"
-version = "0.0.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
