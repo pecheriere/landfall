@@ -36,8 +36,9 @@ pub struct FileSubject<'a> {
 /// statement, its one transparency log entry, the Sigstore verification and the
 /// certificate's identity rules. In place of a digest being named somewhere in the
 /// statement, each subject must be there with that exact name and sha256 together,
-/// and its name must have no other digest. A bundle's signature covers its whole statement, so one verification, on the
-/// first subject's digest, holds for every name read from that statement.
+/// and its name must have no other digest. A bundle's signature covers its whole
+/// statement, so one verification, on the first subject's digest, holds for every name
+/// read from that statement.
 ///
 /// The result's `digest` is the first subject's.
 ///
@@ -45,7 +46,8 @@ pub struct FileSubject<'a> {
 ///
 /// Returns [`AttestationError`] naming the first check that failed:
 /// [`AttestationError::NoFileSubjects`] for no subjects, and
-/// [`AttestationError::FileSubject`] for a file the statement does not name.
+/// [`AttestationError::FileSubject`] for a file the statement does not name with that
+/// digest, or whose name it also gives another digest.
 pub fn verify_file_bundle(
     bundle_json: &[u8],
     subjects: &[FileSubject<'_>],
@@ -94,7 +96,8 @@ pub(super) fn find_subject(
     Err(AttestationError::FileSubject {
         name: subject.name.to_owned(),
         expected: subject.digest.to_string(),
-        found: if times > 1 {
+        // Only an empty name is refused with every digest right, and that is no fault of theirs.
+        found: if times > 1 && !subject.name.is_empty() {
             format!(
                 "{} {times} times, not all with this digest",
                 shown(subject.name)

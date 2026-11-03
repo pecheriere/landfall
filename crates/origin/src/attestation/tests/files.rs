@@ -413,6 +413,23 @@ fn the_exact_name_and_digest_are_found_among_others() {
     assert_eq!(find_subject(&statement, &asked), Ok(()));
 }
 
+/// Asking for no name is refused for that, and not as if the digest were at fault: both
+/// subjects here have the digest asked for.
+#[test]
+fn asking_for_an_empty_name_does_not_blame_the_digest() {
+    let digest = some_digest();
+    let statement = statement_of(&[("", &digest), ("", &digest)]);
+    let asked = FileSubject {
+        name: "",
+        digest: &digest,
+    };
+    let error = find_subject(&statement, &asked).unwrap_err();
+    let AttestationError::FileSubject { found, .. } = &error else {
+        panic!("expected a file subject refusal, got {error:?}");
+    };
+    assert!(!found.contains("not all with this digest"), "{found}");
+}
+
 #[test]
 fn a_subject_with_no_name_is_nothing_to_find() {
     // A subject's name may be left out of a statement, and reads as empty.
