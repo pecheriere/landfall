@@ -208,9 +208,9 @@ Nothing here is needed before PR A to E merge. Until step 1, a `workflow_dispatc
 3. `actions/attest-build-provenance` (the existing pin), `subject-path: out/*`, in `release.yml` itself: `verify_bundle` refuses a reusable workflow's identity.
 4. `assemble_release.py check-bundle` with `steps.attest.outputs.bundle-path`, which proves the shape.
 5. For each file in `out/`: `gh attestation verify <file> --bundle <bundle> --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-ref "refs/tags/$TAG" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners`. Then copy the bundle to `out/landfall-<version>.sigstore.json`.
-6. `gh release create "$TAG" out/* --draft --verify-tag --generate-notes`, with `--prerelease --latest=false` when the version has a `-`.
+6. `gh release create "$TAG" out/* --draft --verify-tag --generate-notes` and its printed URL, with `--prerelease --latest=false` when the version has a `-`.
 7. The existing image steps, with `ghcr.io/` plus the lowercased `$GITHUB_REPOSITORY` in place of the literal name, ending with its attestation, now `create-storage-record: false`.
-8. `gh api --method PATCH` on the draft step 6 made, found by the URL `gh` printed for it, with `draft=false`: a draft planted for the tag isn't this one. Files locked by immutable releases from here.
+8. `gh api --method PATCH` on the draft step 6 made, found by polling the listing for about 2 minutes for the URL `gh` printed, with `tag_name` and `draft=false`: a draft planted for the tag isn't this one, and without the tag the API can publish none. Then read `releases/tags/$TAG` back, within a short bound, and fail unless `draft` is false, `tag_name` is the tag and `immutable` is true. A failure there may mean a public release, so check by hand. Files locked by immutable releases from here.
 
 `check_environment.py`: reads the two answers from files, exit 1 naming each fault, per the ruling.
 

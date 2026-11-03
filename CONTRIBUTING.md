@@ -43,7 +43,11 @@ wants its own releases does each of these for itself, with its own key.
    - **Required reviewers:** at least one, such as yourself.
    - **Prevent self-review:** off (`prevent_self_review`), or a sole maintainer can't approve.
    - **Allow administrators to bypass:** off (`can_admins_bypass`). It defaults to on, and left
-     on, an admin could publish with no reviewer.
+     on, an admin could publish with no reviewer. The guard's message for this is
+     `can_admins_bypass is not off, so an admin could publish with no reviewer`. GitHub may not
+     offer the switch on a repository a user owns. If it doesn't, the guard stays red with that
+     message. A `workflow_dispatch` run shows it before any tag, so settle it there: a run can't
+     publish until the guard passes.
    - **Deployment branches and tags:** "Selected branches and tags" (`custom_branch_policies`
      on, `protected_branches` off), with exactly one rule: the **tag** rule `v[0-9]*`. A branch
      rule, another pattern, or "Protected branches only" would refuse the tag at `publish`, or
@@ -52,7 +56,9 @@ wants its own releases does each of these for itself, with its own key.
    Until this exists, `environment-guard` fails on every run. That is correct: GitHub would
    otherwise create the environment with no protection when `publish` named it.
 2. **Turn on immutable releases** in the repository's settings, so a published release's
-   files can't change.
+   files can't change. The workflow can't read this setting beforehand, so a manual run won't
+   show it. The last step of `publish` reads the release back and fails if it isn't immutable,
+   by which time the release is public.
 3. **Supply the tag-signing public key:** the `ssh-ed25519` key you sign tags with, as other
    types are refused. It goes in `crates/cli/assets/release-signers`, one
    `ssh-ed25519 <base64>` line with no comment, and its fingerprint in `SECURITY.md`, by pull
@@ -92,8 +98,16 @@ pull request, and tag again. A flake anywhere costs this too.
 - After the draft exists, delete the draft.
 - If the image is pushed but its attestation step fails, a tag is left in the registry with no
   attestation. Hosts refuse it, so it's harmless: leave it, or delete that package version.
-- If the last step fails after the image is attested, hosts can deploy that image while the
-  binaries never appear. The design makes the Release object optional, so this is accepted.
+- If the last step fails to publish the draft after the image is attested, hosts can deploy
+  that image while the binaries never appear. The design makes the Release object optional, so
+  this is accepted.
+- **If that step fails while reading the release back, the release may already be public.** Check
+  it by hand before doing anything else: it should not be a draft, should have this tag, and
+  should read as immutable. It could be public with the wrong tag or not locked, and it may not
+  be possible to repair it, in which case the way on is still a new version.
+- **crates.io failing** past the few tries each lookup gets fails `crate-age`, which looks up
+  every locked crate on a release, and so costs a version number. A pull request's check can
+  simply be re-run.
 - **An outage at ziglang.org** fails a build with no cache closed, as the Dockerfile fetches
   zig from there by checksum. If it reaches a tag, it costs a version number. The
   `workflow_dispatch` run shows it, which is one reason to do that just before tagging.

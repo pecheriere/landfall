@@ -290,13 +290,24 @@ jobs:
             *-*) flags=(--prerelease --latest=false) ;;
           esac
           url=$(gh release create "$GITHUB_REF_NAME" out/* --draft --verify-tag --generate-notes "${flags[@]}")
-          # By the URL it printed, and not by the tag: a draft someone planted for this tag isn't
-          # the one to publish. Anything but one id fails here.
-          id=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
-            jq -r --arg url "$url" --arg tag "$GITHUB_REF_NAME" \
-              '.[] | select(.draft and .html_url == $url and .tag_name == $tag) | .id')
-          [[ "$id" =~ ^[0-9]+$ ]]
-          echo "id=$id" >> "$GITHUB_OUTPUT"
+          # By the URL it printed: a draft someone planted for this tag isn't the one to publish, and
+          # a draft's tag_name can be a placeholder. The listing can lag behind a new draft, so this
+          # looks for about 2 minutes. Anything but one id fails here.
+          matches=""
+          for _ in {1..24}; do
+            matches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" |
+              jq -r --arg url "$url" \
+                '.[] | select(.draft and .html_url == $url) | .id') || matches=""
+            if [ -n "$matches" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if ! [[ "$matches" =~ ^[0-9]+$ ]]; then
+            echo "::error title=Release::Wanted one draft at $url, and found: ${matches:-none}. Delete any draft, bump the version by a pull request and tag again."
+            exit 1
+          fi
+          echo "id=$matches" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           # The same reference as .github/buildkit/Dockerfile, which a test checks.
@@ -332,9 +343,25 @@ jobs:
           push-to-registry: true
           # Works only for a repository an organisation owns, with a permission this job lacks.
           create-storage-record: false
-      # With immutable releases on, the files are locked from here.
-      - name: Publish the draft
+      # With immutable releases on, the files are locked from here. The tag is sent as `gh release
+      # edit` sends it, because the API can otherwise publish with no tag, which a host couldn't find.
+      # So the result is read back, with a short wait as that can lag. If the read-back fails, the
+      # release may already be public: check it by hand before doing anything else.
+      - name: Publish the draft, and read it back
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ steps.draft.outputs.id }}
-        run: gh api --method PATCH --silent "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false
+        run: |
+          gh api --method PATCH --silent "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -f tag_name="$GITHUB_REF_NAME" -F draft=false
+          for _ in {1..12}; do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" |
+              jq -e --arg tag "$GITHUB_REF_NAME" \
+                '.draft == false and .tag_name == $tag and .immutable == true' > /dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error title=Release::The release at $GITHUB_REF_NAME doesn't read back as public, with this tag, and immutable. It may already be public: check it by hand."
+          exit 1

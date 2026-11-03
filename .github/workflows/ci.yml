@@ -74,8 +74,8 @@ jobs:
   crate-age:
     # Compares Cargo.lock with the PR's base, so it only runs on pull requests.
     # Nothing stops a push straight to main from skipping it, so a release
-    # workflow must run the same check against the previous release tag before
-    # it publishes anything (release.yml does).
+    # workflow must run the same check on the whole lock file before it publishes
+    # anything (release.yml does).
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # About 5 minutes.

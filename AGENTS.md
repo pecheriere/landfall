@@ -166,6 +166,12 @@ cargo deny check
   branches off, and one policy, a tag policy for `v[0-9]*`. The owner's steps in
   `CONTRIBUTING.md` must name exactly those settings. Red until the owner creates
   the environment, which is correct.
+- The last step of `publish` sends the tag with `draft=false`, as the API can otherwise
+  publish with no tag, and reads the release back: not a draft, this tag, immutable. A
+  failure there may mean a public release, so it's checked by hand. The draft is found by
+  the URL `gh` printed, polling for about 2 minutes, as the listing can lag.
+- `crate_age.py` tries a lookup up to 5 times on a 429, a 5xx or a network error, honouring
+  `Retry-After` up to a minute, and not on a 404.
 - `check-bundle` reads a bundle's shape only: `gh attestation verify` checks the
   signature and identity, in `publish`, on every file, before the draft exists. These
   scripts run under `python3 -I`, so they can't import each other, and tests keep

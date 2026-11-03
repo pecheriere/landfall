@@ -30,6 +30,15 @@ PUBLISH_NEEDS = {
 ATTEMPT_CHECK = '[ "$GITHUB_RUN_ATTEMPT" != 1 ]'
 TAG_EVENT = "if: github.event_name == 'push'"
 RUN = re.compile(r"\s*(?:- )?run:")
+CONDITION = re.compile(r"\s*(?:- )?if:")
+WRITE = re.compile(r":\s*write\b|write-all")
+JOBS = PUBLISH_NEEDS | {"publish"}
+PUBLISH_WRITES = (
+    "contents: write",
+    "packages: write",
+    "id-token: write",
+    "attestations: write",
+)
 
 
 def indent_of(line: str) -> int:
@@ -250,12 +259,65 @@ class PublishOrderTests(WorkflowCase):
         draft = "\n".join(self.publish_steps[step_index(self.publish_steps, "gh release create")])
         self.assertIn("id: draft", draft)
         self.assertIn('url=$(gh release create "$GITHUB_REF_NAME"', draft)
-        self.assertIn(".html_url == $url", draft)
+        # Not by `tag_name`, which on a draft can be a placeholder.
+        self.assertIn("'.[] | select(.draft and .html_url == $url) | .id')", draft)
+        self.assertIn('if ! [[ "$matches" =~ ^[0-9]+$ ]]; then', draft)
+        self.assertIn('echo "id=$matches" >> "$GITHUB_OUTPUT"', draft)
         final = "\n".join(self.publish_steps[-1])
         self.assertIn("RELEASE_ID: ${{ steps.draft.outputs.id }}", final)
         self.assertIn('"repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID"', final)
-        self.assertIn("-F draft=false", final)
         self.assertNotIn("gh release edit", "\n".join(self.lines))
+
+    def test_the_listing_is_polled_within_a_bound(self) -> None:
+        """A new draft can take a moment to be listed, and a tag run has only the one attempt."""
+        draft = "\n".join(self.publish_steps[step_index(self.publish_steps, "gh release create")])
+        self.assertIn("for _ in {1..24}; do", draft)
+        self.assertIn("sleep 5", draft)
+        self.assertLess(draft.index("for _ in"), draft.index("repos/$GITHUB_REPOSITORY/releases"))
+
+    def test_publishing_sends_the_tag_and_reads_the_result_back(self) -> None:
+        """Without the tag the API can drop it, and a green step isn't a release a host can find."""
+        final = "\n".join(self.publish_steps[-1])
+        self.assertIn('-f tag_name="$GITHUB_REF_NAME" -F draft=false', final)
+        self.assertIn('"repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME"', final)
+        self.assertIn(
+            "'.draft == false and .tag_name == $tag and .immutable == true'",
+            final,
+        )
+        self.assertIn("for _ in {1..12}; do", final)
+        self.assertLess(final.index("draft=false"), final.index("releases/tags/"))
+        self.assertEqual(final.count("exit 0"), 1)
+        self.assertTrue(final.endswith("exit 1"), final)
+
+    def test_the_commands_that_decide_are_held_exactly(self) -> None:
+        """Dropping a flag or an argument from these is dropping a check."""
+        for piece, expected in {
+            "assemble_release.py assemble": [
+                "      - name: Assemble the release's files",
+                "        run: >-",
+                "          python3 -I .github/scripts/assemble_release.py assemble",
+                '          --dist dist --macos macos --version "${GITHUB_REF_NAME#v}"',
+                '          --repo "$GITHUB_REPOSITORY" --out out',
+            ],
+            "assemble_release.py check-bundle": [
+                "      - name: Check the attestation's shape against the files",
+                "        env:",
+                "          BUNDLE: ${{ steps.attest.outputs.bundle-path }}",
+                (
+                    "        run: python3 -I .github/scripts/assemble_release.py check-bundle "
+                    '--bundle "$BUNDLE" --out out'
+                ),
+            ],
+            "check_binaries.py dist": [
+                "      - name: Check the static binaries again",
+                "        run: |",
+                "          chmod 0755 dist/linux_arm64/* dist/linux_amd64/*",
+                "          python3 -I .github/scripts/check_binaries.py dist",
+            ],
+        }.items():
+            with self.subTest(piece=piece):
+                step = self.publish_steps[step_index(self.publish_steps, piece)]
+                self.assertEqual(step, expected)
 
     def test_the_image_attestation_records_no_storage(self) -> None:
         """That needs an organisation and a permission `publish` doesn't have."""
@@ -333,22 +395,190 @@ class HygieneTests(WorkflowCase):
         """Anything run later in the job could otherwise read the token from the clone."""
         checkouts = [
             step
-            for name in ("preflight", "environment-guard", "build-linux", "build-macos", "publish")
+            for name in JOBS - {"ci", "smoke"}
             for step in steps(job(self.lines, name))
             if "actions/checkout@" in "\n".join(step)
         ]
-        self.assertEqual(len(checkouts), 5)
+        self.assertEqual(len(checkouts), 7)
         for step in checkouts:
             self.assertIn("          persist-credentials: false", step)
 
     def test_no_expression_reaches_a_shell(self) -> None:
         """A value goes through `env`, so that it can't be read as part of a script."""
-        for name in ("preflight", "environment-guard", "build-linux", "smoke", "publish"):
+        for name in JOBS - {"ci"}:
             for step in steps(job(self.lines, name)):
                 run = [i for i, line in enumerate(step) if RUN.match(line)]
                 if run:
                     with self.subTest(job=name, step=step[0]):
                         self.assertNotIn("${{", "\n".join(step[run[0] :]))
+
+
+class WholeFileTests(WorkflowCase):
+    """Rules no edit gets round by being in a job or a step nobody listed."""
+
+    def test_the_jobs_are_exactly_these(self) -> None:
+        """A new job has none of the gates `publish` has, whatever it's given."""
+        start = self.lines.index("jobs:") + 1
+        names = {
+            line.strip().removesuffix(":")
+            for line in self.lines[start:]
+            if indent_of(line) == JOB_INDENT
+        }
+        self.assertEqual(names, JOBS)
+
+    def test_only_publish_can_write(self) -> None:
+        """Four lines, all in that job, and no broader form anywhere."""
+        writing = [line.strip() for line in self.lines if WRITE.search(line)]
+        self.assertEqual(sorted(writing), sorted(PUBLISH_WRITES))
+        self.assertEqual(
+            sorted(line.strip() for line in self.publish if WRITE.search(line)),
+            sorted(PUBLISH_WRITES),
+        )
+
+    def test_nothing_may_fail_quietly(self) -> None:
+        """`continue-on-error` is the first thing a flake tempts someone to reach for."""
+        self.assertEqual([line for line in self.lines if "continue-on-error" in line], [])
+        self.assertEqual([line for line in self.lines if "set +e" in line], [])
+
+    def test_the_conditions_are_exactly_the_two(self) -> None:
+        """An `if:` on any job or step is a way of not running it."""
+        found = [line for line in self.lines if CONDITION.match(line)]
+        self.assertEqual(found, [f"    {TAG_EVENT}", f"    {TAG_EVENT}"])
+
+    def test_a_failure_is_swallowed_only_where_it_is_then_refused(self) -> None:
+        """The policy list's 404 and a failed listing: the next lines refuse an empty answer."""
+        found = [line.strip() for line in self.lines if "||" in line]
+        self.assertEqual(
+            found,
+            [
+                '> "$RUNNER_TEMP/policies.json" || true',
+                """'.[] | select(.draft and .html_url == $url) | .id') || matches=\"\"""",
+            ],
+        )
+
+    def test_ci_is_only_the_reusable_workflow(self) -> None:
+        """A job here that merely ran `true` would pass for all of CI."""
+        self.assertEqual(
+            job(self.lines, "ci"),
+            [
+                "    needs: on-main",
+                "    uses: $/.github/workflows/ci.yml",
+                "    permissions:",
+                "      contents: read",
+            ],
+        )
+
+    def test_on_main_is_this_check(self) -> None:
+        """Its whole history is what makes `origin/main` something to ask about."""
+        on_main = steps(job(self.lines, "on-main"))
+        self.assertEqual(len(on_main), 2)
+        self.assertIn("          fetch-depth: 0", on_main[0])
+        self.assertEqual(
+            on_main[1],
+            [
+                "      - name: Require the tagged commit to be on main",
+                '        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
+            ],
+        )
+
+    def test_smoke_is_these_runners_and_this_comparison(self) -> None:
+        """Native arm64 is why it exists, and the tag comparison is what a tag run adds."""
+        smoke = job(self.lines, "smoke")
+        self.assertEqual(
+            smoke[smoke.index("    strategy:") : smoke.index("    runs-on: ${{ matrix.runner }}")],
+            [
+                "    strategy:",
+                "      fail-fast: false",
+                "      matrix:",
+                "        include:",
+                "          - runner: ubuntu-24.04",
+                "            artifact-id: ${{ needs.build-linux.outputs.artifact-id }}",
+                "            binaries: linux_amd64/landfall linux_amd64/landfall-agent",
+                "          - runner: ubuntu-24.04-arm",
+                "            artifact-id: ${{ needs.build-linux.outputs.artifact-id }}",
+                "            binaries: linux_arm64/landfall linux_arm64/landfall-agent",
+                "          - runner: macos-26",
+                "            artifact-id: ${{ needs.build-macos.outputs.artifact-id }}",
+                "            binaries: landfall",
+            ],
+        )
+        self.assertEqual(
+            steps(smoke)[-1],
+            [
+                (
+                    "      - name: Run each native binary, and on a tag compare its version "
+                    "with the tag"
+                ),
+                "        shell: bash",
+                "        env:",
+                "          BINARIES: ${{ matrix.binaries }}",
+                "        run: |",
+                "          for binary in $BINARIES; do",
+                '            chmod +x "binaries/$binary"',
+                '            actual=$("binaries/$binary" --version)',
+                '            echo "$binary: $actual"',
+                '            if [ "$GITHUB_EVENT_NAME" = push ]; then',
+                '              test "$actual" = "${binary##*/} ${GITHUB_REF_NAME#v}"',
+                "            fi",
+                "          done",
+            ],
+        )
+
+    def test_the_checks_that_run_a_script_are_held_exactly(self) -> None:
+        """Across the other jobs, for the same reason as `publish`'s."""
+        for name, expected in {
+            "crate-age": [
+                "      - name: Refuse crate versions published less than 7 days ago",
+                "        run: python3 -I .github/scripts/crate_age.py --no-base",
+            ],
+            "preflight": [
+                "      - name: Prove the tag",
+                "        env:",
+                "          GH_TOKEN: ${{ github.token }}",
+                "        run: >-",
+                "          python3 -I .github/scripts/release_preflight.py",
+                (
+                    '          --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" '
+                    '--repo "$GITHUB_REPOSITORY"'
+                ),
+            ],
+        }.items():
+            with self.subTest(job=name):
+                self.assertEqual(steps(job(self.lines, name))[-1], expected)
+
+    def test_the_builds_are_held_exactly(self) -> None:
+        """Locked, from the pinned toolchain, with nothing but the files coming out."""
+        linux = steps(job(self.lines, "build-linux"))
+        build = linux[step_index(linux, "docker/build-push-action@")]
+        self.assertEqual(
+            [build[0], *build[2:]],
+            [
+                "      - name: Build the static binaries",
+                "        with:",
+                "          context: .",
+                "          target: binaries",
+                "          platforms: linux/arm64,linux/amd64",
+                "          outputs: type=local,dest=dist",
+                "          provenance: false",
+                "          sbom: false",
+                "          push: false",
+            ],
+        )
+        self.assertEqual(
+            linux[step_index(linux, "check_binaries.py")],
+            [
+                "      - name: Check the static binaries",
+                "        run: python3 -I .github/scripts/check_binaries.py dist",
+            ],
+        )
+        macos = job(self.lines, "build-macos")
+        self.assertIn(
+            "      - run: cargo build --release --locked -p landfall-cli "
+            "--target aarch64-apple-darwin",
+            macos,
+        )
+        self.assertIn("      RUSTUP_TOOLCHAIN: 1.99.0", macos)
+        self.assertIn("          path: target/aarch64-apple-darwin/release/landfall", macos)
 
 
 class ReadingTests(unittest.TestCase):
