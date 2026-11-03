@@ -299,15 +299,7 @@ async fn a_recover_holding_the_lock_leaves_the_approval_good() {
     assert_eq!(state_of(&f).claim().unwrap(), None);
 
     drop(held.lock().unwrap().take());
-    let mut outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
-    // A flock can outlive its holder for a moment: see `once_released` in the state tests.
-    for _ in 0..1000 {
-        if !matches!(outcome, StepOutcome::Waiting { .. }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
-    }
+    let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     assert_deployed(&outcome);
     assert!(spent(&f, "first"));
 }
@@ -341,17 +333,8 @@ async fn a_held_log_makes_the_work_wait(hold: impl Fn(&fs::File)) {
     assert_eq!(fs::read(root.nonce_log_path()).unwrap(), log_before);
     assert_eq!(touched(&f.docker), []);
     assert_eq!(capture::events("nonce_log_unusable").len(), unusable);
-    // With the log still held, no thread is left with the deployment's lock. A flock can outlive
-    // its holder for a moment: see `once_released` in the state tests.
-    let state = state_of(&f);
-    let mut free = state.lock();
-    for _ in 0..1000 {
-        if free.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        free = state.lock();
-    }
+    // With the log still held, no thread is left with the deployment's lock.
+    let free = state_of(&f).lock();
     assert!(free.is_ok(), "the deployment's lock was left behind");
     drop(free);
 

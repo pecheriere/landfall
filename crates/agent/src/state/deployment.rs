@@ -28,9 +28,19 @@ pub struct DeploymentState {
 /// The exclusive right to deploy one deployment, held until dropped.
 #[derive(Debug)]
 pub struct DeployLock {
-    pub(super) _file: File,
+    pub(super) file: File,
     /// The file it locks, which says whose lock it is.
     pub(super) path: PathBuf,
+}
+
+impl Drop for DeployLock {
+    /// Lets go now rather than when the file closes. A child that another thread is starting has a
+    /// copy of the descriptor until it execs, and with that copy open, closing ours wouldn't free
+    /// the lock: the next to ask would be told it's busy, with nobody holding it. If this fails,
+    /// closing the file is still what frees it.
+    fn drop(&mut self) {
+        drop(self.file.unlock());
+    }
 }
 
 impl DeploymentState {

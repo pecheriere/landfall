@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::super::nonces::append_line;
+use super::super::nonces::{append_line, locked};
 use super::super::{MAX_NONCE_LOG_BYTES, NONCE_LOG, NonceSpend, StateDir, StateError};
 use crate::testing::test_nonce;
 
@@ -316,8 +316,27 @@ fn of_writers_at_once_exactly_one_spends_a_nonce() {
     root.check_nonce_log().unwrap();
 }
 
-/// A child forked in another thread holds the lock until it execs, so one just let go is no
-/// reason to send the work round again.
+/// A child forked in another thread has a copy of the descriptor until it execs, and that mustn't
+/// keep the lock from the next spend, for as long as it takes under load.
+#[test]
+fn a_lock_let_go_is_free_while_a_copy_of_its_descriptor_lives_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = dir(&tmp);
+    assert_eq!(root.spend_nonce(&shared()).unwrap(), NonceSpend::Recorded);
+    let path = root.nonce_log_path();
+    let file = fs::File::open(&path).unwrap();
+    let in_a_child = file.try_clone().unwrap();
+
+    drop(locked(file, fs::File::try_lock, &path).unwrap());
+
+    assert_eq!(
+        root.spend_nonce(&test_nonce("other")).unwrap(),
+        NonceSpend::Recorded
+    );
+    drop(in_a_child);
+}
+
+/// Something else that has the log for a moment is no reason to send the work round again.
 #[test]
 fn a_lock_let_go_in_a_moment_is_gone_through() {
     let tmp = tempfile::tempdir().unwrap();

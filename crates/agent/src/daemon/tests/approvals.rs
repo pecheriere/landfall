@@ -595,15 +595,7 @@ async fn crash_after_recording_the_nonce_spends_the_approval() {
     let mut restarted = f;
     restarted.options = options_for(BTreeMap::from([(id(), restarted.compose.clone())]));
     let verifier = FakeVerifier::passes();
-    let mut outcome = asked(&restarted, &verifier, carrying(7, approval.clone())).await;
-    // A flock can outlive its holder for a moment: see `once_released` in the state tests.
-    for _ in 0..1000 {
-        if !matches!(outcome, StepOutcome::Waiting { .. }) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        outcome = asked(&restarted, &verifier, carrying(7, approval.clone())).await;
-    }
+    let outcome = asked(&restarted, &verifier, carrying(7, approval.clone())).await;
 
     let StepOutcome::Finished {
         outcome: ReportedOutcome::Refused { reason },
