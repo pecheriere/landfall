@@ -87,7 +87,8 @@ release N+1 is signed by the new one.
    the transparency log. It skips `preflight` too, since there's no tag to prove.
 3. Check immutable releases once more, with the `gh api` call above: this is the one setting that
    goes red only after publishing. Then `git tag -s v<version>` on that commit, naming the release
-   key with `-c user.signingkey=...` if it isn't git's default, and push the tag.
+   key with `-c user.signingkey="key::ssh-ed25519 <base64>"` if it isn't git's default, and push the
+   tag.
 4. Approve the `publish` job when it asks, **within 7 days**: the build jobs' artifacts expire
    after that, and a later approval fails at the download and spends the version.
 5. If there's a Homebrew tap, and this isn't a release candidate, which shouldn't reach

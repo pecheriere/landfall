@@ -14,7 +14,7 @@ landfall has no release yet. Once it has, only the latest release gets fixes.
 
 ## Release signing
 
-Release tags are signed with this SSH key, which the `landfall` CLI also carries, in
+Release tags must be signed with this SSH key, which the `landfall` CLI also carries, in
 `crates/cli/assets/release-signers`:
 
 ```text
