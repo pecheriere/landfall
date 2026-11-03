@@ -10,7 +10,7 @@ use landfall_agent::state::Phase;
 
 use super::harness::{
     BACKUP, DIGEST_A, DIGEST_B, PASSES, RunAs, Stack, assert_rolled_back, image, options,
-    passes_only_on, retrying_while_busy, script_with,
+    passes_only_on, script_with,
 };
 
 /// A deadline that lets a check that can't pass fail quickly, for tests that go
@@ -58,16 +58,13 @@ async fn docker_recover_after_failed_rollback_keeps_later_writes() {
     let before = stack.running_since().await;
     stack.options = options();
     let deployment = stack.deployment(&needs_dependency);
-    let report = retrying_while_busy(async || {
-        Box::pin(deploy::recover(
-            &stack.docker,
-            &stack.state,
-            &deployment,
-            &stack.dir,
-            &stack.options,
-        ))
-        .await
-    })
+    let report = Box::pin(deploy::recover(
+        &stack.docker,
+        &stack.state,
+        &deployment,
+        &stack.dir,
+        &stack.options,
+    ))
     .await
     .unwrap();
 
@@ -238,16 +235,13 @@ async fn docker_failed_rollback_up_leaves_what_runs_running() {
     fs::write(&compose_file, intact).unwrap();
     stack.options = options();
     let deployment = stack.deployment(&rest);
-    let recovered = retrying_while_busy(async || {
-        Box::pin(deploy::recover(
-            &stack.docker,
-            &stack.state,
-            &deployment,
-            &stack.dir,
-            &stack.options,
-        ))
-        .await
-    })
+    let recovered = Box::pin(deploy::recover(
+        &stack.docker,
+        &stack.state,
+        &deployment,
+        &stack.dir,
+        &stack.options,
+    ))
     .await
     .unwrap();
     assert_rolled_back(&recovered);

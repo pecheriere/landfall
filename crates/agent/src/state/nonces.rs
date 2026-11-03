@@ -21,8 +21,9 @@
 //! hand can hold it, for as long as it likes, and a thread blocked there would hold on to the
 //! deployment's lock when it is spending. So a call tries for [`LOCK_PATIENCE`], and then says
 //! [`StateError::NonceLogBusy`], and the work waits for the next poll with nothing spent. The
-//! patience is for the agent's own children: one forked in another thread shares this descriptor,
-//! and the lock on it, until it execs, so a lock just let go can stay held for a moment.
+//! patience is for the daemon's own threads, which have the log for as long as a spend takes. A
+//! child forked in another thread shares this descriptor until it execs, so the lock is let go by
+//! [`HeldLog`] and not by closing the file, which would wait for that child.
 
 use std::fs::{File, TryLockError};
 use std::io::{BufReader, Read as _, Write};
@@ -99,12 +100,27 @@ fn open(path: &Path, flags: OFlags) -> Result<Option<File>, StateError> {
     Ok(Some(file))
 }
 
+/// The log, with a lock on it that's let go when this is dropped.
+#[derive(Debug)]
+pub(super) struct HeldLog(File);
+
+impl Drop for HeldLog {
+    /// If this fails, closing the file is still what frees it.
+    fn drop(&mut self) {
+        drop(self.0.unlock());
+    }
+}
+
 /// Tries for a lock on the log, for [`LOCK_PATIENCE`] at most.
-fn locked(attempt: impl Fn() -> Result<(), TryLockError>, path: &Path) -> Result<(), StateError> {
+pub(super) fn locked(
+    file: File,
+    attempt: impl Fn(&File) -> Result<(), TryLockError>,
+    path: &Path,
+) -> Result<HeldLog, StateError> {
     let started = Instant::now();
     loop {
-        match attempt() {
-            Ok(()) => return Ok(()),
+        match attempt(&file) {
+            Ok(()) => return Ok(HeldLog(file)),
             Err(TryLockError::Error(error)) => return Err(io_err("lock", path)(error)),
             Err(TryLockError::WouldBlock) if started.elapsed() >= LOCK_PATIENCE => {
                 return Err(StateError::NonceLogBusy(path.to_owned()));
@@ -155,12 +171,11 @@ fn scan(file: &File, path: &Path, nonce: &[u8; 32]) -> Result<bool, StateError> 
 }
 
 /// The log, with a lock on it to read. `None` if it isn't there.
-fn open_to_read(path: &Path) -> Result<Option<File>, StateError> {
+fn open_to_read(path: &Path) -> Result<Option<HeldLog>, StateError> {
     let Some(file) = open(path, OFlags::RDONLY)? else {
         return Ok(None);
     };
-    locked(|| file.try_lock_shared(), path)?;
-    Ok(Some(file))
+    locked(file, File::try_lock_shared, path).map(Some)
 }
 
 /// Writes `line` through `out`, which ends up in `file`. Called under the file's lock. A
@@ -204,10 +219,10 @@ impl StateDir {
     /// [`StateError::NonceLogBusy`] if something holds its lock to write.
     pub fn nonce_used(&self, nonce: &[u8; 32]) -> Result<bool, StateError> {
         let path = self.nonce_log_path();
-        let Some(file) = open_to_read(&path)? else {
+        let Some(log) = open_to_read(&path)? else {
             return Ok(false);
         };
-        scan(&file, &path, nonce)
+        scan(&log.0, &path, nonce)
     }
 
     /// Reads the log and says if it can be trusted. No log can be.
@@ -219,7 +234,7 @@ impl StateDir {
     pub fn check_nonce_log(&self) -> Result<(), StateError> {
         let path = self.nonce_log_path();
         match open_to_read(&path)? {
-            Some(file) => read_lines(&file, &path, |_| {}),
+            Some(log) => read_lines(&log.0, &path, |_| {}),
             None => Ok(()),
         }
     }
@@ -240,13 +255,14 @@ impl StateDir {
         let Some(file) = open(&path, flags)? else {
             return Err(unusable(&path, "it isn't there after creating it"));
         };
-        locked(|| file.try_lock(), &path)?;
-        if scan(&file, &path, nonce)? {
+        let log = locked(file, File::try_lock, &path)?;
+        let file = &log.0;
+        if scan(file, &path, nonce)? {
             return Ok(NonceSpend::AlreadyUsed);
         }
         let line = format!("{}\n", hex::encode(nonce));
-        let mut out = &file;
-        append_line(&file, &mut out, line.as_bytes(), &path)?;
+        let mut out = file;
+        append_line(file, &mut out, line.as_bytes(), &path)?;
         file.sync_all().map_err(io_err("sync", &path))?;
         sync_dir(self.path())?;
         Ok(NonceSpend::Recorded)

@@ -22,32 +22,6 @@ use serde_json::Value;
 
 use crate::compose_project::ComposeProject;
 
-/// How many times to look again at a lock that is taken, and how long between looks.
-const BUSY_TRIES: u32 = 100;
-
-const BUSY_WAIT: Duration = Duration::from_millis(50);
-
-/// Runs `work`, again if the deployment's lock is taken. Nothing else in a test holds
-/// it once a deploy has returned, but tests run in threads of one process and start
-/// children all the time: a child between `fork` and `exec` has a copy of every
-/// descriptor, the lock's included, and a `flock` lasts until the last copy closes. So
-/// the lock can seem taken for a moment after it was let go. The agent itself takes
-/// that as a reason to wait and try again.
-pub(super) async fn retrying_while_busy<T>(
-    mut work: impl AsyncFnMut() -> Result<T, DeployError>,
-) -> Result<T, DeployError> {
-    let mut tries = 1;
-    loop {
-        match work().await {
-            Err(DeployError::Busy(_)) if tries < BUSY_TRIES => {
-                tries += 1;
-                tokio::time::sleep(BUSY_WAIT).await;
-            }
-            other => return other,
-        }
-    }
-}
-
 pub(super) const REPO: &str = "containerd/busybox";
 
 /// Tag 1.36: what a healthy version runs.
@@ -177,15 +151,6 @@ impl Stack {
     }
 
     pub(super) async fn attempt(
-        &self,
-        rest: &str,
-        tag: &str,
-        digest: &str,
-    ) -> Result<DeployReport, DeployError> {
-        retrying_while_busy(async || Box::pin(self.attempt_once(rest, tag, digest)).await).await
-    }
-
-    async fn attempt_once(
         &self,
         rest: &str,
         tag: &str,

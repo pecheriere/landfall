@@ -5,9 +5,9 @@ use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
 
 use super::super::{
-    DEPLOYED, IN_PROGRESS, InProgress, Phase, RecordedBackup, StateDir, StateError,
+    DEPLOYED, DeployLock, IN_PROGRESS, InProgress, Phase, RecordedBackup, StateDir, StateError,
 };
-use super::{deployed, id, once_released, state};
+use super::{deployed, id, state};
 
 #[test]
 fn state_dir_must_not_be_group_writable() {
@@ -45,7 +45,28 @@ fn second_lock_is_busy() {
     assert!(matches!(&err, StateError::Busy(d) if *d == id("example/prod")));
     assert!(err.to_string().contains("example/prod"));
     drop(held);
-    once_released(|| second.lock()).unwrap();
+    second.lock().unwrap();
+}
+
+/// A child between `fork` and `exec`, started by any other thread, has a copy of every descriptor,
+/// and the lock lives on the file they all share. Letting go mustn't wait for that copy to close:
+/// the next one to ask would be told it's busy, with nobody holding it.
+fn free_with_a_copy_in_a_child(take: impl Fn() -> Result<DeployLock, StateError>) {
+    let held = take().unwrap();
+    let in_a_child = held.file.try_clone().unwrap();
+    take().unwrap_err();
+    drop(held);
+    take().unwrap();
+    drop(in_a_child);
+}
+
+#[test]
+fn a_lock_let_go_is_free_while_a_copy_of_its_descriptor_lives_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let deployment = state(&tmp);
+    free_with_a_copy_in_a_child(|| deployment.lock());
+    let root = StateDir::open(tmp.path()).unwrap();
+    free_with_a_copy_in_a_child(|| root.lock_daemon());
 }
 
 #[test]

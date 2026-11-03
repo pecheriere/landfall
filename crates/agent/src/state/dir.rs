@@ -251,7 +251,7 @@ pub(super) fn lock_file(
         .map_err(io_err("open", path))?;
     match file.try_lock() {
         Ok(()) => Ok(DeployLock {
-            _file: file,
+            file,
             path: path.to_owned(),
         }),
         Err(TryLockError::WouldBlock) => Err(busy()),
