@@ -87,26 +87,47 @@ fn a_host_unfit_for_an_agent_is_refused_with_all_of_it() {
     let files = Files::new();
     let mut remote = FakeRemote::new();
     remote.probe = fit_probe(&[("docker_group", "0"), ("dir_exists:1", "0")]);
+    let source = FakeSource::new();
 
-    let error = error_of(run_plainly(&files.args(), &remote));
+    let error = error_of(run(
+        &files.args(),
+        &source,
+        &remote,
+        &mut FakeConfirm::no_terminal(),
+    ));
 
     let text = error.to_string();
     assert!(text.contains("docker` group"), "{text}");
     assert!(text.contains("/srv/compose/other"), "{text}");
     assert_eq!(error.exit_code(), 1);
     remote.assert_only_probed();
+    assert_eq!(
+        source.asked_for.get(),
+        None,
+        "fetched for a host that can't take it"
+    );
 }
 
 /// Not a probe's output, as from a login shell that couldn't run it.
 #[test]
 fn output_that_is_not_a_probe_is_refused() {
     let files = Files::new();
-    let mut remote = FakeRemote::new();
+    let mut remote = FakeRemote {
+        probe_stderr: "This account is not available.",
+        ..FakeRemote::new()
+    };
     remote.probe = "fish: Unknown command\n".to_owned();
 
     let error = error_of(run_plainly(&files.args(), &remote));
 
-    assert!(error.to_string().contains("login shell"), "{error}");
+    let HostError::Probe { source, .. } = &error else {
+        panic!("{error:?}");
+    };
+    assert!(source.to_string().contains("login shell"), "{error}");
+    assert!(
+        error.to_string().contains("This account is not available"),
+        "{error}"
+    );
     assert_eq!(error.exit_code(), 1);
     remote.assert_only_probed();
 }
@@ -209,6 +230,39 @@ fn a_lost_connection_in_the_script_tries_to_remove_the_upload_and_exits_2() {
             .is_some_and(|last| last.contains("rm -rf -- ")),
         "{:?}",
         remote.commands()
+    );
+}
+
+/// What's there isn't this run's: nothing goes into it, least of all the code, and it isn't
+/// removed.
+#[test]
+fn a_directory_already_there_stops_the_upload() {
+    let files = Files::new();
+    let remote = FakeRemote {
+        mkdir_fails: true,
+        ..FakeRemote::new()
+    };
+
+    let error = error_of(run_plainly(&files.args(), &remote));
+
+    assert!(matches!(error, HostError::Upload { .. }), "{error:?}");
+    assert!(error.to_string().contains("File exists"), "{error}");
+    assert_eq!(error.exit_code(), 2);
+    assert_eq!(remote.script(), None);
+    let commands = remote.commands();
+    assert!(
+        commands
+            .last()
+            .is_some_and(|last| last.contains("mkdir -m 700")),
+        "{commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|c| c.contains("cat >")),
+        "{commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|c| c.contains("rm -rf -- '")),
+        "{commands:?}"
     );
 }
 

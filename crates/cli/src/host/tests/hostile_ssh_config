@@ -1,5 +1,5 @@
 # The opposite of every option `ssh::options` forces. The test reads what `ssh -G` makes of them.
-IgnoreUnknown NoHostAuthenticationForProxyCommand,SomethingElse
+IgnoreUnknown NoHostAuthenticationForProxyCommand,ForkAfterAuthentication,StdinNull,SessionType,ChannelTimeout
 Host *
   BatchMode no
   StrictHostKeyChecking no
@@ -11,6 +11,7 @@ Host *
   ForwardAgent yes
   ForwardX11 yes
   ForwardX11Trusted yes
+  GSSAPIDelegateCredentials yes
   AddKeysToAgent yes
   Tunnel yes
   LocalForward 1234 127.0.0.1:1234
@@ -20,6 +21,11 @@ Host *
   LocalCommand touch /nonexistent/landfall-pwned
   RemoteCommand touch /nonexistent/landfall-pwned
   EscapeChar ~
+  VisualHostKey yes
+  ForkAfterAuthentication yes
+  StdinNull yes
+  SessionType none
+  ChannelTimeout session=1
   LogLevel QUIET
   ConnectTimeout 3600
   ServerAliveInterval 0

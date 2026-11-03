@@ -1,0 +1,6 @@
+# The usual line in a configuration shared between a Mac and anything else, as only Apple's `ssh`
+# has `UseKeychain`. An `IgnoreUnknown` of ours would replace this one, and these would then be fatal.
+IgnoreUnknown UseKeychain,SomeOptionFromTheFuture
+Host *
+  UseKeychain yes
+  SomeOptionFromTheFuture yes

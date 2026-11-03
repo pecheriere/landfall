@@ -3,9 +3,11 @@
 //!
 //! Every call forces the options that keep a user's configuration from weakening it, over one
 //! connection. A time limit holds every call, but for the privileged step at a terminal, where a
-//! person can stop it. A connection that has gone away is ended by its keepalive.
+//! person can stop it. That limit only ends `ssh`: without a terminal, the target isn't told, and
+//! the script there goes on until its next output fails. A connection that has gone away is ended
+//! by its keepalive.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File};
@@ -38,27 +40,27 @@ const POLL: Duration = Duration::from_millis(20);
 /// How slowly an upload is allowed to go, in bytes a second, before it is called hung.
 const SLOWEST_UPLOAD: u64 = 32 * 1024;
 
-/// `ssh` with no way to weaken it from a configuration. The first of each option is the one that
-/// counts, and these come before any configuration is read. `-G` output for each is in
-/// `tests/ssh.rs`. `ControlPath` and `ControlMaster` go by the call, in [`args`].
+/// What keeps a configuration from weakening `ssh`, or changing what comes back from it. The
+/// first of each option is the one that counts, and these come before any configuration is read.
+/// `-G` output for each is in `tests/ssh.rs`. `ControlPath` and `ControlMaster` go by the call, in
+/// [`args`].
 const FORCED: [&str; 21] = [
-    // First, for a build without the option that comes next but one.
-    "IgnoreUnknown=NoHostAuthenticationForProxyCommand",
     "BatchMode=yes",
     "StrictHostKeyChecking=yes",
     "NoHostAuthenticationForLocalhost=no",
-    "NoHostAuthenticationForProxyCommand=no",
     "VerifyHostKeyDNS=no",
     "UpdateHostKeys=no",
     "ForwardAgent=no",
     "ForwardX11=no",
     "ForwardX11Trusted=no",
+    "GSSAPIDelegateCredentials=no",
     "AddKeysToAgent=no",
     "Tunnel=no",
     "ClearAllForwardings=yes",
     "PermitLocalCommand=no",
     "RemoteCommand=none",
     "EscapeChar=none",
+    "VisualHostKey=no",
     // A configuration's `QUIET` would hide the host key message that is read.
     "LogLevel=ERROR",
     "ConnectTimeout=30",
@@ -67,6 +69,24 @@ const FORCED: [&str; 21] = [
     "ServerAliveCountMax=4",
     "ControlPersist=60",
 ];
+
+/// The same, for what not every build of `ssh` has: on one that hasn't, a configuration can't say
+/// it either, and forcing it would be fatal. An `IgnoreUnknown` can't be forced to get round that,
+/// as it would replace the operator's own, so [`Known::ask`] finds out which there are.
+///
+/// In a configuration, the second makes every status 0 while the command goes on running, the
+/// third gives every upload no input, and the fourth and fifth can leave a command unrun or cut
+/// off.
+const IN_SOME_BUILDS: [&str; 5] = [
+    "NoHostAuthenticationForProxyCommand=no",
+    "ForkAfterAuthentication=no",
+    "StdinNull=no",
+    "SessionType=default",
+    "ChannelTimeout=none",
+];
+
+/// How long `ssh -G` may take to say what it knows, which needs no network.
+const ASK_LIMIT: Duration = Duration::from_secs(10);
 
 /// Why `ssh` couldn't do what was asked.
 #[derive(Debug, thiserror::Error)]
@@ -84,12 +104,18 @@ pub enum SshError {
     /// `ssh` couldn't be started.
     #[error("cannot run ssh")]
     Spawn(#[source] io::Error),
-    /// The target's key isn't the one `known_hosts` has.
+    /// `known_hosts` has no key for the target.
     #[error(
-        "the target's host key is unknown or has changed, so nothing ran there. landfall never accepts a key itself: connect once by hand with ssh, and compare the fingerprint with the host's own. ssh said {}",
+        "the target's host key isn't known, so nothing ran there. landfall never accepts a key itself: connect once by hand with ssh, and compare the fingerprint with the host's own. ssh said {}",
         quoted(.0, SHOWN_STDERR)
     )]
     HostKey(String),
+    /// The target's key isn't the one `known_hosts` has.
+    #[error(
+        "the target's host key has CHANGED, so nothing ran there. It may have been reinstalled, or something may be in between. Compare this with the host's own fingerprint, by some other way than this connection, before removing the old key with ssh-keygen -R: {}",
+        quoted(.0, SHOWN_STDERR)
+    )]
+    HostKeyChanged(String),
     /// No connection, or it was lost.
     #[error("the SSH connection failed: ssh said {}", quoted(.0, SHOWN_STDERR))]
     Connection(String),
@@ -202,10 +228,46 @@ fn split_port(rest: &str) -> Option<(&str, Option<u16>)> {
     }
 }
 
+/// Which of the forced options that not every build of `ssh` has, this machine's has.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Known(Vec<&'static str>);
+
+impl Known {
+    /// Asks `program`, with no configuration and no connection, about each.
+    ///
+    /// # Errors
+    ///
+    /// [`SshError`] if it can't be run, or takes too long to say.
+    pub fn ask(program: &OsStr) -> Result<Self, SshError> {
+        let mut known = Vec::new();
+        for option in IN_SOME_BUILDS {
+            let mut command = Command::new(program);
+            command
+                .args(["-G", "-F", "none", "-o", option, "--", "x"])
+                .env_remove("GITHUB_TOKEN")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = command.spawn().map_err(SshError::Spawn)?;
+            if wait_within(&mut child, ASK_LIMIT)?.success() {
+                known.push(option);
+            }
+        }
+        Ok(Self(known))
+    }
+
+    /// Whether `ssh` has `option`, as in [`options`].
+    #[must_use]
+    pub fn has(&self, option: &str) -> bool {
+        self.0.contains(&option)
+    }
+}
+
 /// The options forced on every call, in order.
 #[must_use]
-pub fn options(tty: Tty) -> Vec<&'static str> {
+pub fn options(tty: Tty, known: &Known) -> Vec<&'static str> {
     let mut options = FORCED.to_vec();
+    options.extend(&known.0);
     options.push(match tty {
         Tty::Never => "RequestTTY=no",
         Tty::Force => "RequestTTY=force",
@@ -220,13 +282,14 @@ fn with_options(
     control: &Path,
     config: Option<&Path>,
     tty: Tty,
+    known: &Known,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = first.iter().map(OsString::from).collect();
     if let Some(config) = config {
         args.push("-F".into());
         args.push(config.into());
     }
-    for option in options(tty) {
+    for option in options(tty, known) {
         args.push("-o".into());
         args.push(option.into());
     }
@@ -258,28 +321,55 @@ pub fn args(
     control: &Path,
     config: Option<&Path>,
     tty: Tty,
+    known: &Known,
     command: &str,
 ) -> Vec<OsString> {
-    let mut args = with_options(&[], dest, control, config, tty);
-    args.push("-o".into());
-    args.push("ControlMaster=no".into());
-    let mut args = with_host(args, dest);
+    let mut args = with_host(client_options(&[], dest, control, config, tty, known), dest);
     args.push(command.into());
     args
 }
 
+/// A client of the connection, and never one, whatever a configuration says: it would log in
+/// again, which is another approval, or start a master holding this call's streams.
+fn client_options(
+    first: &[&str],
+    dest: &Destination,
+    control: &Path,
+    config: Option<&Path>,
+    tty: Tty,
+    known: &Known,
+) -> Vec<OsString> {
+    let mut args = with_options(first, dest, control, config, tty, known);
+    args.push("-o".into());
+    args.push("ControlMaster=no".into());
+    args
+}
+
 /// What `ssh` is given to start the connection at `control`, which then goes to the background.
-fn master_args(dest: &Destination, control: &Path, config: Option<&Path>) -> Vec<OsString> {
+/// What's first here is what counts, so it isn't affected by what's forced for a command.
+pub(super) fn master_args(
+    dest: &Destination,
+    control: &Path,
+    config: Option<&Path>,
+    known: &Known,
+) -> Vec<OsString> {
     with_host(
-        with_options(&["-fNM"], dest, control, config, Tty::Never),
+        with_options(&["-fNM"], dest, control, config, Tty::Never, known),
         dest,
     )
 }
 
-/// What `ssh` is given to close the connection at `control`.
-fn exit_args(dest: &Destination, control: &Path, config: Option<&Path>) -> Vec<OsString> {
+/// What `ssh` is given to ask the connection at `control` to do `operation`, which reaches
+/// nothing but its socket.
+pub(super) fn control_args(
+    operation: &str,
+    dest: &Destination,
+    control: &Path,
+    config: Option<&Path>,
+    known: &Known,
+) -> Vec<OsString> {
     with_host(
-        with_options(&["-O", "exit"], dest, control, config, Tty::Never),
+        client_options(&["-O", operation], dest, control, config, Tty::Never, known),
         dest,
     )
 }
@@ -339,8 +429,10 @@ impl Default for Limits {
     }
 }
 
-/// The operator's own `ssh`, over one connection, started when first needed and closed on drop.
-#[derive(Debug)]
+/// The operator's own `ssh`, over one connection, started when first needed, started again if it
+/// has ended by the next time it's needed, and closed on drop. A person at `y/N` for more than
+/// `ControlPersist` is the ordinary way for it to end, and with each command then logging in by
+/// itself, an agent or a hardware key would ask once for each.
 pub struct OpenSsh {
     program: OsString,
     dest: Destination,
@@ -348,7 +440,24 @@ pub struct OpenSsh {
     limits: Limits,
     /// Private to this user. Under `/tmp`, as a macOS `TMPDIR` is too long for a socket.
     dir: tempfile::TempDir,
+    known: OnceCell<Known>,
     started: Cell<bool>,
+    say: Box<dyn Fn(&str)>,
+}
+
+impl fmt::Debug for OpenSsh {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenSsh")
+            .field("dest", &self.dest)
+            .field("config", &self.config)
+            .field("started", &self.started)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Says it on stderr: nothing more can be done if that fails.
+fn say_on_stderr(text: &str) {
+    let _ = writeln!(io::stderr().lock(), "{text}");
 }
 
 impl OpenSsh {
@@ -379,8 +488,23 @@ impl OpenSsh {
             config,
             limits,
             dir,
+            known: OnceCell::new(),
             started: Cell::new(false),
+            say: Box::new(say_on_stderr),
         })
+    }
+
+    /// With what's said to the operator going to `say`, for a test.
+    #[cfg(test)]
+    pub(super) fn saying(mut self, say: impl Fn(&str) + 'static) -> Self {
+        self.say = Box::new(say);
+        self
+    }
+
+    /// The `ssh_config` it was given.
+    #[cfg(test)]
+    pub(super) fn config(&self) -> Option<&Path> {
+        self.config.as_deref()
     }
 
     fn control(&self) -> PathBuf {
@@ -394,18 +518,53 @@ impl OpenSsh {
         command
     }
 
-    /// Starts the connection if it isn't up. Its stderr goes to a file, as a pipe would stay open
-    /// for as long as it lives.
-    fn connect(&self) -> Result<(), SshError> {
-        if self.started.get() {
-            return Ok(());
+    fn known(&self) -> Result<&Known, SshError> {
+        if let Some(known) = self.known.get() {
+            return Ok(known);
         }
+        let known = Known::ask(&self.program)?;
+        Ok(self.known.get_or_init(|| known))
+    }
+
+    /// Whether the connection is still there, asking only its socket.
+    pub(super) fn alive(&self, known: &Known) -> bool {
+        let mut command = self.command(control_args(
+            "check",
+            &self.dest,
+            &self.control(),
+            self.config.as_deref(),
+            known,
+        ));
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        wait_within(&mut child, self.limits.close).is_ok_and(|status| status.success())
+    }
+
+    /// Starts the connection if it isn't up, and says so first: in `BatchMode`, `ssh` itself says
+    /// nothing of a key that wants a touch, or an agent that wants an approval. Its stderr goes to
+    /// a file, as a pipe would stay open for as long as it lives.
+    fn connect(&self) -> Result<&Known, SshError> {
+        let known = self.known()?;
+        if self.started.get() && self.alive(known) {
+            return Ok(known);
+        }
+        self.started.set(false);
+        (self.say)(&format!(
+            "landfall: opening an SSH connection to {}: approve it if your key or agent asks",
+            self.dest
+        ));
         let stderr_path = self.dir.path().join("connect.stderr");
         let stderr = File::create(&stderr_path).map_err(SshError::ControlDir)?;
         let mut command = self.command(master_args(
             &self.dest,
             &self.control(),
             self.config.as_deref(),
+            known,
         ));
         command
             .stdin(Stdio::null())
@@ -415,7 +574,7 @@ impl OpenSsh {
         let status = wait_within(&mut child, self.limits.connect)?;
         if status.success() {
             self.started.set(true);
-            Ok(())
+            Ok(known)
         } else {
             let said = fs::read(&stderr_path).unwrap_or_default();
             Err(lost(&said))
@@ -425,12 +584,13 @@ impl OpenSsh {
 
 impl Remote for OpenSsh {
     fn run(&self, command: &str, stdin: &[u8]) -> Result<Output, SshError> {
-        self.connect()?;
+        let known = self.connect()?;
         let args = args(
             &self.dest,
             &self.control(),
             self.config.as_deref(),
             Tty::Never,
+            known,
             command,
         );
         let limit = self.limits.command + upload_time(stdin.len());
@@ -442,16 +602,22 @@ impl Remote for OpenSsh {
     }
 
     fn run_privileged(&self, script: &str, interactive: bool) -> Result<i32, SshError> {
-        self.connect()?;
+        let known = self.connect()?;
         let tty = if interactive { Tty::Force } else { Tty::Never };
         let args = args(
             &self.dest,
             &self.control(),
             self.config.as_deref(),
             tty,
+            known,
             &privileged_command(script, interactive),
         );
-        let mut child = self.command(args).spawn().map_err(SshError::Spawn)?;
+        let mut command = self.command(args);
+        // With nobody to prompt, what's piped in here is the next thing's, as in a loop over hosts.
+        if !interactive {
+            command.stdin(Stdio::null());
+        }
+        let mut child = command.spawn().map_err(SshError::Spawn)?;
         let status = if interactive {
             child.wait().map_err(SshError::Spawn)?
         } else {
@@ -471,13 +637,15 @@ impl Remote for OpenSsh {
 
 impl Drop for OpenSsh {
     fn drop(&mut self) {
-        if !self.started.get() {
+        let (true, Some(known)) = (self.started.get(), self.known.get()) else {
             return;
-        }
-        let mut command = self.command(exit_args(
+        };
+        let mut command = self.command(control_args(
+            "exit",
             &self.dest,
             &self.control(),
             self.config.as_deref(),
+            known,
         ));
         command
             .stdin(Stdio::null())
@@ -496,7 +664,11 @@ const SSH_FAILED: i32 = 255;
 
 fn lost(stderr: &[u8]) -> SshError {
     let said = String::from_utf8_lossy(stderr).trim().to_owned();
-    if said.contains("Host key verification failed") {
+    if said.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
+        // The banner would otherwise use up all that's shown, before the part worth seeing.
+        let fingerprint: Vec<&str> = said.lines().filter(|l| l.contains("SHA256:")).collect();
+        SshError::HostKeyChanged(fingerprint.join(" "))
+    } else if said.contains("Host key verification failed") {
         SshError::HostKey(said)
     } else {
         SshError::Connection(said)

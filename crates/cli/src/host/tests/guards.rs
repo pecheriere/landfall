@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::process::Command;
 
 use super::plan::{
     AGENT, AGENT_PATH, CODE_PATH, CONFIG, CONFIG_PATH, Fixture, KEY_PATH, MARKER, RECOVER,
@@ -210,7 +211,7 @@ fn docker_is_asked_as_the_agents_user() {
     assert!(
         sandbox
             .log()
-            .contains("runuser -u landfall-agent -- docker version\n"),
+            .contains("runuser -u landfall-agent -- timeout -k 5 30 docker version\n"),
         "{}",
         sandbox.log()
     );
@@ -419,6 +420,30 @@ fn a_rewritten_agent_restarts_a_running_unit() {
         sandbox.log()
     );
     assert!(!exists(&sandbox, MARKER));
+}
+
+/// Where `/usr/local/bin` is a link, what counts is where it goes.
+#[test]
+fn a_directory_that_is_a_link_is_judged_by_where_it_goes() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    let real = sandbox.path("/real-bin");
+    fs::create_dir_all(&real).unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir_all(sandbox.path("/usr/local/bin")).unwrap();
+    symlink(&real, sandbox.path("/usr/local/bin")).unwrap();
+    // What a link's own mode is on Linux. On macOS it has one to set, and only macOS's `chmod`
+    // takes this, which is fine where the link already has it.
+    let _ = Command::new("chmod")
+        .args(["-h", "777"])
+        .arg(sandbox.path("/usr/local/bin"))
+        .stderr(std::process::Stdio::null())
+        .status();
+    let steps = install_steps(&fixture.request());
+
+    let ran = sandbox.run(&render(&[step(&steps, "preflight").clone()]));
+
+    assert_status(&ran, 0);
 }
 
 /// A kill just before the rename: the next run finds the agent in place, and only the marker

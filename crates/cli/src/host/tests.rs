@@ -178,14 +178,16 @@ esac"#
             "stat",
             &format!(
                 r#"format=
+follow=
 while [ "$#" -gt 1 ]; do
   if [ "$1" = -c ]; then format=$2; fi
+  if [ "$1" = -L ]; then follow=-L; fi
   shift
 done
 path=$1
 owner=0:0
 if [ "$path" = "$(cat {ctl}/owned_path 2>/dev/null)" ]; then owner=$(cat {ctl}/owner); fi
-mode=$(/usr/bin/stat -L -c %a "$path" 2>/dev/null || /usr/bin/stat -L -f %Mp%Lp "$path") || exit
+mode=$(/usr/bin/stat $follow -c %a "$path" 2>/dev/null || /usr/bin/stat $follow -f %Mp%Lp "$path") || exit
 printf '%s\n' "$format" | sed "s/%u/${{owner%:*}}/;s/%g/${{owner#*:}}/;s/%a/${{mode#0}}/""#
             ),
         );

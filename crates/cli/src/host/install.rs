@@ -113,6 +113,8 @@ struct Local {
     tag: ReleaseTag,
     dest: Destination,
     code: Option<EnrolCode>,
+    /// That its file can be read by others, on what may be a shared machine.
+    code_is_open: bool,
 }
 
 /// Everything that needs no target, so that a mistake here costs no connection. That this build
@@ -147,6 +149,8 @@ fn local_checks<S: AgentSource>(args: &InstallArgs, source: &S) -> Result<Local,
     let controller = ControllerUrl::parse(&args.controller, args.allow_insecure_controller)?;
     let dest = Destination::parse(&args.dest)?;
     let code = args.code_file.as_deref().map(read_code).transpose()?;
+    let code_is_open = code.as_ref().is_some_and(|(_, open)| *open);
+    let code = code.map(|(code, _)| code);
     Ok(Local {
         config,
         dirs,
@@ -154,11 +158,13 @@ fn local_checks<S: AgentSource>(args: &InstallArgs, source: &S) -> Result<Local,
         tag,
         dest,
         code,
+        code_is_open,
     })
 }
 
-/// The code in a regular file that isn't a link, without any of its content reaching an error.
-fn read_code(path: &Path) -> Result<EnrolCode, HostError> {
+/// The code in a regular file that isn't a link, without any of its content reaching an error, and
+/// whether others can read that file.
+fn read_code(path: &Path) -> Result<(EnrolCode, bool), HostError> {
     let code_file = |source| HostError::CodeFile {
         path: path.to_owned(),
         source,
@@ -177,14 +183,20 @@ fn read_code(path: &Path) -> Result<EnrolCode, HostError> {
     file.take(CODE_FILE_CAP)
         .read_to_string(&mut text)
         .map_err(code_file)?;
-    text.trim()
+    let code = text
+        .trim()
         .parse()
-        .map_err(|_| HostError::CodeInvalid(path.to_owned()))
+        .map_err(|_| HostError::CodeInvalid(path.to_owned()))?;
+    Ok((code, opened.mode() & 0o077 != 0))
 }
 
 fn read_facts<R: Remote>(remote: &R, dirs: &[&str]) -> Result<HostFacts, HostError> {
     let output = remote.run(&remote_command(&probe(dirs)), b"")?;
-    Ok(HostFacts::parse(&String::from_utf8_lossy(&output.stdout))?)
+    HostFacts::parse(&String::from_utf8_lossy(&output.stdout)).map_err(|source| HostError::Probe {
+        source,
+        status: output.status,
+        said: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 /// What the target is to run. The upload's name is in it, so what is shown is what runs.
@@ -346,6 +358,12 @@ pub fn run_with<S: AgentSource, R: Remote>(
 ) -> Result<Outcome, HostError> {
     let local = local_checks(args, source)?;
     let output = |result: io::Result<()>| result.map_err(HostError::Output);
+    if local.code_is_open {
+        output(writeln!(
+            out,
+            "landfall: warning: others can read the enrolment code's file: remove it once this is done"
+        ))?;
+    }
     output(writeln!(out, "landfall: connecting to {}", local.dest))?;
 
     let dirs: Vec<&str> = local.dirs.iter().map(String::as_str).collect();

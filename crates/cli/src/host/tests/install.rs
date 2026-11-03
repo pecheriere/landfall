@@ -72,6 +72,8 @@ struct FakeRemote {
     sudo: i32,
     script: Result<i32, ()>,
     fail_upload_of: Option<&'static str>,
+    mkdir_fails: bool,
+    probe_stderr: &'static str,
 }
 
 impl FakeRemote {
@@ -83,6 +85,8 @@ impl FakeRemote {
             sudo: 0,
             script: Ok(0),
             fail_upload_of: None,
+            mkdir_fails: false,
+            probe_stderr: "",
         }
     }
 
@@ -131,6 +135,11 @@ impl Remote for FakeRemote {
         };
         if command.contains("landfall-probe-begin") {
             output.stdout = self.probe.clone().into_bytes();
+            output.stderr = self.probe_stderr.as_bytes().to_vec();
+        }
+        if self.mkdir_fails && command.contains("mkdir -m 700") {
+            output.status = 1;
+            output.stderr = b"cannot create directory: File exists".to_vec();
         }
         if command.contains("sudo -n true") {
             output.status = self.sudo;

@@ -1,12 +1,12 @@
 //! What is refused with no connection made.
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 
-use super::{CONFIG, FakeConfirm, FakeRemote, FakeSource, Files, error_of, run, run_plainly};
-use crate::host::HostError;
+use super::{CODE, CONFIG, FakeConfirm, FakeRemote, FakeSource, Files, error_of, run, run_plainly};
 use crate::host::install::InstallArgs;
 use crate::host::ssh::SshError;
+use crate::host::{HostError, remote_for, source_for};
 
 #[test]
 fn no_signers_refuses_before_connecting() {
@@ -189,4 +189,49 @@ fn a_development_build_asks_for_a_tag() {
     assert!(error.to_string().contains("--tag"), "{error}");
     assert_eq!(error.exit_code(), 2);
     assert_eq!(remote.calls(), Vec::new());
+}
+
+/// It's cut off at what a code could be, with the code past that.
+#[test]
+fn a_code_file_is_only_read_so_far() {
+    let files = Files::new();
+    fs::write(files.path("code"), format!("{}{CODE}", " ".repeat(8192))).unwrap();
+    let remote = FakeRemote::new();
+
+    let error = error_of(run_plainly(&files.args(), &remote));
+
+    assert!(matches!(error, HostError::CodeInvalid(_)), "{error:?}");
+}
+
+#[test]
+fn a_code_file_others_can_read_is_said_and_does_not_stop_it() {
+    let files = Files::new();
+    let warning = "others can read the enrolment code's file";
+    for (mode, warned) in [(0o600, false), (0o400, false), (0o640, true), (0o644, true)] {
+        fs::set_permissions(files.path("code"), fs::Permissions::from_mode(mode)).unwrap();
+        let ran = run_plainly(&files.args(), &FakeRemote::new());
+        assert!(ran.result.is_ok());
+        assert_eq!(ran.out.contains(warning), warned, "{mode:o}");
+    }
+}
+
+/// `--ssh-config` and `--cache-dir` reach what they're for, on the way a real run goes.
+#[test]
+fn what_a_real_run_uses_is_what_was_asked() {
+    let files = Files::new();
+    let args = InstallArgs {
+        ssh_config: Some(files.path("the-ssh-config")),
+        cache_dir: Some(files.path("the-cache")),
+        ..files.args()
+    };
+    let remote = remote_for(&args).unwrap();
+    assert_eq!(
+        remote.config(),
+        Some(files.path("the-ssh-config").as_path())
+    );
+    assert!(
+        format!("{:?}", source_for(&args)).contains("the-cache"),
+        "{:?}",
+        source_for(&args)
+    );
 }

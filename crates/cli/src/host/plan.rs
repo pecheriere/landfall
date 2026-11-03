@@ -349,13 +349,14 @@ fi
     )
 }
 
-/// As the agent's user, which proves more than the login's client version did.
+/// As the agent's user, which proves more than the login's client version did. Within a limit, as
+/// nothing else would stop it on a hung daemon: with no terminal, ending `ssh` doesn't reach this.
 fn docker() -> String {
     let refusal = quote(
         "the landfall-agent user can't reach Docker: check that the daemon runs, and the docker group",
     );
     format!(
-        "if ! runuser -u landfall-agent -- docker version > /dev/null; then\n  refuse {refusal}\nfi\n"
+        "if ! runuser -u landfall-agent -- timeout -k 5 30 docker version > /dev/null; then\n  refuse {refusal}\nfi\n"
     )
 }
 

@@ -37,8 +37,9 @@ Exit status:
   0  the agent is installed, or --dry-run showed what would run
   1  refused or stopped: the release failed verification, the target isn't fit
      for an agent, sudo can't be used, you declined, or the script stopped
-  2  could not try: configuration, usage, network, SSH connection or host key,
-     or the release could not be fetched
+  2  could not try or finish: configuration, usage, network, SSH connection or
+     host key, a connection lost during the script, a failed upload such as a
+     full disk, or the release could not be fetched
 
 Environment:
   GITHUB_TOKEN  never sent to the target, and removed from what ssh is given";
@@ -116,9 +117,20 @@ pub enum HostError {
     /// SSH couldn't do what was asked.
     #[error(transparent)]
     Ssh(#[from] ssh::SshError),
-    /// What came back isn't what a probe prints.
-    #[error(transparent)]
-    Facts(#[from] facts::FactsError),
+    /// What came back isn't what a probe prints. What it said is hostile, so it's quoted.
+    #[error(
+        "the target didn't answer the probe as it should: status {status}, and it said {}",
+        quoted(.said, 400)
+    )]
+    Probe {
+        /// What's wrong with its output.
+        #[source]
+        source: facts::FactsError,
+        /// The remote command's status.
+        status: i32,
+        /// Its stderr.
+        said: String,
+    },
     /// The target can't take an agent.
     #[error("{}", refusals(.0))]
     Refused(Vec<facts::Refusal>),
@@ -161,7 +173,7 @@ impl HostError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Release(error) if error.is_refusal() => EXIT_REFUSED,
-            Self::Facts(_)
+            Self::Probe { .. }
             | Self::Refused(_)
             | Self::NoTerminal
             | Self::NoSudo
@@ -227,6 +239,15 @@ impl install::Confirm for TerminalConfirm {
     }
 }
 
+fn source_for(args: &install::InstallArgs) -> GitHubReleases {
+    GitHubReleases::new(args.cache_dir.clone(), Refresh::Online)
+}
+
+fn remote_for(args: &install::InstallArgs) -> Result<ssh::OpenSsh, HostError> {
+    let dest = ssh::Destination::parse(&args.dest)?;
+    Ok(ssh::OpenSsh::new(dest, args.ssh_config.clone())?)
+}
+
 /// The process's result: a person saying no isn't success for whatever runs this.
 fn finished(outcome: install::Outcome) -> Result<(), HostError> {
     match outcome {
@@ -243,9 +264,8 @@ fn finished(outcome: install::Outcome) -> Result<(), HostError> {
 pub fn run(command: HostCommand, runtime: &Runtime, out: &mut dyn Write) -> Result<(), HostError> {
     match command {
         HostCommand::Install(args) => {
-            let source = GitHubReleases::new(args.cache_dir.clone(), Refresh::Online);
-            let dest = ssh::Destination::parse(&args.dest)?;
-            let remote = ssh::OpenSsh::new(dest, args.ssh_config.clone())?;
+            let source = source_for(&args);
+            let remote = remote_for(&args)?;
             finished(install::run_with(
                 &args,
                 &source,
