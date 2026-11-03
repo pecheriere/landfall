@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use landfall_core::controller_url::ControllerUrl;
 use landfall_core::text::shown;
 
-use super::plan::{AGENT_PATH, UNIT_PATH};
+use super::plan::{AGENT_PATH, CONFIG_DIR, MARKER, UNIT_PATH};
 use super::shell::{QUOTE_CHECK, SYSTEM_PATH, quote};
 use crate::agent_release::Arch;
 
@@ -34,7 +34,7 @@ const CA_BUNDLES: [&str; 3] = [
 const BOUNDED: &str = "timeout -k 5 10";
 
 /// The keys a probe prints, other than `dir_exists:<n>`.
-const KEYS: [&str; 21] = [
+const KEYS: [&str; 22] = [
     "os",
     "machine",
     "kernel",
@@ -55,6 +55,7 @@ const KEYS: [&str; 21] = [
     "agent_version",
     "agent_sha256",
     "unit_present",
+    "restart_pending",
     "quote_check",
 ];
 
@@ -172,6 +173,18 @@ impl HostFacts {
     #[must_use]
     pub fn unit_present(&self) -> bool {
         self.yes("unit_present")
+    }
+
+    /// Whether a change is waiting for a restart: an upgrade stopped after its rename, or one
+    /// that failed, for two. `None` if the login can't look, in a directory closed to it, or the
+    /// probe didn't say.
+    #[must_use]
+    pub fn restart_pending(&self) -> Option<bool> {
+        match self.value("restart_pending") {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }
     }
 
     /// What the installed agent's `--version` said, if there is one.
@@ -325,6 +338,7 @@ else
   fact agent_sha256 ''
 fi
 if [ -e {UNIT_PATH} ]; then fact unit_present 1; else fact unit_present 0; fi
+if [ -e {MARKER} ]; then fact restart_pending 1; elif [ -d {CONFIG_DIR} ] && [ ! -x {CONFIG_DIR} ]; then fact restart_pending unknown; else fact restart_pending 0; fi
 fact quote_check "$(printf %s {check} | od -An -tx1 | tr -d ' \n')"
 "#
     );
@@ -340,20 +354,27 @@ fact quote_check "$(printf %s {check} | od -An -tx1 | tr -d ' \n')"
     script
 }
 
-/// Whether an agent can go on this host: what it would warn about if so.
-///
-/// # Errors
-///
-/// Every [`Refusal`] that holds, so that one run says all of it.
-pub fn check(
-    facts: &HostFacts,
-    now: i64,
-    dirs: &[&str],
-    controller: &ControllerUrl,
-) -> Result<Vec<Warning>, Vec<Refusal>> {
+/// The commands an install's script needs.
+const INSTALL_TOOLS: [(&str, &str); 5] = [
+    ("has_systemctl", "systemctl"),
+    ("has_sha256sum", "sha256sum"),
+    ("has_runuser", "runuser"),
+    ("has_diff", "diff"),
+    ("has_timeout", "timeout"),
+];
+
+/// The commands an upgrade's script needs, and `timeout`, for the probe reading a version.
+const UPGRADE_TOOLS: [(&str, &str); 4] = [
+    ("has_systemctl", "systemctl"),
+    ("has_sha256sum", "sha256sum"),
+    ("has_runuser", "runuser"),
+    ("has_timeout", "timeout"),
+];
+
+/// What holds for any script on this host.
+fn fit_for_a_script(facts: &HostFacts, tools: &[(&str, &'static str)]) -> Vec<Refusal> {
     let mut refusals = Vec::new();
     let value = |key| facts.value(key).to_owned();
-
     if facts.value("os") != "Linux" {
         refusals.push(Refusal::NotLinux(value("os")));
     }
@@ -366,13 +387,7 @@ pub fn check(
     if leading_number(facts.value("systemd_version")).is_none_or(|got| got < MIN_SYSTEMD) {
         refusals.push(Refusal::OldSystemd(value("systemd_version")));
     }
-    for (key, tool) in [
-        ("has_systemctl", "systemctl"),
-        ("has_sha256sum", "sha256sum"),
-        ("has_runuser", "runuser"),
-        ("has_diff", "diff"),
-        ("has_timeout", "timeout"),
-    ] {
+    for (key, tool) in tools {
         if !facts.yes(key) {
             refusals.push(Refusal::MissingTool(tool));
         }
@@ -380,6 +395,61 @@ pub fn check(
     if facts.value("quote_check") != quote_check_hex() {
         refusals.push(Refusal::QuoteCheck);
     }
+    refusals
+}
+
+fn privilege(facts: &HostFacts) -> Option<Refusal> {
+    (!facts.is_root() && !facts.yes("has_sudo")).then_some(Refusal::NoPrivilege)
+}
+
+fn warnings_or_refusals(
+    facts: &HostFacts,
+    now: i64,
+    refusals: Vec<Refusal>,
+) -> Result<Vec<Warning>, Vec<Refusal>> {
+    if refusals.is_empty() {
+        Ok(clock_warning(facts.value("clock"), now)
+            .into_iter()
+            .collect())
+    } else {
+        Err(refusals)
+    }
+}
+
+/// Whether an upgrade can run on this host: only what its script needs, as Docker, the compose
+/// directories and the controller aren't what it touches.
+///
+/// # Errors
+///
+/// Every [`Refusal`] that holds.
+pub fn check_for_upgrade(facts: &HostFacts, now: i64) -> Result<Vec<Warning>, Vec<Refusal>> {
+    let mut refusals = fit_for_a_script(facts, &UPGRADE_TOOLS);
+    refusals.extend(privilege(facts));
+    warnings_or_refusals(facts, now, refusals)
+}
+
+/// What the target said of its agent, quoted and truncated, as it is hostile.
+#[must_use]
+pub fn shown_version(said: &str) -> String {
+    if said.is_empty() {
+        "nothing".to_owned()
+    } else {
+        shown(said)
+    }
+}
+
+/// Whether an agent can go on this host: what it would warn about if so.
+///
+/// # Errors
+///
+/// Every [`Refusal`] that holds, so that one run says all of it.
+pub fn check(
+    facts: &HostFacts,
+    now: i64,
+    dirs: &[&str],
+    controller: &ControllerUrl,
+) -> Result<Vec<Warning>, Vec<Refusal>> {
+    let mut refusals = fit_for_a_script(facts, &INSTALL_TOOLS);
     // With no `timeout` these were never asked, and it is refused for that.
     if facts.yes("has_timeout") {
         match facts.value("docker_client") {
@@ -409,17 +479,8 @@ pub fn check(
             refusals.push(Refusal::MissingComposeDir((*dir).to_owned()));
         }
     }
-    if !facts.is_root() && !facts.yes("has_sudo") {
-        refusals.push(Refusal::NoPrivilege);
-    }
-
-    if refusals.is_empty() {
-        Ok(clock_warning(facts.value("clock"), now)
-            .into_iter()
-            .collect())
-    } else {
-        Err(refusals)
-    }
+    refusals.extend(privilege(facts));
+    warnings_or_refusals(facts, now, refusals)
 }
 
 fn clock_warning(clock: &str, now: i64) -> Option<Warning> {

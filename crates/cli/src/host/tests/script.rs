@@ -166,6 +166,7 @@ fn a_signal_stops_the_script_and_cleans_up() {
         fs::write(sandbox.path(CODE_PATH), CODE).unwrap();
         let leftovers = [
             "/usr/local/bin/.landfall-agent.new",
+            "/usr/local/bin/.landfall-agent.previous.new",
             "/etc/landfall/.fleet.toml.new",
             "/etc/systemd/system/.landfall-agent.service.new",
             "/etc/systemd/system/.landfall-agent-recover@.service.new",

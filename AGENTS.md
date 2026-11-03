@@ -86,8 +86,13 @@ passkey approvals. Agents drive it through a typed API. Design:
   operator's token), `project` (what landfall trusts about its own releases: its
   repository, ids and workflow as constants, and `assets/release-signers`, read by the
   same rule as `release_preflight.py`, whose test keeps the keys in the two test tables
-  equal), and `agent_release` (the names of an agent's files, and `AgentSource`, which
-  `GitHubReleases` implements by that trust).
+  equal), `agent_release` (the names of an agent's files, and `AgentSource`, which
+  `GitHubReleases` implements by that trust), and `host` (`host install` and `host upgrade`:
+  `facts`, what a read-only probe of the target says and whether it's fit; `shell`, the only way a
+  value reaches a script; `unit`, the systemd units as the guide has them; `plan`, the script that
+  runs as root; `ssh`, the system's `ssh`, its forced options and one connection; and `install` and
+  `upgrade`). Their `run_with` takes a fake source and remote, for the tests, and nothing on a command
+  line leads to them.
 
 Central rule: the controller orchestrates, the host decides. Nothing the
 controller says can make an agent run a release its local configuration does

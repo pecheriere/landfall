@@ -124,7 +124,7 @@ jobs:
         run: |
           LANDFALL_TEST_DIST="$PWD/dist" cargo test -p landfall-cli --locked -- --ignored docker_ \
             | tee "$RUNNER_TEMP/host-install.txt"
-          python3 -I .github/scripts/count_passed.py "$RUNNER_TEMP/host-install.txt" 27
+          python3 -I .github/scripts/count_passed.py "$RUNNER_TEMP/host-install.txt" 40
 
   crate-age:
     # Compares Cargo.lock with the PR's base, so it only runs on pull requests.

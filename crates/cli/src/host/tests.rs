@@ -19,6 +19,7 @@ mod script;
 mod shell;
 mod ssh;
 mod unit;
+mod upgrade;
 
 /// What's mapped into the sandbox, wherever a script says it. With no trailing slash, as a
 /// script names a directory by itself too.

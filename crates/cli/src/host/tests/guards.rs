@@ -374,11 +374,24 @@ fn a_directory_others_can_write_to_is_refused() {
         assert_stopped_at_preflight(&sandbox, &ran);
         assert!(stderr(&ran).contains("1000:755"), "{}", stderr(&ran));
 
-        // As Debian's `root:staff` has had `/usr/local/bin`.
+        // As Debian's `root:staff` has had `/usr/local/bin`. Nothing has that of `/etc/landfall`,
+        // where it would hold the host's rules, and root writes there.
         let sandbox = self::sandbox();
         fs::set_permissions(sandbox.path(dir), fs::Permissions::from_mode(0o775)).unwrap();
         sandbox.set_owner(dir, "0:50");
         let steps = install_steps(&fixture.request());
+        let ran = sandbox.run(&render(&[step(&steps, "preflight").clone()]));
+        if dir == "/etc/landfall" {
+            assert_status(&ran, 1);
+            assert!(stderr(&ran).contains("or a group"), "{}", stderr(&ran));
+        } else {
+            assert_status(&ran, 0);
+        }
+
+        // Only reading for a group is all right, and that's what a host's own group may want.
+        let sandbox = self::sandbox();
+        fs::set_permissions(sandbox.path(dir), fs::Permissions::from_mode(0o750)).unwrap();
+        sandbox.set_owner(dir, "0:50");
         let ran = sandbox.run(&render(&[step(&steps, "preflight").clone()]));
         assert_status(&ran, 0);
     }

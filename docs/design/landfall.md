@@ -119,6 +119,13 @@ uid must not be shared with any container's. Linux 5.8 or later. See `docs/opera
 
 landfall never deploys landfall: the controller and agents are upgraded by hand in v0.
 
+**Installing an agent:** `landfall host install` and `host upgrade` run from an operator's machine over
+their own `ssh`: a read-only probe, the agent verified by the signed tag, the attestation and the sums
+against what that `landfall` holds, and then one script as root, shown with its hash first. The controller
+isn't involved beyond the code the operator mints as ever, and nothing connects in except the operator's
+own login. So this doesn't change who decides: an existing configuration or unit that differs is refused
+unless a flag says otherwise, and the host goes on deciding by that file.
+
 ## 5. Release origin
 
 ### 5.1 Input
@@ -403,7 +410,8 @@ anchor is out of scope for v0.
 - Every UI view is one API resource: deployments, releases (with origin story), deploys (steps, checks,
   logs), approvals, hosts, audit events.
 - `GET /api/v1/deploys/{id}/why`: a deploy's outcome in order, written for an agent to act on.
-- CLI `landfall`: `status`, `why`, `logs`, `request deploy`, `approve`, `rollback`, `hosts`.
+- CLI `landfall`: `status`, `why`, `logs`, `request deploy`, `approve`, `rollback`, `hosts`. Today it has
+  `verify`, and `host install` and `host upgrade`, which reach a host over SSH and not through this API.
 
 ## 10. Logs
 
@@ -426,6 +434,8 @@ window. Without VictoriaLogs the logs view says logs aren't configured.
 | Threat | Mitigation | Residual |
 |---|---|---|
 | Stolen GitHub token / compromised workflow | Host verifies the maintainer's tag signature + cert identity bound to the signed commit | none beyond the maintainer's signing key; with `origin.signed_tags = false`, anyone who can push a tag and run the release workflow can ship a deployable release |
+| Stolen GitHub token vs a host install | `landfall host install` wants the tag signed by a key the CLI holds, and the attestation, and the sums | the maintainer's key; a host's own operator; and whatever the first `landfall` was, so the guide's first trust |
+| Stolen GitHub token vs Homebrew | The tap is filled by hand: the owner checks a release's tag and attestation, and copies one file | that check, and the owner's tap; Homebrew itself checks only the formula's hash |
 | Compromised controller | Host re-verifies origin, signature, rule, approval; upward-only auto; running-digest binding | can trigger allowed auto deploys, delay, lie in UI, mislead an approval to another maintainer-signed release, bypass promotion |
 | Stolen agent API token | Agents can't approve; per-deployment grants; optional warden-only | can request deploys the rules allow |
 | Replayed approval | Running-digest binding + nonce log | none |
