@@ -23,11 +23,15 @@ passkey approvals. Agents drive it through a typed API. Design:
   `software`, a software authenticator for tests, behind the `test-support`
   feature, which only dev-dependencies may enable, as a step in CI checks.
 - `landfall-origin` (`crates/origin`): release origin verification that needs
-  the Sigstore stack or the network: build-provenance bundles and their
-  Fulcio certificate identity, the TUF trust root, and the fetchers for
-  signed tag objects, a repository's tags (GitHub API), image indexes, bundles
-  and referrer tags (GHCR), `verify_release`, which composes them for one
-  release, and `candidates`, which finds every digest attested for it.
+  the Sigstore stack or the network: build-provenance bundles, for an image digest
+  or a named release file (`attestation/file.rs`, the name and digest checked
+  together), and their Fulcio certificate identity, the TUF trust root, and the
+  fetchers for
+  signed tag objects, a repository's tags and a release's files (GitHub API), image
+  indexes, bundles and referrer tags (GHCR), `verify_release`, which composes them for
+  one release, `candidates`, which finds every digest attested for it, and `artifact`,
+  whose `verify_release_file` returns one file of a release once its signed tag, the
+  release's sums and the attestation all agree on it.
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI. A library plus a thin binary;
@@ -77,7 +81,13 @@ passkey approvals. Agents drive it through a typed API. Design:
   `cli::run_watching` take a fake verifier and source, for the end-to-end tests;
   nothing on a command line leads to them.
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
-  agents.
+  agents. A library plus a thin binary; modules: `cli` (the command line, exit
+  statuses), `verify` (`landfall verify`), `access` (the trust root's cache and the
+  operator's token), `project` (what landfall trusts about its own releases: its
+  repository, ids and workflow as constants, and `assets/release-signers`, read by the
+  same rule as `release_preflight.py`, whose test keeps the keys in the two test tables
+  equal), and `agent_release` (the names of an agent's files, and `AgentSource`, which
+  `GitHubReleases` implements by that trust).
 
 Central rule: the controller orchestrates, the host decides. Nothing the
 controller says can make an agent run a release its local configuration does

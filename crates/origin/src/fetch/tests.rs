@@ -7,8 +7,10 @@ use wiremock::MockServer;
 use super::{OCI_INDEX, OCI_MANIFEST};
 use crate::test_support::sha256;
 
+mod assets;
 mod bundles;
 mod errors;
+mod redirects;
 mod tags_and_indexes;
 mod validation;
 

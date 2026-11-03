@@ -1,5 +1,5 @@
-//! Fetchers for release material: signed tag objects from the GitHub API,
-//! image indexes and Sigstore bundles from an OCI registry (GHCR).
+//! Fetchers for release material: signed tag objects and a release's files from
+//! the GitHub API, image indexes and Sigstore bundles from an OCI registry (GHCR).
 //!
 //! Everything fetched here is hostile input until it is verified. This module
 //! checks only what binds the bytes to the name they were asked for (the git
@@ -8,14 +8,20 @@
 //! elsewhere: [`landfall_core::tag`] and [`crate::attestation`].
 //!
 //! Requests go over HTTPS only, with a connect timeout of 10 s and a total
-//! timeout of 30 s. Bodies are never decompressed (no compression feature is
-//! enabled in the HTTP client), so a cap applies to the bytes on the wire.
+//! timeout for each request, a redirect being another request, of 30 s, or 10
+//! minutes for a release's file. Bodies are never decompressed (no compression
+//! feature is enabled in the HTTP client), so a cap applies to the bytes on the
+//! wire.
+//!
+//! The client follows no redirect. `Fetcher::get` does, and a credential goes no
+//! further than the host it is for, on any hop.
 
 use std::time::Duration;
 
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, redirect};
 
+mod assets;
 mod endpoints;
 mod error;
 mod github;
@@ -25,6 +31,7 @@ mod registry;
 #[cfg(test)]
 mod tests;
 
+pub use assets::{BINARY_LIMIT, ReleaseAsset, SUMS_LIMIT};
 pub use endpoints::Endpoints;
 pub use error::{FetchError, RateLimitReset, Service};
 pub(crate) use http::hex;
@@ -45,7 +52,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total timeout for every request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Redirects followed per request (a registry blob redirects to its storage).
+/// Redirects followed per GET (a registry blob and a release's file redirect to their
+/// storage).
 const MAX_REDIRECTS: usize = 3;
 
 /// Tag objects followed when peeling a tag to its commit.
@@ -87,6 +95,8 @@ pub struct Fetcher {
     endpoints: Endpoints,
     /// Sent to the GitHub API only, never to the registry.
     github_token: Option<HeaderValue>,
+    /// [`assets::ASSET_TIMEOUT`], but in a test of it.
+    asset_timeout: Duration,
 }
 
 impl Fetcher {
@@ -100,7 +110,7 @@ impl Fetcher {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .https_only(endpoints.https_only)
-            .redirect(redirect::Policy::limited(MAX_REDIRECTS))
+            .redirect(redirect::Policy::none())
             .user_agent(concat!("landfall/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(FetchError::Client)?;
@@ -108,7 +118,15 @@ impl Fetcher {
             client,
             endpoints,
             github_token: None,
+            asset_timeout: assets::ASSET_TIMEOUT,
         })
+    }
+
+    /// A short timeout for a release's file, so that a test can see it apply.
+    #[cfg(test)]
+    pub(crate) fn with_asset_timeout(mut self, timeout: Duration) -> Self {
+        self.asset_timeout = timeout;
+        self
     }
 
     /// Sends `token` to the GitHub API, for its higher rate limit. It is

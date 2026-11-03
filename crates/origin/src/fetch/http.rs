@@ -1,13 +1,22 @@
-//! Sending a request and reading its answer within the size caps.
+//! Sending a request, following its redirects, and reading its answer within the size caps.
+
+use std::time::Duration;
 
 use jiff::Timestamp;
 use landfall_core::ids::ImageDigest;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, RETRY_AFTER};
-use reqwest::{StatusCode, Url};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION, RETRY_AFTER,
+};
+use reqwest::{RequestBuilder, Response, StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::{FetchError, RATELIMIT_REMAINING, RATELIMIT_RESET, RateLimitReset, Service};
+use super::{
+    FetchError, Fetcher, GITHUB_API_VERSION, MAX_REDIRECTS, RATELIMIT_REMAINING, RATELIMIT_RESET,
+    RateLimitReset, Service,
+};
+
+const TOO_MANY: &str = "there are too many redirects";
 
 /// A response that passed the status check, with its capped body.
 pub(super) struct Fetched {
@@ -15,19 +24,178 @@ pub(super) struct Fetched {
     pub(super) body: Vec<u8>,
 }
 
-/// Sends `request` to `service`, refuses any status but 200 (naming a rate
-/// limit as such), and reads at most `limit` bytes of body.
-pub(super) async fn send(
-    request: reqwest::RequestBuilder,
-    service: Service,
-    url: &Url,
-    limit: usize,
-) -> Result<Fetched, FetchError> {
-    let transport = |source| FetchError::Request {
+/// What is asked of each request of a GET, whichever host it reaches.
+#[derive(Clone, Copy)]
+pub(super) struct Transfer<'a> {
+    /// The `Accept` header.
+    pub(super) accept: &'a str,
+    /// Who it is for, in what a failure says.
+    pub(super) service: Service,
+    /// The cap on the body.
+    pub(super) limit: usize,
+    /// A total timeout for each request, other than the client's.
+    pub(super) timeout: Option<Duration>,
+}
+
+/// What a redirect to the host that has the credential does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SameHost {
+    /// It is the same service, so the credential goes along: a renamed repository, say.
+    KeepsCredential,
+    /// It is refused: what this asks for has no reason to.
+    Refused,
+}
+
+impl Fetcher {
+    /// A GET of `url`, with `credential` on it if there is one, following redirects by
+    /// hand. The client follows none, as what it does about a credential on one redirect
+    /// doesn't hold over the next.
+    ///
+    /// The credential goes to `url`, and along redirects within its host and port as
+    /// `same_host` says. The first redirect anywhere else goes to [`Self::follow`], which
+    /// has no credential to send.
+    pub(super) async fn get(
+        &self,
+        url: &Url,
+        transfer: Transfer<'_>,
+        credential: Option<&HeaderValue>,
+        same_host: SameHost,
+    ) -> Result<Fetched, FetchError> {
+        let mut current = url.clone();
+        for used in 0..=MAX_REDIRECTS {
+            let mut request = self.request(&current, transfer);
+            if transfer.service == Service::GitHubApi {
+                request = request.header("x-github-api-version", GITHUB_API_VERSION);
+            }
+            if let Some(credential) = credential {
+                request = request.header(AUTHORIZATION, credential.clone());
+            }
+            let response = request.send().await.map_err(|e| transport(url, e))?;
+            let Some(next) = self.redirect_of(&response, &current, url)? else {
+                return read(response, transfer, url).await;
+            };
+            if !on_same_host(&next, url) {
+                return self.follow(next, url, transfer, used + 1).await;
+            }
+            if same_host == SameHost::Refused {
+                return Err(redirect_refused(url, "it stays on the host asked"));
+            }
+            current = next;
+        }
+        Err(redirect_refused(url, TOO_MANY))
+    }
+
+    /// The rest of a GET of `asked`, from `first` on another host, with `used` redirects of
+    /// the limit gone. It takes no credential, so it can't send one, and its requests carry
+    /// nothing but `Accept`. It refuses to go back to the host of `asked`, which has no
+    /// reason to be asked again with no credential.
+    async fn follow(
+        &self,
+        first: Url,
+        asked: &Url,
+        transfer: Transfer<'_>,
+        used: usize,
+    ) -> Result<Fetched, FetchError> {
+        let mut current = first;
+        for _ in used..=MAX_REDIRECTS {
+            let request = self.request(&current, transfer);
+            let response = request.send().await.map_err(|e| transport(asked, e))?;
+            let Some(next) = self.redirect_of(&response, &current, asked)? else {
+                return read(response, transfer, asked).await;
+            };
+            if on_same_host(&next, asked) {
+                return Err(redirect_refused(asked, "it comes back to the host asked"));
+            }
+            current = next;
+        }
+        Err(redirect_refused(asked, TOO_MANY))
+    }
+
+    /// A request with nothing on it that isn't for every host.
+    fn request(&self, url: &Url, transfer: Transfer<'_>) -> RequestBuilder {
+        let request = self.client.get(url.clone()).header(ACCEPT, transfer.accept);
+        match transfer.timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        }
+    }
+
+    /// Where `response` to a request for `current` redirects to, if it does. A redirect
+    /// with no `Location` isn't one, and is an unexpected status like any other.
+    fn redirect_of(
+        &self,
+        response: &Response,
+        current: &Url,
+        asked: &Url,
+    ) -> Result<Option<Url>, FetchError> {
+        let is_redirect = matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        );
+        let Some(location) = response.headers().get(LOCATION).filter(|_| is_redirect) else {
+            return Ok(None);
+        };
+        let location = location
+            .to_str()
+            .map_err(|_| redirect_refused(asked, "its location is not text"))?;
+        next_hop(current, location, self.endpoints.https_only)
+            .map(Some)
+            .map_err(|reason| redirect_refused(asked, reason))
+    }
+}
+
+/// What a `Location` on an answer for `current` points to, if it may be followed. A refusal
+/// says why and not where, as the target's query may be a credential.
+pub(super) fn next_hop(
+    current: &Url,
+    location: &str,
+    https_only: bool,
+) -> Result<Url, &'static str> {
+    let next = current
+        .join(location)
+        .map_err(|_| "its location is not a URL")?;
+    if !(next.scheme() == "https" || (!https_only && next.scheme() == "http")) {
+        return Err("its location is not https");
+    }
+    if !next.username().is_empty() || next.password().is_some() {
+        return Err("its location carries credentials");
+    }
+    Ok(next)
+}
+
+fn on_same_host(one: &Url, other: &Url) -> bool {
+    one.host_str() == other.host_str()
+        && one.port_or_known_default() == other.port_or_known_default()
+}
+
+fn redirect_refused(url: &Url, reason: &'static str) -> FetchError {
+    FetchError::Redirect {
         url: url.to_string(),
-        source,
-    };
-    let mut response = request.send().await.map_err(transport)?;
+        reason,
+    }
+}
+
+/// A transport failure of a GET of `url`, without the URL the client has on it: after a
+/// redirect that is a storage host's, whose query is a credential.
+fn transport(url: &Url, source: reqwest::Error) -> FetchError {
+    FetchError::Request {
+        url: url.to_string(),
+        source: source.without_url(),
+    }
+}
+
+/// Refuses any status but 200 (naming a rate limit as such), and reads at most the
+/// transfer's limit of body. `url` is what was asked for, which is what a failure names.
+async fn read(
+    mut response: Response,
+    transfer: Transfer<'_>,
+    url: &Url,
+) -> Result<Fetched, FetchError> {
+    let Transfer { service, limit, .. } = transfer;
     match response.status() {
         StatusCode::OK => {}
         StatusCode::NOT_FOUND => {
@@ -65,7 +233,7 @@ pub(super) async fn send(
         return Err(too_large());
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+    while let Some(chunk) = response.chunk().await.map_err(|e| transport(url, e))? {
         if chunk.len() > limit - body.len() {
             return Err(too_large());
         }

@@ -2,16 +2,12 @@
 
 use landfall_core::ids::{CommitSha, ReleaseTag, RepoName};
 use reqwest::Url;
-use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::Deserialize;
 use sha1_checked::Digest as _;
 use sha1_checked::Sha1;
 
-use super::http::{Fetched, join, parse, send};
-use super::{
-    FetchError, Fetcher, GITHUB_ACCEPT, GITHUB_API_VERSION, MAX_TAG_DEPTH, Service,
-    TAG_OBJECT_LIMIT, hex,
-};
+use super::http::{Fetched, SameHost, Transfer, join, parse};
+use super::{FetchError, Fetcher, GITHUB_ACCEPT, MAX_TAG_DEPTH, Service, TAG_OBJECT_LIMIT, hex};
 
 impl Fetcher {
     /// The raw signed tag object for `tag`: the bytes `git cat-file tag`
@@ -151,15 +147,19 @@ impl Fetcher {
         url: &Url,
         limit: usize,
     ) -> Result<Fetched, FetchError> {
-        let mut request = self
-            .client
-            .get(url.clone())
-            .header(ACCEPT, GITHUB_ACCEPT)
-            .header("x-github-api-version", GITHUB_API_VERSION);
-        if let Some(token) = &self.github_token {
-            request = request.header(AUTHORIZATION, token.clone());
-        }
-        send(request, Service::GitHubApi, url, limit).await
+        let transfer = Transfer {
+            accept: GITHUB_ACCEPT,
+            service: Service::GitHubApi,
+            limit,
+            timeout: None,
+        };
+        self.get(
+            url,
+            transfer,
+            self.github_token.as_ref(),
+            SameHost::KeepsCredential,
+        )
+        .await
     }
 }
 

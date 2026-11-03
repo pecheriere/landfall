@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use landfall_core::ids::{ImageDigest, ReleaseTag};
 use landfall_core::release::Platform;
 use reqwest::Url;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 
-use super::http::{Fetched, content_digest, join, media_type, parse, send, sha256_digest};
+use super::http::{
+    Fetched, SameHost, Transfer, content_digest, join, media_type, parse, sha256_digest,
+};
 use super::{
     ATTESTATION_MANIFEST, BUNDLE_TYPE, DOCKER_LIST, FetchError, Fetcher, MANIFEST_LIMIT, OCI_INDEX,
     OCI_MANIFEST, PREDICATE_TYPE_ANNOTATION, REFERENCE_TYPE_ANNOTATION, Service,
@@ -239,11 +241,14 @@ impl Fetcher {
         token: Option<&HeaderValue>,
         limit: usize,
     ) -> Result<Fetched, FetchError> {
-        let mut request = self.client.get(url.clone()).header(ACCEPT, accept);
-        if let Some(token) = token {
-            request = request.header(AUTHORIZATION, token.clone());
-        }
-        send(request, Service::Registry, url, limit).await
+        let transfer = Transfer {
+            accept,
+            service: Service::Registry,
+            limit,
+            timeout: None,
+        };
+        self.get(url, transfer, token, SameHost::KeepsCredential)
+            .await
     }
 }
 

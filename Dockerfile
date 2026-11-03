@@ -50,8 +50,8 @@ WORKDIR /src
 
 # Dependencies build in their own layer, from the manifests and Cargo.lock
 # only, so the build cache reuses it until Cargo.lock changes. Each crate gets
-# an empty main.rs (lib.rs for the library crates; the server and the agent
-# have both) for this step.
+# an empty main.rs (lib.rs for the library crates; the server, the agent and
+# the CLI have both) for this step.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/core/Cargo.toml crates/core/
 COPY crates/approval/Cargo.toml crates/approval/
@@ -67,7 +67,7 @@ RUN case "$TARGETARCH" in \
     && for crate in server agent cli; do \
         mkdir -p "crates/$crate/src" && echo 'fn main() {}' > "crates/$crate/src/main.rs"; \
     done \
-    && for crate in core approval origin server agent; do \
+    && for crate in core approval origin server agent cli; do \
         mkdir -p "crates/$crate/src" && : > "crates/$crate/src/lib.rs"; \
     done \
     && cargo zigbuild --release --locked -p landfall-server -p landfall-agent -p landfall-cli --target "$(cat /target-triple)"

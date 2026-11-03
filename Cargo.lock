@@ -1535,11 +1535,15 @@ dependencies = [
 name = "landfall-cli"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "landfall-approval",
  "landfall-core",
  "landfall-origin",
+ "reqwest",
+ "semver",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1575,6 +1579,7 @@ dependencies = [
  "sha1-checked",
  "sha2 0.11.1",
  "sigstore-verify",
+ "ssh-key",
  "tempfile",
  "thiserror",
  "tokio",

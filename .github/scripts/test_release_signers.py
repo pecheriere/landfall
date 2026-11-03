@@ -117,6 +117,9 @@ class SignerTests(unittest.TestCase):
         for name, raw in {
             "another type in the bytes": bad_type,
             "a key length that lies": bad_key_length,
+            "a key length of 33": wire(RFC_KEY_1, key_length=33),
+            "a key length of 36": wire(RFC_KEY_1, key_length=36),
+            "a key length of 524320": wire(RFC_KEY_1, key_length=524320),
             "too long": wire(RFC_KEY_1) + b"\0",
             "too short": wire(RFC_KEY_1)[:-1],
         }.items():
@@ -168,6 +171,17 @@ class SignerTests(unittest.TestCase):
         """Half of all 32-byte strings aren't a point at all."""
         with self.assertRaisesRegex(RefusedError, "not a point"):
             parse_signers(f"{line(NOT_ON_THE_CURVE)}\n")
+
+    def test_the_rust_parser_is_tested_on_the_same_keys(self) -> None:
+        """The two parsers must not disagree, so the Rust table holds each key of the lists here."""
+        path = REPOSITORY_ROOT / "crates" / "cli" / "src" / "project" / "tests.rs"
+        rust = path.read_text(encoding="utf-8")
+        canonical = [little(value) for value in SMALL_ORDER.values()]
+        spelled = [P, P + 1, 2**255 - 1, 1 | SIGN_BIT, (P - 1) | SIGN_BIT]
+        keys = [RFC_KEY_1, RFC_KEY_2, NOT_ON_THE_CURVE, *canonical, *map(little, spelled)]
+        for key in keys:
+            with self.subTest(key=key.hex()):
+                self.assertIn(f'"{key.hex()}"', rust)
 
     def test_a_key_from_ssh_keygen_passes(self) -> None:
         """Strictness that refused a real key would be no use to anyone."""

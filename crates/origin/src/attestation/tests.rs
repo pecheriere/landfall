@@ -7,6 +7,7 @@ use super::{AttestationError, CertificateIdentity, Expected, verify_bundle};
 use crate::trust::TrustRoot;
 
 mod bundles;
+mod files;
 mod identity;
 
 const BUNDLE: &[u8] = include_bytes!("../../tests/fixtures/attestation/bundle.json");
