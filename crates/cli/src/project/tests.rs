@@ -261,6 +261,39 @@ fn wire_formats_that_are_not_an_ed25519_key_are_refused() {
     }
 }
 
+/// `ssh-key` reads a nested key's 32 bytes whatever its length said, so these parse there,
+/// and `release_preflight.py` refuses them. The review's comparison of the two found these.
+#[test]
+fn a_key_length_above_the_keys_is_refused() {
+    let key = bytes(RFC_KEY_1);
+    for length in [33, 34, 36, 40, 48, 96, 524_320, u32::MAX] {
+        let raw = wire(&key, b"ssh-ed25519", length);
+        let line = format!("ssh-ed25519 {}\n", STANDARD.encode(raw));
+        let error = parse_signers(&line).unwrap_err();
+        assert!(
+            matches!(error, ProjectError::Line { line: 1, .. }),
+            "{length}: {error:?}"
+        );
+    }
+}
+
+/// One key spelled two ways would be two lines of text and one signer.
+#[test]
+fn another_spelling_of_a_key_is_not_a_second_key() {
+    let raw = wire(&bytes(RFC_KEY_1), b"ssh-ed25519", 33);
+    let spelled = format!("ssh-ed25519 {}", STANDARD.encode(raw));
+    for text in [
+        format!("{}\n{spelled}\n", good()),
+        format!("{spelled}\n{}\n", good()),
+    ] {
+        assert_refused("the same key by another length", &text);
+    }
+    assert_eq!(
+        parse_signers(&format!("{}\n{}\n", good(), good())).unwrap_err(),
+        ProjectError::Repeated { line: 2 }
+    );
+}
+
 #[test]
 fn base64_with_anything_more_is_refused() {
     let encoded = encoded();
@@ -349,15 +382,16 @@ fn a_carriage_return_anywhere_is_refused() {
     }
 }
 
-/// The real file, so a mistyped key fails here and not on every host: it holds comments
-/// until the owner supplies a key, and good keys after.
+/// The real file, so a mistyped key fails here and not on every host, and a key commented
+/// out fails too. A fork with no key yet fails here until it has one, which is the point.
 #[test]
-fn embedded_signers_parse_or_are_empty() {
-    match signers() {
-        Ok(keys) => assert_ne!(keys.len(), 0),
-        Err(error) => assert_eq!(error, ProjectError::NoSigners),
-    }
-    assert!(!SIGNERS.contains('\r'));
+fn embedded_signers_parse_and_hold_a_key() {
+    let lines = SIGNERS
+        .split('\n')
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .count();
+    assert_ne!(lines, 0, "the file holds no key");
+    assert_eq!(signers().unwrap().len(), lines);
 }
 
 #[test]

@@ -26,7 +26,7 @@ pub const OWNER_ID: u64 = 1_872_741;
 pub const WORKFLOW: &str = ".github/workflows/release.yml";
 
 /// The keys that may sign a release tag, as `release_preflight.py` also reads them.
-pub const SIGNERS: &str = include_str!("../assets/release-signers");
+const SIGNERS: &str = include_str!("../assets/release-signers");
 
 /// The key type on every line of [`SIGNERS`].
 const KEY_TYPE: &str = "ssh-ed25519";
@@ -39,7 +39,7 @@ const KEY_FIELD_LENGTH: usize = 68;
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum ProjectError {
-    /// The file holds no key, as it does before the project's owner supplies one.
+    /// The file holds no key, which is where a fork starts.
     #[error(
         "this build of landfall trusts no release-signing key, so it can't verify an agent: \
          crates/cli/assets/release-signers holds no key. Use an official release of landfall, \
@@ -85,7 +85,7 @@ pub fn signers() -> Result<Vec<(PrincipalId, SignerKey)>, ProjectError> {
 ///
 /// A [`ProjectError`] saying which line and why, and [`ProjectError::NoSigners`] when
 /// there is no key.
-pub fn parse_signers(text: &str) -> Result<Vec<(PrincipalId, SignerKey)>, ProjectError> {
+fn parse_signers(text: &str) -> Result<Vec<(PrincipalId, SignerKey)>, ProjectError> {
     if text.contains('\r') {
         return Err(ProjectError::CarriageReturn);
     }
@@ -100,7 +100,7 @@ pub fn parse_signers(text: &str) -> Result<Vec<(PrincipalId, SignerKey)>, Projec
             line: number,
             reason,
         })?;
-        if !seen.insert(line) {
+        if !seen.insert(key.fingerprint()) {
             return Err(ProjectError::Repeated { line: number });
         }
         let name = format!("release-{}", keys.len() + 1);

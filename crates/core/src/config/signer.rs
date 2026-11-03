@@ -20,9 +20,10 @@ impl SignerKey {
     /// # Errors
     ///
     /// The reason it is refused, without the signer's name, which the caller adds:
-    /// not an `ssh-ed25519` key, or 32 bytes that are not a good key. `verify_tag`
-    /// verifies with plain `verify`, so for a key of small order anyone could forge a
-    /// tag: it, and another spelling of a point, must not load.
+    /// not an `ssh-ed25519` key, bytes that are not exactly what such a key encodes to, or
+    /// 32 bytes that are not a good key. `verify_tag` verifies with plain `verify`, so for
+    /// a key of small order anyone could forge a tag: it, and another spelling of a point
+    /// or of the key, must not load.
     pub fn parse(text: &str) -> Result<Self, String> {
         let key_type = text.split_whitespace().next().unwrap_or_default();
         if key_type != "ssh-ed25519" {
@@ -45,6 +46,16 @@ impl SignerKey {
         };
         key_fault(&ed25519.0).map_or(Ok(()), Err)?;
         key.set_comment("");
+        // The parser reads a nested key's 32 bytes and never checks that its length
+        // said 32, so what it read is checked against what that key encodes to.
+        let encoded = key
+            .to_openssh()
+            .map_err(|e| format!("cannot encode the key: {}", shown_in_config(&e.to_string())))?;
+        if encoded.split_whitespace().nth(1) != text.split_whitespace().nth(1) {
+            return Err(
+                "the key's bytes are not the one encoding of an ssh-ed25519 key".to_owned(),
+            );
+        }
         Ok(Self { key })
     }
 
@@ -60,10 +71,10 @@ impl SignerKey {
     }
 }
 
-/// What is wrong with 32 bytes as an Ed25519 public key, if anything, in the order
-/// `release_preflight.py`'s `key_fault` looks. Decompressing accepts a y beyond the
-/// field's prime and a sign on x = 0, each another spelling of a point, so only
-/// compressing it again shows those.
+/// What is wrong with 32 bytes as an Ed25519 public key, if anything: it refuses what
+/// `release_preflight.py`'s `key_fault` refuses, though one key may be told a different
+/// reason. Decompressing accepts a y beyond the field's prime and a sign on x = 0, each
+/// another spelling of a point, so only compressing it again shows those.
 fn key_fault(bytes: &[u8; 32]) -> Option<String> {
     let Ok(point) = VerifyingKey::from_bytes(bytes) else {
         return Some("the key is not a point on the curve".to_owned());

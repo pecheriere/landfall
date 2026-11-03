@@ -117,6 +117,9 @@ class SignerTests(unittest.TestCase):
         for name, raw in {
             "another type in the bytes": bad_type,
             "a key length that lies": bad_key_length,
+            "a key length of 33": wire(RFC_KEY_1, key_length=33),
+            "a key length of 36": wire(RFC_KEY_1, key_length=36),
+            "a key length of 524320": wire(RFC_KEY_1, key_length=524320),
             "too long": wire(RFC_KEY_1) + b"\0",
             "too short": wire(RFC_KEY_1)[:-1],
         }.items():

@@ -153,6 +153,27 @@ fn a_signer_key_not_on_the_curve_is_rejected() {
     assert!(err.contains("not a point"), "{err}");
 }
 
+/// The key parser reads the 32 bytes whatever their length field says, so another length
+/// is another spelling of a key, which a check of its own must refuse. Named, in a config.
+#[test]
+fn a_signer_key_with_another_length_is_rejected() {
+    let good = bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    for length in [33_u32, 36, 524_320] {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&11_u32.to_be_bytes());
+        wire.extend_from_slice(b"ssh-ed25519");
+        wire.extend_from_slice(&length.to_be_bytes());
+        wire.extend_from_slice(&good);
+        let line = format!("ssh-ed25519 {}", STANDARD.encode(wire));
+        let err = parse_str(&with_signer(&line)).unwrap_err();
+        let ConfigError::InvalidSigner { signer, reason } = &err else {
+            panic!("{length}: {err}");
+        };
+        assert_eq!(signer.to_string(), "maintainer", "{length}");
+        assert!(reason.contains("one encoding"), "{length}: {reason}");
+    }
+}
+
 #[test]
 fn a_good_signer_key_still_passes() {
     // RFC 8032's first test vector, so it is nobody's.
