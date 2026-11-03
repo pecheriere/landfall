@@ -9,22 +9,26 @@ use std::process::{Child, Command, Output, Stdio};
 
 use tempfile::TempDir;
 
-use super::shell::SYSTEM_PATH;
+use super::shell::{SYSTEM_PATH, quote};
 
 mod facts;
+mod guards;
 mod plan;
 mod script;
 mod shell;
 mod unit;
 
-/// What's mapped into the sandbox, wherever a script says it.
-const MAPPED: [&str; 4] = ["/usr/local/bin/", "/etc/", "/var/lib/", "/tmp"];
+/// What's mapped into the sandbox, wherever a script says it. With no trailing slash, as a
+/// script names a directory by itself too.
+const MAPPED: [&str; 4] = ["/usr/local/bin", "/etc", "/var/lib", "/tmp"];
+
+const STATE_DIR: &str = "/var/lib/landfall-agent";
 
 /// Stands for no value in the rows of `states`, which `set --` would otherwise lose.
 const NOTHING: &str = "-";
 
 pub(super) struct Sandbox {
-    _dir: TempDir,
+    dir: TempDir,
     root: PathBuf,
     stubs: PathBuf,
     env: Vec<(String, String)>,
@@ -33,7 +37,7 @@ pub(super) struct Sandbox {
 impl Sandbox {
     /// A sandbox whose unit is inactive and which has no agent's user yet.
     pub(super) fn new() -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = temp_dir();
         let root = dir.path().join("root");
         let stubs = dir.path().join("stubs");
         for path in [
@@ -50,7 +54,7 @@ impl Sandbox {
             root,
             stubs,
             env: Vec::new(),
-            _dir: dir,
+            dir,
         };
         sandbox.install_stubs();
         sandbox.set_states(&[("inactive", "", 0)]);
@@ -71,7 +75,8 @@ exec shasum -a 256 "$@""#,
         );
         self.stub(
             "runuser",
-            &format!("echo \"runuser $*\" >> {log}\nshift 3\nexec \"$@\""),
+            // With the umask a PAM session may well set, whatever the script's was.
+            &format!("echo \"runuser $*\" >> {log}\nshift 3\numask 022\nexec \"$@\""),
         );
         self.stub(
             "systemctl",
@@ -121,10 +126,12 @@ done
 if [ -n "$directory" ]; then mkdir -p "$target"; else : > "$target"; fi"#
             ),
         );
+        let home = self.path(STATE_DIR);
+        let home = home.display();
         self.stub(
             "useradd",
             &format!(
-                "echo \"useradd $*\" >> {log}\necho 999 > {ctl}/agent_uid\necho 'landfall-agent docker' > {ctl}/agent_groups"
+                "echo \"useradd $*\" >> {log}\necho 'landfall-agent:x:999:999::{home}:/usr/sbin/nologin' > {ctl}/passwd\necho 'landfall-agent docker' > {ctl}/agent_groups"
             ),
         );
         self.stub(
@@ -133,14 +140,48 @@ if [ -n "$directory" ]; then mkdir -p "$target"; else : > "$target"; fi"#
                 "echo \"usermod $*\" >> {log}\necho 'landfall-agent docker' > {ctl}/agent_groups"
             ),
         );
+        self.install_lookup_stubs();
+    }
+
+    /// The commands that only say what's there, answering for a host the tests make up.
+    fn install_lookup_stubs(&self) {
+        let log = self.path("/log");
+        let log = log.display();
+        let ctl = self.stubs.display();
         self.stub(
             "id",
             &format!(
                 r#"case "$1" in
-  -u) exec cat {ctl}/agent_uid 2>/dev/null ;;
   -nG) exec cat {ctl}/agent_groups ;;
+  *) echo 1000 ;;
 esac"#
             ),
+        );
+        self.stub(
+            "getent",
+            &format!(
+                r#"case "$1 ${{2:-}}" in
+  "passwd landfall-agent") grep '^landfall-agent:' {ctl}/passwd 2>/dev/null || exit 2 ;;
+  "passwd ") cat {ctl}/passwd 2>/dev/null ;;
+  *) exit 2 ;;
+esac"#
+            ),
+        );
+        // Files here can't belong to root, so all do but the one `set_owner` names. The mode is
+        // the file's own.
+        self.stub(
+            "stat",
+            &format!(
+                r#"for path in "$@"; do :; done
+owner=0:0
+if [ "$path" = "$(cat {ctl}/owned_path 2>/dev/null)" ]; then owner=$(cat {ctl}/owner); fi
+mode=$(/usr/bin/stat -c %a "$path" 2>/dev/null || /usr/bin/stat -f %Mp%Lp "$path") || exit
+echo "$owner:${{mode#0}}""#
+            ),
+        );
+        self.stub(
+            "timeout",
+            &format!("echo \"timeout $*\" >> {log}\nshift 3\nexec \"$@\""),
         );
     }
 
@@ -154,8 +195,15 @@ esac"#
         write_executable(&self.stubs.join(name), body);
     }
 
+    /// `shell` runs first whenever the stub `name` is called.
+    pub(super) fn before(&self, name: &str, shell: &str) {
+        let real = self.stubs.join(format!("{name}.real"));
+        fs::rename(self.stubs.join(name), &real).unwrap();
+        self.stub(name, &format!("{shell}\nexec {} \"$@\"", real.display()));
+    }
+
     /// The rows `systemctl` answers from: state, invocation id and restarts. A `sleep` moves
-    /// to the next, and the last holds.
+    /// to the next, and the last holds. This starts them again from the first.
     pub(super) fn set_states(&self, rows: &[(&str, &str, u32)]) {
         let text = rows
             .iter()
@@ -166,12 +214,29 @@ esac"#
             .collect::<Vec<_>>()
             .concat();
         fs::write(self.stubs.join("states"), text).unwrap();
+        fs::write(self.stubs.join("tick"), "0\n").unwrap();
     }
 
-    /// An agent's user that already exists.
+    /// An agent's user that already exists, and is as an install would have made it.
     pub(super) fn set_agent_user(&self, uid: u32, groups: &str) {
-        fs::write(self.stubs.join("agent_uid"), format!("{uid}\n")).unwrap();
+        let home = self.path(STATE_DIR);
+        self.set_passwd(&format!(
+            "landfall-agent:x:{uid}:{uid}::{}:/usr/sbin/nologin\n",
+            home.display()
+        ));
         fs::write(self.stubs.join("agent_groups"), format!("{groups}\n")).unwrap();
+    }
+
+    /// What `getent passwd` says.
+    pub(super) fn set_passwd(&self, text: &str) {
+        fs::write(self.stubs.join("passwd"), text).unwrap();
+    }
+
+    /// `owner` is what `stat` says of the file a script calls `absolute`, as `uid:gid`.
+    pub(super) fn set_owner(&self, absolute: &str, owner: &str) {
+        let path = self.path(absolute);
+        fs::write(self.stubs.join("owned_path"), path.display().to_string()).unwrap();
+        fs::write(self.stubs.join("owner"), owner).unwrap();
     }
 
     /// An environment variable for what runs.
@@ -179,9 +244,38 @@ esac"#
         self.env.push((name.to_owned(), value.to_owned()));
     }
 
-    /// `script` with every path it names in the sandbox, and its `PATH` the stubs'. One pass,
-    /// so that the sandbox's own path isn't mapped again wherever the temp directory is.
+    /// `script` with every path it names in the sandbox, and its `PATH` the stubs'. It must say
+    /// that `PATH`, or it would find the real commands, and what this returns names none of
+    /// [`MAPPED`] but in the sandbox.
     pub(super) fn text(&self, script: &str) -> String {
+        let system_path = format!("PATH={SYSTEM_PATH}");
+        let (before, after) = script
+            .split_once(&system_path)
+            .unwrap_or_else(|| panic!("a script that doesn't set {system_path}:\n{script}"));
+        let text = format!(
+            "{}PATH={}{}",
+            self.mapped(before),
+            quote(&self.path_var()),
+            self.mapped(after)
+        );
+
+        let root = self.root.display();
+        let outside = MAPPED
+            .iter()
+            .fold(text.clone(), |rest, dir| {
+                rest.replace(&format!("{root}{dir}"), "")
+            })
+            .replace(&self.dir.path().display().to_string(), "");
+        for dir in MAPPED {
+            let dir = dir.trim_end_matches('/');
+            assert!(!outside.contains(dir), "{dir} isn't mapped in:\n{text}");
+        }
+        text
+    }
+
+    /// One pass, so that the sandbox's own path isn't mapped again wherever the temp directory
+    /// is.
+    fn mapped(&self, script: &str) -> String {
         let root = self.root.display().to_string();
         let mut mapped = String::with_capacity(script.len());
         let mut rest = script;
@@ -195,10 +289,7 @@ esac"#
                 rest = &rest[next.len_utf8()..];
             }
         }
-        mapped.replace(
-            &format!("PATH={SYSTEM_PATH}"),
-            &format!("PATH={}", self.path_var()),
-        )
+        mapped
     }
 
     fn path_var(&self) -> String {
@@ -232,6 +323,21 @@ esac"#
     /// What the stubs were asked to do.
     pub(super) fn log(&self) -> String {
         fs::read_to_string(self.path("/log")).unwrap_or_default()
+    }
+}
+
+/// A temp directory whose path a script can say bare, as the mapped paths are. So not under a
+/// `TMPDIR` that needs quoting.
+fn temp_dir() -> TempDir {
+    let base = std::env::temp_dir();
+    let plain = base.to_str().is_some_and(|path| {
+        path.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    });
+    if plain {
+        TempDir::new().unwrap()
+    } else {
+        TempDir::new_in("/tmp").unwrap()
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::process::{Command, Output};
 
 use landfall_core::controller_url::ControllerUrl;
@@ -15,30 +16,30 @@ use crate::host::plan::{
 };
 
 pub(super) const UPLOAD: &str = "/tmp/landfall-install.0123456789abcdef";
-const AGENT_PATH: &str = "/usr/local/bin/landfall-agent";
-const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
-const UNIT_PATH: &str = "/etc/systemd/system/landfall-agent.service";
-const RECOVER_PATH: &str = "/etc/systemd/system/landfall-agent-recover@.service";
-const MARKER: &str = "/etc/landfall/.restart-pending";
+pub(super) const AGENT_PATH: &str = "/usr/local/bin/landfall-agent";
+pub(super) const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
+pub(super) const UNIT_PATH: &str = "/etc/systemd/system/landfall-agent.service";
+pub(super) const RECOVER_PATH: &str = "/etc/systemd/system/landfall-agent-recover@.service";
+pub(super) const MARKER: &str = "/etc/landfall/.restart-pending";
 pub(super) const CODE_PATH: &str = "/var/lib/landfall-agent/.enrol-code";
-const KEY_PATH: &str = "/var/lib/landfall-agent/agent.key";
+pub(super) const KEY_PATH: &str = "/var/lib/landfall-agent/agent.key";
 pub(super) const CODE: &str = "the-enrolment-code";
-const CONFIG: &str = "# the fleet\n";
-const UNIT: &str = "[Unit]\nDescription=it's a unit with $HOME in it\n";
-const RECOVER: &str = "[Unit]\nDescription=the recover unit\n";
+pub(super) const CONFIG: &str = "# the fleet\n";
+pub(super) const UNIT: &str = "[Unit]\nDescription=it's a unit with $HOME in it\n";
+pub(super) const RECOVER: &str = "[Unit]\nDescription=the recover unit\n";
 
 /// What the agent's file does when run: says it ran.
-const AGENT: &str = "#!/bin/sh\necho \"landfall-agent $*\" >> \"$AGENT_LOG\"\n";
+pub(super) const AGENT: &str = "#!/bin/sh\necho \"landfall-agent $*\" >> \"$AGENT_LOG\"\n";
 
-struct Fixture {
-    controller: ControllerUrl,
-    host: HostId,
-    sha256: String,
-    config_sha256: String,
+pub(super) struct Fixture {
+    pub(super) controller: ControllerUrl,
+    pub(super) host: HostId,
+    pub(super) sha256: String,
+    pub(super) config_sha256: String,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             controller: ControllerUrl::parse("https://controller.example", false).unwrap(),
             host: "home-1".parse().unwrap(),
@@ -49,7 +50,7 @@ impl Fixture {
 
     /// A request with a code, whose every field is here: no `..`, so that one holding a code
     /// could not be added without this file saying so.
-    fn request(&self) -> InstallRequest<'_> {
+    pub(super) fn request(&self) -> InstallRequest<'_> {
         InstallRequest {
             sha256: &self.sha256,
             version: "1.2.3",
@@ -71,7 +72,7 @@ impl Fixture {
         }
     }
 
-    fn without_code(&self) -> InstallRequest<'_> {
+    pub(super) fn without_code(&self) -> InstallRequest<'_> {
         InstallRequest {
             enrol: None,
             ..self.request()
@@ -80,18 +81,33 @@ impl Fixture {
 }
 
 /// A sandbox with the upload in place, and the agent's log as `AGENT_LOG`.
-fn sandbox() -> Sandbox {
+pub(super) fn sandbox() -> Sandbox {
     let mut sandbox = Sandbox::new();
-    fs::create_dir_all(sandbox.path(UPLOAD)).unwrap();
-    fs::write(sandbox.path(UPLOAD).join(UPLOAD_AGENT), AGENT).unwrap();
-    fs::write(sandbox.path(UPLOAD).join(UPLOAD_CONFIG), CONFIG).unwrap();
-    fs::write(sandbox.path(UPLOAD).join(UPLOAD_CODE), CODE).unwrap();
+    put_upload(&sandbox);
     let log = sandbox.path("/log").display().to_string();
     sandbox.set_env("AGENT_LOG", &log);
     sandbox
 }
 
-fn step<'a>(steps: &'a [Step], title: &str) -> &'a Step {
+/// The upload in place, as a script removes it when it ends.
+pub(super) fn put_upload(sandbox: &Sandbox) {
+    fs::create_dir_all(sandbox.path(UPLOAD)).unwrap();
+    fs::write(sandbox.path(UPLOAD).join(UPLOAD_AGENT), AGENT).unwrap();
+    fs::write(sandbox.path(UPLOAD).join(UPLOAD_CONFIG), CONFIG).unwrap();
+    fs::write(sandbox.path(UPLOAD).join(UPLOAD_CODE), CODE).unwrap();
+}
+
+/// A file a script finds installed, with exactly that mode, whatever the runner's umask.
+pub(super) fn place(sandbox: &Sandbox, path: &str, text: &str, mode: u32) {
+    set_file(&sandbox.path(path), text, mode);
+}
+
+fn set_file(path: &Path, text: &str, mode: u32) {
+    fs::write(path, text).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+pub(super) fn step<'a>(steps: &'a [Step], title: &str) -> &'a Step {
     steps
         .iter()
         .find(|step| step.title == title)
@@ -99,7 +115,7 @@ fn step<'a>(steps: &'a [Step], title: &str) -> &'a Step {
 }
 
 /// The script of `titles`, after preflight, which sets what the rest go by.
-fn script_of(request: &InstallRequest<'_>, titles: &[&str]) -> String {
+pub(super) fn script_of(request: &InstallRequest<'_>, titles: &[&str]) -> String {
     let steps = install_steps(request);
     let mut chosen = vec![step(&steps, "preflight").clone()];
     chosen.extend(titles.iter().map(|title| step(&steps, title).clone()));
@@ -116,7 +132,7 @@ pub(super) fn assert_status(output: &Output, code: i32) {
     );
 }
 
-fn read(sandbox: &Sandbox, path: &str) -> String {
+pub(super) fn read(sandbox: &Sandbox, path: &str) -> String {
     fs::read_to_string(sandbox.path(path)).unwrap()
 }
 
@@ -191,7 +207,7 @@ fn script_never_holds_the_code() {
     // It goes by path: read from the upload, and given to the agent by name.
     assert!(script.contains(CODE_PATH), "{script}");
     assert!(
-        script.contains(&format!("read_upload {UPLOAD_CODE} > {CODE_PATH}")),
+        script.contains(&format!("read_upload {UPLOAD_CODE} | ")),
         "{script}"
     );
     assert!(
@@ -229,7 +245,13 @@ fn a_code_for_a_running_agent_is_refused_in_the_script() {
     let fixture = Fixture::new();
     let steps = install_steps(&fixture.request());
     let preflight = render(&[step(&steps, "preflight").clone()]);
-    for state in ["active", "activating", "deactivating", "reloading"] {
+    for state in [
+        "active",
+        "activating",
+        "deactivating",
+        "reloading",
+        "unknown",
+    ] {
         let sandbox = sandbox();
         sandbox.set_states(&[(state, "running-id", 0)]);
         fs::write(sandbox.path(CODE_PATH), "an old code").unwrap();
@@ -247,6 +269,20 @@ fn a_code_for_a_running_agent_is_refused_in_the_script() {
     }
 }
 
+/// When `systemctl` can't say, the agent may be running.
+#[test]
+fn a_code_is_refused_when_the_units_state_cannot_be_read() {
+    let fixture = Fixture::new();
+    let steps = install_steps(&fixture.request());
+    let sandbox = sandbox();
+    sandbox.stub("systemctl", "exit 1");
+
+    let ran = sandbox.run(&render(&[step(&steps, "preflight").clone()]));
+
+    assert_status(&ran, 1);
+    assert!(stderr(&ran).contains("is unknown"), "{}", stderr(&ran));
+}
+
 #[test]
 fn no_code_and_no_key_is_refused() {
     let fixture = Fixture::new();
@@ -258,6 +294,7 @@ fn no_code_and_no_key_is_refused() {
     assert_status(&ran, 1);
     assert!(stderr(&ran).contains("--code-file"), "{}", stderr(&ran));
 
+    put_upload(&sandbox);
     fs::write(sandbox.path(KEY_PATH), "a key").unwrap();
     assert_status(&sandbox.run(&preflight), 0);
     assert_eq!(read(&sandbox, KEY_PATH), "a key");
@@ -267,7 +304,7 @@ fn no_code_and_no_key_is_refused() {
 fn a_differing_agent_is_refused_naming_upgrade() {
     let fixture = Fixture::new();
     let sandbox = sandbox();
-    fs::write(sandbox.path(AGENT_PATH), "another agent").unwrap();
+    place(&sandbox, AGENT_PATH, "another agent", 0o755);
 
     let ran = sandbox.run(&render(&install_steps(&fixture.request())));
 
@@ -286,7 +323,7 @@ fn a_differing_agent_is_refused_naming_upgrade() {
 fn differing_config_is_refused_before_any_change() {
     let fixture = Fixture::new();
     let sandbox = sandbox();
-    fs::write(sandbox.path(CONFIG_PATH), "# the host's own rules\n").unwrap();
+    place(&sandbox, CONFIG_PATH, "# the host's own rules\n", 0o644);
 
     let ran = sandbox.run(&render(&install_steps(&fixture.request())));
 
@@ -313,7 +350,12 @@ fn differing_units_are_refused_before_any_change() {
     for path in [UNIT_PATH, RECOVER_PATH] {
         let fixture = Fixture::new();
         let sandbox = sandbox();
-        fs::write(sandbox.path(path), "[Unit]\nDescription=the host's own\n").unwrap();
+        place(
+            &sandbox,
+            path,
+            "[Unit]\nDescription=the host's own\n",
+            0o644,
+        );
 
         let ran = sandbox.run(&render(&install_steps(&fixture.request())));
 
@@ -380,6 +422,11 @@ fn a_host_with_nothing_goes_through_every_step() {
         "{log}"
     );
     assert!(position("landfall-agent enrol") < position("systemctl enable --now"));
+    // It doesn't wait for a unit still stopping: `wait_healthy` says what became of it.
+    assert!(
+        log.contains("systemctl enable --now --no-block landfall-agent\n"),
+        "{log}"
+    );
 
     // Nothing is left of what it held on the way.
     assert!(!exists(&sandbox, CODE_PATH));
@@ -401,10 +448,10 @@ fn a_second_run_changes_nothing() {
     let sandbox = sandbox();
     sandbox.set_agent_user(999, "landfall-agent docker");
     sandbox.set_states(&[("active", "running", 0)]);
-    fs::write(sandbox.path(AGENT_PATH), AGENT).unwrap();
-    fs::write(sandbox.path(CONFIG_PATH), CONFIG).unwrap();
-    fs::write(sandbox.path(UNIT_PATH), UNIT).unwrap();
-    fs::write(sandbox.path(RECOVER_PATH), RECOVER).unwrap();
+    place(&sandbox, AGENT_PATH, AGENT, 0o755);
+    place(&sandbox, CONFIG_PATH, CONFIG, 0o644);
+    place(&sandbox, UNIT_PATH, UNIT, 0o644);
+    place(&sandbox, RECOVER_PATH, RECOVER, 0o644);
     fs::write(sandbox.path(KEY_PATH), "the key").unwrap();
     let modified = |path: &str| {
         fs::metadata(sandbox.path(path))
@@ -435,10 +482,10 @@ fn a_replacement_keeps_the_old_file_and_restarts() {
     let sandbox = sandbox();
     sandbox.set_agent_user(999, "landfall-agent docker");
     sandbox.set_states(&[("active", "old", 0), ("active", "new", 0)]);
-    fs::write(sandbox.path(AGENT_PATH), AGENT).unwrap();
-    fs::write(sandbox.path(CONFIG_PATH), "# old config\n").unwrap();
-    fs::write(sandbox.path(UNIT_PATH), "old unit\n").unwrap();
-    fs::write(sandbox.path(RECOVER_PATH), "old recover\n").unwrap();
+    place(&sandbox, AGENT_PATH, AGENT, 0o755);
+    place(&sandbox, CONFIG_PATH, "# old config\n", 0o644);
+    place(&sandbox, UNIT_PATH, "old unit\n", 0o644);
+    place(&sandbox, RECOVER_PATH, "old recover\n", 0o644);
     fs::write(sandbox.path(KEY_PATH), "the key").unwrap();
     let request = InstallRequest {
         replace_config: true,
@@ -468,6 +515,7 @@ fn a_replacement_keeps_the_old_file_and_restarts() {
         log.contains("systemctl restart --no-block landfall-agent"),
         "{log}"
     );
+    assert!(log.contains("systemctl daemon-reload"), "{log}");
     assert!(!exists(&sandbox, MARKER));
 }
 
@@ -477,7 +525,7 @@ fn an_interrupted_replacement_still_restarts() {
     let sandbox = sandbox();
     sandbox.set_agent_user(999, "landfall-agent docker");
     sandbox.set_states(&[("active", "old", 0), ("active", "new", 0)]);
-    fs::write(sandbox.path(CONFIG_PATH), CONFIG).unwrap();
+    place(&sandbox, CONFIG_PATH, CONFIG, 0o644);
     fs::write(sandbox.path(MARKER), "").unwrap();
     fs::write(sandbox.path(KEY_PATH), "the key").unwrap();
 
@@ -497,8 +545,8 @@ fn an_interrupted_replacement_still_restarts() {
 fn an_interrupted_unit_change_still_reloads() {
     let fixture = Fixture::new();
     let sandbox = sandbox();
-    fs::write(sandbox.path(UNIT_PATH), UNIT).unwrap();
-    fs::write(sandbox.path(RECOVER_PATH), RECOVER).unwrap();
+    place(&sandbox, UNIT_PATH, UNIT, 0o644);
+    place(&sandbox, RECOVER_PATH, RECOVER, 0o644);
     fs::write(sandbox.path(MARKER), "").unwrap();
 
     let ran = sandbox.run(&script_of(&fixture.request(), &["units"]));
@@ -640,6 +688,11 @@ fn a_failed_enrolment_leaves_no_code() {
     let fixture = Fixture::new();
     let sandbox = sandbox();
     super::write_executable(&sandbox.path(AGENT_PATH), "exit 3");
+    fs::copy(
+        sandbox.path(AGENT_PATH),
+        sandbox.path(UPLOAD).join(UPLOAD_AGENT),
+    )
+    .unwrap();
     let sha256 = hash(&fs::read(sandbox.path(AGENT_PATH)).unwrap());
     let request = InstallRequest {
         sha256: &sha256,

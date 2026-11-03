@@ -1,13 +1,14 @@
 //! Reading a probe's output, and what it refuses.
 
 use std::fmt::Write as _;
+use std::fs;
 
 use landfall_core::controller_url::ControllerUrl;
 
 use super::{Sandbox, stderr, stdout};
 use crate::agent_release::Arch;
 use crate::host::facts::{FactsError, HostFacts, Refusal, Warning, check, probe};
-use crate::host::shell::QUOTE_CHECK;
+use crate::host::shell::{QUOTE_CHECK, SYSTEM_PATH};
 
 const NOW: i64 = 1_800_000_000;
 
@@ -35,6 +36,7 @@ fn good() -> Vec<(String, String)> {
         ("has_sha256sum", "1"),
         ("has_runuser", "1"),
         ("has_diff", "1"),
+        ("has_timeout", "1"),
         ("docker_client", "24.0.7"),
         ("compose", "2.21.0"),
         ("docker_group", "1"),
@@ -84,8 +86,8 @@ fn a_fit_host_passes_with_no_warning() {
     assert_eq!(check(&facts, NOW, &DIRS, &https()), Ok(Vec::new()));
 }
 
-#[test]
-fn probe_output_parses() {
+/// A sandbox where a probe finds a host fit for an agent, but for what a test then changes.
+fn fit_sandbox() -> Sandbox {
     let sandbox = Sandbox::new();
     sandbox.stub(
         "uname",
@@ -93,34 +95,50 @@ fn probe_output_parses() {
     );
     sandbox.stub("id", "echo 1000");
     sandbox.stub("sudo", "exit 1");
-    sandbox.stub("date", "echo 1800000000");
+    sandbox.stub(
+        "date",
+        &format!(r#"if [ "$1" = +%s ]; then echo {NOW}; else echo 'Tue Nov  3'; fi"#),
+    );
     sandbox.stub(
         "docker",
         r#"if [ "$1" = --version ]; then echo 'Docker version 24.0.7, build afdd53b'; else echo v2.21.0; fi"#,
     );
     sandbox.stub(
         "systemctl",
-        r#"if [ "$1" = --version ]; then echo 'systemd 252 (252.22-1)'; echo '+PAM +AUDIT'; fi"#,
+        r#"case "$1 ${2:-}" in
+  "--version ") echo 'systemd 252 (252.22-1)'; echo '+PAM +AUDIT' ;;
+  "cat docker.service") ;;
+  *) exit 1 ;;
+esac"#,
     );
-    sandbox.stub("getent", "echo docker:x:999:");
-    std::fs::create_dir_all(sandbox.path("/etc/ssl/certs")).unwrap();
-    std::fs::write(sandbox.path("/etc/ssl/certs/ca-certificates.crt"), "").unwrap();
-    std::fs::create_dir_all(sandbox.path("/tmp/app")).unwrap();
-    std::fs::write(sandbox.path("/usr/local/bin/landfall-agent"), "").unwrap();
+    sandbox.stub("getent", r#"[ "$*" = "group docker" ]"#);
+    fs::create_dir_all(sandbox.path("/etc/ssl/certs")).unwrap();
+    fs::write(sandbox.path("/etc/ssl/certs/ca-certificates.crt"), "").unwrap();
+    sandbox
+}
+
+fn probed(sandbox: &Sandbox, dirs: &[&str]) -> HostFacts {
+    let ran = sandbox.run(&probe(dirs));
+    assert!(ran.status.success(), "{}", stderr(&ran));
+    HostFacts::parse(&stdout(&ran)).unwrap()
+}
+
+#[test]
+fn probe_output_parses() {
+    let sandbox = fit_sandbox();
+    fs::create_dir_all(sandbox.path("/tmp/app")).unwrap();
     super::write_executable(
         &sandbox.path("/usr/local/bin/landfall-agent"),
         "echo 'landfall-agent 1.2.3'",
     );
-    std::fs::write(
+    fs::write(
         sandbox.path("/etc/systemd/system/landfall-agent.service"),
         "",
     )
     .unwrap();
 
     let dirs = ["/tmp/app", "/tmp/it's gone"];
-    let ran = sandbox.run(&probe(&dirs));
-    assert!(ran.status.success(), "{}", stderr(&ran));
-    let facts = HostFacts::parse(&stdout(&ran)).unwrap();
+    let facts = probed(&sandbox, &dirs);
 
     assert_eq!(facts.arch(), Some(Arch::Arm64));
     assert!(!facts.is_root());
@@ -134,6 +152,132 @@ fn probe_output_parses() {
         check(&facts, NOW, &dirs, &https()),
         Err(vec![Refusal::MissingComposeDir(dirs[1].to_owned())])
     );
+}
+
+#[test]
+fn the_probe_sets_its_own_path() {
+    let text = probe(&DIRS);
+    assert!(text.starts_with(&format!("PATH={SYSTEM_PATH}\nexport PATH\n")));
+}
+
+#[test]
+fn what_could_hang_the_probe_has_a_time_limit() {
+    let sandbox = fit_sandbox();
+    super::write_executable(&sandbox.path("/usr/local/bin/landfall-agent"), "echo 1.2.3");
+
+    let facts = probed(&sandbox, &[]);
+
+    assert_eq!(check(&facts, NOW, &[], &https()), Ok(Vec::new()));
+    let log = sandbox.log();
+    for command in [
+        "docker --version".to_owned(),
+        "docker compose version --short".to_owned(),
+        format!(
+            "{} --version",
+            sandbox.path("/usr/local/bin/landfall-agent").display()
+        ),
+    ] {
+        assert!(
+            log.lines()
+                .any(|line| line == format!("timeout -k 5 10 {command}")),
+            "{command} in {log}"
+        );
+    }
+}
+
+/// It has nothing to go on for Docker then, and saying there's no Docker would be wrong.
+#[test]
+fn a_host_with_no_timeout_is_refused_for_that_alone() {
+    let mut rows = good();
+    for row in &mut rows {
+        match row.0.as_str() {
+            "has_timeout" => "0".clone_into(&mut row.1),
+            "docker_client" | "compose" => row.1.clear(),
+            _ => {}
+        }
+    }
+    let facts = HostFacts::parse(&output(&rows)).unwrap();
+    assert_eq!(refusals(&facts), vec![Refusal::MissingTool("timeout")]);
+}
+
+#[test]
+fn a_ca_bundle_counts_in_any_of_its_places() {
+    for path in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ] {
+        let sandbox = fit_sandbox();
+        fs::remove_file(sandbox.path("/etc/ssl/certs/ca-certificates.crt")).unwrap();
+        let file = sandbox.path(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "").unwrap();
+        let facts = probed(&sandbox, &[]);
+        assert_eq!(check(&facts, NOW, &[], &https()), Ok(Vec::new()), "{path}");
+    }
+    let sandbox = fit_sandbox();
+    fs::remove_file(sandbox.path("/etc/ssl/certs/ca-certificates.crt")).unwrap();
+    let facts = probed(&sandbox, &[]);
+    assert_eq!(
+        check(&facts, NOW, &[], &https()),
+        Err(vec![Refusal::NoCaBundle])
+    );
+}
+
+#[test]
+fn the_probe_asks_for_the_docker_group_and_service_by_name() {
+    // `fit_sandbox`'s stubs answer only those exact questions, so a fit result is the question.
+    let facts = probed(&fit_sandbox(), &[]);
+    assert_eq!(check(&facts, NOW, &[], &https()), Ok(Vec::new()));
+
+    let sandbox = fit_sandbox();
+    sandbox.stub("getent", "exit 2");
+    assert_eq!(
+        check(&probed(&sandbox, &[]), NOW, &[], &https()),
+        Err(vec![Refusal::NoDockerGroup])
+    );
+
+    let sandbox = fit_sandbox();
+    sandbox.stub(
+        "systemctl",
+        r#"if [ "$1" = --version ]; then echo 'systemd 252'; else exit 1; fi"#,
+    );
+    assert_eq!(
+        check(&probed(&sandbox, &[]), NOW, &[], &https()),
+        Err(vec![Refusal::NoDockerService])
+    );
+}
+
+#[test]
+fn the_probe_reads_the_clock_in_seconds() {
+    let sandbox = fit_sandbox();
+    sandbox.stub(
+        "date",
+        &format!(r#"if [ "$1" = +%s ]; then echo {}; fi"#, NOW + 600),
+    );
+    assert_eq!(
+        check(&probed(&sandbox, &[]), NOW, &[], &https()),
+        Ok(vec![Warning::ClockOff(600)])
+    );
+}
+
+#[test]
+fn a_file_is_not_a_compose_directory() {
+    let sandbox = fit_sandbox();
+    fs::write(sandbox.path("/tmp/app"), "").unwrap();
+    assert!(!probed(&sandbox, &["/tmp/app"]).dir_exists(0));
+}
+
+/// A second line would otherwise reach the parser, which refuses a line with no `=`.
+#[test]
+fn only_the_first_line_of_an_agents_version_is_read() {
+    let sandbox = fit_sandbox();
+    super::write_executable(
+        &sandbox.path("/usr/local/bin/landfall-agent"),
+        "echo 'landfall-agent 1.2.3'\necho 'built somewhere'",
+    );
+    let facts = probed(&sandbox, &[]);
+    assert_eq!(facts.agent_version(), Some("landfall-agent 1.2.3"));
 }
 
 #[test]
@@ -244,6 +388,7 @@ fn each_refusal_is_named() {
         ("has_sha256sum", "0", Refusal::MissingTool("sha256sum")),
         ("has_runuser", "0", Refusal::MissingTool("runuser")),
         ("has_diff", "0", Refusal::MissingTool("diff")),
+        ("has_timeout", "0", Refusal::MissingTool("timeout")),
         ("quote_check", "6162", Refusal::QuoteCheck),
         ("quote_check", "", Refusal::QuoteCheck),
         ("docker_client", "", Refusal::NoDocker),

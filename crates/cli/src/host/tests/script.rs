@@ -86,11 +86,21 @@ fn an_upload_older_than_an_hour_is_removed_and_a_recent_one_kept() {
     let sandbox = Sandbox::new();
     let old = sandbox.path("/tmp/landfall-install.old");
     let recent = sandbox.path("/tmp/landfall-install.recent");
-    let other = sandbox.path("/tmp/something-else");
-    for path in [&old, &recent, &other] {
+    // What must not be taken for an old upload, as this runs as root: other names like it, and
+    // the same name further down.
+    let others = [
+        "/tmp/something-else",
+        "/tmp/landfall-install",
+        "/tmp/landfall-installer.old",
+        "/tmp/landfall-old",
+        "/tmp/xlandfall-install.old",
+        "/tmp/deeper/landfall-install.old",
+    ]
+    .map(|path| sandbox.path(path));
+    for path in [&old, &recent].into_iter().chain(&others) {
         fs::create_dir_all(path).unwrap();
     }
-    for path in [&old, &other] {
+    for path in std::iter::once(&old).chain(&others) {
         let touched = Command::new("touch")
             .args(["-t", "202001010000"])
             .arg(path)
@@ -103,7 +113,9 @@ fn an_upload_older_than_an_hour_is_removed_and_a_recent_one_kept() {
 
     assert!(!old.exists());
     assert!(recent.exists());
-    assert!(other.exists());
+    for path in &others {
+        assert!(path.exists(), "{}", path.display());
+    }
 }
 
 fn wait_for(path: &std::path::Path) {
@@ -114,9 +126,27 @@ fn wait_for(path: &std::path::Path) {
     }
 }
 
+/// Whether a shell started from here can trap `signal`. It can't if this process was itself
+/// started with it ignored, as `nohup` does with `HUP` and a non-interactive shell's `&` does with
+/// `INT`: POSIX has a shell keep that, whatever it says. The shell signals only itself.
+fn can_be_trapped(signal: &str) -> bool {
+    let ran = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("trap 'exit 3' {signal}\nkill -{signal} $$\nexit 0"))
+        .output()
+        .unwrap();
+    ran.status.code() == Some(3)
+}
+
 #[test]
 fn a_signal_stops_the_script_and_cleans_up() {
-    for signal in ["TERM", "HUP", "INT"] {
+    // A runner can pass on an ignored `HUP` or `INT`. One ignoring `TERM` too leaves nothing here
+    // to run, so that's a failure rather than a pass that shows nothing.
+    assert!(can_be_trapped("TERM"), "this runner ignores SIGTERM");
+    let trappable = ["TERM", "HUP", "INT"]
+        .into_iter()
+        .filter(|signal| can_be_trapped(signal));
+    for signal in trappable {
         let sandbox = Sandbox::new();
         for path in [UPLOAD, "/var/lib/landfall-agent"] {
             fs::create_dir_all(sandbox.path(path)).unwrap();
@@ -129,6 +159,8 @@ fn a_signal_stops_the_script_and_cleans_up() {
             "/etc/systemd/system/.landfall-agent.service.new",
             "/etc/systemd/system/.landfall-agent-recover@.service.new",
             "/etc/landfall/fleet.toml.previous.new",
+            "/etc/systemd/system/landfall-agent.service.previous.new",
+            "/etc/systemd/system/landfall-agent-recover@.service.previous.new",
         ];
         for path in leftovers {
             fs::write(sandbox.path(path), "").unwrap();
@@ -225,6 +257,19 @@ fn health_check_branches() {
         stdout(&ran)
     );
     assert!(!sandbox.log().contains("journalctl"), "{}", sandbox.log());
+
+    // Another id by the end of the window: it hasn't held still, and then doesn't come up.
+    let (_, ran) = health(&[
+        ("active", "new", 0),
+        ("active", "newer", 0),
+        ("failed", "newer", 0),
+    ]);
+    assert_status(&ran, 1);
+
+    // The same id with more restarts by the end of the window.
+    let (sandbox, ran) = health(&[("active", "new", 0), ("active", "new", 1)]);
+    assert_status(&ran, 1);
+    assert!(sandbox.log().contains("journalctl"), "{}", sandbox.log());
 
     // Stopping for a while, then up on a new id.
     let (_, ran) = health(&[("deactivating", "old", 0), ("active", "new", 0)]);

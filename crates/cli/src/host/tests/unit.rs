@@ -7,15 +7,18 @@ use crate::host::unit::{UnitError, UnitInput, agent_unit, check_path, recover_un
 
 const GUIDE: &str = include_str!("../../../../../docs/operations.md");
 
-/// The directives of the `ini` block after `marker` in the guide.
-fn guide_directives(marker: &str) -> Vec<&'static str> {
+const ENVIRONMENT_FILE: &str = "EnvironmentFile=-/etc/landfall/agent.env";
+
+/// The lines of the `ini` block after `marker` in the guide, but its comments.
+fn guide_lines(marker: &str) -> Vec<&'static str> {
     let (_, after) = GUIDE.split_once(marker).unwrap();
     let (_, block) = after.split_once("```ini\n").unwrap();
     let (block, _) = block.split_once("```").unwrap();
-    block
-        .lines()
-        .filter(|line| line.contains('=') && !line.starts_with('#'))
-        .collect()
+    without_comments(block)
+}
+
+fn without_comments(text: &str) -> Vec<&str> {
+    text.lines().filter(|line| !line.starts_with('#')).collect()
 }
 
 fn controller() -> ControllerUrl {
@@ -40,34 +43,38 @@ fn has_line(unit: &str, line: &str) -> bool {
     unit.lines().any(|candidate| candidate == line)
 }
 
+/// Line for line, so that nothing can be added to undo the guide's hardening, or moved to where
+/// systemd ignores it. The one line the guide doesn't have is the agent's environment file.
 #[test]
 fn unit_matches_the_operations_guide() {
     let unit = rendered(false, &["/srv/compose/app"]);
-    let directives = guide_directives("`/etc/systemd/system/landfall-agent.service`");
-    assert!(directives.len() > 15, "{directives:?}");
-    for directive in directives {
-        assert!(has_line(&unit, directive), "{directive}\n{unit}");
-    }
-    for section in ["[Unit]", "[Service]", "[Install]"] {
-        assert!(has_line(&unit, section), "{section}\n{unit}");
-    }
+    let mut lines = without_comments(&unit);
+    let extra = lines
+        .iter()
+        .position(|line| *line == ENVIRONMENT_FILE)
+        .unwrap();
+    assert_eq!(lines[extra - 1], "SupplementaryGroups=docker", "{unit}");
+    lines.remove(extra);
+    assert_eq!(
+        lines,
+        guide_lines("`/etc/systemd/system/landfall-agent.service`")
+    );
 }
 
 #[test]
 fn recover_unit_matches_the_operations_guide() {
     let unit = recover_unit(&["/srv/compose/app"]);
-    let directives = guide_directives("`/etc/systemd/system/landfall-agent-recover@.service`");
-    assert!(directives.len() > 10, "{directives:?}");
-    for directive in directives {
-        assert!(has_line(&unit, directive), "{directive}\n{unit}");
-    }
+    assert_eq!(
+        without_comments(&unit),
+        guide_lines("`/etc/systemd/system/landfall-agent-recover@.service`")
+    );
 }
 
 #[test]
 fn the_agent_reads_its_optional_environment_file() {
     assert!(has_line(
         &rendered(false, &["/srv/compose/app"]),
-        "EnvironmentFile=-/etc/landfall/agent.env"
+        ENVIRONMENT_FILE
     ));
 }
 

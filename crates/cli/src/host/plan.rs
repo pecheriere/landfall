@@ -27,6 +27,7 @@ pub(super) const AGENT_PATH: &str = "/usr/local/bin/landfall-agent";
 /// Where the agent's unit is installed.
 pub(super) const UNIT_PATH: &str = "/etc/systemd/system/landfall-agent.service";
 
+const AGENT_DIR: &str = "/usr/local/bin";
 const AGENT_NEW: &str = "/usr/local/bin/.landfall-agent.new";
 const CONFIG_DIR: &str = "/etc/landfall";
 const CONFIG_PATH: &str = "/etc/landfall/fleet.toml";
@@ -42,6 +43,15 @@ const MARKER: &str = "/etc/landfall/.restart-pending";
 const STATE_DIR: &str = "/var/lib/landfall-agent";
 const CODE_PATH: &str = "/var/lib/landfall-agent/.enrol-code";
 const KEY_PATH: &str = "/var/lib/landfall-agent/agent.key";
+
+/// What an installed agent's mode is, as `stat` says it.
+const AGENT_MODE: &str = "755";
+
+/// What an installed configuration's or unit's mode is, as `stat` says it.
+const FILE_MODE: &str = "644";
+
+const TAMPERED_AGENT: &str = "the uploaded agent doesn't have the verified SHA-256";
+const TAMPERED_CONFIG: &str = "the uploaded configuration doesn't have the SHA-256 this was given";
 
 /// How long a started agent is watched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +143,8 @@ pub fn install_steps(request: &InstallRequest<'_>) -> Vec<Step> {
     steps
 }
 
-/// All of it before any change, but for removing an enrolment code left by a killed run.
+/// All of it before any change, but for removing an enrolment code left by a killed run, and
+/// that only once the directory it is in is known to be the one it should be.
 fn preflight(request: &InstallRequest<'_>) -> String {
     let upload = quote(request.upload);
     let Timing {
@@ -142,12 +153,18 @@ fn preflight(request: &InstallRequest<'_>) -> String {
     } = request.timing;
     let agent_unit = quote(request.unit);
     let recover_unit = quote(request.recover_unit);
+    let state_refusal = quote(&format!(
+        "{STATE_DIR} is a link, or isn't a directory: the agent's state belongs in a directory of its own there"
+    ));
     let mut shell = format!(
         "upload={upload}
 stable_secs={stable_secs}
 give_up_secs={give_up_secs}
 agent_unit={agent_unit}
 recover_unit={recover_unit}
+if [ -L {STATE_DIR} ] || {{ [ -e {STATE_DIR} ] && [ ! -d {STATE_DIR} ]; }}; then
+  refuse {state_refusal}
+fi
 rm -f {CODE_PATH}
 "
     );
@@ -169,19 +186,29 @@ esac
     }
 
     let sha256 = quote(request.sha256);
+    let config_sha256 = quote(request.config_sha256);
+    let tampered_agent = quote(TAMPERED_AGENT);
+    let tampered_config = quote(TAMPERED_CONFIG);
+    let _ = writeln!(
+        shell,
+        "upload_is {UPLOAD_AGENT} {sha256} || refuse {tampered_agent}\n\
+         upload_is {UPLOAD_CONFIG} {config_sha256} || refuse {tampered_config}"
+    );
+
     let refusal = quote(&format!(
         "another landfall-agent is installed, and this would install {}: use landfall host upgrade",
         request.version
     ));
     let _ = writeln!(
         shell,
-        "if [ -e {AGENT_PATH} ] && ! file_is {AGENT_PATH} {sha256}; then\n  refuse {refusal}\nfi"
+        "check_installed {AGENT_PATH} {AGENT_MODE}\n\
+         if [ -e {AGENT_PATH} ] && ! file_is {AGENT_PATH} {sha256}; then\n  refuse {refusal}\nfi"
     );
 
-    let config_sha256 = quote(request.config_sha256);
     let _ = writeln!(
         shell,
-        "if [ -e {CONFIG_PATH} ] && ! file_is {CONFIG_PATH} {config_sha256}; then\n  read_upload {UPLOAD_CONFIG} | diff -u {CONFIG_PATH} - || true"
+        "check_installed {CONFIG_PATH} {FILE_MODE}\n\
+         if [ -e {CONFIG_PATH} ] && ! file_is {CONFIG_PATH} {config_sha256}; then\n  read_upload {UPLOAD_CONFIG} | diff -u {CONFIG_PATH} - || true"
     );
     if !request.replace_config {
         let refusal = quote(&format!(
@@ -194,7 +221,8 @@ esac
     for (path, text) in [(UNIT_PATH, "$agent_unit"), (RECOVER_PATH, "$recover_unit")] {
         let _ = writeln!(
             shell,
-            "if [ -e {path} ] && ! text_is {path} \"{text}\"; then\n  printf '%s' \"{text}\" | diff -u {path} - || true"
+            "check_installed {path} {FILE_MODE}\n\
+             if [ -e {path} ] && ! text_is {path} \"{text}\"; then\n  printf '%s' \"{text}\" | diff -u {path} - || true"
         );
         if !request.replace_unit {
             let refusal = quote(&format!(
@@ -207,14 +235,38 @@ esac
     shell
 }
 
+/// A user that exists already must be one an install could have made: the guide's, with a uid
+/// of its own, as anything sharing it could read or signal the agent.
 fn user() -> String {
     let root_refusal = quote(
         "the landfall-agent user has uid 0, and the agent's uid must be its own: see the guide's Running it under systemd",
     );
+    let home_refusal = quote(&format!(
+        "the landfall-agent user's home isn't {STATE_DIR}, where the unit's sandbox expects it: see the guide's Running it under systemd"
+    ));
+    let shell_refusal = quote(
+        "the landfall-agent user has a login shell, and it should have none: see the guide's Running it under systemd",
+    );
+    let shared_refusal = quote(
+        "the landfall-agent user's uid is shared with another user, and the agent's uid must be its own: see the guide's Running it under systemd",
+    );
     format!(
-        r#"if agent_uid=$(id -u landfall-agent 2>/dev/null); then
+        r#"if agent_entry=$(getent passwd landfall-agent); then
+  agent_uid=$(printf '%s\n' "$agent_entry" | cut -d: -f3)
+  agent_home=$(printf '%s\n' "$agent_entry" | cut -d: -f6)
+  agent_shell=$(printf '%s\n' "$agent_entry" | cut -d: -f7)
   if [ "$agent_uid" = 0 ]; then
     refuse {root_refusal}
+  fi
+  if [ "$agent_home" != {STATE_DIR} ]; then
+    refuse {home_refusal}
+  fi
+  case "$agent_shell" in
+    /usr/sbin/nologin|/sbin/nologin|/usr/bin/nologin|/bin/false|/usr/bin/false) ;;
+    *) refuse {shell_refusal} ;;
+  esac
+  if [ "$(getent passwd | cut -d: -f3 | grep -cx "$agent_uid")" -gt 1 ]; then
+    refuse {shared_refusal}
   fi
   case " $(id -nG landfall-agent) " in
     *" docker "*) ;;
@@ -236,10 +288,10 @@ fn state() -> String {
 
 fn config(request: &InstallRequest<'_>) -> String {
     let sha256 = quote(request.config_sha256);
-    let refusal = quote("the uploaded configuration doesn't have the SHA-256 this was given");
+    let refusal = quote(TAMPERED_CONFIG);
     format!(
         "if ! file_is {CONFIG_PATH} {sha256}; then
-  install -d -o root -g root -m 0755 {CONFIG_DIR}
+  [ -d {CONFIG_DIR} ] || install -d -o root -g root -m 0755 {CONFIG_DIR}
   rm -f {CONFIG_NEW}
   read_upload {UPLOAD_CONFIG} > {CONFIG_NEW}
   file_is {CONFIG_NEW} {sha256} || refuse {refusal}
@@ -256,12 +308,13 @@ fi
 /// It stays private to root until root has compared its hash with the verified one.
 fn binary(request: &InstallRequest<'_>) -> String {
     let sha256 = quote(request.sha256);
-    let refusal = quote("the uploaded agent doesn't have the verified SHA-256");
+    let refusal = quote(TAMPERED_AGENT);
     format!(
         "if ! file_is {AGENT_PATH} {sha256}; then
-  install -d -o root -g root -m 0755 /usr/local/bin
+  [ -d {AGENT_DIR} ] || install -d -o root -g root -m 0755 {AGENT_DIR}
   rm -f {AGENT_NEW}
   : > {AGENT_NEW}
+  chown root:root {AGENT_NEW}
   chmod 0700 {AGENT_NEW}
   read_upload {UPLOAD_AGENT} > {AGENT_NEW}
   file_is {AGENT_NEW} {sha256} || refuse {refusal}
@@ -282,28 +335,27 @@ fn docker() -> String {
     )
 }
 
-/// The marker holds a rerun to the reload as well: with the files in place and the reload not
-/// done, nothing else would say one is due.
+/// The reload goes by the marker, which every change here sets. That also holds a rerun to the
+/// reload: with the files in place and the reload not done, nothing else would say one is due.
 fn units() -> String {
     format!(
-        r#"units_changed=
-if ! text_is {UNIT_PATH} "$agent_unit"; then
+        r#"if ! text_is {UNIT_PATH} "$agent_unit"; then
   mark_restart
   put_text {UNIT_PATH} {UNIT_NEW} "$agent_unit"
-  units_changed=1
 fi
 if ! text_is {RECOVER_PATH} "$recover_unit"; then
   mark_restart
   put_text {RECOVER_PATH} {RECOVER_NEW} "$recover_unit"
-  units_changed=1
 fi
-if [ -n "$units_changed" ] || [ -e {MARKER} ]; then
+if [ -e {MARKER} ]; then
   systemctl daemon-reload
 fi
 "#
     )
 }
 
+/// The agent's user writes the code, so a link planted in its directory gets it nothing it
+/// doesn't have already.
 fn enrol(target: &EnrolTarget<'_>) -> String {
     let controller = quote(target.controller.as_str());
     let host = quote(target.host.as_ref());
@@ -312,10 +364,11 @@ fn enrol(target: &EnrolTarget<'_>) -> String {
     } else {
         ""
     };
+    let refusal = quote("the uploaded enrolment code couldn't be read, or is empty");
     format!(
         "rm -f {CODE_PATH}
-install -o landfall-agent -g landfall-agent -m 0600 /dev/null {CODE_PATH}
-read_upload {UPLOAD_CODE} > {CODE_PATH}
+read_upload {UPLOAD_CODE} | runuser -u landfall-agent -- sh -c 'umask 077 && cat > \"$1\"' sh {CODE_PATH}
+[ -s {CODE_PATH} ] || refuse {refusal}
 runuser -u landfall-agent -- {AGENT_PATH} enrol --controller {controller} --host {host} --code-file {CODE_PATH}{insecure}
 rm -f {CODE_PATH}
 "
@@ -323,7 +376,8 @@ rm -f {CODE_PATH}
 }
 
 /// `--no-block` throughout, as a stop waits for a deploy in flight, for up to three hours, and
-/// [`WAIT_HEALTHY`] says what became of it.
+/// [`WAIT_HEALTHY`] says what became of it. The marker goes once the unit has been seen healthy,
+/// so an agent still stopping keeps it, and the next run looks at what replaced it.
 fn start() -> String {
     format!(
         r#"previous_id=$(unit_show InvocationID)
@@ -331,12 +385,12 @@ if systemctl is-active --quiet landfall-agent; then
   if [ -e {MARKER} ]; then
     systemctl restart --no-block landfall-agent
     wait_healthy "$previous_id"
-    rm -f {MARKER}
+    [ -n "$health_unseen" ] || rm -f {MARKER}
   fi
 else
   systemctl enable --now --no-block landfall-agent
   wait_healthy "$previous_id"
-  rm -f {MARKER}
+  [ -n "$health_unseen" ] || rm -f {MARKER}
 fi
 "#
     )
@@ -344,15 +398,17 @@ fi
 
 /// `wait_healthy <the invocation id before the start>`. The unit has `Restart=always`, so a
 /// broken agent never reads `failed`: it cycles. So healthy is a new id, active, with the same
-/// id and restart count `stable_secs` later. Reads `stable_secs` and `give_up_secs`.
+/// id and restart count `stable_secs` later. Reads `stable_secs` and `give_up_secs`, and sets
+/// `health_unseen` when it passes only because a deploy is finishing.
 const WAIT_HEALTHY: &str = r#"unit_show() {
   systemctl show -p "$1" --value landfall-agent 2>/dev/null || echo unknown
 }
 health_failed() {
-  echo "landfall: landfall-agent isn't healthy: $1" >&2
+  printf "landfall: landfall-agent isn't healthy: %s\n" "$1" >&2
   journalctl -u landfall-agent -n 20 --no-pager >&2 || true
 }
 wait_healthy() {
+  health_unseen=
   waited=0
   first_restarts=
   while :; do
@@ -375,7 +431,8 @@ wait_healthy() {
     fi
     if [ "$waited" -ge "$give_up_secs" ]; then
       if [ "$now_state" = deactivating ]; then
-        echo "landfall: landfall-agent is still stopping after $waited s: a deploy is finishing. What it ran with stays in force until that deploy ends, and then the unit starts by itself"
+        echo "landfall: landfall-agent is still stopping after $waited s: a deploy is finishing. What it ran with stays in force until that deploy ends, and then the unit starts by itself. Run this again after that, to see it healthy"
+        health_unseen=1
         return 0
       fi
       health_failed "it is $now_state after $waited s"
@@ -394,7 +451,7 @@ wait_healthy() {
 /// in hand ends, as a shell does.
 #[must_use]
 pub fn render(steps: &[Step]) -> String {
-    let leftovers = [AGENT_NEW, CONFIG_NEW, UNIT_NEW, RECOVER_NEW, CODE_PATH].join(" ");
+    let leftovers = [AGENT_NEW, CONFIG_NEW, UNIT_NEW, RECOVER_NEW].join(" ");
     let previous_news = [CONFIG_PATH, UNIT_PATH, RECOVER_PATH]
         .map(|path| format!("{path}.previous.new"))
         .join(" ");
@@ -405,7 +462,7 @@ PATH={SYSTEM_PATH}
 export PATH
 cd /
 refuse() {{
-  echo "landfall: refused: $1" >&2
+  printf 'landfall: refused: %s\n' "$1" >&2
   exit 1
 }}
 read_upload() {{
@@ -420,11 +477,25 @@ file_is() {{
   file_sum=$(sha256sum < "$1") || return 1
   [ "${{file_sum%% *}}" = "$2" ]
 }}
+upload_is() {{
+  upload_sum=$(read_upload "$1" | sha256sum) || return 1
+  [ "${{upload_sum%% *}}" = "$2" ]
+}}
+check_installed() {{
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  if [ -L "$1" ] || [ ! -f "$1" ]; then
+    refuse "$1 isn't a regular file, and this writes it as one: look at what it is, and remove it to have it written again"
+  fi
+  installed_as=$(stat -c %u:%g:%a -- "$1") || refuse "$1 couldn't be looked at"
+  if [ "$installed_as" != "0:0:$2" ]; then
+    refuse "$1 has owner, group and mode $installed_as, and root trusts what it says: make it 0:0:$2, or remove it to have it written again"
+  fi
+}}
 text_is() {{
   printf '%s' "$2" | diff -q "$1" - > /dev/null 2>&1
 }}
 mark_restart() {{
-  install -d -o root -g root -m 0755 {CONFIG_DIR}
+  [ -d {CONFIG_DIR} ] || install -d -o root -g root -m 0755 {CONFIG_DIR}
   : > {MARKER}
 }}
 keep_previous() {{
@@ -445,6 +516,7 @@ put_text() {{
   trap '' HUP INT TERM PIPE
   set +e
   rm -f -- {leftovers} {previous_news}
+  [ -L {STATE_DIR} ] || rm -f -- {CODE_PATH}
   if [ -n "${{upload:-}}" ]; then
     rm -rf -- "$upload"
   fi

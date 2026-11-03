@@ -51,6 +51,11 @@ fn a_remote_command_runs_its_script_as_written() {
 }
 
 #[test]
+fn a_remote_command_replaces_the_login_shell() {
+    assert_eq!(remote_command("echo 'a'"), r"exec sh -c 'echo '\''a'\'''");
+}
+
+#[test]
 fn the_quoting_check_holds_what_other_shells_read_differently() {
     for part in ["'", "\\", "\\\\", "\n"] {
         assert!(QUOTE_CHECK.contains(part), "{part:?}");

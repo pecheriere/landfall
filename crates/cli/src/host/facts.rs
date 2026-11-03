@@ -29,8 +29,12 @@ const CA_BUNDLES: [&str; 3] = [
     "/etc/ssl/cert.pem",
 ];
 
+/// What holds a command the probe can't vouch for to a time limit, so that a hung one can't hang
+/// the probe: 10 s, then a kill 5 s later if it ignored that.
+const BOUNDED: &str = "timeout -k 5 10";
+
 /// The keys a probe prints, other than `dir_exists:<n>`.
-const KEYS: [&str; 20] = [
+const KEYS: [&str; 21] = [
     "os",
     "machine",
     "kernel",
@@ -41,6 +45,7 @@ const KEYS: [&str; 20] = [
     "has_sha256sum",
     "has_runuser",
     "has_diff",
+    "has_timeout",
     "docker_client",
     "compose",
     "docker_group",
@@ -305,14 +310,15 @@ fact systemd_version "$(systemctl --version 2>/dev/null | sed -n '1s/^systemd \(
 fact has_sha256sum "$(has sha256sum)"
 fact has_runuser "$(has runuser)"
 fact has_diff "$(has diff)"
-fact docker_client "$(docker --version 2>/dev/null | sed -n '1s/^Docker version \([0-9][^, ]*\).*/\1/p')"
-fact compose "$(docker compose version --short 2>/dev/null | sed -n '1p')"
+fact has_timeout "$(has timeout)"
+fact docker_client "$({BOUNDED} docker --version 2>/dev/null | sed -n '1s/^Docker version \([0-9][^, ]*\).*/\1/p')"
+fact compose "$({BOUNDED} docker compose version --short 2>/dev/null | sed -n '1p')"
 fact docker_group "$(yes_if getent group docker)"
 fact docker_service "$(yes_if systemctl cat docker.service)"
 if {ca_test}; then fact ca_bundle 1; else fact ca_bundle 0; fi
 fact clock "$(date +%s 2>/dev/null)"
 if [ -x {AGENT_PATH} ]; then
-  fact agent_version "$({AGENT_PATH} --version 2>/dev/null | sed -n '1p')"
+  fact agent_version "$({BOUNDED} {AGENT_PATH} --version 2>/dev/null | sed -n '1p')"
   fact agent_sha256 "$(sha256sum < {AGENT_PATH} 2>/dev/null | sed 's/ .*//')"
 else
   fact agent_version ''
@@ -365,6 +371,7 @@ pub fn check(
         ("has_sha256sum", "sha256sum"),
         ("has_runuser", "runuser"),
         ("has_diff", "diff"),
+        ("has_timeout", "timeout"),
     ] {
         if !facts.yes(key) {
             refusals.push(Refusal::MissingTool(tool));
@@ -373,17 +380,20 @@ pub fn check(
     if facts.value("quote_check") != quote_check_hex() {
         refusals.push(Refusal::QuoteCheck);
     }
-    match facts.value("docker_client") {
-        "" => refusals.push(Refusal::NoDocker),
-        client if !pair_at_least(client, MIN_DOCKER) => {
-            refusals.push(Refusal::OldDocker(client.to_owned()));
+    // With no `timeout` these were never asked, and it is refused for that.
+    if facts.yes("has_timeout") {
+        match facts.value("docker_client") {
+            "" => refusals.push(Refusal::NoDocker),
+            client if !pair_at_least(client, MIN_DOCKER) => {
+                refusals.push(Refusal::OldDocker(client.to_owned()));
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    let compose = facts.value("compose");
-    let compose_major = leading_number(compose.strip_prefix('v').unwrap_or(compose));
-    if compose_major.is_none_or(|major| major < MIN_COMPOSE_MAJOR) {
-        refusals.push(Refusal::NoCompose(compose.to_owned()));
+        let compose = facts.value("compose");
+        let compose_major = leading_number(compose.strip_prefix('v').unwrap_or(compose));
+        if compose_major.is_none_or(|major| major < MIN_COMPOSE_MAJOR) {
+            refusals.push(Refusal::NoCompose(compose.to_owned()));
+        }
     }
     if !facts.yes("docker_group") {
         refusals.push(Refusal::NoDockerGroup);
