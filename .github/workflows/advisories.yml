@@ -46,9 +46,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Build without the token, so only the test run itself sees it.
-      - run: cargo test -p landfall-origin -p landfall-agent -p landfall-server --locked --no-run
+      - run: cargo test -p landfall-origin -p landfall-agent -p landfall-server -p landfall-cli --locked --no-run
       # By name: the agent's other ignored tests need Docker or root, and ci.yml
       # runs those. Every test here is named `live_`, and no other has that in its name.
-      - run: cargo test -p landfall-origin -p landfall-agent -p landfall-server --locked --no-fail-fast -- --ignored live_
+      - run: cargo test -p landfall-origin -p landfall-agent -p landfall-server -p landfall-cli --locked --no-fail-fast -- --ignored live_
         env:
           GITHUB_TOKEN: ${{ github.token }}

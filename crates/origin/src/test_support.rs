@@ -1,12 +1,15 @@
 //! Mock GitHub API and registry responses shared by the fetcher and release
 //! tests, shaped like what GitHub and GHCR serve.
 
+use landfall_core::config::SignerKey;
 use landfall_core::ids::ImageDigest;
 use reqwest::Url;
 use serde_json::json;
 use sha1_checked::Digest as _;
 use sha1_checked::Sha1;
 use sha2::{Digest, Sha256};
+use ssh_key::private::Ed25519Keypair;
+use ssh_key::{HashAlg, LineEnding, PrivateKey};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -44,6 +47,50 @@ pub(crate) fn payload_and_signature(raw: &[u8]) -> (String, String) {
     let text = std::str::from_utf8(raw).unwrap();
     let at = text.find("-----BEGIN SSH SIGNATURE-----").unwrap();
     (text[..at].to_owned(), text[at..].to_owned())
+}
+
+/// A throwaway tag-signing key, from `seed`.
+pub(crate) struct TestSigner(PrivateKey);
+
+impl TestSigner {
+    pub(crate) fn new(seed: u8) -> Self {
+        Self(PrivateKey::from(Ed25519Keypair::from_seed(&[seed; 32])))
+    }
+
+    /// The key as a configuration or a build would trust it.
+    pub(crate) fn key(&self) -> SignerKey {
+        SignerKey::parse(&self.0.public_key().to_openssh().unwrap()).unwrap()
+    }
+
+    /// What `git cat-file tag` prints for `tag`, signed by this key, over `commit`.
+    pub(crate) fn tag_object(&self, tag: &str, commit: &str) -> Vec<u8> {
+        let payload = format!(
+            "object {commit}\ntype commit\ntag {tag}\n\
+             tagger Example <example@example.invalid> 1767225600 +0000\n\nrelease\n"
+        );
+        let signature = self
+            .0
+            .sign("git", HashAlg::Sha512, payload.as_bytes())
+            .unwrap()
+            .to_pem(LineEnding::LF)
+            .unwrap();
+        format!("{payload}{signature}").into_bytes()
+    }
+}
+
+/// The tag `tag` of `repo` as a signed tag object, the raw bytes given.
+pub(crate) async fn mount_signed_tag(server: &MockServer, repo: &str, tag: &str, raw: &[u8]) {
+    let sha = tag_object_id(raw);
+    let (payload, signature) = payload_and_signature(raw);
+    mount_ref(server, repo, tag, "tag", &sha).await;
+    mount_tag(
+        server,
+        (repo, tag),
+        &sha,
+        ("1".repeat(40).as_str(), "commit"),
+        Some((&payload, &signature)),
+    )
+    .await;
 }
 
 /// The tag ref `tag` of `repo`, pointing at `sha` of type `kind`.

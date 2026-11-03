@@ -1,5 +1,5 @@
-//! Fetchers for release material: signed tag objects from the GitHub API,
-//! image indexes and Sigstore bundles from an OCI registry (GHCR).
+//! Fetchers for release material: signed tag objects and a release's files from
+//! the GitHub API, image indexes and Sigstore bundles from an OCI registry (GHCR).
 //!
 //! Everything fetched here is hostile input until it is verified. This module
 //! checks only what binds the bytes to the name they were asked for (the git
@@ -8,7 +8,7 @@
 //! elsewhere: [`landfall_core::tag`] and [`crate::attestation`].
 //!
 //! Requests go over HTTPS only, with a connect timeout of 10 s and a total
-//! timeout of 30 s. Bodies are never decompressed (no compression feature is
+//! timeout of 30 s, or 10 minutes for a release's file. Bodies are never decompressed (no compression feature is
 //! enabled in the HTTP client), so a cap applies to the bytes on the wire.
 
 use std::time::Duration;
@@ -16,6 +16,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, redirect};
 
+mod assets;
 mod endpoints;
 mod error;
 mod github;
@@ -25,6 +26,7 @@ mod registry;
 #[cfg(test)]
 mod tests;
 
+pub use assets::{BINARY_LIMIT, ReleaseAsset, SUMS_LIMIT};
 pub use endpoints::Endpoints;
 pub use error::{FetchError, RateLimitReset, Service};
 pub(crate) use http::hex;

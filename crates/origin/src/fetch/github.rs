@@ -1,8 +1,8 @@
 //! Signed tag objects and commits, from the GitHub API.
 
 use landfall_core::ids::{CommitSha, ReleaseTag, RepoName};
-use reqwest::Url;
 use reqwest::header::{ACCEPT, AUTHORIZATION};
+use reqwest::{RequestBuilder, Url};
 use serde::Deserialize;
 use sha1_checked::Digest as _;
 use sha1_checked::Sha1;
@@ -151,15 +151,21 @@ impl Fetcher {
         url: &Url,
         limit: usize,
     ) -> Result<Fetched, FetchError> {
+        let request = self.github_request(url, GITHUB_ACCEPT);
+        send(request, Service::GitHubApi, url, limit).await
+    }
+
+    /// A GET to the GitHub API asking for `accept`, with the token when there is one.
+    pub(super) fn github_request(&self, url: &Url, accept: &str) -> RequestBuilder {
         let mut request = self
             .client
             .get(url.clone())
-            .header(ACCEPT, GITHUB_ACCEPT)
+            .header(ACCEPT, accept)
             .header("x-github-api-version", GITHUB_API_VERSION);
         if let Some(token) = &self.github_token {
             request = request.header(AUTHORIZATION, token.clone());
         }
-        send(request, Service::GitHubApi, url, limit).await
+        request
     }
 }
 

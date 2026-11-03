@@ -1,6 +1,10 @@
 //! Signer keys, and when signed tags are required.
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+
 use super::super::ConfigError;
+use super::super::signer::SignerKey;
 use super::{EXAMPLE, edited, fixture_key, id, parse_str, with_signer};
 use crate::ids::PrincipalId;
 
@@ -49,6 +53,111 @@ fn garbage_signer_is_rejected() {
             "{garbage:?}: {err}"
         );
     }
+}
+
+/// The key's OpenSSH line, for these 32 bytes.
+fn key_line(key: &[u8; 32]) -> String {
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&11_u32.to_be_bytes());
+    wire.extend_from_slice(b"ssh-ed25519");
+    wire.extend_from_slice(&32_u32.to_be_bytes());
+    wire.extend_from_slice(key);
+    format!("ssh-ed25519 {}", STANDARD.encode(wire))
+}
+
+/// 32 bytes from 64 hex digits.
+fn bytes(hex: &str) -> [u8; 32] {
+    let mut key = [0_u8; 32];
+    for (at, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[at * 2..at * 2 + 2], 16).unwrap();
+    }
+    key
+}
+
+/// Every point of small order, in its canonical encoding, as
+/// `.github/scripts/release_preflight_support.py` lists them and checks them by
+/// the arithmetic. For each, anyone can forge a signature.
+fn small_order_points() -> Vec<(&'static str, [u8; 32])> {
+    const ONE: &str = "0100000000000000000000000000000000000000000000000000000000000000";
+    const MINUS_ONE: &str = "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f";
+    const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const ZERO_SIGN: &str = "0000000000000000000000000000000000000000000000000000000000000080";
+    const ORDER_8: &str = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05";
+    const ORDER_8_SIGN: &str = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85";
+    const OTHER_8: &str = "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a";
+    const OTHER_8_SIGN: &str = "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa";
+    [
+        ("the identity", ONE),
+        ("y = -1", MINUS_ONE),
+        ("y = 0", ZERO),
+        ("y = 0, the other x", ZERO_SIGN),
+        ("order 8", ORDER_8),
+        ("order 8, the other x", ORDER_8_SIGN),
+        ("order 8, the other y", OTHER_8),
+        ("order 8, the other y and x", OTHER_8_SIGN),
+    ]
+    .into_iter()
+    .map(|(name, hex)| (name, bytes(hex)))
+    .collect()
+}
+
+/// Issue 36: for such a key a tag can be forged with no secret, and `verify_tag`
+/// would accept it, so it must not load.
+#[test]
+fn a_signer_of_small_order_is_rejected_and_named() {
+    for (name, key) in small_order_points() {
+        let err = parse_str(&with_signer(&key_line(&key))).unwrap_err();
+        let ConfigError::InvalidSigner { signer, reason } = &err else {
+            panic!("{name}: {err}");
+        };
+        assert_eq!(signer.to_string(), "maintainer", "{name}");
+        assert!(reason.contains("small order"), "{name}: {reason}");
+    }
+}
+
+/// A y of p or more is another spelling of a smaller y, and so is a sign on x = 0.
+#[test]
+fn a_signer_key_that_is_not_canonical_is_rejected() {
+    for (name, hex) in [
+        (
+            "y = p",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ),
+        (
+            "y = p + 1",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ),
+        (
+            "y = 2^255 - 1",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ),
+        (
+            "a sign on x = 0 at y = 1",
+            "0100000000000000000000000000000000000000000000000000000000000080",
+        ),
+        (
+            "a sign on x = 0 at y = -1",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ),
+    ] {
+        let err = SignerKey::parse(&key_line(&bytes(hex))).unwrap_err();
+        assert!(err.contains("canonical"), "{name}: {err}");
+    }
+}
+
+#[test]
+fn a_signer_key_not_on_the_curve_is_rejected() {
+    let mut key = [0_u8; 32];
+    key[0] = 2;
+    let err = SignerKey::parse(&key_line(&key)).unwrap_err();
+    assert!(err.contains("not a point"), "{err}");
+}
+
+#[test]
+fn a_good_signer_key_still_passes() {
+    // RFC 8032's first test vector, so it is nobody's.
+    let good = bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    SignerKey::parse(&key_line(&good)).unwrap();
 }
 
 #[test]

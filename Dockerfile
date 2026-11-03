@@ -67,7 +67,7 @@ RUN case "$TARGETARCH" in \
     && for crate in server agent cli; do \
         mkdir -p "crates/$crate/src" && echo 'fn main() {}' > "crates/$crate/src/main.rs"; \
     done \
-    && for crate in core approval origin server agent; do \
+    && for crate in core approval origin server agent cli; do \
         mkdir -p "crates/$crate/src" && : > "crates/$crate/src/lib.rs"; \
     done \
     && cargo zigbuild --release --locked -p landfall-server -p landfall-agent -p landfall-cli --target "$(cat /target-triple)"

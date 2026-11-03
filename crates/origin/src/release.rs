@@ -236,13 +236,6 @@ pub async fn verify_release_origin(
     })?;
 
     let (commit, signed) = if origin.signed_tags() {
-        let raw = match fetcher.tag_object(repo.name(), tag).await {
-            Ok(raw) => raw,
-            Err(FetchError::LightweightTag { .. } | FetchError::NotSigned { .. }) => {
-                return Err(ReleaseError::TagSignature(TagVerifyError::NotSigned));
-            }
-            Err(e) => return Err(ReleaseError::TagObject(e)),
-        };
         // A validated configuration names only signers that exist, so
         // nothing is dropped here; were one missing, trust would only narrow.
         let signers: Vec<(PrincipalId, &SignerKey)> = origin
@@ -250,8 +243,8 @@ pub async fn verify_release_origin(
             .iter()
             .filter_map(|id| config.signer(id).map(|key| (id.clone(), key)))
             .collect();
-        let signed = verify_tag(&raw, tag, &signers).map_err(ReleaseError::TagSignature)?;
-        (signed.commit.clone(), Some(signed))
+        let (commit, signed) = signed_commit(fetcher, repo.name(), tag, &signers).await?;
+        (commit, Some(signed))
     } else {
         let commit = fetcher
             .tag_commit(repo.name(), tag)
@@ -290,6 +283,30 @@ pub async fn verify_release_origin(
         attestation,
         platforms,
     })
+}
+
+/// The commit of `tag`, from its tag object, which one of `signers` must have signed.
+/// A lightweight or unsigned tag is [`TagVerifyError::NotSigned`].
+///
+/// # Errors
+///
+/// [`ReleaseError::TagSignature`] when the tag is not signed as it must be, and
+/// [`ReleaseError::TagObject`] when its object could not be fetched.
+pub async fn signed_commit(
+    fetcher: &Fetcher,
+    repo: &RepoName,
+    tag: &ReleaseTag,
+    signers: &[(PrincipalId, &SignerKey)],
+) -> Result<(CommitSha, SignedTag), ReleaseError> {
+    let raw = match fetcher.tag_object(repo, tag).await {
+        Ok(raw) => raw,
+        Err(FetchError::LightweightTag { .. } | FetchError::NotSigned { .. }) => {
+            return Err(ReleaseError::TagSignature(TagVerifyError::NotSigned));
+        }
+        Err(e) => return Err(ReleaseError::TagObject(e)),
+    };
+    let signed = verify_tag(&raw, tag, signers).map_err(ReleaseError::TagSignature)?;
+    Ok((signed.commit.clone(), signed))
 }
 
 /// [`verify_bundle`] on a blocking thread, since it is signature checks with no

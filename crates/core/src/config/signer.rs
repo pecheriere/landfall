@@ -1,5 +1,6 @@
 //! Tag-signing keys from `[signers]`.
 
+use ed25519_dalek::VerifyingKey;
 use ssh_key::{Algorithm, HashAlg, PublicKey};
 
 use super::shown_in_config;
@@ -14,9 +15,15 @@ pub struct SignerKey {
 }
 
 impl SignerKey {
-    /// Parses one `[signers]` value; the error is the reason, without the
-    /// signer's name, which the caller adds.
-    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+    /// Parses one signer's key.
+    ///
+    /// # Errors
+    ///
+    /// The reason it is refused, without the signer's name, which the caller adds:
+    /// not an `ssh-ed25519` key, or 32 bytes that are not a good key. `verify_tag`
+    /// verifies with plain `verify`, so for a key of small order anyone could forge a
+    /// tag: it, and another spelling of a point, must not load.
+    pub fn parse(text: &str) -> Result<Self, String> {
         let key_type = text.split_whitespace().next().unwrap_or_default();
         if key_type != "ssh-ed25519" {
             return Err(format!(
@@ -30,12 +37,13 @@ impl SignerKey {
                 shown_in_config(&e.to_string())
             )
         })?;
-        if key.algorithm() != Algorithm::Ed25519 {
+        let Some(ed25519) = key.key_data().ed25519() else {
             return Err(format!(
                 "key type {} is not supported; use an ssh-ed25519 public key",
-                shown_in_config(key.algorithm().as_ref())
+                shown_in_config(Algorithm::as_str(&key.algorithm()))
             ));
-        }
+        };
+        key_fault(&ed25519.0).map_or(Ok(()), Err)?;
         key.set_comment("");
         Ok(Self { key })
     }
@@ -50,4 +58,20 @@ impl SignerKey {
     pub(crate) fn public_key(&self) -> &PublicKey {
         &self.key
     }
+}
+
+/// What is wrong with 32 bytes as an Ed25519 public key, if anything, in the order
+/// `release_preflight.py`'s `key_fault` looks. Decompressing accepts a y beyond the
+/// field's prime and a sign on x = 0, each another spelling of a point, so only
+/// compressing it again shows those.
+fn key_fault(bytes: &[u8; 32]) -> Option<String> {
+    let Ok(point) = VerifyingKey::from_bytes(bytes) else {
+        return Some("the key is not a point on the curve".to_owned());
+    };
+    if point.to_edwards().compress().as_bytes() != bytes {
+        return Some("the key is not a canonical encoding of its point".to_owned());
+    }
+    point.is_weak().then(|| {
+        "the key is a point of small order, for which anyone can forge a signature".to_owned()
+    })
 }

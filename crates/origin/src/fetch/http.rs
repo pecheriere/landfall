@@ -23,9 +23,11 @@ pub(super) async fn send(
     url: &Url,
     limit: usize,
 ) -> Result<Fetched, FetchError> {
-    let transport = |source| FetchError::Request {
+    // Without its URL: after a redirect that is the storage host's, whose query is a
+    // credential, and the URL that was asked for is named anyway.
+    let transport = |source: reqwest::Error| FetchError::Request {
         url: url.to_string(),
-        source,
+        source: source.without_url(),
     };
     let mut response = request.send().await.map_err(transport)?;
     match response.status() {

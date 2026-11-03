@@ -1,17 +1,17 @@
 //! `landfall verify`: verify one release of one deployment end to end, as a
 //! host would before deploying it, and print where it came from.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use clap::Args;
 use landfall_core::config::{Config, ConfigError};
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::release::Platform;
-use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin, verify_release};
-use landfall_origin::trust::{Refresh, TrustError, load_trusted_root};
+use landfall_origin::trust::Refresh;
 use thiserror::Error;
+
+use crate::access::{AccessError, public_fetcher, trust_root};
 
 /// Arguments of `landfall verify`.
 #[derive(Debug, Args)]
@@ -73,27 +73,9 @@ pub enum VerifyError {
         /// `std::env::consts::ARCH`.
         arch: &'static str,
     },
-    /// No `--cache-dir` was given and no default can be derived.
-    #[error("no cache directory: set XDG_CACHE_HOME or HOME, or pass --cache-dir")]
-    NoCacheDir,
-    /// The default cache directory could not be created.
-    #[error("cannot create cache directory {}", .path.display())]
-    CreateCacheDir {
-        /// The directory.
-        path: PathBuf,
-        /// The I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-    /// `GITHUB_TOKEN` is set but cannot be used. The value is never shown.
-    #[error("GITHUB_TOKEN is set but is not valid UTF-8 text or not a valid HTTP header value")]
-    Token,
-    /// The Sigstore trust root could not be built.
-    #[error("Sigstore trust root")]
-    Trust(#[source] TrustError),
-    /// The HTTP client could not be built.
-    #[error("HTTP client")]
-    Fetcher(#[source] FetchError),
+    /// The trust root or the fetcher could not be had.
+    #[error(transparent)]
+    Access(#[from] AccessError),
     /// The release was refused, or its material could not be fetched.
     #[error(
         "release {tag} of {deployment} {}",
@@ -153,30 +135,13 @@ pub async fn run(args: VerifyArgs) -> Result<ReleaseOrigin, VerifyError> {
     };
     let config = load_config(&args.config)?;
 
-    let cache_dir = if let Some(dir) = args.cache_dir {
-        dir
-    } else {
-        let dir = default_cache_dir(std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME"))
-            .ok_or(VerifyError::NoCacheDir)?;
-        create_dir(&dir)?;
-        dir
-    };
     let refresh = if args.offline {
         Refresh::Offline
     } else {
         Refresh::Online
     };
-    let root = load_trusted_root(&cache_dir, refresh)
-        .await
-        .map_err(VerifyError::Trust)?;
-
-    let mut fetcher = Fetcher::new(Endpoints::public().map_err(VerifyError::Fetcher)?)
-        .map_err(VerifyError::Fetcher)?;
-    if let Some(token) = github_token(std::env::var_os("GITHUB_TOKEN"))? {
-        fetcher = fetcher
-            .with_github_token(&token)
-            .map_err(|_| VerifyError::Token)?;
-    }
+    let root = trust_root(args.cache_dir, refresh).await?;
+    let fetcher = public_fetcher()?;
     verify_release(
         &fetcher,
         &root,
@@ -193,19 +158,6 @@ pub async fn run(args: VerifyArgs) -> Result<ReleaseOrigin, VerifyError> {
     })
 }
 
-/// The GitHub token from the value of `GITHUB_TOKEN`: `None` when unset or
-/// empty.
-fn github_token(value: Option<OsString>) -> Result<Option<String>, VerifyError> {
-    match value {
-        None => Ok(None),
-        Some(value) if value.is_empty() => Ok(None),
-        Some(value) => value
-            .into_string()
-            .map(Some)
-            .map_err(|_| VerifyError::Token),
-    }
-}
-
 /// The OCI platform of a Linux host with this `std::env::consts::ARCH`.
 fn host_platform(os: &'static str, arch: &'static str) -> Result<Platform, VerifyError> {
     let architecture = match (os, arch) {
@@ -220,36 +172,16 @@ fn host_platform(os: &'static str, arch: &'static str) -> Result<Platform, Verif
     })
 }
 
-/// `$XDG_CACHE_HOME/landfall/tuf`, or `$HOME/.cache/landfall/tuf`. A
-/// relative or empty value is ignored, as the XDG base directory
-/// specification requires.
-fn default_cache_dir(xdg_cache_home: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
-    let absolute = |value: Option<OsString>| value.map(PathBuf::from).filter(|p| p.is_absolute());
-    absolute(xdg_cache_home)
-        .or_else(|| absolute(home).map(|home| home.join(".cache")))
-        .map(|base| base.join("landfall").join("tuf"))
-}
-
-fn create_dir(dir: &Path) -> Result<(), VerifyError> {
-    std::fs::create_dir_all(dir).map_err(|source| VerifyError::CreateCacheDir {
-        path: dir.to_path_buf(),
-        source,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-
     use landfall_core::tag::TagVerifyError;
     use landfall_origin::fetch::FetchError;
     use landfall_origin::release::ReleaseError;
     use landfall_origin::trust::TrustError;
 
     use super::{
-        ConfigError, EXIT_REFUSED, EXIT_UNVERIFIED, VerifyError, default_cache_dir, github_token,
-        host_platform, load_config,
+        AccessError, ConfigError, EXIT_REFUSED, EXIT_UNVERIFIED, VerifyError, host_platform,
+        load_config,
     };
 
     #[test]
@@ -298,33 +230,14 @@ mod tests {
         assert_eq!(EXIT_UNVERIFIED, 2);
         for error in [
             release(ReleaseError::UnknownDeployment("app/prod".parse().unwrap())),
-            VerifyError::Trust(TrustError::Expired("timestamp".to_owned())),
-            VerifyError::NoCacheDir,
-            VerifyError::Token,
+            VerifyError::Access(AccessError::Trust(TrustError::Expired(
+                "timestamp".to_owned(),
+            ))),
+            VerifyError::Access(AccessError::NoCacheDir),
+            VerifyError::Access(AccessError::Token),
         ] {
             assert_eq!(error.exit_code(), EXIT_UNVERIFIED, "{error:?}");
         }
-    }
-
-    #[test]
-    fn github_token_is_used_only_when_set_and_non_empty() {
-        assert!(github_token(None).unwrap().is_none());
-        assert!(github_token(Some(OsString::new())).unwrap().is_none());
-        assert_eq!(
-            github_token(Some(OsString::from("t0ken")))
-                .unwrap()
-                .as_deref(),
-            Some("t0ken")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_github_token_is_an_error_that_does_not_show_it() {
-        use std::os::unix::ffi::OsStringExt;
-        let error = github_token(Some(OsString::from_vec(b"secret\xff".to_vec()))).unwrap_err();
-        assert!(matches!(error, VerifyError::Token), "{error:?}");
-        assert!(!error.to_string().contains("secret"), "{error}");
     }
 
     #[test]
@@ -353,25 +266,5 @@ mod tests {
             );
             assert!(error.to_string().contains("pass --platform"), "{error}");
         }
-    }
-
-    #[test]
-    fn cache_dir_follows_xdg_then_home() {
-        let os = |s: &str| Some(OsString::from(s));
-        assert_eq!(
-            default_cache_dir(os("/xdg"), os("/home/u")),
-            Some(PathBuf::from("/xdg/landfall/tuf"))
-        );
-        assert_eq!(
-            default_cache_dir(None, os("/home/u")),
-            Some(PathBuf::from("/home/u/.cache/landfall/tuf"))
-        );
-        // Relative or empty values are ignored.
-        assert_eq!(
-            default_cache_dir(os("cache"), os("/home/u")),
-            Some(PathBuf::from("/home/u/.cache/landfall/tuf"))
-        );
-        assert_eq!(default_cache_dir(os(""), os("")), None);
-        assert_eq!(default_cache_dir(None, None), None);
     }
 }

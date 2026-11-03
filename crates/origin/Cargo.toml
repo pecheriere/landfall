@@ -24,6 +24,9 @@ tokio = { workspace = true, features = ["rt"] }
 [dev-dependencies]
 base64.workspace = true
 landfall-approval.workspace = true
+# Signing a tag in a test, over a commit the test chooses: the library the
+# verifier already uses, through landfall-core.
+ssh-key.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 wiremock.workspace = true
