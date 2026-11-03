@@ -28,8 +28,9 @@ use sqlx::SqlitePool;
 
 const CHILD_ARGS: &str = "LANDFALL_UPKEEP_CHILD";
 const CHILD_INTERVAL_MS: &str = "LANDFALL_UPKEEP_INTERVAL_MS";
-/// Shorter than nextest's limit, so that a failure says what it was waiting for.
-const PATIENCE: Duration = Duration::from_secs(20);
+/// A stuck wait ends here, saying what it was waiting for. Starting a process on a loaded machine
+/// takes tens of seconds, so this is the same as the agent's end-to-end tests have.
+const PATIENCE: Duration = Duration::from_mins(1);
 const RP_ID: &str = "landfall.example";
 const ORIGIN: &str = "https://landfall.example";
 
@@ -75,7 +76,9 @@ fn child_process() {
         let args: Vec<String> = serde_json::from_str(&args).unwrap();
         let every: u64 = std::env::var(CHILD_INTERVAL_MS).unwrap().parse().unwrap();
         let cli = Cli::parse_from(std::iter::once("landfall-server".to_owned()).chain(args));
-        let code = cli::run_watching(cli, Arc::new(NoReleases), Duration::from_millis(every));
+        // Held open by a test that takes its time on a loaded machine, it must not run out.
+        let every = Duration::from_millis(every);
+        let code = cli::run_watching_draining(cli, Arc::new(NoReleases), every, PATIENCE * 2);
         std::process::exit(code.into());
     }
 }

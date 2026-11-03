@@ -37,8 +37,8 @@ landfall-server serve --config /etc/landfall/fleet.toml \
 
 It looks at releases when it starts and every five minutes after that, so a host that
 reports for the first time is looked at on the next round. SIGTERM ends it in seconds:
-long polls are answered at once, and requests in flight have five seconds. Agents wait
-and try again, so stopping it never interrupts a deploy. Exit status 0 after a stop, 2
+long polls are answered at once, and requests in flight have five seconds, after which
+they get no answer. Agents wait and try again, so stopping it never interrupts a deploy. Exit status 0 after a stop, 2
 if it could not start. `GET /healthz` answers 200 while the database does.
 
 It logs to stderr, one line each, every decision about a release and every hold, when it

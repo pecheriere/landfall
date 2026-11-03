@@ -347,7 +347,8 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
         let cache_dir = trust_cache_dir(args)?;
         Ok(Arc::new(LiveSource::new(fetcher, watched, cache_dir)))
     };
-    serve_watching(args, config, source, watcher::TICK_INTERVAL).await
+    let drain = ServeOptions::default().drain_timeout;
+    serve_watching(args, config, source, watcher::TICK_INTERVAL, drain).await
 }
 
 /// Serves `config`, with the watcher looking at what `source` makes every
@@ -357,6 +358,7 @@ async fn serve_watching<S: ReleaseSource>(
     config: Config,
     source: impl FnOnce(&ServeArgs, Arc<Config>) -> Result<Arc<S>, CliError>,
     interval: Duration,
+    drain_timeout: Duration,
 ) -> Result<u8, CliError> {
     let store = Store::open(&args.db).await?;
     let watched = Arc::new(config.clone());
@@ -395,18 +397,21 @@ async fn serve_watching<S: ReleaseSource>(
         state.begin_shutdown();
         stop_watcher.send_replace(true);
     };
-    crate::serve::run(listener, app, args.serve_options(), shutdown).await;
+    let options = ServeOptions {
+        drain_timeout,
+        ..args.serve_options()
+    };
+    crate::serve::run(listener, app, options, shutdown).await;
     // Told to stop as the serving began to, it lets go at once. If the watcher
     // had already stopped, that was a panic and it was logged by the runtime.
     drop(watching.await);
     drop(flushing.await);
     // It stopped as the draining began, and a request finishing since may have counted something.
-    // A request still running past the drain can count one too late even for this.
+    // No request is running now, so nothing can count anything after this.
     flush_dropped(&draining).await;
     crate::web::tend(&draining).await;
-    // So that the main file holds everything. A request still running past the
-    // drain has its connection for a while yet, and stopping does not wait for that:
-    // the next start reads what is left in the write-ahead log.
+    // So that the main file holds everything. If it can't in time, the next start reads what is
+    // left in the write-ahead log.
     if tokio::time::timeout(CLOSE_TIMEOUT, closing.close())
         .await
         .is_err()
@@ -587,10 +592,23 @@ pub fn run(cli: Cli) -> u8 {
 /// leads here.
 #[must_use]
 pub fn run_watching<S: ReleaseSource>(cli: Cli, source: Arc<S>, interval: Duration) -> u8 {
+    let drain = ServeOptions::default().drain_timeout;
+    run_watching_draining(cli, source, interval, drain)
+}
+
+/// [`run_watching`], giving requests in flight `drain_timeout` when it stops, for a test holding
+/// one of them open, which on a loaded machine can take longer than a real drain allows.
+#[must_use]
+pub fn run_watching_draining<S: ReleaseSource>(
+    cli: Cli,
+    source: Arc<S>,
+    interval: Duration,
+    drain_timeout: Duration,
+) -> u8 {
     match cli.command {
         Command::Serve(args) => on_a_runtime(async move {
             let config = load_config(&args.config)?;
-            serve_watching(args, config, |_, _| Ok(source), interval).await
+            serve_watching(args, config, |_, _| Ok(source), interval, drain_timeout).await
         }),
         command => run(Cli { command }),
     }

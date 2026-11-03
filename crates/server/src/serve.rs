@@ -134,15 +134,18 @@ async fn until_closing(mut closing: watch::Receiver<bool>) {
 
 /// Serves one connection until it ends, or until it reaches its lifetime or
 /// `closing` says to stop: then it finishes what it is doing, for up to
-/// [`ServeOptions::finish_timeout`]. The peer's address reaches the routes as
-/// [`ConnectInfo`]. A failed connection is the client's affair: nothing to log.
+/// [`ServeOptions::finish_timeout`], or until `cut_off` says to drop it. The peer's address
+/// reaches the routes as [`ConnectInfo`]. A failed connection is the client's affair: nothing to
+/// log. What `_held` holds goes back after the connection and its handler are gone, as
+/// [`run`] goes by that.
 async fn serve_connection(
     stream: TcpStream,
     peer: SocketAddr,
     app: Router,
     options: ServeOptions,
     closing: watch::Receiver<bool>,
-    held: (OwnedSemaphorePermit, SourceSlot),
+    cut_off: watch::Receiver<bool>,
+    _held: (OwnedSemaphorePermit, SourceSlot),
 ) {
     let service = service_fn(move |mut request: Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
@@ -166,13 +169,17 @@ async fn serve_connection(
     };
     if !ended {
         connection.as_mut().graceful_shutdown();
-        drop(tokio::time::timeout(options.finish_timeout, connection).await);
+        tokio::select! {
+            finished = tokio::time::timeout(options.finish_timeout, connection) => drop(finished),
+            () = until_closing(cut_off) => {}
+        }
     }
-    drop(held);
 }
 
 /// Serves `app` on `listener` until `shutdown` completes, then lets requests in
-/// flight finish for up to [`ServeOptions::drain_timeout`].
+/// flight finish for up to [`ServeOptions::drain_timeout`], and drops what's left of them. No
+/// handler is running when this returns, so what the caller does next is the last word: nothing
+/// can count a failure after it has written the counts down.
 ///
 /// Failing to accept one connection is no reason to stop serving the others, so
 /// it is logged and retried.
@@ -187,6 +194,7 @@ pub async fn run(
         usize::try_from(permits).unwrap_or(usize::MAX),
     ));
     let (closing, closing_rx) = watch::channel(false);
+    let (cut_off, cut_off_rx) = watch::channel(false);
     let sources = SourceCounts::default();
     let refusals = RefusalLog::default();
     let started = Instant::now();
@@ -215,6 +223,7 @@ pub async fn run(
                         app.clone(),
                         options,
                         closing_rx.clone(),
+                        cut_off_rx.clone(),
                         (permit, slot),
                     ));
                 } else {
@@ -238,6 +247,9 @@ pub async fn run(
     closing.send_replace(true);
     // Every permit back means every connection is done.
     drop(tokio::time::timeout(options.drain_timeout, connections.acquire_many(permits)).await);
+    cut_off.send_replace(true);
+    // Without a limit: each drops what it's doing the next time it runs, and no handler blocks.
+    drop(connections.acquire_many(permits).await);
 }
 
 #[cfg(test)]
@@ -248,11 +260,11 @@ mod tests {
     use axum::routing::get;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, oneshot};
     use tokio::task::JoinHandle;
 
     use super::{
-        Duration, Instant, IpAddr, Router, ServeOptions, SocketAddr, SourceCounts, SourceSlot,
+        Arc, Duration, Instant, IpAddr, Router, ServeOptions, SocketAddr, SourceCounts, SourceSlot,
         TcpListener, run,
     };
 
@@ -281,13 +293,17 @@ mod tests {
     }
 
     async fn start(options: ServeOptions) -> Server {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/peer", get(peer))
             .route("/slow", get(slow))
             .route("/big", get(big))
             .route("/hang", get(std::future::pending::<()>));
+        serving(app, options).await
+    }
+
+    async fn serving(app: Router, options: ServeOptions) -> Server {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(run(listener, app, options, async {
             drop(stopped.await);
@@ -409,6 +425,41 @@ mod tests {
             .await
             .expect("stopping should not hang")
             .unwrap();
+    }
+
+    /// What the server does last as it stops goes by this: a handler still running could count
+    /// something after the last time the counts are written down, and answer as if it had been.
+    #[tokio::test]
+    async fn no_handler_runs_on_once_stopping_is_over() {
+        let running = Arc::new(Notify::new());
+        let alive = Arc::new(());
+        let (told, held) = (Arc::clone(&running), Arc::clone(&alive));
+        let hang = move || async move {
+            told.notify_one();
+            std::future::pending::<()>().await;
+            drop(held);
+        };
+        let app = Router::new().route("/hang", get(hang));
+        let server = serving(
+            app,
+            ServeOptions {
+                drain_timeout: Duration::from_millis(100),
+                ..ServeOptions::default()
+            },
+        )
+        .await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /hang HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        running.notified().await;
+
+        server.stop.send(()).unwrap();
+        server.task.await.unwrap();
+
+        assert_eq!(Arc::strong_count(&alive), 1, "a handler is still running");
+        assert_eq!(read_to_close(&mut stream).await, "", "it answers nothing");
     }
 
     /// The only slot goes to a client that asks for more than the socket buffers
