@@ -2,5 +2,6 @@
 # no trailing comment, since a key's comment usually carries a name. Blank lines and whole-line
 # comments like this one are skipped. Two keys may overlap for a rotation.
 #
-# This file holds no key until the project's owner supplies one. Until then the release preflight
-# refuses every tag, and `landfall host install` and `host upgrade` refuse to run.
+# Each key's fingerprint is also published in SECURITY.md. A file with no key refuses every tag,
+# and `landfall host install` and `host upgrade` refuse to run, which is where a fork starts.
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIIL0cC4SOr9wwVqusLkgjYTUOC+EsTTuhfAuj2DmrTw
