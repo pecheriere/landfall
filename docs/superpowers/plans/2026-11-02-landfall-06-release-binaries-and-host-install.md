@@ -103,11 +103,11 @@ The independent review (15 Important, 33 Minor) found the design sound and its e
 |---|---|
 | `BatchMode=yes`, `StrictHostKeyChecking=yes` | `batchmode yes`, `stricthostkeychecking true` |
 | `NoHostAuthenticationForLocalhost=no` | `no` |
-| Only where `ssh -G -F none -o <option> -- x` accepts it, asked first: `NoHostAuthenticationForProxyCommand=no`, `ForkAfterAuthentication=no`, `StdinNull=no`, `SessionType=default`, `ChannelTimeout=none`. A forced `IgnoreUnknown` would replace the operator's, making what theirs protects fatal. | `no`, `no`, `no`, `default`, `none` |
+| Only where `ssh -G -F none -o <option> -- x` accepts it, asked first: `NoHostAuthenticationForProxyCommand=no`, `ForkAfterAuthentication=no`, `StdinNull=no`, `SessionType=default`, `ChannelTimeout=none`, `GSSAPIDelegateCredentials=no`. A forced `IgnoreUnknown` would replace the operator's, making what theirs protects fatal. | `no`, `no`, `no`, `default`, `none`, `no` |
 | `VerifyHostKeyDNS=no`, `UpdateHostKeys=no` | both false |
-| `ForwardAgent=no`, `ForwardX11=no`, `ForwardX11Trusted=no`, `GSSAPIDelegateCredentials=no`, `AddKeysToAgent=no`, `Tunnel=no` | all off |
+| `ForwardAgent=no`, `ForwardX11=no`, `ForwardX11Trusted=no`, `AddKeysToAgent=no`, `Tunnel=no` | all off |
 | `ClearAllForwardings=yes` | `clearallforwardings yes`, and the config's `LocalForward`, `RemoteForward` and `DynamicForward` gone from the output |
-| `PermitLocalCommand=no`, `RemoteCommand=none`, `EscapeChar=none`, `VisualHostKey=no` | off; no `remotecommand` line. `localcommand` is still listed, and inert |
+| `PermitLocalCommand=no`, `RemoteCommand=none`, `EscapeChar=none`, `VisualHostKey=no`, `FingerprintHash=sha256` | off; no `remotecommand` line. `localcommand` is still listed, and inert |
 | `LogLevel=ERROR`, `ConnectTimeout=30` | `loglevel ERROR` (a config's `QUIET` would hide the host-key message we read), `connecttimeout 30` |
 | `ServerAliveInterval=15`, `ServerAliveCountMax=4` | as set: a connection gone away ends within about a minute, privileged step included |
 | `RequestTTY=no`, or `force` for the privileged step | `requesttty false`, `force` |

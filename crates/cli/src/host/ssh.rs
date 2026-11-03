@@ -53,7 +53,6 @@ const FORCED: [&str; 21] = [
     "ForwardAgent=no",
     "ForwardX11=no",
     "ForwardX11Trusted=no",
-    "GSSAPIDelegateCredentials=no",
     "AddKeysToAgent=no",
     "Tunnel=no",
     "ClearAllForwardings=yes",
@@ -61,6 +60,8 @@ const FORCED: [&str; 21] = [
     "RemoteCommand=none",
     "EscapeChar=none",
     "VisualHostKey=no",
+    // What's shown of a changed key, and what the guide says to compare it with.
+    "FingerprintHash=sha256",
     // A configuration's `QUIET` would hide the host key message that is read.
     "LogLevel=ERROR",
     "ConnectTimeout=30",
@@ -76,13 +77,15 @@ const FORCED: [&str; 21] = [
 ///
 /// In a configuration, the second makes every status 0 while the command goes on running, the
 /// third gives every upload no input, and the fourth and fifth can leave a command unrun or cut
-/// off.
-const IN_SOME_BUILDS: [&str; 5] = [
+/// off. The last forwards credentials as `ForwardAgent` does. A build without GSSAPI takes it, and
+/// says on every call that it does nothing, ahead of anything else it has to say.
+const IN_SOME_BUILDS: [&str; 6] = [
     "NoHostAuthenticationForProxyCommand=no",
     "ForkAfterAuthentication=no",
     "StdinNull=no",
     "SessionType=default",
     "ChannelTimeout=none",
+    "GSSAPIDelegateCredentials=no",
 ];
 
 /// How long `ssh -G` may take to say what it knows, which needs no network.
@@ -101,6 +104,10 @@ pub enum SshError {
     /// The private directory for the connection couldn't be made.
     #[error("cannot make a private directory for the connection")]
     ControlDir(#[source] io::Error),
+    /// `ssh` failed when asked what it has, for some reason other than not having it. That's
+    /// not guessed at, as an option left out would be a config's to set.
+    #[error("ssh couldn't say which options it has: it said {}", quoted(.0, SHOWN_STDERR))]
+    CannotAsk(String),
     /// `ssh` couldn't be started.
     #[error("cannot run ssh")]
     Spawn(#[source] io::Error),
@@ -237,21 +244,38 @@ impl Known {
     ///
     /// # Errors
     ///
-    /// [`SshError`] if it can't be run, or takes too long to say.
+    /// [`SshError`] if it can't be run, takes too long to say, or fails for any reason other than
+    /// not having an option.
     pub fn ask(program: &OsStr) -> Result<Self, SshError> {
-        let mut known = Vec::new();
-        for option in IN_SOME_BUILDS {
+        Self::ask_within(program, ASK_LIMIT)
+    }
+
+    /// The same, with this long for each question.
+    pub(super) fn ask_within(program: &OsStr, limit: Duration) -> Result<Self, SshError> {
+        let ask = |options: &[&str]| {
             let mut command = Command::new(program);
             command
-                .args(["-G", "-F", "none", "-o", option, "--", "x"])
-                .env_remove("GITHUB_TOKEN")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            let mut child = command.spawn().map_err(SshError::Spawn)?;
-            if wait_within(&mut child, ASK_LIMIT)?.success() {
-                known.push(option);
+                .args(["-G", "-F", "none"])
+                .args(options)
+                .args(["--", "x"])
+                .env_remove("GITHUB_TOKEN");
+            collect(command, b"", limit)
+        };
+        let plain = ask(&[])?;
+        if plain.status != 0 {
+            return Err(SshError::CannotAsk(text_of(&plain.stderr)));
+        }
+        let mut known = Vec::new();
+        for option in IN_SOME_BUILDS {
+            let answer = ask(&["-o", option])?;
+            let said = text_of(&answer.stderr);
+            if said.contains("Bad configuration option") || said.contains("Unsupported option") {
+                continue;
             }
+            if answer.status != 0 {
+                return Err(SshError::CannotAsk(said));
+            }
+            known.push(option);
         }
         Ok(Self(known))
     }
@@ -433,6 +457,9 @@ impl Default for Limits {
 /// has ended by the next time it's needed, and closed on drop. A person at `y/N` for more than
 /// `ControlPersist` is the ordinary way for it to end, and with each command then logging in by
 /// itself, an agent or a hardware key would ask once for each.
+///
+/// Each has a socket of its own. A killed one leaves its file, and `ssh` starting at a path that's
+/// taken turns multiplexing off and logs in all the same, which nothing would then ever end.
 pub struct OpenSsh {
     program: OsString,
     dest: Destination,
@@ -442,6 +469,8 @@ pub struct OpenSsh {
     dir: tempfile::TempDir,
     known: OnceCell<Known>,
     started: Cell<bool>,
+    /// Which connection this is, for its socket's name.
+    generation: Cell<u32>,
     say: Box<dyn Fn(&str)>,
 }
 
@@ -490,6 +519,7 @@ impl OpenSsh {
             dir,
             known: OnceCell::new(),
             started: Cell::new(false),
+            generation: Cell::new(0),
             say: Box::new(say_on_stderr),
         })
     }
@@ -508,7 +538,7 @@ impl OpenSsh {
     }
 
     fn control(&self) -> PathBuf {
-        self.dir.path().join("c")
+        self.dir.path().join(format!("c.{}", self.generation.get()))
     }
 
     /// `ssh`, without what must never go to a target.
@@ -550,10 +580,16 @@ impl OpenSsh {
     /// a file, as a pipe would stay open for as long as it lives.
     fn connect(&self) -> Result<&Known, SshError> {
         let known = self.known()?;
-        if self.started.get() && self.alive(known) {
-            return Ok(known);
+        if self.started.get() {
+            if self.alive(known) {
+                return Ok(known);
+            }
+            // It may only be stalled. If so and this doesn't reach it, it can still end by itself,
+            // having a socket of its own, as `ControlPersist` needs.
+            self.close(known);
+            self.started.set(false);
         }
-        self.started.set(false);
+        self.generation.set(self.generation.get() + 1);
         (self.say)(&format!(
             "landfall: opening an SSH connection to {}: approve it if your key or agent asks",
             self.dest
@@ -578,6 +614,25 @@ impl OpenSsh {
         } else {
             let said = fs::read(&stderr_path).unwrap_or_default();
             Err(lost(&said))
+        }
+    }
+
+    /// Asks the connection to end. It ends by itself soon enough if this fails, and nothing here
+    /// could be done about it.
+    fn close(&self, known: &Known) {
+        let mut command = self.command(control_args(
+            "exit",
+            &self.dest,
+            &self.control(),
+            self.config.as_deref(),
+            known,
+        ));
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(mut child) = command.spawn() {
+            let _ = wait_within(&mut child, self.limits.close);
         }
     }
 }
@@ -637,23 +692,8 @@ impl Remote for OpenSsh {
 
 impl Drop for OpenSsh {
     fn drop(&mut self) {
-        let (true, Some(known)) = (self.started.get(), self.known.get()) else {
-            return;
-        };
-        let mut command = self.command(control_args(
-            "exit",
-            &self.dest,
-            &self.control(),
-            self.config.as_deref(),
-            known,
-        ));
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        // It ends by itself soon enough if this fails, and nothing here could be done about it.
-        if let Ok(mut child) = command.spawn() {
-            let _ = wait_within(&mut child, self.limits.close);
+        if let (true, Some(known)) = (self.started.get(), self.known.get()) {
+            self.close(known);
         }
     }
 }
@@ -663,7 +703,7 @@ impl Drop for OpenSsh {
 const SSH_FAILED: i32 = 255;
 
 fn lost(stderr: &[u8]) -> SshError {
-    let said = String::from_utf8_lossy(stderr).trim().to_owned();
+    let said = text_of(stderr);
     if said.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
         // The banner would otherwise use up all that's shown, before the part worth seeing.
         let fingerprint: Vec<&str> = said.lines().filter(|l| l.contains("SHA256:")).collect();
@@ -673,6 +713,10 @@ fn lost(stderr: &[u8]) -> SshError {
     } else {
         SshError::Connection(said)
     }
+}
+
+fn text_of(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
 /// How much longer `bytes` of input may take.

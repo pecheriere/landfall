@@ -121,7 +121,7 @@ jobs:
         run: |
           LANDFALL_TEST_DIST="$PWD/dist" cargo test -p landfall-cli --locked -- --ignored docker_ \
             | tee "$RUNNER_TEMP/host-install.txt"
-          test "$(grep -Ec '^test .*docker_.* \.\.\. ok$' "$RUNNER_TEMP/host-install.txt")" -ge 24
+          test "$(grep -Ec '^test .*docker_.* \.\.\. ok$' "$RUNNER_TEMP/host-install.txt")" -ge 25
 
   crate-age:
     # Compares Cargo.lock with the PR's base, so it only runs on pull requests.

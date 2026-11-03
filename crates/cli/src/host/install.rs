@@ -195,8 +195,16 @@ fn read_facts<R: Remote>(remote: &R, dirs: &[&str]) -> Result<HostFacts, HostErr
     HostFacts::parse(&String::from_utf8_lossy(&output.stdout)).map_err(|source| HostError::Probe {
         source,
         status: output.status,
-        said: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        said: said_by_probe(&output),
     })
+}
+
+/// Its stderr, and how its stdout starts: `nologin` says why on stdout.
+fn said_by_probe(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next().unwrap_or_default();
+    format!("{} {first}", stderr.trim()).trim().to_owned()
 }
 
 /// What the target is to run. The upload's name is in it, so what is shown is what runs.

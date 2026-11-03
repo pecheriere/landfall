@@ -116,7 +116,7 @@ fn output_that_is_not_a_probe_is_refused() {
         probe_stderr: "This account is not available.",
         ..FakeRemote::new()
     };
-    remote.probe = "fish: Unknown command\n".to_owned();
+    remote.probe = "fish: Unknown command\nand more\n".to_owned();
 
     let error = error_of(run_plainly(&files.args(), &remote));
 
@@ -128,6 +128,11 @@ fn output_that_is_not_a_probe_is_refused() {
         error.to_string().contains("This account is not available"),
         "{error}"
     );
+    assert!(
+        error.to_string().contains("fish: Unknown command"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("and more"), "{error}");
     assert_eq!(error.exit_code(), 1);
     remote.assert_only_probed();
 }

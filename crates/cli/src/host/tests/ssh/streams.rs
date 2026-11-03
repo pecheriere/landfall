@@ -82,6 +82,22 @@ fn an_unattended_script_is_given_no_input() {
     assert_eq!(found_by_child("unattended_input"), "");
 }
 
+/// `sudo`'s password comes this way, so every install at a terminal needing one depends on it.
+#[test]
+fn a_script_at_a_terminal_keeps_its_input() {
+    assert_eq!(found_by_child("attended_input"), "what's piped in\n");
+}
+
+#[test]
+#[ignore = "the other half of a test, which it does nothing without"]
+fn attended_input() {
+    let Some(found) = found_path() else {
+        return;
+    };
+    let fake = Fake::new(&format!("cat > {}\nexit 0", found.display()));
+    assert_eq!(fake.open().run_privileged("the script", true).unwrap(), 0);
+}
+
 #[test]
 #[ignore = "the other half of a test, which it does nothing without"]
 fn unattended_input() {

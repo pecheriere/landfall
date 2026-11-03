@@ -19,6 +19,8 @@ use crate::host::ssh::{
     options,
 };
 
+mod asking;
+mod masters;
 mod streams;
 
 const HOSTILE_CONFIG: &str = concat!(
@@ -151,7 +153,6 @@ fn the_forced_options_are_these() {
             "ForwardAgent=no",
             "ForwardX11=no",
             "ForwardX11Trusted=no",
-            "GSSAPIDelegateCredentials=no",
             "AddKeysToAgent=no",
             "Tunnel=no",
             "ClearAllForwardings=yes",
@@ -159,6 +160,7 @@ fn the_forced_options_are_these() {
             "RemoteCommand=none",
             "EscapeChar=none",
             "VisualHostKey=no",
+            "FingerprintHash=sha256",
             "LogLevel=ERROR",
             "ConnectTimeout=30",
             "ServerAliveInterval=15",
@@ -193,42 +195,6 @@ fn the_operators_ignore_unknown_is_left_to_them() {
     }
 }
 
-#[test]
-fn what_a_build_of_ssh_has_is_asked() {
-    const ALL: [&str; 5] = [
-        "NoHostAuthenticationForProxyCommand=no",
-        "ForkAfterAuthentication=no",
-        "StdinNull=no",
-        "SessionType=default",
-        "ChannelTimeout=none",
-    ];
-    let fake = Fake::new("");
-    let known = Known::ask(fake.dir.path().join("ssh").as_os_str()).unwrap();
-    for option in ALL {
-        assert!(known.has(option), "{option}");
-        assert!(options(Tty::Never, &known).contains(&option), "{option}");
-    }
-    // It's asked with no configuration of the operator's, and only offline.
-    let asked = fs::read_to_string(fake.dir.path().join("asked")).unwrap();
-    assert_eq!(asked.lines().count(), 5, "{asked}");
-    assert!(
-        asked.lines().all(|line| line.starts_with("-G -F none -o ")),
-        "{asked}"
-    );
-
-    fake.set_unknown(&["StdinNull", "ChannelTimeout"]);
-    let known = Known::ask(fake.dir.path().join("ssh").as_os_str()).unwrap();
-    for option in ALL {
-        let has = !(option.starts_with("StdinNull") || option.starts_with("ChannelTimeout"));
-        assert_eq!(known.has(option), has, "{option}");
-        assert_eq!(
-            options(Tty::Never, &known).contains(&option),
-            has,
-            "{option}"
-        );
-    }
-}
-
 /// The real `ssh`, offline: `-G` says what it resolved, and connects to nothing.
 #[test]
 fn forced_options_hold_against_a_hostile_config() {
@@ -254,6 +220,7 @@ fn forced_options_hold_against_a_hostile_config() {
             ("permitlocalcommand", "no"),
             ("escapechar", "none"),
             ("visualhostkey", "no"),
+            ("fingerprinthash", "SHA256"),
             ("loglevel", "ERROR"),
             ("connecttimeout", "30"),
             ("serveraliveinterval", "15"),
@@ -381,13 +348,21 @@ impl Fake {
             &format!(
                 r#"if [ "$1" = -G ]; then
   printf '%s\n' "$*" >> {dir}/asked
+  if [ -e {dir}/hang_ask ]; then exec sleep 30; fi
   for name in $(cat {dir}/unknown 2>/dev/null); do
-    case "$*" in *"$name"=*) exit 255 ;; esac
+    case "$*" in *"$name"=*) echo "line 0: Bad configuration option: $name" >&2; exit 255 ;; esac
   done
+  for name in $(cat {dir}/unsupported 2>/dev/null); do
+    case "$*" in *"$name"=*) echo "line 0: Unsupported option \"$name\"" >&2; exit 0 ;; esac
+  done
+  if [ -e {dir}/ask_fails ]; then
+    case "$*" in *"$(cat {dir}/ask_fails)"*) cat {dir}/ask_says >&2; exit 255 ;; esac
+  fi
   exit 0
 fi
 if [ "$1 $2" = "-O check" ]; then
   printf '%s\n' "$*" >> {dir}/checks
+  if [ -e {dir}/hang_check ]; then exec sleep 30; fi
   if [ -e {dir}/alive ]; then exit 0; else exit 255; fi
 fi
 printf '%s\n' "$*" >> {dir}/log
@@ -413,6 +388,16 @@ esac
 
     fn set_unknown(&self, names: &[&str]) {
         fs::write(self.dir.path().join("unknown"), names.join(" ")).unwrap();
+    }
+
+    fn set_unsupported(&self, name: &str) {
+        fs::write(self.dir.path().join("unsupported"), name).unwrap();
+    }
+
+    /// Asking about what holds `matching` fails, saying `says`.
+    fn set_ask_failure(&self, matching: &str, says: &str) {
+        fs::write(self.dir.path().join("ask_fails"), matching).unwrap();
+        fs::write(self.dir.path().join("ask_says"), says).unwrap();
     }
 
     /// As `ControlPersist` does.
@@ -454,12 +439,16 @@ esac
     }
 }
 
-fn control_dir(log_line: &str) -> PathBuf {
+fn control_path_of(log_line: &str) -> PathBuf {
     let path = log_line
         .split(' ')
         .find_map(|word| word.strip_prefix("ControlPath="))
         .unwrap();
-    Path::new(path).parent().unwrap().to_owned()
+    PathBuf::from(path)
+}
+
+fn control_dir(log_line: &str) -> PathBuf {
+    control_path_of(log_line).parent().unwrap().to_owned()
 }
 
 #[test]
