@@ -39,6 +39,7 @@ It looks at releases when it starts and every five minutes after that, so a host
 reports for the first time is looked at on the next round. SIGTERM ends it in seconds:
 long polls are answered at once, and requests in flight have five seconds, after which
 they get no answer. Agents wait and try again, so stopping it never interrupts a deploy.
+[What stopping can take](#what-stopping-takes) sets how long a service manager should wait.
 Exit status 0 after a stop, 2 if it could not start. `GET /healthz` answers 200 while the database does.
 
 It logs to stderr, one line each, every decision about a release and every hold, when it
@@ -92,11 +93,44 @@ WantedBy=multi-user.target
 Or in its container, as uid 65532 with a volume that user can write:
 
 ```sh
-docker run -d --name landfall -p 127.0.0.1:8080:8080 --env-file server.env \
+docker run -d --name landfall --stop-timeout 30 -p 127.0.0.1:8080:8080 --env-file server.env \
   -v /srv/landfall:/data -v /etc/landfall/fleet.toml:/fleet.toml:ro \
   ghcr.io/pecheriere/landfall serve --config /fleet.toml --db /data/controller.db \
   --listen 0.0.0.0:8080
 ```
+
+### What stopping takes
+
+SIGTERM takes well under a second with nothing in flight. Each limit below is only waited out by
+something going wrong, and each goes on to the next step whatever happened:
+
+| Step | Limit | What it's for |
+|---|---|---|
+| Drain | 5 s | Requests in flight finish. Those that don't get no answer. |
+| Cut-off | 5 s | What's left is dropped at once, unless a handler is blocking its thread. |
+| Watcher and flushing tasks | 5 s | They were told to stop when the drain began. |
+| The last flush | Up to 5 s a row, on a busy database | Writes down counted failures and dropped calls. |
+| Closing the database | 5 s | So that the main file holds everything. |
+| Its last log lines | 1 s each, for at most 2 | Said only if something went wrong. |
+| The runtime's threads | 1 s | Any still blocked are left behind as the process ends. |
+
+That's 23 s before the flush's own time, so give it **30 s**, which leaves a row's wait or two:
+
+- **systemd:** `TimeoutStopSec=30`, as in the unit above. The agent's unit has `TimeoutStopSec=3h`,
+  which is about deploys and is [its own matter](#stopping-the-unit).
+- **`docker run`:** `--stop-timeout 30`, as above. `docker stop` then goes by that, unless it's given
+  `-t`.
+- **Compose:** `stop_grace_period: 30s` on the service.
+
+Docker's default is 10 s, which is just the drain and the cut-off: without one of these, a controller
+with a blocked handler is killed before its last flush.
+
+**What's lost if it's killed first** is what a crash loses, and no more. Everything committed stays,
+and the next start reads what's left in the write-ahead log. Failed sign-ins and dropped calls
+counted since the last flush aren't written down, so that's up to five minutes' worth of them. The
+log line `stopped with 1 request still running` means a handler was still blocked after all this,
+and that anything it counts from then on is lost in the same way. If every thread is blocked, stopping
+can't get as far as this: only the signal that kills it ends it.
 
 ### `GITHUB_TOKEN`
 
@@ -320,7 +354,7 @@ A backup from before an upgrade needs `serve` once before step 4. With no networ
 port, nothing can reach it meanwhile. It is ready when its log says `listening on`:
 
 ```sh
-docker run -d --name landfall-upgrade --network none -v /srv/landfall:/data \
+docker run -d --name landfall-upgrade --stop-timeout 30 --network none -v /srv/landfall:/data \
   -v /etc/landfall/fleet.toml:/fleet.toml:ro ghcr.io/pecheriere/landfall \
   serve --config /fleet.toml --db /data/controller.db --listen 127.0.0.1:8080
 docker logs landfall-upgrade

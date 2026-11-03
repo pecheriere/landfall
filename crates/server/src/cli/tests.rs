@@ -1,13 +1,16 @@
 mod tokens;
 
+use std::sync::{Arc, Mutex};
+
 use clap::{CommandFactory as _, Parser as _};
 
 use landfall_core::config::ConfigError;
 
 use super::{
-    Cli, CliError, Command, DeploymentId, EXIT_OK, EXIT_TAMPERED, HostId, OsString, Path, PathBuf,
-    ServeArgs, ServeOptions, Store, execute, github_token, load_config, on_a_runtime,
-    release_fetcher, trust_cache_dir,
+    ApiState, CLOSE_TIMEOUT, Cli, CliError, Command, DeploymentId, Duration, EXIT_OK,
+    EXIT_TAMPERED, HostId, LET_GO_TIMEOUT, Limits, OsString, Path, PathBuf, SAY_TIMEOUT, ServeArgs,
+    ServeOptions, Store, TASKS_TIMEOUT, execute, finish_stopping, github_token, load_config,
+    on_a_runtime, real_limits, release_fetcher, trust_cache_dir, wait_for_tasks,
 };
 
 #[test]
@@ -562,7 +565,7 @@ async fn serve_refuses_a_missing_configuration_before_touching_the_database() {
     assert!(!path.exists());
 }
 
-/// The process ends, with a task blocking its thread, as a handler on a stuck stderr would.
+/// The process ends, with a task blocking its thread, as a handler on a stuck stderr does.
 #[test]
 fn a_task_blocking_its_thread_cant_keep_the_process() {
     let (blocked_for_good, blocked) = std::sync::mpsc::channel::<()>();
@@ -582,4 +585,101 @@ fn a_task_blocking_its_thread_cant_keep_the_process() {
     let code = ended.recv_timeout(std::time::Duration::from_secs(60));
     assert_eq!(code, Ok(7));
     drop(blocked_for_good);
+}
+
+/// What `docs/operations.md` says of stopping, and what the real `serve` goes by. These have no
+/// other test: the end-to-end tests wait for nothing this long, and those holding a request open
+/// set their own.
+#[test]
+fn the_real_limits_are_the_documented_ones_and_fit_the_units_stop_timeout() {
+    let (limits, drain) = real_limits();
+    let cut_off = ServeOptions::default().cut_off_timeout;
+    assert_eq!(limits.body_timeout, Duration::from_secs(10));
+    assert_eq!(limits.request_timeout, Duration::from_secs(45));
+    assert_eq!(drain, Duration::from_secs(5));
+    assert_eq!(drain, ServeOptions::default().drain_timeout);
+    assert_eq!(cut_off, Duration::from_secs(5));
+    assert_eq!(TASKS_TIMEOUT, Duration::from_secs(5));
+    assert_eq!(CLOSE_TIMEOUT, Duration::from_secs(5));
+
+    let all = drain + cut_off + TASKS_TIMEOUT + CLOSE_TIMEOUT + SAY_TIMEOUT * 2 + LET_GO_TIMEOUT;
+    assert_eq!(all, Duration::from_secs(23), "the sum in the guide");
+    assert!(
+        all + Duration::from_secs(5) < Duration::from_secs(30),
+        "`TimeoutStopSec=30` must leave the last flush a row's wait for the database"
+    );
+}
+
+/// A store and the state over it, as `serve` has them.
+async fn stopping_state(dir: &Path) -> (ApiState, Store) {
+    let store = Store::open(&dir.join("c.db")).await.unwrap();
+    let config = landfall_approval::parse_config(b"").unwrap();
+    let state = ApiState::new(store.clone(), config, Limits::default());
+    (state, store)
+}
+
+fn kept_saying() -> (
+    impl Fn(&str) + Clone + Send + 'static,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let kept = Arc::clone(&said);
+    (
+        move |line: &str| kept.lock().unwrap().push(line.to_owned()),
+        said,
+    )
+}
+
+#[tokio::test]
+async fn the_operator_is_told_of_requests_left_running_and_of_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    for (left, words) in [
+        (1, "stopped with 1 request still"),
+        (2, "stopped with 2 requests still"),
+    ] {
+        let (state, store) = stopping_state(dir.path()).await;
+        let (say, said) = kept_saying();
+        finish_stopping(&state, &store, left, say).await;
+        let said = said.lock().unwrap();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains(words), "{said:?}");
+    }
+    let (state, store) = stopping_state(dir.path()).await;
+    let (say, said) = kept_saying();
+    finish_stopping(&state, &store, 0, say).await;
+    assert_eq!(*said.lock().unwrap(), [] as [String; 0]);
+}
+
+/// With the stderr stuck that left the request running, saying so can't keep the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stderr_that_takes_nothing_cant_hold_up_the_end_of_stopping() {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, store) = stopping_state(dir.path()).await;
+    let (stuck_for_good, stuck) = std::sync::mpsc::channel::<()>();
+    let stuck = Arc::new(Mutex::new(stuck));
+    let say = move |_: &str| {
+        let _ = stuck.lock().unwrap().recv();
+    };
+
+    let stopping = tokio::spawn(async move { finish_stopping(&state, &store, 1, say).await });
+
+    tokio::time::timeout(Duration::from_secs(60), stopping)
+        .await
+        .expect("it waited for stderr")
+        .unwrap();
+    drop(stuck_for_good);
+}
+
+/// A task stuck past its limit can't keep the last flush from running.
+#[tokio::test]
+async fn stopping_waits_for_its_tasks_only_so_long() {
+    let watching = tokio::spawn(std::future::pending::<()>());
+    let flushing = tokio::spawn(std::future::pending::<()>());
+
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        wait_for_tasks(watching, flushing, Duration::from_millis(50)),
+    )
+    .await
+    .expect("it waited for the tasks");
 }

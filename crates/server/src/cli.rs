@@ -20,7 +20,8 @@ use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 
 use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
@@ -34,10 +35,11 @@ mod tokens;
 
 /// How long stopping waits for the database's last connection to close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long stopping waits for the watcher and the flushing to let go. With the drain, the cut-off,
-/// the database's closing and [`LET_GO_TIMEOUT`], that's 21 s of the guide's `TimeoutStopSec=30`,
-/// which leaves room for the last flush.
+/// How long stopping waits for the watcher and the flushing to let go. `docs/operations.md` adds up
+/// what stopping can take, against `TimeoutStopSec=30`.
 const TASKS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long stopping waits for each of its last lines to be taken by stderr.
+const SAY_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the runtime gets for its threads to end, once the work is done. Without a limit, a task
 /// blocking its thread would keep the process until something killed it.
 const LET_GO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -346,6 +348,11 @@ fn trust_cache_dir(args: &ServeArgs) -> Result<PathBuf, CliError> {
     Ok(path)
 }
 
+/// What a request runs against in the real `serve`, and how long it has when stopping begins.
+fn real_limits() -> (Limits, Duration) {
+    (Limits::default(), ServeOptions::default().drain_timeout)
+}
+
 async fn serve(args: ServeArgs) -> Result<u8, CliError> {
     let config = load_config(&args.config)?;
     let token = github_token(std::env::var_os("GITHUB_TOKEN"))?;
@@ -354,7 +361,7 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
         let cache_dir = trust_cache_dir(args)?;
         Ok(Arc::new(LiveSource::new(fetcher, watched, cache_dir)))
     };
-    let (limits, drain) = (Limits::default(), ServeOptions::default().drain_timeout);
+    let (limits, drain) = real_limits();
     serve_watching(args, config, source, watcher::TICK_INTERVAL, limits, drain).await
 }
 
@@ -410,31 +417,69 @@ async fn serve_watching<S: ReleaseSource>(
         ..args.serve_options()
     };
     let left_running = crate::serve::run(listener, app, options, shutdown).await;
-    // Told to stop as the serving began to, they let go at once, and the limit is so that the last
-    // flush below runs whatever holds them up. If the watcher had already stopped, that was a panic
-    // and it was logged by the runtime.
-    drop(tokio::time::timeout(TASKS_TIMEOUT, async { tokio::join!(watching, flushing) }).await);
+    wait_for_tasks(watching, flushing, TASKS_TIMEOUT).await;
+    finish_stopping(&draining, &closing, left_running, crate::agent_api::log).await;
+    Ok(EXIT_OK)
+}
+
+/// Waits for the watcher and the flushing, told to stop as the serving began to. They let go at
+/// once, and the limit is so that what comes after runs whatever holds them up. If the watcher had
+/// already stopped, that was a panic and it was logged by the runtime.
+async fn wait_for_tasks<A, B>(watching: JoinHandle<A>, flushing: JoinHandle<B>, limit: Duration) {
+    drop(tokio::time::timeout(limit, async { tokio::join!(watching, flushing) }).await);
+}
+
+/// The last of stopping: writes the counts down, closes the database, and says what went wrong.
+async fn finish_stopping(
+    state: &ApiState,
+    store: &Store,
+    left_running: usize,
+    say: impl Fn(&str) + Clone + Send + 'static,
+) {
     // It stopped as the draining began, and a request finishing since may have counted something.
     // No request is running now, so nothing can count anything after this, but for what `run` said
     // was left, whose count is lost if it goes on to make one.
-    flush_dropped(&draining).await;
-    crate::web::tend(&draining).await;
+    flush_dropped(state).await;
+    crate::web::tend(state).await;
     // So that the main file holds everything. If it can't in time, the next start reads what is
     // left in the write-ahead log.
-    if tokio::time::timeout(CLOSE_TIMEOUT, closing.close())
+    if tokio::time::timeout(CLOSE_TIMEOUT, store.close())
         .await
         .is_err()
     {
-        crate::agent_api::log("the database did not close in time; it stays whole, with its -wal");
+        let line = "the database did not close in time; it stays whole, with its -wal";
+        say_in_time(say.clone(), line.to_owned()).await;
     }
-    // Last, as what can leave one running is a stderr that doesn't take what it's given.
-    if left_running > 0 {
-        crate::agent_api::log(&format!(
-            "stopped with {left_running} requests still running, each blocking its thread: \
-             anything they count from here on isn't written down"
-        ));
+    if let Some(line) = left_running_line(left_running) {
+        say_in_time(say, line).await;
     }
-    Ok(EXIT_OK)
+}
+
+/// What the operator is told of requests that couldn't be stopped, if any.
+fn left_running_line(left_running: usize) -> Option<String> {
+    let requests = match left_running {
+        0 => return None,
+        1 => "1 request".to_owned(),
+        many => format!("{many} requests"),
+    };
+    Some(format!(
+        "stopped with {requests} still running, each blocking its thread: anything counted from \
+         here on isn't written down. If this repeats, look at what reads this log, as a stuck \
+         stderr is what can block one"
+    ))
+}
+
+/// Says `line` on a thread of its own, without waiting long: what can leave a request running is a
+/// stderr that doesn't take what it's given, and that mustn't keep the process from ending.
+async fn say_in_time(say: impl FnOnce(&str) + Send + 'static, line: String) {
+    let (said, has_said) = oneshot::channel::<()>();
+    let saying = std::thread::Builder::new().spawn(move || {
+        say(&line);
+        let _ = said.send(());
+    });
+    if saying.is_ok() {
+        drop(tokio::time::timeout(SAY_TIMEOUT, has_said).await);
+    }
 }
 
 /// The database `serve` uses, which must exist.
@@ -608,7 +653,7 @@ pub fn run(cli: Cli) -> u8 {
 /// leads here.
 #[must_use]
 pub fn run_watching<S: ReleaseSource>(cli: Cli, source: Arc<S>, interval: Duration) -> u8 {
-    let (limits, drain) = (Limits::default(), ServeOptions::default().drain_timeout);
+    let (limits, drain) = real_limits();
     run_watching_within(cli, source, interval, limits, drain)
 }
 

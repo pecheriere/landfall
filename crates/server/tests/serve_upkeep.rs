@@ -3,8 +3,8 @@
 //!
 //! The controller is this test binary run again as `cli::run_watching_within`, as in the agent's
 //! end-to-end tests: `main` but for the watcher's source, and for the clocks a request runs
-//! against, as these tests hold one open for as long as a loaded machine makes them. One test runs
-//! the real `cli::run`, for the real ones.
+//! against, as these tests hold one open for as long as a loaded machine makes them. The real
+//! values have a test of their own, in `cli`.
 
 #![cfg(test)]
 
@@ -32,7 +32,6 @@ use sqlx::SqlitePool;
 
 const CHILD_ARGS: &str = "LANDFALL_UPKEEP_CHILD";
 const CHILD_INTERVAL_MS: &str = "LANDFALL_UPKEEP_INTERVAL_MS";
-const CHILD_IS_REAL: &str = "LANDFALL_UPKEEP_REAL";
 /// A stuck wait ends here, saying what it was waiting for. On a starved machine, starting or
 /// stopping a process has been seen to take over a minute. It's long so that a slow machine can't
 /// fail these, and only a hung test ever waits it out.
@@ -84,17 +83,13 @@ fn child_process() {
         let args: Vec<String> = serde_json::from_str(&args).unwrap();
         let every: u64 = std::env::var(CHILD_INTERVAL_MS).unwrap().parse().unwrap();
         let cli = Cli::parse_from(std::iter::once("landfall-server".to_owned()).chain(args));
-        let code = if std::env::var_os(CHILD_IS_REAL).is_some() {
-            cli::run(cli)
-        } else {
-            let limits = Limits {
-                body_timeout: NO_HURRY,
-                request_timeout: NO_HURRY,
-                ..Limits::default()
-            };
-            let every = Duration::from_millis(every);
-            cli::run_watching_within(cli, Arc::new(NoReleases), every, limits, NO_HURRY)
+        let limits = Limits {
+            body_timeout: NO_HURRY,
+            request_timeout: NO_HURRY,
+            ..Limits::default()
         };
+        let every = Duration::from_millis(every);
+        let code = cli::run_watching_within(cli, Arc::new(NoReleases), every, limits, NO_HURRY);
         std::process::exit(code.into());
     }
 }
@@ -107,22 +102,6 @@ struct Controller {
 
 impl Controller {
     fn start(dir: &Path, key: &SoftwareAuthenticator, every_ms: u64) -> Self {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command.env(CHILD_INTERVAL_MS, every_ms.to_string());
-        Self::start_as(command, dir, key)
-    }
-
-    /// The real `serve`, which is what's documented, and which has nothing to watch here.
-    fn start_real(dir: &Path, key: &SoftwareAuthenticator) -> Self {
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .env(CHILD_IS_REAL, "1")
-            .env(CHILD_INTERVAL_MS, "0")
-            .env_remove("GITHUB_TOKEN");
-        Self::start_as(command, dir, key)
-    }
-
-    fn start_as(mut command: Command, dir: &Path, key: &SoftwareAuthenticator) -> Self {
         let config = dir.join("fleet.toml");
         let text = format!(
             "[approval]\nrp_id = \"{RP_ID}\"\norigin = \"{ORIGIN}\"\n\n[approvers]\n\
@@ -141,9 +120,10 @@ impl Controller {
             "--listen",
             "127.0.0.1:0"
         ]);
-        let mut child = command
+        let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_process", "--ignored", "--nocapture"])
             .env(CHILD_ARGS, args.to_string())
+            .env(CHILD_INTERVAL_MS, every_ms.to_string())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -429,37 +409,4 @@ async fn serve_gives_a_request_the_drain_it_is_told() {
     let answer = finish(stream, &body);
     assert!(answer.starts_with("HTTP/1.1 403"), "{answer}");
     assert!(controller.exit_status().success());
-}
-
-/// The five seconds `docs/operations.md` gives requests in flight, in the real `serve`, which is
-/// nothing else in these tests. A request whose body doesn't come is also out by its own clock, at
-/// which it's answered, so on a machine so loaded that it got most of the way there before the
-/// signal, that's the sooner it can stop.
-#[tokio::test]
-async fn the_real_serve_gives_a_request_five_seconds_and_stops() {
-    let dir = tempfile::tempdir().unwrap();
-    let key = SoftwareAuthenticator::es256().unwrap();
-    let mut controller = Controller::start_real(dir.path(), &key);
-    let body = controller.forged_finish(&key).to_string();
-    let began = Instant::now();
-    let mut stream = a_request_under_way(&controller, &body);
-
-    controller.stop();
-    let stopping = Instant::now();
-    let status = controller.exit_status();
-    let took = stopping.elapsed();
-
-    assert!(status.success(), "{status}");
-    let drain = Duration::from_secs(5);
-    let body_runs_out = Limits::default()
-        .body_timeout
-        .saturating_sub(stopping.duration_since(began));
-    assert!(took >= drain.min(body_runs_out), "only {took:?}");
-    // With time to spare, the drain was the first to end, and that gets no answer. A longer drain
-    // would have let the body's clock answer.
-    if body_runs_out > drain + Duration::from_secs(4) {
-        let mut answer = String::new();
-        drop(stream.read_to_string(&mut answer));
-        assert_eq!(answer, "", "after {took:?}");
-    }
 }
