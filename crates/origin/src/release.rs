@@ -54,6 +54,7 @@ pub struct ReleaseOrigin {
 /// Why a release was refused. Each variant is one step of the verification
 /// and carries that step's error as its source.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ReleaseError {
     /// The deployment is not in the configuration.
     #[error("deployment {0} is not in the configuration")]

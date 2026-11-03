@@ -35,8 +35,8 @@ pub struct FileSubject<'a> {
 /// the bundle's limits and format, a [`SLSA_PROVENANCE`](super::SLSA_PROVENANCE)
 /// statement, its one transparency log entry, the Sigstore verification and the
 /// certificate's identity rules. In place of a digest being named somewhere in the
-/// statement, each subject must be there with that exact name and sha256 together.
-/// A bundle's signature covers its whole statement, so one verification, on the
+/// statement, each subject must be there with that exact name and sha256 together,
+/// and its name must have no other digest. A bundle's signature covers its whole statement, so one verification, on the
 /// first subject's digest, holds for every name read from that statement.
 ///
 /// The result's `digest` is the first subject's.
@@ -63,28 +63,46 @@ pub fn verify_file_bundle(
     verify_parsed(&bundle, first.digest, root, expected)
 }
 
-/// Whether one subject of `statement` has both the name and the digest of `subject`.
+/// Whether `statement` gives the name of `subject` to at least one subject, and every
+/// subject of that name has the digest of `subject`.
+///
+/// A name with two digests is refused for either of them: it no longer says which file
+/// it means, and the digest asked for must not be what chooses. The same name twice with
+/// the same digest leaves no doubt, so it passes; `actions/attest` removes those anyway.
 /// A subject may have no name, which reads as empty: that is not a name to find.
 pub(super) fn find_subject(
     statement: &Statement,
     subject: &FileSubject<'_>,
 ) -> Result<(), AttestationError> {
+    let named = || {
+        statement
+            .subject
+            .iter()
+            .filter(|named| named.name == subject.name)
+    };
     let found = !subject.name.is_empty()
-        && statement.subject.iter().any(|named| {
-            named.name == subject.name
-                && named.digest.sha256.as_ref().is_some_and(|hash| {
-                    subject.digest.as_ref().strip_prefix("sha256:") == Some(&*hash.to_hex())
-                })
+        && named().next().is_some()
+        && named().all(|named| {
+            named.digest.sha256.as_ref().is_some_and(|hash| {
+                subject.digest.as_ref().strip_prefix("sha256:") == Some(&*hash.to_hex())
+            })
         });
     if found {
-        Ok(())
-    } else {
-        Err(AttestationError::FileSubject {
-            name: subject.name.to_owned(),
-            expected: subject.digest.to_string(),
-            found: names_shown(statement),
-        })
+        return Ok(());
     }
+    let times = named().count();
+    Err(AttestationError::FileSubject {
+        name: subject.name.to_owned(),
+        expected: subject.digest.to_string(),
+        found: if times > 1 {
+            format!(
+                "{} {times} times, not all with this digest",
+                shown(subject.name)
+            )
+        } else {
+            names_shown(statement)
+        },
+    })
 }
 
 /// The statement's names for a refusal. Nothing has checked them yet, as this comes

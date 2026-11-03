@@ -131,6 +131,29 @@ fn some_digest() -> ImageDigest {
     format!("sha256:{}", "ab".repeat(32)).parse().unwrap()
 }
 
+/// With one digest throughout, so only the name can decide: the statement's own
+/// name is found, and `asked` is refused.
+fn assert_name_alone_refuses(in_statement: &str, asked: &str) {
+    let digest = some_digest();
+    let statement = statement_of(&[(in_statement, &digest)]);
+    let own = FileSubject {
+        name: in_statement,
+        digest: &digest,
+    };
+    assert_eq!(find_subject(&statement, &own), Ok(()), "{in_statement:?}");
+    let other = FileSubject {
+        name: asked,
+        digest: &digest,
+    };
+    assert!(
+        matches!(
+            find_subject(&statement, &other),
+            Err(AttestationError::FileSubject { .. })
+        ),
+        "{asked:?} against {in_statement:?}"
+    );
+}
+
 /// The fixture's identity, as its certificate has it.
 fn act_identity() -> CertificateIdentity {
     CertificateIdentity {
@@ -258,26 +281,13 @@ fn every_subject_is_checked_not_only_the_first() {
 
 #[test]
 fn name_that_only_contains_the_wanted_name_is_refused() {
-    let digest = some_digest();
-    let statement = statement_of(&[("act_Linux_arm64.tar.gz.evil", &digest)]);
-    for name in [
-        "act_Linux_arm64.tar.gz",
-        "Linux_arm64.tar.gz",
-        "ACT_LINUX_ARM64.TAR.GZ",
-        "./act_Linux_arm64.tar.gz.evil",
-        "act_Linux_arm64.tar.gz.evil ",
+    for (in_statement, asked) in [
+        ("act_Linux_arm64.tar.gz.evil", ARM),
+        ("evil-act_Linux_arm64.tar.gz", ARM),
+        (ARM, "Linux_arm64.tar.gz"),
+        (ARM, "act_Linux_arm64"),
     ] {
-        let subject = FileSubject {
-            name,
-            digest: &digest,
-        };
-        assert!(
-            matches!(
-                find_subject(&statement, &subject),
-                Err(AttestationError::FileSubject { .. })
-            ),
-            "{name}"
-        );
+        assert_name_alone_refuses(in_statement, asked);
     }
 
     // The same, on the real statement: part of a real name, with its real digest.
@@ -290,6 +300,106 @@ fn name_that_only_contains_the_wanted_name_is_refused() {
         verify(BUNDLE, &asked, &config()),
         Err(AttestationError::FileSubject { .. })
     ));
+}
+
+/// Each pair is one name in two spellings, either way round: a file is only ever
+/// the bytes of its name, so none of these is the other.
+#[test]
+fn another_spelling_of_the_name_is_refused() {
+    for (one, other) in [
+        ("./x", "x"),
+        ("a/x", "x"),
+        ("/x", "x"),
+        ("X", "x"),
+        ("x ", "x"),
+        (" x", "x"),
+        ("x\0", "x"),
+        ("x\n", "x"),
+        // NFC and NFD of one word.
+        ("caf\u{e9}", "cafe\u{301}"),
+        // A Cyrillic letter for the Latin one.
+        ("\u{445}", "x"),
+    ] {
+        assert_name_alone_refuses(one, other);
+        assert_name_alone_refuses(other, one);
+    }
+}
+
+/// Having the name twice says nothing of which file it means, so it isn't for
+/// the digest asked for to choose: an honest `subject-path` over two directories
+/// with the same basename signs just this.
+#[test]
+fn a_name_given_with_two_digests_is_refused_for_either() {
+    let (one, other) = (some_digest(), attested(ARM));
+    for statement in [
+        statement_of(&[("x", &one), ("x", &other)]),
+        statement_of(&[("x", &other), ("x", &one)]),
+    ] {
+        for digest in [&one, &other] {
+            let asked = FileSubject { name: "x", digest };
+            let error = find_subject(&statement, &asked).unwrap_err();
+            let AttestationError::FileSubject { found, .. } = &error else {
+                panic!("expected a file subject refusal, got {error:?}");
+            };
+            assert_eq!(found, "\"x\" 2 times, not all with this digest");
+        }
+    }
+}
+
+/// The same name and digest twice leaves no doubt what the name means.
+#[test]
+fn a_name_given_twice_with_one_digest_is_found() {
+    let digest = some_digest();
+    let statement = statement_of(&[("x", &digest), ("x", &digest)]);
+    let asked = FileSubject {
+        name: "x",
+        digest: &digest,
+    };
+    assert_eq!(find_subject(&statement, &asked), Ok(()));
+
+    let other = attested(ARM);
+    let elsewhere = FileSubject {
+        name: "x",
+        digest: &other,
+    };
+    assert!(matches!(
+        find_subject(&statement, &elsewhere),
+        Err(AttestationError::FileSubject { .. })
+    ));
+}
+
+#[test]
+fn a_same_name_subject_with_no_sha256_is_refused() {
+    let digest = some_digest();
+    let statement: Statement = serde_json::from_value(json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [
+            { "name": "x", "digest": { "sha256": "ab".repeat(32) } },
+            { "name": "x", "digest": { "sha512": "cd".repeat(64) } },
+        ],
+        "predicateType": SLSA_PROVENANCE,
+    }))
+    .unwrap();
+    let asked = FileSubject {
+        name: "x",
+        digest: &digest,
+    };
+    assert!(matches!(
+        find_subject(&statement, &asked),
+        Err(AttestationError::FileSubject { .. })
+    ));
+}
+
+/// Another file's duplicate is no reason to refuse this file.
+#[test]
+fn a_name_given_twice_does_not_touch_another_name() {
+    let (one, other) = (some_digest(), attested(ARM));
+    let statement = statement_of(&[("y", &one), ("y", &other), ("x", &one)]);
+    let asked = FileSubject {
+        name: "x",
+        digest: &one,
+    };
+    assert_eq!(find_subject(&statement, &asked), Ok(()));
 }
 
 #[test]
@@ -350,6 +460,51 @@ fn what_a_hostile_statement_names_is_quoted_and_bounded() {
     let nothing = statement_of(&[]);
     let error = find_subject(&nothing, &asked).unwrap_err();
     assert!(error.to_string().contains("no subject"), "{error}");
+}
+
+#[test]
+fn the_list_of_names_says_how_many_it_left_out() {
+    let digest = some_digest();
+    let asked = FileSubject {
+        name: ARM,
+        digest: &digest,
+    };
+    for (names, ends) in [(16, "\"n\""), (17, "and 1 more")] {
+        let statement = statement_of(&vec![("n", &digest); names]);
+        let Err(AttestationError::FileSubject { found, .. }) = find_subject(&statement, &asked)
+        else {
+            panic!("expected a file subject refusal");
+        };
+        assert!(found.ends_with(ends), "{found}");
+    }
+}
+
+#[test]
+fn a_refusal_says_the_statement_is_not_yet_verified() {
+    let digest = some_digest();
+    let asked = FileSubject {
+        name: ARM,
+        digest: &digest,
+    };
+    let error = find_subject(&statement_of(&[]), &asked).unwrap_err();
+    assert!(error.to_string().contains("unverified"), "{error}");
+}
+
+#[test]
+fn another_payload_type_is_refused() {
+    let mut bundle: Value = serde_json::from_slice(BUNDLE).unwrap();
+    bundle["dsseEnvelope"]["payloadType"] = Value::String("text/plain".to_owned());
+    let edited = serde_json::to_vec(&bundle).unwrap();
+    let arm = attested(ARM);
+    let asked = [FileSubject {
+        name: ARM,
+        digest: &arm,
+    }];
+    let result = verify(&edited, &asked, &config());
+    let Err(AttestationError::Bundle(message)) = result else {
+        panic!("expected a malformed bundle, got {result:?}");
+    };
+    assert!(message.contains("payload type"), "{message}");
 }
 
 #[test]

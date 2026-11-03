@@ -129,16 +129,17 @@ pub enum AttestationError {
         found: String,
     },
     /// The statement has no subject with this file's name and digest together, as
-    /// when another attested file's digest is asked for under this name.
-    #[error(
-        "bundle does not attest a file named {name:?} with digest {expected}: it names {found}"
-    )]
+    /// when another attested file's digest is asked for under this name, or it gives
+    /// this name another digest too. This comes before the signature is checked, so
+    /// it says nothing of what the release attests: a tampered statement gets it too.
+    #[error("the unverified statement does not give {name:?} digest {expected}: it has {found}")]
     FileSubject {
         /// The name asked for.
         name: String,
         /// The digest asked for.
         expected: String,
-        /// The names the statement has, quoted, and cut short if there are many.
+        /// What the unverified statement has: its names, quoted, and cut short if
+        /// there are many, or how often it has this name.
         found: String,
     },
     /// [`verify_file_bundle`] was asked about no file at all, which would prove nothing.
