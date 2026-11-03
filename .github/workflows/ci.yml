@@ -118,10 +118,13 @@ jobs:
       # A filter matching nothing would pass, hence the count: at least the tests written.
       - name: Host install against a real sshd
         shell: bash
+        # Plain `cargo test` has no limit, and the job's is for a cold build of the binaries. Each
+        # test's container stops at once if it can't boot, so this is only for one that hangs.
+        timeout-minutes: 15
         run: |
           LANDFALL_TEST_DIST="$PWD/dist" cargo test -p landfall-cli --locked -- --ignored docker_ \
             | tee "$RUNNER_TEMP/host-install.txt"
-          test "$(grep -Ec '^test .*docker_.* \.\.\. ok$' "$RUNNER_TEMP/host-install.txt")" -ge 26
+          python3 -I .github/scripts/count_passed.py "$RUNNER_TEMP/host-install.txt" 27
 
   crate-age:
     # Compares Cargo.lock with the PR's base, so it only runs on pull requests.

@@ -7,7 +7,7 @@ the `host-install` job. Run them by hand after changing `crates/cli/src/host/`.
 
 ## What they need
 
-Docker, `ssh`, `ssh-keygen`, and `nc` for one line of a config. No root, and no network beyond
+Docker, `ssh`, `ssh-keygen`, `pgrep` and `kill`, and `nc` for one line of a config. No root, and no network beyond
 what building takes.
 
 ```sh
@@ -42,6 +42,11 @@ throwaway key and `ssh_config`, with `IdentityAgent none`, so nothing reaches yo
 | `--security-opt apparmor=unconfined` | Docker's default profile refuses those mounts on a host with AppArmor. It isn't active on Docker Desktop, so that part is from what it does on a runner. |
 | `--cgroupns=private` | So that this systemd sees a cgroup tree of its own to write to. |
 | `--tmpfs /run`, `--tmpfs /run/lock` | Where systemd expects a tmpfs. |
+
+A container that can't boot, as on a host whose AppArmor or seccomp refuses one of these, fails its
+test at once with its exit code and `docker logs`. **If they show `mount` refused on a runner, the
+fallback is `--privileged` in `harness.rs` with `CMD ["/sbin/init"]` in the `Dockerfile`,** which
+passed here as well.
 
 `SYS_ADMIN` is a broad capability, and this isn't a sandbox for hostile code: it's what lets a test
 of a root script not need all of `--privileged`.

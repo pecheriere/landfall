@@ -232,7 +232,7 @@ fn docker_nothing_secret_is_left_behind() {
     let target = Target::start();
     target.installed();
     assert!(!target.exists(CODE_PATH));
-    assert_eq!(target.sh("ls -d /tmp/landfall-install.*").stdout, b"");
+    assert_eq!(target.uploads_left(), "");
 
     // After an enrolment that fails: a code it wasn't given.
     target.stop_unit();
@@ -247,7 +247,7 @@ fn docker_nothing_secret_is_left_behind() {
     let ran = target.install(&args);
     assert_ne!(ran.status(), 0, "{}", ran.out);
     assert!(!target.exists(CODE_PATH));
-    assert_eq!(target.sh("ls -d /tmp/landfall-install.*").stdout, b"");
+    assert_eq!(target.uploads_left(), "");
 
     // After an upload that was killed: this login's goes on the next run, and another user's once
     // it has aged, by the root script.

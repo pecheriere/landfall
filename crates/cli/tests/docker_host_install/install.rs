@@ -1,12 +1,16 @@
 //! What an install does on a machine, from nothing and over what's there.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
 use landfall_cli::host::install::{InstallArgs, Outcome};
-use landfall_cli::host::plan::render;
+use landfall_cli::host::plan::{UPLOAD_AGENT, UPLOAD_CODE, render};
 use landfall_cli::host::shell::quote;
 use landfall_cli::host::ssh::{self, Remote, SshError};
 
 use crate::harness::{
-    AGENT_NEW, AGENT_PATH, CONFIG_PATH, Captured, FLEET, FixedSource, KEY_PATH, MARKER,
+    AGENT_NEW, AGENT_PATH, CODE_PATH, CONFIG_PATH, Captured, FLEET, FixedSource, KEY_PATH, MARKER,
     RECOVER_PATH, STATE_DIR, Target, UNIT_PATH, UPLOAD, Unattended, dest_as, install_through,
     real_agent, sha256_hex, steps, upload_with_config, wait_until,
 };
@@ -183,12 +187,15 @@ fn docker_tampered_upload_is_refused() {
     assert!(!target.exists(AGENT_NEW));
 }
 
-/// Swaps the upload for a link to what the login can't read, just before the script runs.
-struct Swapping<R>(R);
+/// Swaps a file of the upload for a link to what the login can't read, just before the script runs.
+struct Swapping<R> {
+    inner: R,
+    file: &'static str,
+}
 
 impl<R: Remote> Remote for Swapping<R> {
     fn run(&self, command: &str, stdin: &[u8]) -> Result<ssh::Output, SshError> {
-        self.0.run(command, stdin)
+        self.inner.run(command, stdin)
     }
 
     fn run_privileged(&self, script: &str, interactive: bool) -> Result<i32, SshError> {
@@ -197,40 +204,61 @@ impl<R: Remote> Remote for Swapping<R> {
             .find_map(|line| line.strip_prefix("upload='"))
             .unwrap()
             .trim_end_matches('\'');
-        let swapped = self.0.run(
+        let swapped = self.inner.run(
             &format!(
                 "ln -sf /etc/shadow {}",
-                quote(&format!("{upload}/landfall-agent"))
+                quote(&format!("{upload}/{}", self.file))
             ),
             b"",
         )?;
         assert_eq!(swapped.status, 0);
-        self.0.run_privileged(script, interactive)
+        self.inner.run_privileged(script, interactive)
     }
 }
 
+/// `enrol-code` is the file that shows it, having no hash: read as root, what's in `/etc/shadow`
+/// would be on its way to the agent.
 #[test]
 #[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
 fn docker_symlink_in_the_upload_gains_nothing() {
-    let target = Target::start();
-    let remote = Swapping(target.remote_as("operator"));
+    for file in [UPLOAD_AGENT, UPLOAD_CODE] {
+        let target = Target::start();
+        let remote = Swapping {
+            inner: Captured::new(target.remote_as("operator")),
+            file,
+        };
 
-    let ran = install_through(
-        &target.args(),
-        &FixedSource::real(),
-        &remote,
-        &mut Unattended,
-    );
+        let ran = install_through(
+            &target.args(),
+            &FixedSource::real(),
+            &remote,
+            &mut Unattended,
+        );
 
-    assert_eq!(ran.status(), 1, "{}", ran.error_text());
-    assert!(!target.exists(AGENT_PATH));
-    assert!(!target.exists(AGENT_NEW));
-    let shadow_root = target.sh_ok("grep ^root: /etc/shadow");
-    let found = target.sh(&format!(
-        "grep -rlF {} /usr/local/bin /etc/landfall /var/lib/landfall-agent /tmp",
-        quote(shadow_root.trim())
-    ));
-    assert_eq!(String::from_utf8_lossy(&found.stdout), "");
+        assert_eq!(ran.status(), 1, "{file}: {}", ran.error_text());
+        let said = String::from_utf8_lossy(&remote.inner.said.borrow()).into_owned();
+        assert!(said.contains("Permission denied"), "{file}: {said}");
+        assert!(!target.exists(CODE_PATH), "{file}");
+        assert!(!target.exists(AGENT_NEW), "{file}");
+        // The agent's own is refused in preflight. The code's comes after the agent is in place.
+        assert_eq!(
+            target
+                .sh_ok(&format!("[ -e {AGENT_PATH} ] && echo there || echo gone"))
+                .trim(),
+            if file == UPLOAD_AGENT {
+                "gone"
+            } else {
+                "there"
+            },
+            "{file}"
+        );
+        let shadow_root = target.sh_ok("grep ^root: /etc/shadow");
+        let found = target.sh(&format!(
+            "grep -rlF {} /usr/local/bin /etc/landfall /var/lib/landfall-agent /tmp",
+            quote(shadow_root.trim())
+        ));
+        assert_eq!(String::from_utf8_lossy(&found.stdout), "", "{file}");
+    }
 }
 
 #[test]
@@ -397,10 +425,40 @@ fn docker_sudo_needing_a_password_without_a_terminal_is_refused() {
 
     assert_eq!(ran.status(), 1, "{}", ran.error_text());
     assert!(ran.error_text().contains("sudo"), "{}", ran.error_text());
-    assert_eq!(target.sh("ls -d /tmp/landfall-install.*").stdout, b"");
+    assert_eq!(target.uploads_left(), "");
     assert!(!target.exists(AGENT_PATH));
     assert!(!target.exists(CONFIG_PATH));
-    assert_eq!(target.sh("getent passwd landfall-agent").stdout, b"");
+    assert_eq!(target.sh_ok("getent passwd landfall-agent || true"), "");
+}
+
+/// What a refusal by `AppArmor` or seccomp on a runner would look like: it must read well in CI's log,
+/// and not wait, and leave no container. A container that stops at once, and one that stops later.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_a_container_that_cannot_boot_says_why() {
+    for (shell, code, words) in [
+        ("echo mount said no >&2; exit 32", "32", "mount said no"),
+        ("sleep 2; echo died later >&2; exit 33", "33", "died later"),
+    ] {
+        let label = format!("landfall-test-cannot-boot={}-{code}", std::process::id());
+        let start = Instant::now();
+
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            Target::boot(&["sh", "-c", shell], &label);
+        }))
+        .unwrap_err();
+
+        assert!(start.elapsed() < Duration::from_secs(60), "{shell}");
+        let message = panicked.downcast_ref::<String>().unwrap();
+        assert!(message.contains(&format!("exit code {code}")), "{message}");
+        assert!(message.contains(words), "{message}");
+        assert!(message.contains("README.md"), "{message}");
+        let left = Command::new("docker")
+            .args(["ps", "-aq", "--filter", &format!("label={label}")])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&left.stdout), "", "{shell}");
+    }
 }
 
 /// The real agent must be what these tests put in place, or they'd show nothing of it.

@@ -266,8 +266,15 @@ impl Target {
     /// A fresh machine, with sshd up, a controller running, and this test's key let in.
     pub(crate) fn start() -> Self {
         let dist = dist();
+        Self::boot(&[], IMAGE).finish_starting(&dist)
+    }
+
+    /// A machine that has booted or has been seen not to, running `command` in place of the
+    /// image's, with `label` to find it by. From `docker run` on, `Drop` has the container.
+    pub(crate) fn boot(command: &[&str], label: &str) -> Self {
         check_image();
-        let id = docker_ok(&[
+        let dir = TempDir::new().unwrap();
+        let mut run = vec![
             "run",
             "-d",
             // Not `--privileged`: README.md says why each of these is needed.
@@ -283,41 +290,87 @@ impl Target {
             "-p",
             "127.0.0.1::22",
             "--label",
+            label,
             IMAGE,
-            IMAGE,
-        ])
-        .trim()
-        .to_owned();
-        let port = docker_ok(&["port", &id, "22/tcp"]);
-        let port = port
-            .lines()
-            .next()
-            .and_then(|line| line.rsplit(':').next())
-            .unwrap()
-            .to_owned();
-        let dir = TempDir::new().unwrap();
+        ];
+        run.extend(command);
+        let id = docker_ok(&run).trim().to_owned();
         let identity = dir.path().join("key");
-        let made = Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", ""])
-            .arg("-f")
-            .arg(&identity)
-            .status()
-            .unwrap();
-        assert!(made.success());
         let known_hosts = dir.path().join("known_hosts");
-        let target = Self {
+        let mut target = Self {
             id,
             dir,
-            port,
+            port: String::new(),
             known_hosts,
             identity,
             host_key: String::new(),
         };
-        target.finish_starting(&dist)
+        let made = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", ""])
+            .arg("-f")
+            .arg(&target.identity)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        target.port = target.published_port();
+        target.wait_for_boot();
+        target
+    }
+
+    /// The port, once `docker` has one to say. It has none for a container that's stopped.
+    fn published_port(&self) -> String {
+        let start = Instant::now();
+        loop {
+            self.assert_still_running();
+            let port = docker(&["port", &self.id, "22/tcp"]);
+            if port.status.success() {
+                return text(&port.stdout)
+                    .lines()
+                    .next()
+                    .and_then(|line| line.rsplit(':').next())
+                    .unwrap()
+                    .to_owned();
+            }
+            assert!(
+                start.elapsed() < BOOT_LIMIT,
+                "no port for the container: {}\n{}",
+                text(&port.stderr),
+                self.how_it_stands()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// A container that has stopped will never come up, so nothing should wait for it to.
+    fn assert_still_running(&self) {
+        let status = docker(&["inspect", "-f", "{{.State.Status}}", &self.id]);
+        let status = text(&status.stdout);
+        assert!(
+            status.trim() == "running",
+            "the machine stopped instead of booting.\n{}",
+            self.how_it_stands()
+        );
+    }
+
+    /// What can be said of the container, for a failure that needs reading from CI's log alone.
+    fn how_it_stands(&self) -> String {
+        let state = docker(&[
+            "inspect",
+            "-f",
+            "status {{.State.Status}}, exit code {{.State.ExitCode}}, error {{.State.Error}}",
+            &self.id,
+        ]);
+        let logs = docker(&["logs", "--tail", "50", &self.id]);
+        format!(
+            "container {id}: {state}\ndocker logs:\n{stdout}{stderr}\nIf `mount` was refused, README.md has the fallback.",
+            id = self.id,
+            state = text(&state.stdout).trim(),
+            stdout = text(&logs.stdout),
+            stderr = text(&logs.stderr),
+        )
     }
 
     fn finish_starting(mut self, dist: &Path) -> Self {
-        self.wait_for_boot();
         let public_key = fs::read_to_string(self.identity.with_extension("pub")).unwrap();
         for user in ["operator", "needs-password"] {
             let group = self.sh_ok(&format!("id -gn {user}"));
@@ -367,6 +420,7 @@ impl Target {
     fn wait_for_boot(&self) {
         let start = Instant::now();
         loop {
+            self.assert_still_running();
             if self
                 .sh("systemctl is-active --quiet ssh.service dbus.service docker.service")
                 .status
@@ -376,7 +430,8 @@ impl Target {
             }
             assert!(
                 start.elapsed() < BOOT_LIMIT,
-                "the machine didn't boot: {}",
+                "the machine didn't boot in {BOOT_LIMIT:?}.\n{}\nInside it:\n{}",
+                self.how_it_stands(),
                 text(
                     &self
                         .sh("systemctl list-units --failed; systemctl status ssh.service")
@@ -418,8 +473,22 @@ impl Target {
         text(&ran.stdout)
     }
 
+    /// Whether `path` is there, on a machine that can say: a failed `docker exec` also has a
+    /// status of 1, and would otherwise read as its not being there.
+    #[track_caller]
     pub(crate) fn exists(&self, path: &str) -> bool {
-        self.sh(&format!("[ -e {path} ]")).status.success()
+        let ran = self.sh(&format!("[ -e {path} ]"));
+        match ran.status.code() {
+            Some(0) => true,
+            Some(1) if ran.stderr.is_empty() => false,
+            _ => panic!("couldn't look for {path}: {ran:?}"),
+        }
+    }
+
+    /// The uploads in `/tmp`, on a machine that can say.
+    #[track_caller]
+    pub(crate) fn uploads_left(&self) -> String {
+        self.sh_ok("ls -d /tmp/landfall-install.* 2>/dev/null || true")
     }
 
     /// The `ssh_config`, starting with `lines` so that they are the ones that count, and otherwise
@@ -564,11 +633,17 @@ impl Target {
 
     /// How many times anyone has logged in over SSH.
     pub(crate) fn logins(&self) -> usize {
-        self.sh("journalctl --sync; journalctl -u ssh.service --no-pager -q")
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| text(line).contains("Accepted publickey"))
-            .count()
+        self.login_log().len()
+    }
+
+    /// `sshd`'s line for each login, with its time.
+    pub(crate) fn login_log(&self) -> Vec<String> {
+        let log = self
+            .sh_ok("journalctl --sync; journalctl -u ssh.service --no-pager -q -o short-precise");
+        log.lines()
+            .filter(|line| line.contains("Accepted publickey"))
+            .map(str::to_owned)
+            .collect()
     }
 
     /// How the machine stands, in text that two machines installed alike share.
