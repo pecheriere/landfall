@@ -68,8 +68,12 @@ pub struct ServeOptions {
     /// cannot take the rest. Behind a proxy all agents are one source, and this
     /// needs raising: see `docs/operations.md`.
     pub max_connections_per_source: u32,
-    /// How long stopping waits for requests in flight.
+    /// How long stopping waits for requests in flight. Those still running then get no answer.
     pub drain_timeout: Duration,
+    /// How long stopping then waits for those to be gone. Each goes the next time it runs, so this
+    /// is only for a handler blocking its thread, on a stuck stderr say, which can't be stopped.
+    /// With `TimeoutStopSec=30` in the guide, this leaves room for what stopping does after it.
+    pub cut_off_timeout: Duration,
 }
 
 impl Default for ServeOptions {
@@ -83,6 +87,7 @@ impl Default for ServeOptions {
             max_connections: 1024,
             max_connections_per_source: 32,
             drain_timeout: Duration::from_secs(5),
+            cut_off_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -179,7 +184,9 @@ async fn serve_connection(
 /// Serves `app` on `listener` until `shutdown` completes, then lets requests in
 /// flight finish for up to [`ServeOptions::drain_timeout`], and drops what's left of them. No
 /// handler is running when this returns, so what the caller does next is the last word: nothing
-/// can count a failure after it has written the counts down.
+/// can count a failure after it has written the counts down. The exception is what this gives: how
+/// many connections were still there after [`ServeOptions::cut_off_timeout`], each with a handler
+/// blocking its thread, and able to count something if it ever comes back.
 ///
 /// Failing to accept one connection is no reason to stop serving the others, so
 /// it is logged and retried.
@@ -188,11 +195,10 @@ pub async fn run(
     app: Router,
     options: ServeOptions,
     shutdown: impl Future<Output = ()>,
-) {
+) -> usize {
     let permits = options.max_connections;
-    let connections = Arc::new(Semaphore::new(
-        usize::try_from(permits).unwrap_or(usize::MAX),
-    ));
+    let total = usize::try_from(permits).unwrap_or(usize::MAX);
+    let connections = Arc::new(Semaphore::new(total));
     let (closing, closing_rx) = watch::channel(false);
     let (cut_off, cut_off_rx) = watch::channel(false);
     let sources = SourceCounts::default();
@@ -248,13 +254,18 @@ pub async fn run(
     // Every permit back means every connection is done.
     drop(tokio::time::timeout(options.drain_timeout, connections.acquire_many(permits)).await);
     cut_off.send_replace(true);
-    // Without a limit: each drops what it's doing the next time it runs, and no handler blocks.
-    drop(connections.acquire_many(permits).await);
+    let gone = tokio::time::timeout(options.cut_off_timeout, connections.acquire_many(permits));
+    match gone.await {
+        Ok(_) => 0,
+        Err(_) => total.saturating_sub(connections.available_permits()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use axum::extract::ConnectInfo;
     use axum::routing::get;
@@ -289,7 +300,7 @@ mod tests {
     struct Server {
         addr: SocketAddr,
         stop: oneshot::Sender<()>,
-        task: JoinHandle<()>,
+        task: JoinHandle<usize>,
     }
 
     async fn start(options: ServeOptions) -> Server {
@@ -427,6 +438,38 @@ mod tests {
             .unwrap();
     }
 
+    /// `app` served with short limits on stopping, with a request to `/hang` running, which told
+    /// `running` so.
+    async fn hanging(app: Router, running: &Notify) -> Hanging {
+        let server = serving(
+            app,
+            ServeOptions {
+                drain_timeout: Duration::from_millis(100),
+                cut_off_timeout: Duration::from_secs(2),
+                ..ServeOptions::default()
+            },
+        )
+        .await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /hang HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        running.notified().await;
+        Hanging {
+            stop: server.stop,
+            task: server.task,
+            _stream: stream,
+        }
+    }
+
+    /// A server with a request running, whose connection stays open for as long as this does.
+    struct Hanging {
+        stop: oneshot::Sender<()>,
+        task: JoinHandle<usize>,
+        _stream: TcpStream,
+    }
+
     /// What the server does last as it stops goes by this: a handler still running could count
     /// something after the last time the counts are written down, and answer as if it had been.
     #[tokio::test]
@@ -460,6 +503,62 @@ mod tests {
 
         assert_eq!(Arc::strong_count(&alive), 1, "a handler is still running");
         assert_eq!(read_to_close(&mut stream).await, "", "it answers nothing");
+    }
+
+    /// On real worker threads, where a connection's task is still dropping its handler while
+    /// `run` goes on, unless it waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stopping_waits_for_a_handler_to_be_gone() {
+        struct SlowToGo(Arc<AtomicBool>);
+        impl Drop for SlowToGo {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(300));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(Notify::new());
+        let (told, flag) = (Arc::clone(&running), Arc::clone(&gone));
+        let hang = move || async move {
+            let guard = SlowToGo(flag);
+            told.notify_one();
+            std::future::pending::<()>().await;
+            drop(guard);
+        };
+        let server = hanging(Router::new().route("/hang", get(hang)), &running).await;
+
+        server.stop.send(()).unwrap();
+
+        assert_eq!(server.task.await.unwrap(), 0);
+        assert!(
+            gone.load(Ordering::SeqCst),
+            "it returned with it still there"
+        );
+    }
+
+    /// A handler that can't be cut off, as it never gives its thread back: it can't hold up
+    /// stopping past the limit, and `run` says it's there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handler_blocking_its_thread_holds_up_stopping_only_so_long() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let running = Arc::new(Notify::new());
+        let told = Arc::clone(&running);
+        let hang = move || async move {
+            told.notify_one();
+            let _ = blocked.lock().unwrap().recv();
+        };
+        let server = hanging(Router::new().route("/hang", get(hang)), &running).await;
+
+        server.stop.send(()).unwrap();
+
+        // Blocked until after this, so this returning at all is the point.
+        let left = tokio::time::timeout(Duration::from_secs(60), server.task)
+            .await
+            .expect("it waited for the handler")
+            .unwrap();
+        assert_eq!(left, 1);
+        drop(release);
     }
 
     /// The only slot goes to a client that asks for more than the socket buffers

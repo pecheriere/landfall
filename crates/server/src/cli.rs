@@ -34,6 +34,13 @@ mod tokens;
 
 /// How long stopping waits for the database's last connection to close.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long stopping waits for the watcher and the flushing to let go. With the drain, the cut-off,
+/// the database's closing and [`LET_GO_TIMEOUT`], that's 21 s of the guide's `TimeoutStopSec=30`,
+/// which leaves room for the last flush.
+const TASKS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the runtime gets for its threads to end, once the work is done. Without a limit, a task
+/// blocking its thread would keep the process until something killed it.
+const LET_GO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -347,8 +354,8 @@ async fn serve(args: ServeArgs) -> Result<u8, CliError> {
         let cache_dir = trust_cache_dir(args)?;
         Ok(Arc::new(LiveSource::new(fetcher, watched, cache_dir)))
     };
-    let drain = ServeOptions::default().drain_timeout;
-    serve_watching(args, config, source, watcher::TICK_INTERVAL, drain).await
+    let (limits, drain) = (Limits::default(), ServeOptions::default().drain_timeout);
+    serve_watching(args, config, source, watcher::TICK_INTERVAL, limits, drain).await
 }
 
 /// Serves `config`, with the watcher looking at what `source` makes every
@@ -358,6 +365,7 @@ async fn serve_watching<S: ReleaseSource>(
     config: Config,
     source: impl FnOnce(&ServeArgs, Arc<Config>) -> Result<Arc<S>, CliError>,
     interval: Duration,
+    limits: Limits,
     drain_timeout: Duration,
 ) -> Result<u8, CliError> {
     let store = Store::open(&args.db).await?;
@@ -385,7 +393,7 @@ async fn serve_watching<S: ReleaseSource>(
     ));
 
     let closing = store.clone();
-    let state = ApiState::new(store, config, Limits::default());
+    let state = ApiState::new(store, config, limits);
     let draining = state.clone();
     let app = crate::router(state.clone());
     let flushing = tokio::spawn(keep_flushing(state.clone(), interval, stop_flushing));
@@ -401,13 +409,14 @@ async fn serve_watching<S: ReleaseSource>(
         drain_timeout,
         ..args.serve_options()
     };
-    crate::serve::run(listener, app, options, shutdown).await;
-    // Told to stop as the serving began to, it lets go at once. If the watcher
-    // had already stopped, that was a panic and it was logged by the runtime.
-    drop(watching.await);
-    drop(flushing.await);
+    let left_running = crate::serve::run(listener, app, options, shutdown).await;
+    // Told to stop as the serving began to, they let go at once, and the limit is so that the last
+    // flush below runs whatever holds them up. If the watcher had already stopped, that was a panic
+    // and it was logged by the runtime.
+    drop(tokio::time::timeout(TASKS_TIMEOUT, async { tokio::join!(watching, flushing) }).await);
     // It stopped as the draining began, and a request finishing since may have counted something.
-    // No request is running now, so nothing can count anything after this.
+    // No request is running now, so nothing can count anything after this, but for what `run` said
+    // was left, whose count is lost if it goes on to make one.
     flush_dropped(&draining).await;
     crate::web::tend(&draining).await;
     // So that the main file holds everything. If it can't in time, the next start reads what is
@@ -417,6 +426,13 @@ async fn serve_watching<S: ReleaseSource>(
         .is_err()
     {
         crate::agent_api::log("the database did not close in time; it stays whole, with its -wal");
+    }
+    // Last, as what can leave one running is a stderr that doesn't take what it's given.
+    if left_running > 0 {
+        crate::agent_api::log(&format!(
+            "stopped with {left_running} requests still running, each blocking its thread: \
+             anything they count from here on isn't written down"
+        ));
     }
     Ok(EXIT_OK)
 }
@@ -592,23 +608,26 @@ pub fn run(cli: Cli) -> u8 {
 /// leads here.
 #[must_use]
 pub fn run_watching<S: ReleaseSource>(cli: Cli, source: Arc<S>, interval: Duration) -> u8 {
-    let drain = ServeOptions::default().drain_timeout;
-    run_watching_draining(cli, source, interval, drain)
+    let (limits, drain) = (Limits::default(), ServeOptions::default().drain_timeout);
+    run_watching_within(cli, source, interval, limits, drain)
 }
 
-/// [`run_watching`], giving requests in flight `drain_timeout` when it stops, for a test holding
-/// one of them open, which on a loaded machine can take longer than a real drain allows.
+/// [`run_watching`], with `limits` on requests and `drain_timeout` for those in flight when it
+/// stops, for a test holding one of them open, which on a loaded machine can take longer than the
+/// real ones allow. Nothing on the command line leads here either.
 #[must_use]
-pub fn run_watching_draining<S: ReleaseSource>(
+pub fn run_watching_within<S: ReleaseSource>(
     cli: Cli,
     source: Arc<S>,
     interval: Duration,
+    limits: Limits,
     drain_timeout: Duration,
 ) -> u8 {
     match cli.command {
         Command::Serve(args) => on_a_runtime(async move {
             let config = load_config(&args.config)?;
-            serve_watching(args, config, |_, _| Ok(source), interval, drain_timeout).await
+            let source = |_: &ServeArgs, _| Ok(source);
+            serve_watching(args, config, source, interval, limits, drain_timeout).await
         }),
         command => run(Cli { command }),
     }
@@ -619,7 +638,11 @@ fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
         .enable_all()
         .build()
         .map_err(CliError::Runtime)
-        .and_then(|runtime| runtime.block_on(work));
+        .and_then(|runtime| {
+            let result = runtime.block_on(work);
+            runtime.shutdown_timeout(LET_GO_TIMEOUT);
+            result
+        });
     match result {
         Ok(code) => code,
         Err(error) => {

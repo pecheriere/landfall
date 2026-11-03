@@ -6,8 +6,8 @@ use landfall_core::config::ConfigError;
 
 use super::{
     Cli, CliError, Command, DeploymentId, EXIT_OK, EXIT_TAMPERED, HostId, OsString, Path, PathBuf,
-    ServeArgs, ServeOptions, Store, execute, github_token, load_config, release_fetcher,
-    trust_cache_dir,
+    ServeArgs, ServeOptions, Store, execute, github_token, load_config, on_a_runtime,
+    release_fetcher, trust_cache_dir,
 };
 
 #[test]
@@ -560,4 +560,26 @@ async fn serve_refuses_a_missing_configuration_before_touching_the_database() {
     let error = execute(serve, &mut Vec::new()).await.unwrap_err();
     assert!(matches!(error, CliError::ReadConfig { .. }), "{error}");
     assert!(!path.exists());
+}
+
+/// The process ends, with a task blocking its thread, as a handler on a stuck stderr would.
+#[test]
+fn a_task_blocking_its_thread_cant_keep_the_process() {
+    let (blocked_for_good, blocked) = std::sync::mpsc::channel::<()>();
+    let (result, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let code = on_a_runtime(async move {
+            let (started, has_started) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+            });
+            has_started.await.unwrap();
+            Ok(7)
+        });
+        result.send(code).unwrap();
+    });
+    let code = ended.recv_timeout(std::time::Duration::from_secs(60));
+    assert_eq!(code, Ok(7));
+    drop(blocked_for_good);
 }
