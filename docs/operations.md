@@ -671,7 +671,7 @@ in its row.
 | No code and no `agent.key` | Give a code |
 | A code, with the agent not stopped | `systemctl stop landfall-agent`, as `enrol` needs the lock it holds. The existing key is kept, and a code for a host already enrolled needs `enrol-code --replace` |
 | An installed file that's a link, or isn't exactly owner, group and mode `0:0:755` for the agent and `0:0:644` for the configuration and units | Make it that, so that only root can change it and the agent can read it. That's stricter than safety alone needs, and it's one rule. Configuration and units can also be removed, to be written again |
-| `/usr/local/bin`, `/etc/landfall` or `/etc/systemd/system` not root's, or writable by others | Fix it. Writable by a group is left alone |
+| `/usr/local/bin`, `/etc/landfall` or `/etc/systemd/system` not root's, or writable by others | Fix it. Writable by a group is left alone, as Debian's `root:staff` has it, **so that group is trusted:** a link left there isn't followed, but one planted at the right moment could be, and whoever can replace the agent is as good as root anyway |
 | A link at `/var/lib/landfall-agent`, or a file | Move it |
 | The agent's user can't reach Docker, checked as that user | Look at the daemon and the `docker` group, and run it again. The configuration and the binary are in place by then, which a rerun takes as they are |
 | A `landfall-agent` user with a login shell, another home, uid 0 or a uid another user has | See the next section for what it must be |
@@ -728,15 +728,17 @@ touched. **Upgrade the agents and the controller together:** see [upgrading](#up
 | No binary, with the unit there | Puts it in place, and restarts. If the binary is there and only the login can't see it, it refuses, without `--allow-downgrade` |
 | No unit | Refuses: use `host install` |
 
-It restarts the unit whatever state it's in, so **it starts an agent you had stopped,** though it doesn't
-enable it. If you've stopped an agent to keep deploys off a host, upgrade it when you mean to start it.
+When it changes the binary it restarts the unit whatever state it's in, so **it starts an agent you had
+stopped,** though it doesn't enable it. If you've stopped an agent to keep deploys off a host, upgrade it
+when you mean to start it.
 
-The old binary is kept as `/usr/local/bin/landfall-agent.previous`, one step back from the last one seen
-healthy: a failed upgrade, or one still waiting on a deploy, isn't kept over it. It doesn't go back by
+The old binary is kept as `/usr/local/bin/landfall-agent.previous`, unless a restart was still due from
+before and one is kept already, as a failed upgrade or one still waiting on a deploy isn't kept over it.
+So it's the last one known to have run, which can be one older than you expect. It doesn't go back by
 itself. If the new one doesn't hold still you get the last journal lines, exit 1, and the command:
 
 ```text
-landfall: to go back, as root: mv -f /usr/local/bin/landfall-agent.previous /usr/local/bin/landfall-agent && systemctl restart landfall-agent
+landfall: to go back, as root: mv -f /usr/local/bin/landfall-agent.previous /usr/local/bin/landfall-agent && rm -f /etc/landfall/.restart-pending && systemctl restart landfall-agent
 ```
 
 **Read the journal lines before you run it.** The new agent may not be at fault: with Docker down, say,
@@ -777,17 +779,21 @@ each way of getting it does and doesn't check:
 
   Compare what `ssh-keygen -lf` prints with `SECURITY.md`, and with a copy of it you got some other way,
   as a stolen token can change the repository too. Keep `allowed-signers` outside the clone. It needs a
-  name in front of each key, as `sed` puts there: `ssh-keygen` calls a bare line from
-  `release-signers` an invalid key. Then tie the attestation to the commit that tag names, by adding this
-  to the `gh attestation verify` above:
+  name in front of each key, as `sed` puts there: `ssh-keygen` says `missing key` of a bare line from
+  `release-signers`. Then tie the attestation to the commit that tag names:
 
   ```sh
-  --source-digest "$(git -C landfall rev-parse --verify --quiet "$tag^{commit}")"
+  commit=$(git -C landfall rev-parse --verify "$tag^{commit}")
+  echo "$commit"
   ```
 
-  `git rev-parse "$tag"` alone gives the tag object, which that flag refuses. The format of
-  `allowed-signers` has been checked with `ssh-keygen -Y` and a throwaway key. `verify-tag` itself hasn't
-  been run on one of landfall's tags, as there are none yet.
+  **Stop if that printed no commit,** as an empty `--source-digest` checks nothing, and passes. Otherwise
+  add `--source-digest "$commit"` to the `gh attestation verify` above. `git rev-parse "$tag"` alone gives
+  the tag object, which that flag refuses.
+
+  How much of this has run: the format of `allowed-signers` with `ssh-keygen -Y` and a throwaway key, and
+  `--source-digest` on another project's release. `git verify-tag` with that file hasn't run at all, on
+  any tag, and there are no tags of landfall's yet.
 
 - **`brew install`** checks only the SHA-256 in the tap's formula, so you're trusting the tap, whose
   formula the owner verified that way and copied by hand. Homebrew itself verifies neither the

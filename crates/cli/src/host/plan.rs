@@ -483,10 +483,11 @@ if [ -e {MARKER} ]; then had_marker=1; else had_marker=; fi
     )
 }
 
-/// As an install's, but for keeping what was there, unless a marker was there already: then
-/// what's on disk was never seen healthy, and the one kept is a better way back. The marker comes
-/// before the rename, so that a run stopped after it still restarts on the next: what runs isn't
-/// what's on disk.
+/// As an install's, but for keeping what was there. With a marker already there, what's on disk
+/// may never have been seen healthy, so a `.previous` that's there is the better way back. With none
+/// there, this is: something to go back to is better than nothing. The marker comes after that, so
+/// that a run stopped in the middle of it has changed nothing, and right before the rename, so that
+/// one stopped after it still restarts on the next: what runs isn't what's on disk.
 fn upgrade_binary(request: &UpgradeRequest<'_>) -> String {
     let sha256 = quote(request.sha256);
     let refusal = quote(TAMPERED_AGENT);
@@ -499,11 +500,12 @@ fn upgrade_binary(request: &UpgradeRequest<'_>) -> String {
   read_upload {UPLOAD_AGENT} > {AGENT_NEW}
   file_is {AGENT_NEW} {sha256} || refuse {refusal}
   chmod 0755 {AGENT_NEW}
-  mark_restart
-  if [ -e {AGENT_PATH} ] && [ -z \"$had_marker\" ]; then
+  if [ -e {AGENT_PATH} ] && {{ [ -z \"$had_marker\" ] || [ ! -e {AGENT_PREVIOUS} ]; }}; then
+    rm -f {AGENT_PREVIOUS_NEW}
     cp -p -- {AGENT_PATH} {AGENT_PREVIOUS_NEW}
     mv -f -- {AGENT_PREVIOUS_NEW} {AGENT_PREVIOUS}
   fi
+  mark_restart
   mv -f {AGENT_NEW} {AGENT_PATH}
 fi
 "
@@ -525,13 +527,15 @@ fn upgrade_restart() -> String {
   systemctl restart --no-block landfall-agent
   if ! wait_healthy "$previous_id"; then
     if [ -e {AGENT_PREVIOUS} ]; then
-      printf '%s\n' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && systemctl restart landfall-agent' >&2
+      printf '%s\n' 'landfall: to go back, as root: mv -f {AGENT_PREVIOUS} {AGENT_PATH} && rm -f {MARKER} && systemctl restart landfall-agent' >&2
     else
       printf '%s\n' {no_previous} >&2
     fi
     exit 1
   fi
   settle_marker
+else
+  echo 'landfall: nothing is waiting for a restart'
 fi
 "#
     )
@@ -631,6 +635,7 @@ text_is() {{
 }}
 mark_restart() {{
   [ -d {CONFIG_DIR} ] || install -d -o root -g root -m 0755 {CONFIG_DIR}
+  rm -f {MARKER}
   : > {MARKER}
 }}
 settle_marker() {{
@@ -642,6 +647,7 @@ settle_marker() {{
 }}
 keep_previous() {{
   [ -e "$1" ] || return 0
+  rm -f -- "$1.previous.new"
   cp -p -- "$1" "$1.previous.new"
   mv -f -- "$1.previous.new" "$1.previous"
 }}

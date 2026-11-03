@@ -522,6 +522,32 @@ fn a_replacement_keeps_the_old_file_and_restarts() {
     assert!(!exists(&sandbox, MARKER));
 }
 
+/// Left there by whoever can write in a directory a group can.
+#[test]
+fn a_link_left_where_it_writes_is_not_followed() {
+    let fixture = Fixture::new();
+    let sandbox = sandbox();
+    let victim = sandbox.path("/victim");
+    fs::write(&victim, "theirs").unwrap();
+    place(&sandbox, CONFIG_PATH, "# old\n", 0o644);
+    for planted in [MARKER, "/etc/landfall/fleet.toml.previous.new"] {
+        std::os::unix::fs::symlink(&victim, sandbox.path(planted)).unwrap();
+    }
+    let request = InstallRequest {
+        replace_config: true,
+        ..fixture.request()
+    };
+
+    let ran = sandbox.run(&script_of(&request, &["config"]));
+
+    assert_status(&ran, 0);
+    assert_eq!(fs::read_to_string(victim).unwrap(), "theirs");
+    assert_eq!(
+        read(&sandbox, &format!("{CONFIG_PATH}.previous")),
+        "# old\n"
+    );
+}
+
 #[test]
 fn an_interrupted_replacement_still_restarts() {
     let fixture = Fixture::new();

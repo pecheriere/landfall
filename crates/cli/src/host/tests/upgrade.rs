@@ -597,6 +597,8 @@ exec /bin/mv "$@""#,
     assert_status(&ran, 9);
     assert!(!previous.exists());
     assert_eq!(read(&sandbox, AGENT_PATH), "the old agent");
+    // Nothing has changed yet, so nothing is due, and a rerun keeps it again.
+    assert!(!exists(&sandbox, MARKER));
 }
 
 /// Written through otherwise, as root.
@@ -628,6 +630,35 @@ fn a_failed_upgrade_is_not_kept_as_the_way_back() {
     assert_eq!(read(&sandbox, AGENT_PREVIOUS), "the good agent");
 }
 
+/// With a marker left over and nothing kept, as after going back, what's there still gets kept:
+/// something to go back to is better than nothing.
+#[test]
+fn with_nothing_kept_a_marker_does_not_stop_the_old_one_being_kept() {
+    let sandbox = installed();
+    fs::write(sandbox.path(MARKER), "").unwrap();
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 0);
+    assert_eq!(read(&sandbox, AGENT_PREVIOUS), "the old agent");
+}
+
+/// Left there by whoever can write in a directory a group can.
+#[test]
+fn a_link_left_where_it_writes_is_not_followed() {
+    let sandbox = installed();
+    let victim = sandbox.path("/victim");
+    fs::write(&victim, "theirs").unwrap();
+    for planted in [MARKER, "/usr/local/bin/.landfall-agent.previous.new"] {
+        symlink(&victim, sandbox.path(planted)).unwrap();
+    }
+
+    let ran = sandbox.run(&script_for(&hash(AGENT.as_bytes())));
+
+    assert_status(&ran, 0);
+    assert_eq!(fs::read_to_string(victim).unwrap(), "theirs");
+}
+
 /// It may be an install's, stopped with its units written and no reload.
 #[test]
 fn a_marker_from_before_this_run_is_reloaded_for() {
@@ -653,6 +684,11 @@ fn with_the_right_file_and_no_marker_nothing_restarts() {
 
     assert_status(&ran, 0);
     assert!(!sandbox.log().contains("restart"), "{}", sandbox.log());
+    assert!(
+        stdout(&ran).contains("nothing is waiting for a restart"),
+        "{}",
+        stdout(&ran)
+    );
 }
 
 #[test]
@@ -774,6 +810,7 @@ fn an_agent_that_does_not_come_up_says_how_to_go_back() {
     assert!(said.contains("a journal line"), "{said}");
     assert!(said.contains("to go back, as root: mv -f "), "{said}");
     assert!(said.contains("landfall-agent.previous"), "{said}");
+    assert!(said.contains(".restart-pending"), "{said}");
     assert!(exists(&sandbox, MARKER));
 }
 
