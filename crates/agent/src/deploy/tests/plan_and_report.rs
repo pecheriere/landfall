@@ -1,6 +1,10 @@
 //! The plan, the report, and a deploy that never starts.
 
 use std::fs;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use landfall_origin::attestation::VerifiedAttestation;
 use landfall_origin::release::ReleaseOrigin;
@@ -9,7 +13,7 @@ use super::super::files::timestamp_id;
 use super::super::{DeployError, DeployPlan, Outcome, run};
 use super::{
     COMMIT, DIGEST, OLD, PINNED, PREVIOUS, STOP_FALSE, STOP_TRUE, backups, changes, container,
-    count_stops, deploy, deployment, failing_check, fixture, healthy_deploy, options,
+    count_stops, deploy, deploy_with, deployment, failing_check, fixture, healthy_deploy, options,
     override_text, reports, resolves,
 };
 
@@ -110,17 +114,34 @@ async fn concurrent_deploy_is_busy() {
     assert_eq!(f.docker.calls(), []);
     drop(held);
 
+    // A second deploy while the first is under way. The first is held at its first call to docker,
+    // which comes after its lock, until the second has answered: left to the scheduler, the
+    // second can take the lock only once the first has finished, and then both deploy.
     healthy_deploy(&f);
-    let (first, second) = tokio::join!(deploy(&f), deploy(&f));
-    let busy = [&first, &second]
-        .iter()
-        .filter(|r| matches!(r, Err(DeployError::Busy(_))))
-        .count();
-    let done = [&first, &second]
-        .iter()
-        .filter(|r| matches!(r, Ok(report) if report.outcome == Outcome::Deployed))
-        .count();
-    assert_eq!((busy, done), (1, 1), "{first:?} {second:?}");
+    let under_way = Arc::new(Notify::new());
+    let signal = Arc::clone(&under_way);
+    f.docker.on_call(move |_| signal.notify_one());
+    // The checks pass at once. A long deadline only keeps a starved machine from failing them.
+    let mut patient = options();
+    patient.checks.deadline = Duration::from_secs(60);
+    let first = deploy_with(&f, &patient);
+    tokio::pin!(first);
+    tokio::select! {
+        biased;
+        () = under_way.notified() => {}
+        result = &mut first => panic!("the first finished without calling docker: {result:?}"),
+    }
+    let calls = f.docker.calls().len();
+
+    let second = deploy_with(&f, &patient).await;
+
+    assert!(matches!(second, Err(DeployError::Busy(_))), "{second:?}");
+    assert_eq!(f.docker.calls().len(), calls, "the second called docker");
+    let first = first.await;
+    assert!(
+        matches!(&first, Ok(report) if report.outcome == Outcome::Deployed),
+        "{first:?}"
+    );
 }
 
 #[tokio::test]

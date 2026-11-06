@@ -315,6 +315,9 @@ async fn a_held_log_makes_the_work_wait(hold: impl Fn(&fs::File)) {
     );
     let holder = fs::File::open(root.nonce_log_path()).unwrap();
     hold(&holder);
+    // What a child another test is forking holds until it execs, kept so that every run needs the
+    // holder to unlock and not just close.
+    let childs_copy = holder.try_clone().unwrap();
     let log_before = fs::read(root.nonce_log_path()).unwrap();
     let unusable = capture::events("nonce_log_unusable").len();
 
@@ -339,9 +342,12 @@ async fn a_held_log_makes_the_work_wait(hold: impl Fn(&fs::File)) {
     drop(free);
 
     // Once it's let go the same approval goes through.
+    // Unlocked, as closing would leave `childs_copy` holding it.
+    holder.unlock().unwrap();
     drop(holder);
     let outcome = asked(&f, &FakeVerifier::passes(), approved_minor(&keys, 7)).await;
     assert_deployed(&outcome);
+    drop(childs_copy);
     assert!(spent(&f, "first"));
 }
 
@@ -420,8 +426,13 @@ async fn a_nonce_log_that_cannot_be_used_is_journalled_at_start() {
     fs::write(&good, "").unwrap();
     let holder = fs::File::open(&good).unwrap();
     holder.lock().unwrap();
+    // What a child another test is forking holds until it execs, kept so that every run needs the
+    // holder to unlock and not just close.
+    let childs_copy = holder.try_clone().unwrap();
     journal_nonce_log(&root);
     assert_eq!(capture::events("nonce_log_unusable").len(), seen);
+    // Unlocked, as closing would leave `childs_copy` holding it.
+    holder.unlock().unwrap();
     drop(holder);
 
     fs::write(root.nonce_log_path(), "torn").unwrap();
@@ -429,6 +440,7 @@ async fn a_nonce_log_that_cannot_be_used_is_journalled_at_start() {
     let events = capture::events("nonce_log_unusable");
     assert_eq!(events.len(), seen + 1);
     assert_eq!(events.last().unwrap().0, Priority::Critical);
+    drop(childs_copy);
 }
 
 #[tokio::test]
