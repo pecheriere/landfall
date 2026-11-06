@@ -344,8 +344,13 @@ fn a_lock_let_go_in_a_moment_is_gone_through() {
     assert_eq!(root.spend_nonce(&shared()).unwrap(), NonceSpend::Recorded);
     let holder = fs::File::open(root.nonce_log_path()).unwrap();
     holder.lock().unwrap();
+    // What a child another test is forking holds until it execs, kept so that every run needs the
+    // holder to unlock and not just close.
+    let childs_copy = holder.try_clone().unwrap();
     let letting_go = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(50));
+        // Unlocked, as closing would leave `childs_copy` holding it.
+        holder.unlock().unwrap();
         drop(holder);
     });
 
@@ -354,6 +359,7 @@ fn a_lock_let_go_in_a_moment_is_gone_through() {
         NonceSpend::Recorded
     );
     letting_go.join().unwrap();
+    drop(childs_copy);
 }
 
 #[test]
@@ -363,6 +369,9 @@ fn a_lock_held_on_the_log_is_said_and_changes_nothing() {
     assert_eq!(root.spend_nonce(&shared()).unwrap(), NonceSpend::Recorded);
     let before = fs::read(root.nonce_log_path()).unwrap();
     let holder = fs::File::open(root.nonce_log_path()).unwrap();
+    // What a child another test is forking holds until it execs, kept so that every run needs the
+    // holder to unlock and not just close.
+    let childs_copy = holder.try_clone().unwrap();
     let busy = |result: Result<NonceSpend, StateError>| {
         assert!(
             matches!(result, Err(StateError::NonceLogBusy(_))),
@@ -385,9 +394,12 @@ fn a_lock_held_on_the_log_is_said_and_changes_nothing() {
     busy(root.spend_nonce(&test_nonce("other")));
     assert_eq!(fs::read(root.nonce_log_path()).unwrap(), before);
 
+    // Unlocked, as closing would leave `childs_copy` holding it.
+    holder.unlock().unwrap();
     drop(holder);
     assert_eq!(
         root.spend_nonce(&test_nonce("other")).unwrap(),
         NonceSpend::Recorded
     );
+    drop(childs_copy);
 }
