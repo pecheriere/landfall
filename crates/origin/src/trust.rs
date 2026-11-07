@@ -69,7 +69,11 @@ impl TrustRoot {
 }
 
 /// Why the trust root could not be built.
+///
+/// Non-exhaustive, so that the `test-support` feature's variant stays additive: no crate
+/// can match every variant, and so none compiles with the feature and not without it.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TrustError {
     /// The cache directory is unusable, or the cache is missing or invalid.
     #[error("TUF cache: {0}")]

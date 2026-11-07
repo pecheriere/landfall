@@ -21,7 +21,7 @@ in the sums, so no binary of the release is kept here.
 | Rekor log index | `3746720453` |
 | Integrated time | `1794089053` (2026-11-07T22:04:13Z) |
 | Published | 2026-11-07T22:19:19Z |
-| Subjects | 10, by basename, including `SHA256SUMS` and `LICENSE-MIT` |
+| Subjects | 9, by basename: the 8 files `SHA256SUMS` lists, and `SHA256SUMS` |
 
 The SAN is
 `https://github.com/pecheriere/landfall/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1`.
@@ -31,7 +31,9 @@ The SAN is
 - `tag-ref.json`: `GET /repos/pecheriere/landfall/git/ref/tags/v0.1.0-rc.1`, as GitHub
   answered it.
 - `tag-object.json`: `GET /repos/pecheriere/landfall/git/tags/<tag object>`, as GitHub
-  answered it: the signed tag object, whose payload and signature hash back to its id.
+  answered it: the signed tag object. Only its `verification.payload` and
+  `verification.signature` are used, and together they hash back to its id. The other
+  fields, such as `message`, are not read.
 - `landfall-0.1.0-rc.1.sigstore.json`: the release's bundle (v0.3, DSSE, SLSA provenance
   v1, one Rekor entry), the release asset of that name.
 - `SHA256SUMS`: the release's file of that name, 740 bytes, whose sha256 is a subject of
@@ -39,7 +41,11 @@ The SAN is
 - `LICENSE-MIT`: the release's file of that name, 1077 bytes, listed in `SHA256SUMS` and a
   subject of the bundle.
 - `trusted_root.json`: a snapshot of the Sigstore public-good trusted root (the first line
-  of `gh attestation trusted-root`), so the test runs offline.
+  of `gh attestation trusted-root`), so the test runs offline. Taken on 2026-11-07, it is
+  byte-identical to the snapshots in `crates/origin/tests/fixtures/attestation/` and
+  `attestation-files/`, so this release needs no newer root than they do. It is kept here
+  anyway, so that this fixture stands alone and its recipe rebuilds all of it, and a cli
+  test doesn't reach into another crate's fixtures.
 
 The test serves the release's listing itself, with GitHub's ids, names and sizes of the
 three assets it asks for, as nothing in the listing is verified.
