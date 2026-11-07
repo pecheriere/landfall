@@ -6,9 +6,10 @@ use super::{FetchError, GITHUB_API};
 
 /// The base URLs requests go to.
 ///
-/// [`Endpoints::new`] accepts only `https` URLs. Plain `http`, for the mock
-/// servers in this crate's tests, is reachable only through a constructor
-/// compiled into test builds.
+/// [`Endpoints::new`] accepts only `https` URLs. Plain `http`, for mock
+/// servers, is reachable only through a constructor compiled into this crate's
+/// tests and into builds with the `test-support` feature, which only
+/// dev-dependencies enable.
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     pub(super) github_api: Url,
@@ -52,9 +53,11 @@ impl Endpoints {
         )
     }
 
-    /// Endpoints over plain `http`, for mock servers. Test builds only.
-    #[cfg(test)]
-    pub(crate) fn plain_http(github_api: Url, registry: Url) -> Self {
+    /// Endpoints over plain `http`, for mock servers. Test builds and the
+    /// `test-support` feature only: no release binary can reach it.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn plain_http(github_api: Url, registry: Url) -> Self {
         Self {
             github_api,
             registry,

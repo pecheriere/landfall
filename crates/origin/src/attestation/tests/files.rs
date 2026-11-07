@@ -63,7 +63,7 @@ fn config() -> Config {
 }
 
 fn root() -> TrustRoot {
-    TrustRoot::from_json(TRUSTED_ROOT)
+    TrustRoot::from_json(TRUSTED_ROOT).unwrap()
 }
 
 /// The fixture's signed statement, read as plain JSON, independently of the

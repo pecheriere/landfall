@@ -83,7 +83,7 @@ fn sums_for(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn root() -> TrustRoot {
-    TrustRoot::from_json(TRUSTED_ROOT)
+    TrustRoot::from_json(TRUSTED_ROOT).unwrap()
 }
 
 fn principal() -> PrincipalId {

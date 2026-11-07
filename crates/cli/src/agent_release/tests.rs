@@ -17,6 +17,8 @@ use super::{
 };
 use crate::project;
 
+mod first_release;
+
 /// A digest for a file that isn't hashed here, in hex.
 const DIGEST_HEX: &str = "abababababababababababababababababababababababababababababababab";
 
