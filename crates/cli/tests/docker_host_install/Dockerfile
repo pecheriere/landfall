@@ -1,7 +1,7 @@
 # A throwaway host for the `docker_` tests of `host install`: real systemd, sshd, sudo and useradd,
 # and a stand-in for Docker. Nothing in it is a secret: its host keys are in the image, and it only
 # listens on 127.0.0.1 for the length of a test. README.md says why each thing is here.
-FROM debian:bookworm-20261020-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM debian:bookworm-20261027-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 # `dbus` because a login's `systemctl cat docker.service` needs the system bus, without which the
 # probe takes it for Docker from snap. `systemd` only recommends it, and this says no to those.
