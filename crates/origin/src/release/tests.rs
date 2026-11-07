@@ -98,7 +98,7 @@ fn signed_fixture_project_config() -> Config {
 }
 
 fn root() -> TrustRoot {
-    TrustRoot::from_json(TRUSTED_ROOT)
+    TrustRoot::from_json(TRUSTED_ROOT).unwrap()
 }
 
 fn deployment() -> DeploymentId {

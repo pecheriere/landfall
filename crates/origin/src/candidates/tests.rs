@@ -68,7 +68,7 @@ fn real_candidate() -> RunCandidate {
     let attestation = crate::attestation::verify_bundle(
         BUNDLE,
         &real_digest(),
-        &TrustRoot::from_json(TRUSTED_ROOT),
+        &TrustRoot::from_json(TRUSTED_ROOT).unwrap(),
         &crate::attestation::Expected {
             repo: &repo,
             repo_id: 121_898_717,
@@ -149,7 +149,7 @@ impl Mocks {
         let commit: CommitSha = COMMIT.parse().unwrap();
         attested_digests(
             &fetcher(&self.github, &self.registry),
-            &TrustRoot::from_json(TRUSTED_ROOT),
+            &TrustRoot::from_json(TRUSTED_ROOT).unwrap(),
             config,
             (&deployment(), &tag, &commit, version_digest),
             cache,

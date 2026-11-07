@@ -31,7 +31,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   indexes, bundles and referrer tags (GHCR), `verify_release`, which composes them for
   one release, `candidates`, which finds every digest attested for it, and `artifact`,
   whose `verify_release_file` returns one file of a release once its signed tag, the
-  release's sums and the attestation all agree on it.
+  release's sums and the attestation all agree on it. Its `test-support` feature,
+  which only dev-dependencies may enable, adds plain-http endpoints and a trust root
+  from a snapshot, for another crate's tests against mock servers.
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI. A library plus a thin binary;

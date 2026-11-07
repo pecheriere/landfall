@@ -28,14 +28,18 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --check
-      # The software authenticator signs whatever it is told to. Only dev-dependencies may
-      # enable it, and the normal and build edges are what a release binary is made of.
+      # The software authenticator signs whatever it is told to, and origin's test support
+      # fetches over plain http and trusts a root that skipped TUF. Only dev-dependencies
+      # may enable them, and the normal and build edges are what a release binary is made of.
+      # This reads the features each package resolves to, not the feature edges, which leave
+      # out what a crate's own `default` feature turns on in a dependency.
       - name: No release binary has test-support
         shell: bash
         run: |
-          cargo tree --workspace --locked --target all -e normal,build,features > "$RUNNER_TEMP/tree.txt"
+          cargo tree --workspace --locked --target all -e normal,build -f '{p} {f}' > "$RUNNER_TEMP/tree.txt"
           grep -q landfall-approval "$RUNNER_TEMP/tree.txt"
-          if grep -F 'feature "test-support"' "$RUNNER_TEMP/tree.txt"; then
+          grep -q landfall-origin "$RUNNER_TEMP/tree.txt"
+          if grep -E 'landfall-(origin|approval) v.*test-support' "$RUNNER_TEMP/tree.txt"; then
             exit 1
           fi
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

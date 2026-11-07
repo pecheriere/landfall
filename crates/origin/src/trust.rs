@@ -53,16 +53,27 @@ impl TrustRoot {
         &self.0
     }
 
-    /// A root parsed from a `trusted_root.json` snapshot, without TUF. Test
-    /// builds only, for fixtures verified offline.
-    #[cfg(test)]
-    pub(crate) fn from_json(json: &str) -> Self {
-        Self(Arc::new(TrustedRoot::from_json(json).unwrap()))
+    /// A root parsed from a `trusted_root.json` snapshot, without TUF, for
+    /// fixtures verified offline. Test builds and the `test-support` feature
+    /// only, which only dev-dependencies enable: no release binary has it.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError::Snapshot`] when `json` is not a trusted root.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_json(json: &str) -> Result<Self, TrustError> {
+        TrustedRoot::from_json(json)
+            .map(|root| Self(Arc::new(root)))
+            .map_err(|error| TrustError::Snapshot(error.to_string()))
     }
 }
 
 /// Why the trust root could not be built.
+///
+/// Non-exhaustive, so that the `test-support` feature's variant stays additive: no crate
+/// can match every variant, and so none compiles with the feature and not without it.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TrustError {
     /// The cache directory is unusable, or the cache is missing or invalid.
     #[error("TUF cache: {0}")]
@@ -73,6 +84,11 @@ pub enum TrustError {
     /// The repository could not be fetched or its metadata did not verify.
     #[error("TUF fetch: {0}")]
     Fetch(String),
+    /// A `trusted_root.json` snapshot did not parse. Only [`TrustRoot::from_json`]
+    /// gives this, which no release binary has.
+    #[cfg(any(test, feature = "test-support"))]
+    #[error("trusted root snapshot: {0}")]
+    Snapshot(String),
 }
 
 /// Builds the Sigstore trust root with `cache_dir` as the TUF cache.

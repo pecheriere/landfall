@@ -73,7 +73,7 @@ impl Config {
 }
 
 fn root() -> TrustRoot {
-    TrustRoot::from_json(TRUSTED_ROOT)
+    TrustRoot::from_json(TRUSTED_ROOT).unwrap()
 }
 
 fn digest() -> ImageDigest {

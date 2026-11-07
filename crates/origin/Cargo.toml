@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Plain-http endpoints and a trust root from a snapshot, for another crate's tests
+# against mock servers. For tests only: a dev-dependency may enable this, a normal
+# dependency never.
+test-support = []
+
 [dependencies]
 futures-util.workspace = true
 jiff.workspace = true

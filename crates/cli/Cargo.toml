@@ -27,8 +27,12 @@ tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 base64.workspace = true
+# Mock servers over plain http and a snapshot trust root, for the first release's
+# fixture verified offline.
+landfall-origin = { workspace = true, features = ["test-support"] }
 reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true
 
 [lints]
 workspace = true
