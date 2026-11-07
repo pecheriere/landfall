@@ -39,7 +39,7 @@ jobs:
           cargo tree --workspace --locked --target all -e normal,build -f '{p} {f}' > "$RUNNER_TEMP/tree.txt"
           grep -q landfall-approval "$RUNNER_TEMP/tree.txt"
           grep -q landfall-origin "$RUNNER_TEMP/tree.txt"
-          if grep -E 'landfall-(origin|approval) v[^ ]+ \(.*\) .*test-support' "$RUNNER_TEMP/tree.txt"; then
+          if grep -E 'landfall-(origin|approval) v.*test-support' "$RUNNER_TEMP/tree.txt"; then
             exit 1
           fi
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
