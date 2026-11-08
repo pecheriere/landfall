@@ -675,7 +675,8 @@ Those a build of `ssh` doesn't have are left out, having been asked first, as yo
 set them there either. So your `IgnoreUnknown` still works.
 
 **What you set is still yours:** `ProxyCommand`, `ProxyJump`, `KnownHostsCommand`, `UserKnownHostsFile`,
-`Hostname`, `User`, `Port`, `IdentityFile` and `IdentityAgent`, and `--ssh-config` picks another file.
+`Hostname`, `User`, `Port`, `IdentityFile` and `IdentityAgent`, except for the two control calls below,
+and `--ssh-config` picks another file.
 `UserKnownHostsFile /dev/null` makes every host unknown, and so refused. `GITHUB_TOKEN` is never sent:
 it's removed from what `ssh` is given, so that `SendEnv` can't send it.
 

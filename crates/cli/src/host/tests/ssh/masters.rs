@@ -159,10 +159,15 @@ fn asking_a_socket_that_answers_nothing_reaches_nothing_else() {
     let dest = Destination::parse(&format!("ssh://user@127.0.0.1:{}", dropping.port)).unwrap();
     let plain = dir.path().join("plain");
     fs::write(&plain, "").unwrap();
+    // For this host only, and by another name and user: `ssh` refuses a jump to the destination
+    // itself as a loop, before it ever asks the socket.
     let jump = dir.path().join("jump");
     fs::write(
         &jump,
-        format!("Host *\n  ProxyJump user@127.0.0.1:{}\n", dropping.port),
+        format!(
+            "Host 127.0.0.1\n  ProxyJump jumper@localhost:{}\n",
+            dropping.port
+        ),
     )
     .unwrap();
     let known = real_known();
