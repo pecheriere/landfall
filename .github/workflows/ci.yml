@@ -153,8 +153,10 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/lint"
           "$RUNNER_TEMP/lint/bin/pip" install --quiet --require-hashes --only-binary :all: \
             -r .github/requirements-lint.txt
-          "$RUNNER_TEMP/lint/bin/ruff" check .github/scripts
-          "$RUNNER_TEMP/lint/bin/ruff" format --check .github/scripts
+          # The owner's release helper has no `.py`, so it is named, and given the same rules.
+          "$RUNNER_TEMP/lint/bin/ruff" check --config .github/ruff.toml .github/scripts scripts/release-tag
+          "$RUNNER_TEMP/lint/bin/ruff" format --check --config .github/ruff.toml .github/scripts \
+            scripts/release-tag
           python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Refuse crate versions published less than 7 days ago
         run: python3 -I .github/scripts/crate_age.py --base HEAD^1

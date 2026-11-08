@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Sign the release tag for a version: the one thing the owner does for each release.
+
+Run it on your own machine, from a clone of the repository. Agents never run it: a release tag is
+what every host and the Homebrew tap trust, and only the owner signs one. It refuses unless all of
+these hold, and changes nothing until they do:
+
+- the checkout has no changes and no untracked files;
+- `origin/main`, freshly fetched, has `workspace.package.version` equal to VERSION, and the
+  release signers file at that commit holds a key;
+- tag `vVERSION` exists neither here nor on origin;
+- a run of the Release workflow for exactly that commit, on main, succeeded, with every build
+  and check of the dry run green: the automatic one that a version bump starts, or a manual one.
+
+Then it runs `git tag -s vVERSION <commit> -m vVERSION` with git's signing key, or the one given by
+`--signing-key`, checks the tag's signature against the release signers file at that commit, and
+deletes the tag again if that check fails, so a wrong key costs nothing. Last, it prints the push
+command, or pushes the tag with `--push`.
+
+No value reaches a shell: `git` and `gh` get argument lists, and every value from outside is
+checked against a pattern first.
+
+Usage: scripts/release-tag VERSION [--signing-key KEY] [--push]
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import tomllib
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
+
+# The same as `release_preflight.py`'s, which decides in CI what a release's version can be.
+VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+)
+REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.+$)[A-Za-z0-9._-]+")
+COMMIT = re.compile(r"[0-9a-f]{40}")
+RUN_ID = re.compile(r"[1-9][0-9]*")
+ORIGIN = re.compile(
+    r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?"
+)
+SIGNING_KEY = re.compile(r"[^\x00-\x1f\x7f]+")
+
+WORKFLOW = ".github/workflows/release.yml"
+SIGNERS_FILE = "crates/cli/assets/release-signers"
+PRINCIPAL = "landfall-release"
+MAIN = "main"
+DRY_RUN_EVENTS = frozenset({"push", "workflow_dispatch"})
+# What a dry run must have run and passed. `preflight` and `publish` want a tag, so they skip.
+REQUIRED_JOBS = ("version", "on-main", "crate-age", "build-linux", "build-macos")
+SMOKE_PREFIX = "smoke ("
+SMOKE_RUNS = 3
+CI_PREFIX = "ci / "
+TAG_ONLY_JOBS = ("preflight", "publish")
+FINE = frozenset({"success", "skipped"})
+COMMAND_TIMEOUT_SECONDS = 120
+MAX_SHOWN = 200
+
+Run = Callable[[Sequence[str]], subprocess.CompletedProcess]
+
+
+class RefusedError(Exception):
+    """The tag must not be made, for the reason given."""
+
+
+def shown(value: object) -> str:
+    """Return a value safe to print on one line, and not too long."""
+    text = ascii(str(value))[1:-1]
+    return text if len(text) <= MAX_SHOWN else f"{text[:MAX_SHOWN]}..."
+
+
+def run_command(args: Sequence[str]) -> subprocess.CompletedProcess:
+    """Run a command with an argument list, never a shell, and capture what it says."""
+    try:
+        return subprocess.run(
+            list(args),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        msg = f"{args[0]} could not run: {shown(error)}"
+        raise RefusedError(msg) from error
+
+
+def output_of(run: Run, args: Sequence[str]) -> str:
+    """Return what a command printed, refusing if it failed."""
+    result = run(args)
+    if result.returncode != 0:
+        msg = f"`{' '.join(args[:3])} ...` failed: {shown(result.stderr.strip())}"
+        raise RefusedError(msg)
+    return result.stdout
+
+
+def repository_of(url: str) -> str:
+    """Return owner/name for a GitHub remote's URL."""
+    found = ORIGIN.fullmatch(url.strip())
+    if found is None or not REPOSITORY.fullmatch(found.group("repo")):
+        msg = f"origin is not a GitHub repository: {shown(url.strip())}"
+        raise RefusedError(msg)
+    return found.group("repo")
+
+
+def workspace_version(text: str) -> str:
+    """Return `workspace.package.version` from a `Cargo.toml`'s text."""
+    try:
+        version = tomllib.loads(text)["workspace"]["package"]["version"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        msg = f"Cargo.toml has no readable workspace.package.version: {shown(error)}"
+        raise RefusedError(msg) from error
+    if not isinstance(version, str):
+        msg = f"Cargo.toml's version isn't a string: {shown(version)}"
+        raise RefusedError(msg)
+    return version
+
+
+def signer_keys(text: str) -> list[str]:
+    """Return the key lines of the signers file, read as preflight reads it."""
+    keys = [line for line in text.split("\n") if line and not line.startswith("#")]
+    if not keys:
+        msg = f"{SIGNERS_FILE} holds no key, so preflight would refuse every tag"
+        raise RefusedError(msg)
+    return keys
+
+
+def dry_runs(answer: object, sha: str) -> list[str]:
+    """Return the ids of successful dry runs of this commit on main, newest first."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("workflow_runs"), list):
+        msg = "GitHub's list of runs isn't one"
+        raise RefusedError(msg)
+    found = []
+    for run in answer["workflow_runs"]:
+        if not isinstance(run, dict):
+            continue
+        if (
+            run.get("head_sha") == sha
+            and run.get("head_branch") == MAIN
+            and run.get("event") in DRY_RUN_EVENTS
+            and run.get("path") == WORKFLOW
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "success"
+            and RUN_ID.fullmatch(str(run.get("id")))
+        ):
+            found.append(str(run["id"]))
+    return found
+
+
+def job_results(answer: object) -> dict[str, list[Any]]:
+    """Return each job's conclusions by name, from GitHub's list of a run's jobs."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("jobs"), list):
+        msg = "GitHub's list of jobs isn't one"
+        raise RefusedError(msg)
+    jobs: dict[str, list[Any]] = {}
+    for job in answer["jobs"]:
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            msg = "a job in GitHub's list has no name"
+            raise RefusedError(msg)
+        jobs.setdefault(job["name"], []).append(job.get("conclusion"))
+    return jobs
+
+
+def conclusions(jobs: dict[str, list[Any]], prefix: str) -> list[Any]:
+    """Return the conclusions of every job whose name starts with this."""
+    return [
+        result for name, results in jobs.items() if name.startswith(prefix) for result in results
+    ]
+
+
+def jobs_faults(jobs: dict[str, list[Any]]) -> list[str]:
+    """Say why a run's jobs aren't a full, green dry run. Nothing said means they are."""
+    faults = []
+    bad = sorted(name for name, results in jobs.items() if not set(results) <= FINE)
+    if bad:
+        faults.append(f"these jobs didn't pass: {', '.join(bad)}")
+    faults += [
+        f"`{name}` didn't run and pass, so this run built nothing"
+        for name in REQUIRED_JOBS
+        if jobs.get(name) != ["success"]
+    ]
+    smoke = conclusions(jobs, SMOKE_PREFIX).count("success")
+    if smoke != SMOKE_RUNS:
+        faults.append(f"`smoke` passed on {smoke} runners, not {SMOKE_RUNS}")
+    if "success" not in conclusions(jobs, CI_PREFIX):
+        faults.append("no job of `ci` ran and passed")
+    faults += [
+        f"`{name}` ran, which a dry run never does"
+        for name in TAG_ONLY_JOBS
+        if jobs.get(name, ["skipped"]) != ["skipped"]
+    ]
+    return faults
+
+
+def gh_json(run: Run, path: str, fields: dict[str, str]) -> object:
+    """Return a GitHub API answer, read with `gh api` and these query fields."""
+    args = ["gh", "api", "--method", "GET", path]
+    for key, value in fields.items():
+        args += ["-f", f"{key}={value}"]
+    text = output_of(run, args)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        msg = f"GitHub's answer for {path} isn't JSON: {shown(error)}"
+        raise RefusedError(msg) from error
+
+
+def require_dry_run(run: Run, repo: str, sha: str) -> str:
+    """Return the id of a full, green dry run of this commit, or refuse."""
+    runs = gh_json(
+        run,
+        f"repos/{repo}/actions/workflows/release.yml/runs",
+        {"head_sha": sha, "per_page": "100"},
+    )
+    ids = dry_runs(runs, sha)
+    if not ids:
+        msg = (
+            f"no Release run for {sha} on main succeeded. A version bump starts one when it lands; "
+            "otherwise run the workflow by hand on main, and wait for it to pass"
+        )
+        raise RefusedError(msg)
+    faults = []
+    for run_id in ids:
+        found = jobs_faults(
+            job_results(
+                gh_json(
+                    run,
+                    f"repos/{repo}/actions/runs/{run_id}/jobs",
+                    {"filter": "latest", "per_page": "100"},
+                )
+            )
+        )
+        if not found:
+            return run_id
+        faults.append(f"run {run_id}: {', '.join(found)}")
+    msg = f"no successful Release run for {sha} was a full dry run: {'; '.join(faults)}"
+    raise RefusedError(msg)
+
+
+def require_clean(run: Run) -> None:
+    """Refuse a checkout with changes, so nothing local stands in for what's on main."""
+    status = output_of(run, ["git", "status", "--porcelain", "--untracked-files=normal"])
+    if status.strip():
+        msg = "the checkout has changes or untracked files: commit or remove them first"
+        raise RefusedError(msg)
+
+
+def require_new_tag(run: Run, tag: str) -> None:
+    """Refuse a tag that exists here or on origin: a tag can't be moved, or used twice."""
+    if run(["git", "rev-parse", "--quiet", "--verify", f"refs/tags/{tag}"]).returncode == 0:
+        msg = f"{tag} already exists here"
+        raise RefusedError(msg)
+    if output_of(run, ["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"]).strip():
+        msg = f"{tag} already exists on origin: bump the version by a pull request instead"
+        raise RefusedError(msg)
+
+
+def verify_tag(run: Run, tag: str, sha: str, keys: list[str]) -> None:
+    """Check the new tag names this commit and is signed by a release key."""
+    if (
+        output_of(run, ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"]).strip()
+        != sha
+    ):
+        msg = f"{tag} doesn't name {sha}"
+        raise RefusedError(msg)
+    with tempfile.TemporaryDirectory() as directory:
+        allowed = Path(directory) / "allowed_signers"
+        allowed.write_text("".join(f"{PRINCIPAL} {key}\n" for key in keys), encoding="utf-8")
+        result = run(
+            [
+                "git",
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                f"gpg.ssh.allowedSignersFile={allowed}",
+                "verify-tag",
+                f"refs/tags/{tag}",
+            ]
+        )
+    if result.returncode != 0:
+        msg = (
+            f"{tag} isn't signed by a key in {SIGNERS_FILE} at {sha}: "
+            f"{shown(result.stderr.strip())}. Pass the release key with --signing-key"
+        )
+        raise RefusedError(msg)
+
+
+def release_tag(version: str, signing_key: str | None, *, push: bool, run: Run) -> str:
+    """Make, check and maybe push the tag. Return what to tell the owner."""
+    if not VERSION.fullmatch(version):
+        msg = f"{shown(version)} is not a version a release can have"
+        raise RefusedError(msg)
+    if signing_key is not None and not SIGNING_KEY.fullmatch(signing_key):
+        msg = "the signing key holds a control character"
+        raise RefusedError(msg)
+    tag = f"v{version}"
+    require_clean(run)
+    repo = repository_of(output_of(run, ["git", "remote", "get-url", "origin"]))
+    output_of(
+        run,
+        ["git", "fetch", "--no-tags", "origin", f"+refs/heads/{MAIN}:refs/remotes/origin/{MAIN}"],
+    )
+    sha = output_of(
+        run, ["git", "rev-parse", "--verify", f"refs/remotes/origin/{MAIN}^{{commit}}"]
+    ).strip()
+    if not COMMIT.fullmatch(sha):
+        msg = f"origin/main isn't a commit: {shown(sha)}"
+        raise RefusedError(msg)
+    found = workspace_version(output_of(run, ["git", "show", f"{sha}:Cargo.toml"]))
+    if found != version:
+        msg = f"origin/main ({sha}) is at version {shown(found)}, not {version}"
+        raise RefusedError(msg)
+    keys = signer_keys(output_of(run, ["git", "show", f"{sha}:{SIGNERS_FILE}"]))
+    require_new_tag(run, tag)
+    run_id = require_dry_run(run, repo, sha)
+
+    signing = ["-c", f"user.signingkey={signing_key}"] if signing_key is not None else []
+    output_of(run, ["git", *signing, "tag", "--sign", "--message", tag, tag, sha])
+    try:
+        verify_tag(run, tag, sha, keys)
+    except RefusedError:
+        output_of(run, ["git", "tag", "--delete", tag])
+        raise
+    push_args = ["git", "push", "origin", f"refs/tags/{tag}"]
+    made = f"Signed {tag} at {sha}, whose dry run {run_id} passed."
+    if push:
+        output_of(run, push_args)
+        return f"{made} Pushed it: the Release workflow publishes from here."
+    return f"{made} Push it to release:\n  {' '.join(push_args)}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Make the tag, or say why not."""
+    parser = argparse.ArgumentParser(description="Sign the release tag for a version.")
+    parser.add_argument("version", help="the version, without the v, such as 0.2.0")
+    parser.add_argument(
+        "--signing-key",
+        help='git\'s user.signingkey for this tag, such as "key::ssh-ed25519 <base64>"',
+    )
+    parser.add_argument("--push", action="store_true", help="push the tag once it's made")
+    args = parser.parse_args(argv)
+    try:
+        print(release_tag(args.version, args.signing_key, push=args.push, run=run_command))
+    except RefusedError as refusal:
+        print(f"release-tag: refused: {refusal}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
