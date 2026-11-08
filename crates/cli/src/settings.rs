@@ -2,18 +2,19 @@
 //! environment and the CLI's configuration file.
 //!
 //! The token never comes from argv, which other users of the machine can read. It comes from
-//! `LANDFALL_TOKEN`, or from a file only its owner can read. With none configured, no token
+//! `LANDFALL_TOKEN`, or from a file of the user's own that only they can read. With none configured, no token
 //! is sent, which is how a proxy that adds one is used.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use landfall_core::controller_url::{ControllerUrl, UrlError};
 use reqwest::header::HeaderValue;
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use serde::Deserialize;
 use thiserror::Error;
@@ -134,7 +135,8 @@ pub trait Files {
     fn config(&self, path: &Path) -> io::Result<String>;
 
     /// The bytes of the token file at `path`, once it is known to be a regular file, not a
-    /// link, that no one but its owner can read, of at most 256 bytes.
+    /// link, owned by the user the CLI runs as, that no one else can read or write, of at
+    /// most 256 bytes.
     ///
     /// # Errors
     ///
@@ -171,17 +173,16 @@ impl Files for SystemFiles {
             Err(Errno::LOOP) => return Err(TokenFileError::Linked),
             Err(errno) => return Err(TokenFileError::Open(errno.into())),
         };
-        let stat = rustix::fs::fstat(&fd).map_err(|errno| TokenFileError::Read(errno.into()))?;
-        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-            return Err(TokenFileError::NotRegular);
-        }
-        let mode = u32::from(stat.st_mode) & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(TokenFileError::Readable { mode });
-        }
+        let file = File::from(fd);
+        let metadata = file.metadata().map_err(TokenFileError::Read)?;
+        judge_token_file(
+            metadata.is_file(),
+            metadata.mode(),
+            metadata.uid(),
+            rustix::process::geteuid().as_raw(),
+        )?;
         let mut bytes = Vec::with_capacity(TOKEN_CAP + 1);
-        File::from(fd)
-            .take(u64::try_from(TOKEN_CAP + 1).unwrap_or(u64::MAX))
+        file.take(u64::try_from(TOKEN_CAP + 1).unwrap_or(u64::MAX))
             .read_to_end(&mut bytes)
             .map_err(TokenFileError::Read)?;
         if bytes.len() > TOKEN_CAP {
@@ -189,6 +190,22 @@ impl Files for SystemFiles {
         }
         Ok(bytes)
     }
+}
+
+/// Whether an opened token file may be read: a regular file, owned by the user the CLI runs
+/// as, that its group and others can neither read nor write.
+fn judge_token_file(is_file: bool, mode: u32, owner: u32, euid: u32) -> Result<(), TokenFileError> {
+    if !is_file {
+        return Err(TokenFileError::NotRegular);
+    }
+    if owner != euid {
+        return Err(TokenFileError::NotOwned { owner });
+    }
+    let mode = mode & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(TokenFileError::Readable { mode });
+    }
+    Ok(())
 }
 
 /// Why a token file was refused. Its contents are never shown.
@@ -204,6 +221,12 @@ pub enum TokenFileError {
     /// It is a directory, a FIFO or anything else but a regular file.
     #[error("it is not a regular file")]
     NotRegular,
+    /// Someone other than the user the CLI runs as owns it.
+    #[error("it is owned by uid {owner}, not by the user running landfall")]
+    NotOwned {
+        /// Its owner's uid.
+        owner: u32,
+    },
     /// Its group or others may read or write it.
     #[error("its mode is {mode:o}, which lets others than its owner at it: chmod 600 it")]
     Readable {

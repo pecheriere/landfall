@@ -7,7 +7,9 @@ use std::io;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use super::{Env, Files, SettingsError, SystemFiles, TokenFileError, TokenSource, resolve};
+use super::{
+    Env, Files, SettingsError, SystemFiles, TokenFileError, TokenSource, judge_token_file, resolve,
+};
 use crate::cli::ApiArgs;
 
 const TOKEN: &str = "lf_Secret-token_0123456789";
@@ -447,4 +449,38 @@ fn token_file_over_256_bytes_is_refused() {
         ..with_controller("https://controller.example")
     };
     assert!(resolve(&flag, &home(), &files).is_err());
+}
+
+#[test]
+fn token_file_owned_by_another_is_refused() {
+    // Another user's file can't be made without root, so the judgement is tested on what the
+    // descriptor says, and the real file of this user passes it above.
+    let error = judge_token_file(true, 0o100_600, 0, 1000).unwrap_err();
+    assert!(
+        matches!(error, TokenFileError::NotOwned { owner: 0 }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("uid 0"), "{error}");
+    assert!(judge_token_file(true, 0o100_600, 1000, 1000).is_ok());
+    assert!(matches!(
+        judge_token_file(false, 0o40_700, 1000, 1000),
+        Err(TokenFileError::NotRegular)
+    ));
+    assert!(matches!(
+        judge_token_file(true, 0o100_660, 1000, 1000),
+        Err(TokenFileError::Readable { mode: 0o660 })
+    ));
+
+    // A real file owned by someone else, where one exists that isn't this user's: refused
+    // whatever its mode, as not owned comes first.
+    // `/etc/hosts` is a link on macOS: the file itself is what is opened.
+    if let Ok(root_owned) = fs::canonicalize("/etc/hosts")
+        && rustix::process::geteuid().as_raw() != 0
+    {
+        let error = SystemFiles.token_file(&root_owned).unwrap_err();
+        assert!(
+            matches!(error, TokenFileError::NotOwned { .. }),
+            "{error:?}"
+        );
+    }
 }
