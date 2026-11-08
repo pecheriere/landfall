@@ -65,6 +65,9 @@ only what they may see.
 |---|---|---|
 | `getOpenApi` | public | public |
 | `listApprovals` | any, filtered by `approve` or `view` | the same |
+| `whoAmI` | any | the same |
+| `listDeployments` | any, filtered by `view` | the same |
+| `getDeployment` | `view` | `view` |
 | `requestDeploy` | `request`, `rollback` | `request`, `rollback` |
 | `approveRequest` | never | `approve` |
 | `cancelRequest` | `requester`, `rollback` | `requester`, `approve`, `rollback` |
@@ -81,6 +84,31 @@ Where the request itself decides which role applies, the operation says so in
 
 A principal with no grant at all on a deployment is told `404 not_found`, the same as for a
 deployment that doesn't exist. One with some other grant there is told `403 forbidden`.
+A deployment a principal can't view is never named to them, not even where another
+deployment's view would: a promotion to or from one reads `"deployment": null, "unseen": true`,
+and a reason about one says "a deployment you can't view".
+
+## Who am I, and deployments
+
+`whoAmI` (`GET /api/v1/me`) names the principal, says whether it came by `token` or `session`,
+and lists each deployment they hold a grant on with what they may do to it now, by this
+credential. A token never lists `approve`, even for an approver. `approve_url` is where an
+approver signs a request with a passkey: the configured `[approval]` origin and `/approvals`.
+
+`listDeployments` (`GET /api/v1/deployments`) lists the deployments of the configuration that
+the principal may view, by id, a page at a time. `host`, `repo` and `needs_you` keep only those
+that match. Each shows what its host last said (`running`), its request waiting for an approver
+(`open_request`) and `needs_you`, whether that request is one this principal could sign. A token
+never approves, so `needs_you` is always `false` for a token, and `needs_you=true` lists nothing
+for one. `latest` is `null` until the controller says where releases stand.
+
+`getDeployment` (`GET /api/v1/deployments/{name}/{stage}`) adds the rule, where its releases go
+on to (`promote_to`) and come from (`promoted_from`), and its holds: the newest 50, with
+`holds_total` counting all of them.
+
+`running` is what the deployment's host, as the configuration has it now, last reported. A
+report from a host the configuration no longer pairs with the deployment is ignored, as the
+watcher ignores it, so a deployment moved to a host that hasn't reported it shows `null`.
 
 ## Refusals
 
@@ -94,7 +122,8 @@ Act on `code`, which never changes its meaning; the document's `ProblemCode` sch
 every one. `title` is for people and may change. A `429 rate_limited` and a `503 busy` come
 with `Retry-After`, in seconds. Each operation's `responses` lists every refusal it can give,
 with the codes each status can carry. The answers operations share are the document's reusable
-responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden` and `BadOrigin` (403),
+responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden`, `BadOrigin` and
+`ReadForbidden` (403),
 `NotFound` (404), `SlowRequest` (408), `BodyTooLarge` (413), `RateLimited` (429), `Internal` and
 `InternalOrUnreadable` (500), and `Busy` (503).
 
@@ -116,8 +145,8 @@ A cursor is opaque: it belongs to the list that gave it, and one from another li
 was changed, is refused with `400 bad_request`. A page is never short of what the principal
 may see: what they may not see is left out before the page is cut, not after.
 
-`listApprovals` isn't paged, as the configuration bounds it: a deployment has at most one open
-request.
+`listDeployments` is paged in order of deployment id. `listApprovals` isn't paged, as the
+configuration bounds it: a deployment has at most one open request.
 
 ## Versions
 

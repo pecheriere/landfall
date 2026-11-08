@@ -10,6 +10,7 @@ mod ceremonies;
 mod deploys;
 mod releases;
 mod requests;
+pub(crate) mod views;
 
 use std::fmt;
 use std::fs::{OpenOptions, Permissions};
@@ -255,6 +256,11 @@ fn migrator() -> Migrator {
             4,
             "passkeys",
             include_str!("../migrations/0004_passkeys.sql"),
+        ),
+        migration(
+            5,
+            "read_indexes",
+            include_str!("../migrations/0005_read_indexes.sql"),
         ),
     ])
 }

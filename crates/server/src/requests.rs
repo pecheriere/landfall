@@ -44,8 +44,8 @@ use axum::extract::State;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use landfall_api::{ApprovalsView, IntentView, RequestState as RequestStateView, RequestView};
-use landfall_core::config::{Config, Deployment, Permission};
-use landfall_core::ids::{DeploymentId, ReleaseTag};
+use landfall_core::config::{Deployment, Permission};
+use landfall_core::ids::ReleaseTag;
 use landfall_core::text::shown;
 use serde_json::json;
 use sqlx::{Sqlite, Transaction};
@@ -55,7 +55,7 @@ use utoipa_axum::routes;
 use crate::agent_api::{ApiProblem, ApiState, read_body};
 use crate::api::{
     ApiJson, ApiQuery, BadOrigin, BadRequest, Busy, IdPath, Internal, NoQuery, RateLimited,
-    SlowRequest, Unauthenticated,
+    SlowRequest, Unauthenticated, visibility,
 };
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
@@ -212,20 +212,6 @@ fn ready_host(snapshot: &RequestSnapshot) -> Result<&WatchedRunning, Stop> {
         ));
     }
     Ok(running)
-}
-
-/// A 403 for someone who may know this deployment exists, and for anyone else the same 404
-/// as for one that doesn't.
-fn visibility(
-    config: &Config,
-    principal: &Principal,
-    deployment: Option<&DeploymentId>,
-) -> HumanProblem {
-    if deployment.is_some_and(|d| sees(config, principal, d)) {
-        HumanProblem::Forbidden
-    } else {
-        HumanProblem::NotFound
-    }
 }
 
 /// The request a path names, as it is now. One nothing can read gets a clear refusal, in the

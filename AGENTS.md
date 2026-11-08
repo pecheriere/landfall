@@ -13,8 +13,9 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-core` (`crates/core`): shared library with no I/O: validated
   identifiers, configuration types and the pure verification and rule logic.
 - `landfall-api` (`crates/api`): the wire types of `/api/v1`, which the controller
-  serialises and the CLI reads. No I/O: `requests`, `problem` (`Problem` and its stable
-  `ProblemCode`s) and `page`. Each enum that can grow has an `Unknown` for a value from a
+  serialises and the CLI reads. No I/O: `requests`, `deployments` (who am I, and the
+  deployments, with `DeploymentRef`, which never names one the reader can't view), `problem`
+  (`Problem` and its stable `ProblemCode`s) and `page`. Each enum that can grow has an `Unknown` for a value from a
   newer controller, which no controller sends. Its `openapi` feature derives each type's
   schema, and only the controller enables it.
 - `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
@@ -45,7 +46,7 @@ passkey approvals. Agents drive it through a typed API. Design:
   modules: `store` (the only code that touches SQLite: migrations, transactions,
   appending to and verifying the audit log, enrolment codes, hosts, nonces,
   deploys, running state, release decisions and holds, API tokens, sessions, deploy
-  requests), `audit` (audit events and the hash-chain encoding), `report` (bounding
+  requests, and `views`, what the API reads to show deployments), `audit` (audit events and the hash-chain encoding), `report` (bounding
   a deploy report before it is stored), `agent_api` (the routes agents call:
   signed-request extractor, handlers, problem answers, rate limit, and `client_source`, who a
   request is from, which every per-source limit and the capped log go by), `auth` (the
@@ -55,7 +56,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   stored hashed, and the human API's problem answers),
   `api` (`/api/v1`: one `OpenApiRouter` registers each route with its annotation, `ApiJson` is
   every success, `query` the path and query-string parameters, a query string refusing any it
-  doesn't take, and `openapi` the document's fixed part: its schemes and shared refusals; the
+  doesn't take, with a page's `Limit` and its `Cursor`, `visible`, the one place that says what a
+  principal may be told of a deployment (404 or 403, and a deployment shown or unseen),
+  `deployments`, who am I and the deployments, and `openapi` the document's fixed part: its schemes and shared refusals; the
   document is served at `/api/v1/openapi.json`, printed by `openapi` and checked in as
   `docs/api/openapi.json`, which a test compares), `requests` (the human API's routes: `asking`
   for a deploy, `approving` one and `cancelling` one), `web` (the browser's side: the static

@@ -9,8 +9,10 @@
 //! Every success is JSON through `ApiJson`, and every refusal `application/problem+json`
 //! with a stable code from the document's `Problem` schema. No answer carries a CORS header.
 
+mod deployments;
 mod openapi;
 mod query;
+mod visible;
 
 use std::sync::LazyLock;
 
@@ -30,6 +32,7 @@ pub(crate) use self::openapi::{
     RateLimited, SlowRequest, Unauthenticated,
 };
 pub(crate) use self::query::{ApiQuery, DeploymentPath, IdPath, NoQuery};
+pub(crate) use self::visible::visibility;
 use crate::agent_api::{ApiState, deadline, json, note_client_source};
 use crate::auth::HumanProblem;
 use crate::requests;
@@ -50,6 +53,7 @@ impl<T: Serialize> IntoResponse for ApiJson<T> {
 /// Every `/api/v1` operation, with the document's fixed part.
 fn operations() -> OpenApiRouter<ApiState> {
     OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
+        .merge(deployments::routes())
         .merge(requests::routes())
         .routes(routes!(document))
 }

@@ -157,6 +157,22 @@ impl Hold {
     pub fn says(&self, reason: &str) -> bool {
         self.reason == stored_reason(reason)
     }
+
+    /// Why, as recorded: quoted, and bounded.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// A hold, from a `release_holds` row with its `reason`, `since`, `last_try` and `slow`.
+pub(super) fn hold_from(row: &SqliteRow) -> Result<Hold, sqlx::Error> {
+    Ok(Hold {
+        reason: row.try_get("reason")?,
+        since: row.try_get("since")?,
+        last_try: row.try_get("last_try")?,
+        slow: row.try_get("slow")?,
+    })
 }
 
 /// What a host last said about a deployment.
@@ -354,12 +370,7 @@ impl Store {
         let mut whole = None;
         for row in &rows {
             let tag: String = row.try_get("tag")?;
-            let hold = Hold {
-                reason: row.try_get("reason")?,
-                since: row.try_get("since")?,
-                last_try: row.try_get("last_try")?,
-                slow: row.try_get("slow")?,
-            };
+            let hold = hold_from(row)?;
             if tag == WHOLE_DEPLOYMENT {
                 whole = Some(hold);
             } else {

@@ -3,7 +3,10 @@
 use landfall_core::intent::DeployIntent;
 use serde_json::json;
 
-use crate::{IntentView, NewApproval, NewRequest, Problem, ProblemCode, RequestState};
+use crate::{
+    DeploymentRef, IntentView, NewApproval, NewRequest, Permission, Problem, ProblemCode,
+    PromotionView, ReleaseStatus, RequestState, Via,
+};
 
 fn intent(expected_running: Option<&str>) -> DeployIntent {
     DeployIntent {
@@ -39,12 +42,47 @@ fn codes_and_states_from_a_newer_controller_read_as_unknown() {
     assert_eq!(problem.code, ProblemCode::Unknown);
     let state: RequestState = serde_json::from_value(json!("teleporting")).unwrap();
     assert_eq!(state, RequestState::Unknown);
+    let via: Via = serde_json::from_value(json!("telepathy")).unwrap();
+    assert_eq!(via, Via::Unknown);
+    let permission: Permission = serde_json::from_value(json!("teleport")).unwrap();
+    assert_eq!(permission, Permission::Unknown);
+    let status: ReleaseStatus = serde_json::from_value(json!("teleported")).unwrap();
+    assert_eq!(status, ReleaseStatus::Unknown);
 }
 
 #[test]
 fn unknown_is_never_sent() {
     assert!(serde_json::to_value(ProblemCode::Unknown).is_err());
     assert!(serde_json::to_value(RequestState::Unknown).is_err());
+    assert!(serde_json::to_value(Via::Unknown).is_err());
+    assert!(serde_json::to_value(Permission::Unknown).is_err());
+    assert!(serde_json::to_value(ReleaseStatus::Unknown).is_err());
+}
+
+#[test]
+fn a_deployment_one_cannot_view_is_never_named() {
+    let seen = PromotionView {
+        deployment: DeploymentRef::Seen("app/beta".parse().unwrap()),
+        healthy_for_secs: 3600,
+    };
+    let unseen = PromotionView {
+        deployment: DeploymentRef::Unseen,
+        healthy_for_secs: 3600,
+    };
+    let seen_json = json!({ "deployment": "app/beta", "healthy_for_secs": 3600 });
+    let unseen_json = json!({ "deployment": null, "unseen": true, "healthy_for_secs": 3600 });
+    assert_eq!(serde_json::to_value(&seen).unwrap(), seen_json);
+    assert_eq!(serde_json::to_value(&unseen).unwrap(), unseen_json);
+    assert_eq!(
+        serde_json::from_value::<PromotionView>(seen_json).unwrap(),
+        seen
+    );
+    assert_eq!(
+        serde_json::from_value::<PromotionView>(unseen_json).unwrap(),
+        unseen
+    );
+    assert_eq!(seen.deployment.to_string(), "app/beta");
+    assert_eq!(unseen.deployment.to_string(), "a deployment you can't view");
 }
 
 #[test]

@@ -490,7 +490,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(applied, 4);
+    assert_eq!(applied, 5);
     assert_eq!(chain(&store).await, (2, None));
 }
 
