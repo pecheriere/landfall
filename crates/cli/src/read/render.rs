@@ -8,8 +8,9 @@ use std::io::{self, Write};
 use landfall_api::{
     ApprovalsView, AuditEntry, CommitsState, CommitsView, DeployView, DeploymentSummary,
     DeploymentView, HostView, HostsView, NextAction, Page, PromotionView, ReleaseStory,
-    ReleaseView, RequestView, RunningView, Why,
+    ReleaseView, RequestState, RequestView, RunningView, Why,
 };
+use landfall_core::ids::PrincipalId;
 use serde_json::Value;
 
 use super::Stopped;
@@ -183,6 +184,13 @@ fn deploy_state(state: &impl serde::Serialize, outcome: Option<&impl serde::Seri
     }
 }
 
+/// `, approved by <principal>`, or nothing when nobody approved.
+fn approved_by(principal: Option<&PrincipalId>) -> String {
+    principal
+        .map(|by| format!(", approved by {}", safe(by.as_ref())))
+        .unwrap_or_default()
+}
+
 /// A deployment's deploys, newest first.
 pub(crate) fn deploys(page: &Page<DeployView>, out: &mut dyn Write) -> io::Result<()> {
     if page.items.is_empty() {
@@ -203,11 +211,7 @@ pub(crate) fn deploys(page: &Page<DeployView>, out: &mut dyn Write) -> io::Resul
             when(deploy.created_at)
         )?;
         if let Some(request) = deploy.request {
-            let by = deploy
-                .approved_by
-                .as_ref()
-                .map(|by| format!(", approved by {}", safe(by.as_ref())))
-                .unwrap_or_default();
+            let by = approved_by(deploy.approved_by.as_ref());
             writeln!(out, "  from request {request}{by}")?;
         }
         if let Some(reason) = &deploy.reason {
@@ -366,11 +370,7 @@ pub(crate) fn story(story: &ReleaseStory, out: &mut dyn Write) -> io::Result<()>
         writeln!(out, "requests:")?;
     }
     for request in &story.requests {
-        let approved = request
-            .approved_by
-            .as_ref()
-            .map(|by| format!(", approved by {}", safe(by.as_ref())))
-            .unwrap_or_default();
+        let approved = approved_by(request.approved_by.as_ref());
         let closed = request
             .closed_reason
             .as_deref()
@@ -539,7 +539,12 @@ fn request(
     );
     writeln!(out, "  expects running {expected}")?;
     writeln!(out, "  nonce {}", safe(&intent.nonce))?;
-    approval_line(approve_url, out)
+    // Only an open request can be signed: the controller lists only those, and anything else
+    // a newer one sends is shown for what it is.
+    if request.state == RequestState::AwaitingApproval {
+        approval_line(approve_url, out)?;
+    }
+    Ok(())
 }
 
 /// The requests waiting for an approver.

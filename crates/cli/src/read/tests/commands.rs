@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::{CALLS, FakeApi, fixture, run, summary};
+use super::{CALLS, FakeApi, fixture, request, run, summary};
 use crate::api_client::ApiError;
 use crate::cli::CliError;
 
@@ -72,6 +72,23 @@ fn status_stops_at_1000_items_or_20_pages_and_says_so() {
     let (result, out) = run("status", &api, false);
     result.unwrap();
     assert_eq!(api.calls().len(), 10);
+    assert_eq!(
+        out.lines().filter(|l| l.starts_with("app/prod")).count(),
+        1000
+    );
+    assert!(
+        out.ends_with(
+            "stopped at 1000 deployments: narrow it with --host, --repo or --needs-you\n"
+        ),
+        "{}",
+        out.lines().last().unwrap()
+    );
+
+    // One page over the API's limit, and no cursor: what is dropped is still said.
+    let api = FakeApi::new(|_, _| Ok(page(1001, None)));
+    let (result, out) = run("status", &api, false);
+    result.unwrap();
+    assert_eq!(api.calls().len(), 1);
     assert_eq!(
         out.lines().filter(|l| l.starts_with("app/prod")).count(),
         1000
@@ -212,6 +229,25 @@ fn approvals_say_where_an_approver_signs() {
         out.contains("This controller has no [approval] settings, so nobody can approve yet."),
         "{out}"
     );
+    // Only an open request is said to be signable; anything else asks nobody who it is.
+    let api = FakeApi::new(|path, _| {
+        Ok(match path {
+            "/api/v1/approvals" => {
+                let (mut approved, mut newer) = (request(), request());
+                approved["state"] = json!("approved");
+                newer["state"] = json!("teleporting");
+                json!({"approvals": [approved, newer]})
+            }
+            other => fixture(other),
+        })
+    });
+    let (result, out) = run("approvals", &api, false);
+    result.unwrap();
+    assert_eq!(api.calls().len(), 1);
+    assert!(out.contains("v1.3.0, approved,"), "{out}");
+    assert!(out.contains("v1.3.0, unknown,"), "{out}");
+    assert!(!out.contains("approver signs"), "{out}");
+    assert!(!out.contains("nobody can approve"), "{out}");
 }
 
 #[test]

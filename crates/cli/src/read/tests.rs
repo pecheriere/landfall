@@ -19,14 +19,14 @@ pub(crate) const DIGEST: &str =
     "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 pub(crate) const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-/// Each command line, and the calls it makes in human output, in order: the method, the
-/// path sent, and the document's path for it, with its parameters as `{…}`.
-/// A call: its method, the path sent, and the document's path for it.
+/// A call: its method, the path sent, and the document's path for it, with its parameters as
+/// `{…}`.
 pub(crate) type Call = (&'static str, &'static str, &'static str);
 
 /// A call the fake recorded: its path and query.
 pub(crate) type Recorded = (String, Vec<(String, String)>);
 
+/// Each command line, and the calls it makes in human output, in order.
 pub(crate) const CALLS: &[(&str, &[Call])] = &[
     (
         "status",

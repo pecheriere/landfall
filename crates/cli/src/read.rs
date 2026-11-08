@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use clap::{Args, Subcommand};
-use landfall_api::{ApprovalsView, DeploymentSummary, MeView, Page};
+use landfall_api::{ApprovalsView, DeploymentSummary, MeView, Page, RequestState};
 use landfall_core::ids::{DeploymentId, HostId, ReleaseTag, RepoName};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -345,7 +345,13 @@ async fn status_list<A: Api>(
         pages += 1;
         let page: Page<Value> = ApiClient::typed(&value)?;
         let room = MAX_ITEMS - items.len();
+        // A page over the API's own limit of 100 can bring more than there is room for:
+        // what is dropped is said, cursor or not.
+        let dropped = page.items.len() > room;
         items.extend(page.items.into_iter().take(room));
+        if dropped {
+            break Some(Stopped::Items);
+        }
         let Some(next) = page.next_cursor else {
             break None;
         };
@@ -384,11 +390,15 @@ async fn approvals<A: Api>(client: &A, out: &mut dyn Write, json: bool) -> Resul
         return write_json(out, &value).map_err(CliError::Output);
     }
     let approvals: ApprovalsView = ApiClient::typed(&value)?;
-    let approve_url = if approvals.approvals.is_empty() {
-        None
-    } else {
+    let open = approvals
+        .approvals
+        .iter()
+        .any(|request| request.state == RequestState::AwaitingApproval);
+    let approve_url = if open {
         let me: MeView = ApiClient::typed(&client.get("/api/v1/me", &[]).await?)?;
         me.approve_url
+    } else {
+        None
     };
     render::approvals(&approvals, approve_url.as_deref(), out).map_err(CliError::Output)
 }

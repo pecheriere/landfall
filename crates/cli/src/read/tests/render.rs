@@ -4,7 +4,7 @@
 use landfall_api::{DeploymentSummary, ReleaseStory, Why};
 use serde_json::{Value, json};
 
-use super::{deploy, deployment, host, listed, story, summary, typed, why};
+use super::{deploy, deployment, host, listed, request, story, summary, typed, why};
 use crate::read::render;
 
 fn printed(write: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
@@ -18,84 +18,100 @@ fn story_text(value: Value) -> String {
     printed(|out| render::story(&story, out))
 }
 
-fn assert_escaped(text: &str) {
+/// Hostile text as a field can hold it: an OSC title escape ended by BEL, a C1 CSI, a
+/// carriage return, a bidi override, and a line feed to forge a line of output.
+const HOSTILE: &str = "h\x1b]0;owned\x07\u{9b}2J\r\u{202e}\nFORGED";
+
+/// [`HOSTILE`], as `safe` prints it.
+const ESCAPED: &str = "h\\u{1b}]0;owned\\u{7}\\u{9b}2J\\u{d}\\u{202e}\\u{a}FORGED";
+
+/// `text` holds [`HOSTILE`] escaped exactly `fields` times, and nothing of it raw: no
+/// control, no override, and no line it forged.
+fn assert_escaped(view: &str, text: &str, fields: usize) {
     for raw in ['\x1b', '\x07', '\r', '\u{9b}', '\u{202e}'] {
-        assert!(!text.contains(raw), "{raw:?} in {text:?}");
+        assert!(!text.contains(raw), "{view}: {raw:?} in {text:?}");
     }
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.trim_start().starts_with("FORGED")),
+        "{view}: a forged line in:\n{text}"
+    );
+    assert_eq!(
+        text.matches(ESCAPED).count(),
+        fields,
+        "{view}: hostile fields escaped, in:\n{text}"
+    );
 }
 
+/// Every server string each command prints for a person, seeded with [`HOSTILE`].
 #[test]
 fn hostile_text_is_escaped_in_human_output() {
-    // A release story: a commit summary, its author, a check name and a host's reason.
+    let hostile = json!(HOSTILE);
+
+    // release: a commit's summary and author, reasons naming a check and a host's words, the
+    // origin's identity and run, the next step, and why a request closed.
     let mut commits = listed(1, 1);
-    commits["commits"][0]["summary"] = json!("fix\x1b]0;owned\x07");
-    commits["commits"][0]["author"] = json!("dev\rroot");
+    commits["commits"][0]["summary"] = hostile.clone();
+    commits["commits"][0]["author"] = hostile.clone();
     let mut value = story(commits);
-    value["reasons"] = json!([
-        "check \"web\u{9b}2J\" failed",
-        "home-1 said \"\u{202e}gpj.exe\"",
-    ]);
-    let text = story_text(value);
-    assert_escaped(&text);
-    for escaped in [
-        "fix\\u{1b}]0;owned\\u{7}",
-        "dev\\u{d}root",
-        "web\\u{9b}2J",
-        "\\u{202e}gpj.exe",
-    ] {
-        assert!(text.contains(escaped), "{escaped} missing from:\n{text}");
-    }
+    value["reasons"] = json!([HOSTILE, HOSTILE]);
+    value["origin"]["san"] = hostile.clone();
+    value["origin"]["run_url"] = hostile.clone();
+    value["next"]["detail"] = hostile.clone();
+    value["requests"][0]["closed_reason"] = hostile.clone();
+    assert_escaped("release", &story_text(value), 8);
 
-    // A deploy's host reason and failed step, in history.
+    // history: the host's reason, why going back failed, and a failed step's name and words.
     let mut value = deploy();
-    value["reason"] = json!("\u{202e}bad");
-    value["steps"][1]["name"] = json!("checks\u{9b}2J");
-    value["steps"][1]["failure"] = json!("web\x1b[2K");
+    value["reason"] = hostile.clone();
+    value["rollback_reason"] = hostile.clone();
+    value["steps"][1]["name"] = hostile.clone();
+    value["steps"][1]["failure"] = hostile.clone();
     let page = typed(json!({"items": [value], "next_cursor": null}));
-    let text = printed(|out| render::deploys(&page, out));
-    assert_escaped(&text);
-    for escaped in ["\\u{202e}bad", "checks\\u{9b}2J", "web\\u{1b}[2K"] {
-        assert!(text.contains(escaped), "{escaped} missing from:\n{text}");
-    }
+    assert_escaped("history", &printed(|out| render::deploys(&page, out)), 4);
 
-    // Why: the summary and each event's text, a check name among them.
+    // why: the summary, an event's text, and the next step.
     let mut value = why();
-    value["summary"] = json!("failed at \"checks\x1b]0;x\x07\"");
-    value["events"][1]["text"] = json!("check \"web\u{9b}2J\" failed\r");
+    value["summary"] = hostile.clone();
+    value["events"][1]["text"] = hostile.clone();
+    value["next"]["detail"] = hostile.clone();
     let why: Why = typed(value);
-    let text = printed(|out| render::why(&why, out));
-    assert_escaped(&text);
-    assert!(text.contains("checks\\u{1b}]0;x\\u{7}"), "{text}");
-    assert!(
-        text.contains("check \"web\\u{9b}2J\" failed\\u{d}"),
-        "{text}"
-    );
+    assert_escaped("why", &printed(|out| render::why(&why, out)), 3);
 
-    // A hold's reason, in a deployment's status.
+    // status: a hold's reason, the phase a host reported, and the rule's bumps.
     let mut value = deployment();
-    value["holds"][0]["reason"] = json!("host said \u{202e}no\r");
+    value["holds"][0]["reason"] = hostile.clone();
+    value["summary"]["running"]["phase"] = hostile.clone();
+    value["rule"]["auto"] = hostile.clone();
+    value["rule"]["approve"] = hostile.clone();
     let view = typed(value);
-    let text = printed(|out| render::deployment(&view, out));
-    assert_escaped(&text);
-    assert!(text.contains("host said \\u{202e}no\\u{d}"), "{text}");
+    assert_escaped("status", &printed(|out| render::deployment(&view, out)), 4);
 
-    // A host's phase, in the hosts list.
+    // hosts: the phase of each deployment on it.
     let mut value = host();
-    value["deployments"][0]["running"]["phase"] = json!("idle\x1b[31m");
+    value["deployments"][0]["running"]["phase"] = hostile.clone();
     let view = typed(value);
-    let text = printed(|out| render::host(&view, out));
-    assert_escaped(&text);
-    assert!(text.contains("idle\\u{1b}[31m"), "{text}");
+    assert_escaped("hosts", &printed(|out| render::host(&view, out)), 1);
 
-    // An audit row's detail.
+    // audit: the kind, and a detail's key, its value, and a value that isn't a string.
+    let mut detail = serde_json::Map::new();
+    detail.insert(HOSTILE.to_owned(), hostile.clone());
+    detail.insert("nested".to_owned(), json!([HOSTILE]));
     let page = typed(json!({"items": [{
-        "seq": 1, "ts": 1, "kind": "deploy_refused\u{9b}", "deployment": null, "host": null,
-        "detail": {"reason": "\"\u{202e}x\r\""},
+        "seq": 1, "ts": 1, "kind": HOSTILE, "deployment": null, "host": null, "detail": detail,
     }], "next_cursor": null}));
     let text = printed(|out| render::audit(&page, out));
-    assert_escaped(&text);
-    assert!(text.contains("deploy_refused\\u{9b}"), "{text}");
-    assert!(text.contains("\\u{202e}x\\u{d}"), "{text}");
+    // The nested value is JSON first, so its controls are JSON escapes, escaped again.
+    assert_escaped("audit", &text, 3);
+    assert!(text.contains("nested=[\"h\\\\u001b]0;owned"), "{text}");
+
+    // approvals: the nonce, and where /me says an approver signs.
+    let mut value = request();
+    value["intent"]["nonce"] = hostile.clone();
+    let view = typed(json!({"approvals": [value]}));
+    let text = printed(|out| render::approvals(&view, Some(HOSTILE), out));
+    assert_escaped("approvals", &text, 2);
 }
 
 #[test]
@@ -217,4 +233,30 @@ fn unknown_status_prints_unknown() {
     let line: DeploymentSummary = typed(value);
     let text = printed(|out| render::deployments(std::slice::from_ref(&line), out));
     assert!(text.contains("latest v1.3.0 unknown"), "{text}");
+}
+
+/// A newer controller's fields change nothing a person reads, and its values read `unknown`.
+#[test]
+fn human_output_ignores_unknown_fields() {
+    let mut value = story(listed(1, 1));
+    value["from_the_future"] = json!({"x": "\u{9b}"});
+    value["release"]["new_field"] = json!(1);
+    value["commits"]["commits"][0]["signed"] = json!(true);
+    value["requests"][0]["state"] = json!("escalated");
+    let text = story_text(value);
+    let plain = story_text(story(listed(1, 1)));
+    assert_eq!(
+        text,
+        plain.replace("request 7: awaiting_approval", "request 7: unknown")
+    );
+
+    let mut value = summary();
+    value["new"] = json!(1);
+    value["running"]["uptime_secs"] = json!(5);
+    let with_extra: DeploymentSummary = typed(value);
+    let line: DeploymentSummary = typed(summary());
+    assert_eq!(
+        printed(|out| render::deployments(std::slice::from_ref(&with_extra), out)),
+        printed(|out| render::deployments(std::slice::from_ref(&line), out))
+    );
 }
