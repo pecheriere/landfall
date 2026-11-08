@@ -16,6 +16,7 @@ mod deploys;
 mod hosts;
 mod page;
 mod problem;
+mod raw;
 mod releases;
 mod requests;
 
@@ -28,6 +29,7 @@ pub use deploys::{DeployView, StepView, Why, WhyEvent, WhyKind};
 pub use hosts::{HostView, HostsView};
 pub use page::Page;
 pub use problem::{Problem, ProblemCode};
+pub use raw::RawJson;
 pub use releases::{
     CommitSource, CommitView, CommitsState, CommitsView, Decision, DeployBrief, DeployState,
     NextAction, NextKind, OriginView, Outcome, ReleaseStory, ReleaseView, RequestBrief,

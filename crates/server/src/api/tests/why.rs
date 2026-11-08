@@ -1,7 +1,7 @@
 //! Why a deploy ended as it did: `why::explain`, a pure function over the deploy and its
 //! steps, for each outcome and for a deploy not yet finished.
 
-use landfall_api::{DeployState, NextKind, Outcome, WhyKind};
+use landfall_api::{DeployState, NextKind, Outcome, RawJson, WhyKind};
 use landfall_core::ids::HostId;
 use landfall_core::protocol::DeployReportBody;
 use serde_json::json;
@@ -59,10 +59,11 @@ fn step(position: u32, name: &str, failure: Option<&str>) -> StepRow {
         millis: 100,
         failure: failure.map(|text| format!("{text:?}")),
         detail: (name == "checks").then(|| {
-            json!({
+            RawJson::from_value(&json!({
                 "kind": "checks",
                 "checks": [{ "check": "\"container-healthy\"", "attempts": 3, "millis": 90 }],
-            })
+            }))
+            .unwrap()
         }),
     }
 }

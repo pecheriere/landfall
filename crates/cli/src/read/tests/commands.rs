@@ -344,3 +344,65 @@ fn status_stops_at_the_byte_budget_and_holds_no_more() {
     assert!(held > 6 << 20 && held <= MAX_BYTES, "{held}");
     assert_eq!(printed["stopped"], stop);
 }
+
+/// One `audit` answer of nearly 4 MiB whose detail is wide and nested about a hundred deep,
+/// from a real controller's socket: the command completes, the detail held is its text and
+/// no larger than the answer, and it is printed from that text, escaped.
+#[tokio::test]
+async fn a_wide_deep_audit_detail_is_held_as_its_text() {
+    use landfall_api::{AuditEntry, Page};
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::api_client::{ApiClient, BODY_CAP};
+
+    // Each element: a hundred nested arrays around a one-key object, and a C1 CSI in the key.
+    let deep = format!("{}{{\"\u{9b}\":0}}{}", "[".repeat(100), "]".repeat(100));
+    let count = (BODY_CAP - 1024) / (deep.len() + 1);
+    let wide = vec![deep.as_str(); count].join(",");
+    let detail = format!("{{\"wide\":[{wide}]}}");
+    let body = format!(
+        "{{\"items\":[{{\"seq\":1,\"ts\":1,\"kind\":\"deploy_queued\",\"deployment\":null,\
+         \"host\":null,\"detail\":{detail}}}],\"next_cursor\":null}}"
+    );
+    assert!(
+        body.len() <= BODY_CAP && body.len() > BODY_CAP - 4096,
+        "{}",
+        body.len()
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/audit"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body.clone(), "application/json"))
+        .mount(&server)
+        .await;
+    let settings = crate::settings::Settings {
+        controller: landfall_core::controller_url::ControllerUrl::parse(&server.uri(), true)
+            .unwrap(),
+        token: None,
+    };
+    let client = ApiClient::new(&settings).unwrap();
+
+    // What the CLI holds of it: the answer's text, and the detail as its own text within it.
+    let text = client.get("/api/v1/audit", &[]).await.unwrap();
+    assert_eq!(text, body);
+    let page: Page<AuditEntry> = ApiClient::typed(&text).unwrap();
+    assert_eq!(page.items[0].detail.get(), detail);
+    assert!(page.items[0].detail.get().len() <= BODY_CAP);
+
+    // Printed for a person, field by field from the text: the C1 escaped, nothing raw.
+    let command = super::parse("audit");
+    let mut out = Vec::new();
+    crate::read::run_with(&command, &client, &mut out, false)
+        .await
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.starts_with("1 1970-01-01T00:00:01Z deploy_queued wide=[[[["),
+        "{}",
+        &out[..80]
+    );
+    assert!(!out.contains('\u{9b}'));
+    assert_eq!(out.matches("{\"\\u{9b}\":0}").count(), count);
+    assert_eq!(out.lines().count(), 1);
+}

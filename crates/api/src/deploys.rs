@@ -3,7 +3,7 @@
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, PrincipalId, ReleaseTag};
 use serde::{Deserialize, Serialize};
 
-use crate::{DeployState, NextAction, Outcome};
+use crate::{DeployState, NextAction, Outcome, RawJson};
 
 /// One step a host reported of a deploy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +28,7 @@ pub struct StepView {
         feature = "openapi",
         schema(value_type = Option<Object>, required = true)
     )]
-    pub detail: Option<serde_json::Value>,
+    pub detail: Option<RawJson>,
 }
 
 /// A deploy: a release sent to its deployment's host, and what the host said of it.

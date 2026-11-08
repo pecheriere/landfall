@@ -30,7 +30,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest body read: a page of the API is far smaller.
-const BODY_CAP: usize = 4 * 1024 * 1024;
+pub(crate) const BODY_CAP: usize = 4 * 1024 * 1024;
 
 /// The most of a problem's title kept, so that a hostile one can't flood a terminal.
 const TITLE_CHARS: usize = 256;

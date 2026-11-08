@@ -15,9 +15,10 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-api` (`crates/api`): the wire types of `/api/v1`, which the controller serialises
   and the CLI reads. No I/O: `requests`, `deployments` (who am I, and the deployments, with
   `DeploymentRef`, which never names one the reader can't view), `problem` (`Problem` and its
-  stable `ProblemCode`s) and `page`. Each enum that can grow has an `Unknown` for a value from a
-  newer controller, which no controller sends. Its `openapi` feature derives each type's schema,
-  and only the controller enables it.
+  stable `ProblemCode`s), `page` and `raw` (`RawJson`, the audit row's and a deploy step's
+  `detail` kept as their JSON text, never as a tree). Each enum that can grow has an `Unknown`
+  for a value from a newer controller, which no controller sends. Its `openapi` feature derives
+  each type's schema, and only the controller enables it.
 - `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
   a key from local configuration, and parses an attestation, trusting none of it,
   for its key.

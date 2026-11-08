@@ -95,8 +95,9 @@ pub(crate) fn parse(line: &str) -> ReadCommand {
     Line::try_parse_from(args).unwrap().command
 }
 
-pub(crate) fn typed<T: DeserializeOwned>(value: Value) -> T {
-    serde_json::from_value(value).unwrap()
+/// `value` as `T`, read from its text, as the CLI reads an answer.
+pub(crate) fn typed<T: DeserializeOwned>(value: &Value) -> T {
+    serde_json::from_str(&value.to_string()).unwrap()
 }
 
 type Answer = Box<dyn Fn(&str, &[(String, String)]) -> Result<Value, ApiError> + Send + Sync>;

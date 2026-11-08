@@ -13,7 +13,7 @@ fn printed(write: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
     String::from_utf8(out).unwrap()
 }
 
-fn story_text(value: Value) -> String {
+fn story_text(value: &Value) -> String {
     let story: ReleaseStory = typed(value);
     printed(|out| render::story(&story, out))
 }
@@ -62,7 +62,7 @@ fn hostile_text_is_escaped_in_human_output() {
     value["origin"]["run_url"] = hostile.clone();
     value["next"]["detail"] = hostile.clone();
     value["requests"][0]["closed_reason"] = hostile.clone();
-    assert_escaped("release", &story_text(value), 9);
+    assert_escaped("release", &story_text(&value), 9);
 
     // history: the host's reason, why going back failed, and a failed step's name and words.
     let mut value = deploy();
@@ -70,7 +70,7 @@ fn hostile_text_is_escaped_in_human_output() {
     value["rollback_reason"] = hostile.clone();
     value["steps"][1]["name"] = hostile.clone();
     value["steps"][1]["failure"] = hostile.clone();
-    let page = typed(json!({"items": [value], "next_cursor": null}));
+    let page = typed(&json!({"items": [value], "next_cursor": null}));
     assert_escaped("history", &printed(|out| render::deploys(&page, out)), 4);
 
     // why: the summary, an event's text, and the next step.
@@ -78,7 +78,7 @@ fn hostile_text_is_escaped_in_human_output() {
     value["summary"] = hostile.clone();
     value["events"][1]["text"] = hostile.clone();
     value["next"]["detail"] = hostile.clone();
-    let why: Why = typed(value);
+    let why: Why = typed(&value);
     assert_escaped("why", &printed(|out| render::why(&why, out)), 3);
 
     // status: a hold's reason, the phase a host reported, and the rule's bumps.
@@ -87,20 +87,20 @@ fn hostile_text_is_escaped_in_human_output() {
     value["summary"]["running"]["phase"] = hostile.clone();
     value["rule"]["auto"] = hostile.clone();
     value["rule"]["approve"] = hostile.clone();
-    let view = typed(value);
+    let view = typed(&value);
     assert_escaped("status", &printed(|out| render::deployment(&view, out)), 4);
 
     // hosts: the phase of each deployment on it.
     let mut value = host();
     value["deployments"][0]["running"]["phase"] = hostile.clone();
-    let view = typed(value);
+    let view = typed(&value);
     assert_escaped("hosts", &printed(|out| render::host(&view, out)), 1);
 
     // audit: the kind, and a detail's key, its value, and a value that isn't a string.
     let mut detail = serde_json::Map::new();
     detail.insert(HOSTILE.to_owned(), hostile.clone());
     detail.insert("nested".to_owned(), json!([HOSTILE]));
-    let page = typed(json!({"items": [{
+    let page = typed(&json!({"items": [{
         "seq": 1, "ts": 1, "kind": HOSTILE, "deployment": null, "host": null, "detail": detail,
     }], "next_cursor": null}));
     let text = printed(|out| render::audit(&page, out));
@@ -111,7 +111,7 @@ fn hostile_text_is_escaped_in_human_output() {
     // approvals: the nonce, and where /me says an approver signs.
     let mut value = request();
     value["intent"]["nonce"] = hostile.clone();
-    let view = typed(json!({"approvals": [value]}));
+    let view = typed(&json!({"approvals": [value]}));
     let text = printed(|out| render::approvals(&view, Some(HOSTILE), out));
     assert_escaped("approvals", &text, 2);
 }
@@ -120,7 +120,7 @@ fn hostile_text_is_escaped_in_human_output() {
 fn status_line_shows_needs_you() {
     let mut value = summary();
     value["needs_you"] = json!(true);
-    let line: DeploymentSummary = typed(value);
+    let line: DeploymentSummary = typed(&value);
     let text = printed(|out| render::deployments(std::slice::from_ref(&line), out));
     assert_eq!(
         text,
@@ -131,7 +131,7 @@ fn status_line_shows_needs_you() {
     value["running"] = Value::Null;
     value["latest"] = Value::Null;
     value["open_request"] = Value::Null;
-    let line: DeploymentSummary = typed(value);
+    let line: DeploymentSummary = typed(&value);
     let text = printed(|out| render::deployments(std::slice::from_ref(&line), out));
     assert_eq!(
         text,
@@ -142,7 +142,7 @@ fn status_line_shows_needs_you() {
 
 #[test]
 fn story_heads_commits_as_unverified_and_says_how_many() {
-    let text = story_text(story(listed(2, 2)));
+    let text = story_text(&story(listed(2, 2)));
     assert!(
         text.contains(
             "commits, as GitHub lists them (not verified; authors are GitHub's attribution), since v1.2.0:"
@@ -152,7 +152,7 @@ fn story_heads_commits_as_unverified_and_says_how_many() {
     assert!(text.contains("\"change 0\" (dev)"), "{text}");
     assert!(!text.contains("the newest"), "{text}");
 
-    let text = story_text(story(listed(100, 250)));
+    let text = story_text(&story(listed(100, 250)));
     assert!(
         text.contains(
             "the newest 100 of 250; all of them at https://github.com/example/app/compare/a...b"
@@ -176,14 +176,14 @@ fn unknown_commit_state_is_not_printed_as_none() {
         let mut commits = listed(0, 0);
         commits["state"] = json!(state);
         commits["total"] = Value::Null;
-        let text = story_text(story(commits));
+        let text = story_text(&story(commits));
         assert!(text.contains(says), "{state}: {text}");
         assert!(!text.contains("no commits"), "{state}: {text}");
         assert!(!text.contains("as GitHub lists them"), "{state}: {text}");
     }
 
     // Listed and empty is the one case of none.
-    let text = story_text(story(listed(0, 0)));
+    let text = story_text(&story(listed(0, 0)));
     assert!(text.contains("no commits"), "{text}");
 }
 
@@ -192,7 +192,7 @@ fn too_large_prints_the_link_and_no_list() {
     let mut commits = listed(3, 3);
     commits["state"] = json!("too_large");
     commits["total"] = Value::Null;
-    let text = story_text(story(commits));
+    let text = story_text(&story(commits));
     assert!(
         text.contains(
             "commits: too large to list here: https://github.com/example/app/compare/a...b"
@@ -205,7 +205,7 @@ fn too_large_prints_the_link_and_no_list() {
 
 #[test]
 fn why_prints_summary_events_and_next() {
-    let why: Why = typed(why());
+    let why: Why = typed(&why());
     let text = printed(|out| render::why(&why, out));
     assert_eq!(
         text,
@@ -223,7 +223,7 @@ fn unknown_status_prints_unknown() {
     value["release"]["status"] = json!("teleporting");
     value["release"]["decision"] = json!("dithering");
     value["next"]["kind"] = json!("dance");
-    let text = story_text(value);
+    let text = story_text(&value);
     assert!(
         text.starts_with("v1.3.0: unknown (decision unknown)\n"),
         "{text}"
@@ -232,7 +232,7 @@ fn unknown_status_prints_unknown() {
 
     let mut value = summary();
     value["latest"]["status"] = json!("teleporting");
-    let line: DeploymentSummary = typed(value);
+    let line: DeploymentSummary = typed(&value);
     let text = printed(|out| render::deployments(std::slice::from_ref(&line), out));
     assert!(text.contains("latest v1.3.0 unknown"), "{text}");
 }
@@ -245,8 +245,8 @@ fn human_output_ignores_unknown_fields() {
     value["release"]["new_field"] = json!(1);
     value["commits"]["commits"][0]["signed"] = json!(true);
     value["requests"][0]["state"] = json!("escalated");
-    let text = story_text(value);
-    let plain = story_text(story(listed(1, 1)));
+    let text = story_text(&value);
+    let plain = story_text(&story(listed(1, 1)));
     assert_eq!(
         text,
         plain.replace("request 7: awaiting_approval", "request 7: unknown")
@@ -255,8 +255,8 @@ fn human_output_ignores_unknown_fields() {
     let mut value = summary();
     value["new"] = json!(1);
     value["running"]["uptime_secs"] = json!(5);
-    let with_extra: DeploymentSummary = typed(value);
-    let line: DeploymentSummary = typed(summary());
+    let with_extra: DeploymentSummary = typed(&value);
+    let line: DeploymentSummary = typed(&summary());
     assert_eq!(
         printed(|out| render::deployments(std::slice::from_ref(&with_extra), out)),
         printed(|out| render::deployments(std::slice::from_ref(&line), out))

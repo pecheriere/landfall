@@ -2,16 +2,19 @@
 //! [`safe`] before it is printed, and every enum through [`wire_name`], so a value from a newer
 //! controller reads `unknown`.
 
-use std::fmt::Write as _;
+use std::borrow::Cow;
+use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 
 use landfall_api::{
     ApprovalsView, AuditEntry, CommitsState, CommitsView, DeployView, DeploymentSummary,
-    DeploymentView, HostView, HostsView, NextAction, Page, PromotionView, ReleaseStory,
+    DeploymentView, HostView, HostsView, NextAction, Page, PromotionView, RawJson, ReleaseStory,
     ReleaseView, RequestState, RequestView, RunningView, Why,
 };
 use landfall_core::ids::PrincipalId;
-use serde_json::Value;
+use serde::Deserializer as _;
+use serde::de::{MapAccess, Visitor};
+use serde_json::value::RawValue;
 
 use super::Stopped;
 use crate::display::{safe, wire_name};
@@ -463,11 +466,43 @@ pub(crate) fn hosts(hosts: &HostsView, out: &mut dyn Write) -> io::Result<()> {
     Ok(())
 }
 
-/// A value of an audit row's detail: a string as itself, anything else as JSON, escaped.
-fn detail_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => safe(text).into_owned(),
-        other => safe(&other.to_string()).into_owned(),
+/// A value of an audit row's detail: a string as itself, anything else as its JSON text as
+/// received, escaped.
+fn detail_value(value: &RawValue) -> String {
+    match serde_json::from_str::<String>(value.get()) {
+        Ok(text) => safe(&text).into_owned(),
+        Err(_) => safe(value.get()).into_owned(),
+    }
+}
+
+/// An audit row's detail, read from its text field by field, in the order received, without a
+/// tree: each field as ` name=value`, or the whole text, escaped, if it isn't an object.
+fn detail_fields(detail: &RawJson, line: &mut String) {
+    let mut fields = String::new();
+    let mut reader = serde_json::Deserializer::from_str(detail.get());
+    if reader.deserialize_map(Fields(&mut fields)).is_ok() {
+        line.push_str(&fields);
+    } else {
+        let _ = write!(line, " {}", safe(detail.get()));
+    }
+}
+
+/// Writes each field of a JSON object as it is read, keeping none.
+struct Fields<'a>(&'a mut String);
+
+impl<'de> Visitor<'de> for Fields<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        while let Some((name, value)) = map.next_entry::<Cow<'de, str>, &'de RawValue>()? {
+            // Writing to a String cannot fail.
+            let _ = write!(self.0, " {}={}", safe(&name), detail_value(value));
+        }
+        Ok(())
     }
 }
 
@@ -484,16 +519,7 @@ pub(crate) fn audit(page: &Page<AuditEntry>, out: &mut dyn Write) -> io::Result<
         if let Some(host) = &entry.host {
             let _ = write!(line, " on {}", safe(host.as_ref()));
         }
-        match &entry.detail {
-            Value::Object(fields) => {
-                for (name, value) in fields {
-                    let _ = write!(line, " {}={}", safe(name), detail_value(value));
-                }
-            }
-            other => {
-                let _ = write!(line, " {}", detail_value(other));
-            }
-        }
+        detail_fields(&entry.detail, &mut line);
         writeln!(out, "{line}")?;
     }
     more_line(page.next_cursor.is_some(), out)

@@ -14,7 +14,7 @@
 use std::collections::BTreeSet;
 
 use axum::extract::State;
-use landfall_api::{AuditEntry, Page};
+use landfall_api::{AuditEntry, Page, RawJson};
 use landfall_core::config::Deployment;
 use landfall_core::ids::{DeploymentId, HostId};
 use landfall_core::text::{quoted, shown};
@@ -34,8 +34,8 @@ use super::visible::viewable_deployments;
 use crate::agent_api::{ApiProblem, ApiState};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal};
-use crate::store::AuditRow;
 use crate::store::views::{AuditBranches, AuditScope};
+use crate::store::{AuditRow, StoreError};
 
 mod detail;
 
@@ -69,21 +69,21 @@ struct AuditQuery {
 /// may see that host. A detail that isn't a JSON object, which only someone editing the
 /// database writes, is shown quoted, as unreadable, rather than failing the page, and so is a
 /// kind this version doesn't know.
-fn entry(reader: &Reader<'_>, row: AuditRow) -> AuditEntry {
+fn entry(reader: &Reader<'_>, row: AuditRow) -> Result<AuditEntry, StoreError> {
     let kind = row.kind.parse::<EventKind>().ok();
     let detail = match serde_json::from_str::<Value>(&row.detail) {
         Ok(Value::Object(stored)) => reader.detail(kind, &stored),
         _ => json!({ "unreadable": quoted(&row.detail, UNREADABLE_CHARS) }),
     };
-    AuditEntry {
+    Ok(AuditEntry {
         seq: row.seq,
         ts: row.ts,
         kind: kind.map_or_else(|| shown(&row.kind), |kind| kind.as_str().to_owned()),
         // Each row was selected by a configured deployment's id, or a host's.
         deployment: row.deployment.and_then(|id| id.parse().ok()),
         host: reader.host(row.host.as_deref()),
-        detail,
-    }
+        detail: RawJson::from_value(&detail)?,
+    })
 }
 
 /// `GET /api/v1/audit`: the audit log as far as this principal may see it, newest first, a page
@@ -166,7 +166,10 @@ async fn list(
         .map(|last| Cursor::new(CursorList::Audit, last.seq.to_string()).encode());
     let reader = Reader::new(state.config(), &principal);
     Ok(ApiJson(Page {
-        items: rows.into_iter().map(|row| entry(&reader, row)).collect(),
+        items: rows
+            .into_iter()
+            .map(|row| entry(&reader, row))
+            .collect::<Result<_, _>>()?,
         next_cursor,
     }))
 }
