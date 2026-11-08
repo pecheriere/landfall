@@ -22,6 +22,7 @@ use super::deploys::parsed;
 use super::history::{LastFinished, ReleaseRow, release_from};
 use super::releases::hold_from;
 use super::{Hold, Store, StoreError};
+use crate::logger::log;
 
 /// Each deployment's latest release, from a JSON list of `[deployment, prefix]`: on the
 /// primary keys of `releases`, `highest_releases` and `first_tags`. Here and below, `CROSS
@@ -146,12 +147,20 @@ pub(super) async fn note_release(
     Ok(())
 }
 
+/// A release row's deployment and tag, if this version can read both.
+fn readable(deployment: &[u8], tag: &[u8]) -> Option<(DeploymentId, ReleaseTag)> {
+    let deployment = std::str::from_utf8(deployment).ok()?.parse().ok()?;
+    let tag = std::str::from_utf8(tag).ok()?.parse().ok()?;
+    Some((deployment, tag))
+}
+
 impl Store {
     /// Fills each deployment's latest release from the releases already recorded, if `0007`
-    /// left that to do, in one transaction: once.
+    /// left that to do, in one transaction: once. A row this version can't read is left out,
+    /// and only how many is logged, so that one odd row never stops the controller starting.
     ///
     /// # Errors
-    /// A database failure, or [`StoreError::Corrupt`] for an unreadable row.
+    /// A database failure.
     pub(super) async fn fill_latest(&self) -> Result<(), StoreError> {
         let mut tx = self.begin().await?;
         let pending: Option<i64> = sqlx::query_scalar("SELECT pending FROM latest_unfilled")
@@ -160,18 +169,30 @@ impl Store {
         if pending.is_none() {
             return Ok(());
         }
-        let rows = sqlx::query("SELECT deployment, tag FROM releases")
-            .fetch_all(&mut *tx)
-            .await?;
-        for row in &rows {
-            let deployment: DeploymentId = parsed(row, "deployment")?;
-            let tag: ReleaseTag = parsed(row, "tag")?;
+        // As bytes, so that text that isn't text is a row to skip, not an error.
+        let rows: Vec<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("SELECT CAST(deployment AS BLOB), CAST(tag AS BLOB) FROM releases")
+                .fetch_all(&mut *tx)
+                .await?;
+        let mut skipped = 0_usize;
+        for (deployment, tag) in &rows {
+            let Some((deployment, tag)) = readable(deployment, tag) else {
+                skipped += 1;
+                continue;
+            };
             note_release(&mut tx, &deployment, &tag).await?;
         }
         sqlx::query("DELETE FROM latest_unfilled")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        if skipped > 0 {
+            // Only the count: what the rows hold may be anyone's text.
+            log(&format!(
+                "store: latest releases filled without {skipped} release row(s) this version \
+                 can't read"
+            ));
+        }
         Ok(())
     }
 

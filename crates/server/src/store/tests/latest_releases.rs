@@ -118,6 +118,54 @@ async fn opening_fills_the_latest_from_releases_already_recorded_once() {
     assert_eq!(latest(&store, "app/prod", "v").await.unwrap(), "v1.10.0");
 }
 
+#[tokio::test]
+async fn opening_skips_a_release_it_cannot_read_and_fills_from_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("controller.db");
+    fs::write(&path, "").unwrap();
+    let store = Store::open_existing(&path).await.unwrap();
+    let all = migrator();
+    let before = Migrator::with_migrations(all.iter().take(6).cloned().collect());
+    before.run(store.pool()).await.unwrap();
+    for (deployment, tag) in [
+        ("app/prod", "v1.9.0".to_owned()),
+        ("app/prod", "v1.10.0".to_owned()),
+        // Rows no current code can read: a tag that isn't one, a deployment that isn't one,
+        // and text that isn't UTF-8.
+        ("app/prod", "bad tag\u{1b}[2J".to_owned()),
+        ("not a deployment", "v9.0.0".to_owned()),
+    ] {
+        sqlx::query(
+            "INSERT INTO releases (deployment, tag, decision, reason, seen_at)
+             VALUES (?, ?, 'manual', 'beyond', 1000)",
+        )
+        .bind(deployment)
+        .bind(tag)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO releases (deployment, tag, decision, reason, seen_at)
+         VALUES ('app/prod', CAST(x'ff' AS TEXT), 'manual', 'beyond', 1000)",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    store.close().await;
+
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(latest(&store, "app/prod", "v").await.unwrap(), "v1.10.0");
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM latest_unfilled")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
+    store.close().await;
+    // And it opens again.
+    Store::open(&path).await.unwrap();
+}
+
 /// What `EXPLAIN QUERY PLAN` says of `sql`, with `binds` text parameters, one line a step.
 async fn plan(store: &Store, sql: &str, binds: usize) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
