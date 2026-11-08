@@ -33,10 +33,17 @@ behind it, it shows the signers file whole with its fingerprints, lists `.github
 and that code by name, and shows the rest whole. Control characters in anything git prints are
 shown as escapes, so a commit can't rewrite what the owner reads.
 
-Then it runs `git tag -s vVERSION <commit> -m vVERSION` with git's signing key, or the one given by
-`--signing-key`, checks the tag's signature against the signers file at that commit, and deletes
-the tag again if that check fails, so a wrong key costs nothing. Last, it prints the push command,
-or pushes the tag with `--push`, saying first what it pushes.
+The signing key is `--signing-key`, a path to a public key file or `key::ssh-ed25519 <base64>`, or
+by default the one key in the trusted signers file. Git is never handed a path: the key is parsed
+here and given as `user.signingkey=key::<type> <base64>`, with `gpg.format=ssh`. The trusted file
+must then hold one key (during a rotation it holds two, so name which signs). After showing the
+review and before asking, it checks that the SSH agent at `SSH_AUTH_SOCK` offers that key
+(`ssh-add -L`), as git signs through it.
+
+Then it runs `git tag -s vVERSION <commit> -m vVERSION` with that key, checks the tag's signature
+against the signers file at that commit, and deletes the tag again if that check fails, so a wrong
+key costs nothing. Last, it prints the push command, or pushes the tag with `--push`, saying first
+what it pushes.
 
 No value reaches a shell: `git` and `gh` get argument lists, and every value from outside is
 checked against a pattern first.
@@ -48,6 +55,7 @@ Usage:
 import argparse
 import base64
 import binascii
+import contextlib
 import hashlib
 import json
 import os
@@ -76,6 +84,10 @@ ORIGIN = re.compile(
     r"(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?"
 )
 SIGNING_KEY = re.compile(r"[^\x00-\x1f\x7f]+")
+AGENT_KEY_TYPE = re.compile(r"[a-z0-9@.-]+")
+# A signing key given in full, as `<type> <base64>` or `key::<type> <base64>`; any other is a path.
+KEY_BLOB = re.compile(r"[A-Za-z0-9+/]+={0,2}", re.ASCII)
+KEY_LITERAL = re.compile(r"(?:key::)?[a-z0-9@.-]+ [A-Za-z0-9+/]+={0,2}", re.ASCII)
 
 WORKFLOW = ".github/workflows/release.yml"
 SIGNERS_FILE = "crates/cli/assets/release-signers"
@@ -156,7 +168,8 @@ def run_command(args: Sequence[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
             list(args),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
@@ -549,6 +562,87 @@ def check_request(request: Request, terminal: Terminal) -> None:
         raise RefusedError(msg)
 
 
+def key_parts(line: str) -> tuple[str, str] | None:
+    """Return a public key line's type and base64, or None if it isn't one."""
+    match line.split():
+        case [key_type, blob, *_] if AGENT_KEY_TYPE.fullmatch(key_type) and KEY_BLOB.fullmatch(
+            blob
+        ):
+            try:
+                base64.b64decode(blob, validate=True)
+            except binascii.Error:
+                return None
+            return key_type, blob
+        case _:
+            return None
+
+
+def key_of_file(path: str) -> tuple[str, str]:
+    """Return the one key in a public key file, read as the trusted signers file is."""
+    try:
+        with Path(path).expanduser().open("rb") as handle:
+            content = handle.read(MAX_TRUSTED_BYTES + 1)
+        text = content.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        msg = f"the signing key file {shown(path)} can't be read as text: {shown(error)}"
+        raise RefusedError(msg) from error
+    lines = [line for line in text.split("\n") if line and not line.startswith("#")]
+    parts = key_parts(lines[0]) if len(lines) == 1 and len(content) <= MAX_TRUSTED_BYTES else None
+    if parts is None:
+        msg = f"the signing key file {shown(path)} must hold exactly one public key line"
+        raise RefusedError(msg)
+    return parts
+
+
+def signing_choice(request: Request, trusted: list[str]) -> tuple[str, str]:
+    """Return the one key the tag is signed with, as type and base64, never as a path for git."""
+    value = request.signing_key
+    if value is None:
+        if len(trusted) != 1:
+            msg = (
+                f"your trusted signers file holds {len(trusted)} keys, so it can't say which one "
+                "signs: pass --signing-key with a path to a file holding that key, or "
+                '"key::ssh-ed25519 <base64>"'
+            )
+            raise RefusedError(msg)
+        parts = key_parts(trusted[0])
+    elif KEY_LITERAL.fullmatch(value) or value.startswith("key::"):
+        parts = key_parts(value.removeprefix("key::")) if KEY_LITERAL.fullmatch(value) else None
+    else:
+        return key_of_file(value)
+    if parts is None:
+        msg = "the signing key isn't an SSH public key, such as ssh-ed25519 <base64>"
+        raise RefusedError(msg)
+    return parts
+
+
+def require_in_agent(run: Run, key: tuple[str, str], say: Callable[[str], None]) -> None:
+    """Refuse unless the SSH agent offers this key, if git signs through it.
+
+    Only `ssh-keygen`, git's default, asks the agent at SSH_AUTH_SOCK. Another `gpg.ssh.program`
+    signs its own way, so the agent check doesn't apply: the signature is still verified after.
+    """
+    program = run(["git", "config", "--get", "gpg.ssh.program"]).stdout.strip()
+    if program and Path(program).name != "ssh-keygen":
+        say(
+            f"git signs with {shown(program)} (gpg.ssh.program), so the SSH agent check doesn't "
+            "apply; the signature is still verified after signing."
+        )
+        return
+    found: list[tuple[str, str]] = []
+    # No ssh-add, or no answer in time, is the same refusal as an agent without the key.
+    with contextlib.suppress(RefusedError):
+        found = [p for p in map(key_parts, run(["ssh-add", "-L"]).stdout.split("\n")) if p]
+    if key not in found:
+        msg = (
+            f"the SSH agent at SSH_AUTH_SOCK doesn't offer the release key "
+            f"{fingerprint(' '.join(key))}: there is no agent, it has no identities, or it holds "
+            "other keys. Point SSH_AUTH_SOCK at the agent that holds it, such as 1Password's. "
+            "~/.ssh/config's IdentityAgent covers ssh alone, not git"
+        )
+        raise RefusedError(msg)
+
+
 def ready(request: Request, trusted: list[str], run: Run) -> Ready:
     """Check everything that decides whether this commit may be tagged."""
     tag = f"v{request.version}"
@@ -628,8 +722,17 @@ def release_tag(request: Request, run: Run, terminal: Terminal) -> str:
     check_request(request, terminal)
     checkout = Path(output_of(run, ["git", "rev-parse", "--show-toplevel"]).strip())
     trusted = read_trusted(request.trusted_signers, checkout, os.getuid())
+    chosen = signing_choice(request, trusted) if request.signing_key is not None else None
+    if chosen is not None and chosen not in map(key_parts, trusted):
+        msg = (
+            f"the signing key {fingerprint(' '.join(chosen))} isn't in your trusted signers "
+            "file, so no tag it signs could be released"
+        )
+        raise RefusedError(msg)
     state = ready(request, trusted, run)
     show(state, run, terminal.say)
+    key = chosen or signing_choice(request, trusted)
+    require_in_agent(run, key, terminal.say)
     try:
         typed = terminal.ask(f"Type {request.version} to sign {state.tag} at {state.sha}: ")
     except EOFError as error:
@@ -639,7 +742,7 @@ def release_tag(request: Request, run: Run, terminal: Terminal) -> str:
         msg = f"you typed {shown(typed.strip())}, not {request.version}: nothing was signed"
         raise RefusedError(msg)
 
-    signing = ["-c", f"user.signingkey={request.signing_key}"] if request.signing_key else []
+    signing = ["-c", "gpg.format=ssh", "-c", f"user.signingkey=key::{key[0]} {key[1]}"]
     output_of(run, ["git", *signing, "tag", "--sign", "--message", state.tag, state.tag, state.sha])
     try:
         verify_tag(run, state.tag, state.sha, state.keys)
@@ -675,7 +778,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--signing-key",
-        help='git\'s user.signingkey for this tag, such as "key::ssh-ed25519 <base64>"',
+        help=(
+            "git's user.signingkey for this tag: a path to a public key file or "
+            '"key::ssh-ed25519 <base64>" (default: the trusted signers file, if it holds one key)'
+        ),
     )
     parser.add_argument("--push", action="store_true", help="push the tag once it's made")
     args = parser.parse_args(argv)
