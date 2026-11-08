@@ -17,8 +17,10 @@ unless all of these hold, and changes nothing until they do:
 - the keys in the repository's release signers file at that commit are exactly the keys in the
   owner's trusted signers file (`--trusted-signers`, by default
   `$XDG_CONFIG_HOME/landfall/release-signers`): outside the checkout, not a link, owned by the
-  owner or by root, and writable by its owner alone. A root-owned one is out of reach of code
-  running as the owner too.
+  owner or by root, and writable by its owner alone. A root-owned one keeps the key list from
+  being changed without sudo. Nothing here holds against code running as the owner, which can
+  wrap `git` on PATH or edit this script: there, only the release key's prompt before each
+  signature and the owner's judgment remain, so release with no unattended agents running.
 
 What the repository says can be written by anyone who lands a commit, so the trusted file is the
 anchor. The last release is the highest `v*` tag behind the commit that a trusted key signed: a
@@ -82,20 +84,24 @@ MAIN = "main"
 # main, and the release tags, whose signatures say where the last release was. Not forced: a local
 # tag that differs from origin's fails the fetch.
 FETCH_REFSPECS = (f"+refs/heads/{MAIN}:refs/remotes/origin/{MAIN}", "refs/tags/v*:refs/tags/v*")
-# What decides what a release trusts or how it's built, shown in full before signing.
-# The code that reads the signers or checks a tag, an attestation or a release's files is in it too:
-# a release can change whom its binaries trust without touching the signers file.
+# What decides what a release trusts or how it's built is shown in full before signing (SENSITIVE,
+# below). It includes the code and data that decide whom a release's binaries trust, and whether a
+# host or the CLI lets a verification gate an install or a deploy, as a release can change those
+# without touching the signers file: all of `landfall-origin`, with its embedded Sigstore root.
 TRUST_CODE = (
+    "crates/origin/Cargo.toml",
+    "crates/origin/src/",
+    "crates/origin/assets/",
+    "crates/core/src/tag.rs",
+    "crates/core/src/release.rs",
+    "crates/core/src/config/signer.rs",
+    "crates/agent/src/daemon/verifier.rs",
+    "crates/agent/src/daemon/judge.rs",
+    "crates/cli/src/verify.rs",
+    "crates/cli/src/host.rs",
     "crates/cli/src/project.rs",
     "crates/cli/src/agent_release.rs",
-    "crates/core/src/tag.rs",
-    "crates/core/src/config/signer.rs",
-    "crates/origin/src/attestation.rs",
-    "crates/origin/src/attestation/file.rs",
-    "crates/origin/src/release.rs",
-    "crates/origin/src/artifact.rs",
-    "crates/origin/src/candidates.rs",
-    "crates/origin/src/trust.rs",
+    "crates/cli/assets/",
 )
 SENSITIVE = (
     SIGNERS_FILE,
