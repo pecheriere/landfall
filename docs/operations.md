@@ -106,8 +106,8 @@ something going wrong, and each goes on to the next step whatever happened:
 
 | Step | Limit | What it's for |
 |---|---|---|
-| Drain | 5 s | Requests in flight finish. Those that don't get no answer. |
-| Cut-off | 5 s | What's left is dropped at once, unless a handler is blocking its thread. |
+| Drain | 5 s | Requests in flight finish. Those that don't get no answer. A connection that has answered waits up to 2 s for its client to close, within the drain. |
+| Cut-off | 5 s | What's left is dropped at once, unless a handler is blocking its thread. A connection still waiting for its client goes too. |
 | Watcher and flushing tasks | 5 s | They were told to stop when the drain began. |
 | The last flush | Up to 5 s a row, on a busy database | Writes down counted failures and dropped calls. |
 | Closing the database | 5 s | So that the main file holds everything. |
@@ -421,6 +421,11 @@ connections from one address, out of 1,024 in all, and a rate limit on requests
 that need no key. Past the per-address cap a connection is closed with no answer
 and the controller logs the refusal to stderr, at most 60 such lines a minute. A
 connection lasts at most about two minutes, after which the client reconnects.
+Once a connection has given its last answer, the controller closes its side and
+waits up to 2 s for the client to close the other, throwing away up to 64 KiB of
+anything still sent. Without it, a body the controller answered before reading
+would reset the connection and could lose the answer. That wait still counts
+against both caps.
 
 Behind a TLS-terminating proxy, the proxy is the one address all agents share. So:
 
