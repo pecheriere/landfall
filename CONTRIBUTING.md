@@ -97,10 +97,16 @@ its own key.
      `chmod 600`, it holds against a stolen GitHub token, which can't reach your machine. It doesn't
      hold against code running as you, such as an agent you leave running unattended: that can edit
      the file, and then land a matching commit and tag.
-   - **Owned by root** closes that: for example
+   - **Owned by root**, for example
      `sudo install -D -m 0644 -o root <copy> /usr/local/etc/landfall/release-signers`, then
-     `scripts/release-tag ... --trusted-signers /usr/local/etc/landfall/release-signers`. Code
-     running as you can't change it without `sudo`.
+     `scripts/release-tag ... --trusted-signers /usr/local/etc/landfall/release-signers`, the key
+     list itself can't be changed without `sudo`. That is all it protects. Code running as you can
+     still put its own `git` first on your `PATH`, edit the helper in your clone, or change an alias
+     or your shell history so the flag is dropped, and show you a clean review of something else.
+   - **So against code running as you, the helper holds nothing.** What remains is the 1Password
+     prompt before each signature with the release key, and your judgment about when you sign.
+     Release from a session with no unattended agents running as you, or from a separate macOS
+     account that runs none.
 
 To rotate the key, let two overlap: release N carries both keys and is signed by the old one, and
 release N+1 is signed by the new one. Add the new key to your own copy (step 7) before release N.

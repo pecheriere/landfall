@@ -207,12 +207,18 @@ cargo deny check
   signs the tag with `scripts/release-tag <version> --commit <sha>`, which agents never run,
   and which refuses without a terminal. Its anchor is the owner's own signers file outside
   the clone (`--trusted-signers`, opened with `O_NOFOLLOW` and checked on the open file: the
-  owner's or root's, writable by its owner alone): the last release is the highest `v*` tag a key there
-  signed, the repository's signers must equal those keys, and other `v*` tags above it are
-  named. It shows the range since then and any change to the signers file, `.github/`,
-  itself, `Cargo.*` and the code that reads signers or checks tags and attestations
-  (`TRUST_CODE`), with control characters escaped, and wants the version typed. Its tests are
-  `test_release_tag.py`, with the terminal injected. `CONTRIBUTING.md` has the procedure, and
+  owner's or root's, writable by its owner alone): the last release is the highest `v*` tag
+  a key there signed, the repository's signers must equal those keys, and other `v*` tags
+  above it are named. It shows the range since then and any change to the signers file,
+  `.github/`, itself, `Cargo.*` and `TRUST_CODE` (all of `crates/origin/`, the tag, release
+  and signer code in core, the agent's verifier and judge, the CLI's verify, host, project
+  and agent-release code, and `crates/cli/assets/`), with control characters escaped, and
+  wants the version typed. It protects against a stolen GitHub token, not against code
+  running as the owner, which can wrap `git` or edit the helper: there only the release
+  key's per-signature prompt and the owner's judgment remain. Its tests are
+  `test_release_tag.py`, with the terminal injected, and `test_release_tag_git.py`, with
+  real git and throwaway keys; a test keeps every file the verifying crates build in
+  covered by what it shows. `CONTRIBUTING.md` has the procedure, and
   `test_release_workflow.py` holds what the workflow must keep doing: edit the two
   together.
 - **The dry run:** a push to main that changes `workspace.package.version`, and a
