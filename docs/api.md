@@ -11,7 +11,9 @@ cargo run -p landfall-server -- openapi > docs/api/openapi.json
 ```
 
 How to make a token and ask for a first deploy is in
-[`operations.md`](operations.md#api-tokens-requests-and-approvals).
+[`operations.md`](operations.md#api-tokens-requests-and-approvals). The `landfall` command is a
+client of this API, and [its section there](operations.md#the-landfall-command) says how it finds
+the controller and its token; its `--json` prints these answers as they were received.
 
 ## Authentication
 
@@ -44,8 +46,9 @@ use up the other. Each session has its own, and all of a principal's tokens shar
 | State changes (`POST`) | 120 | 1 a second |
 | Reads (`GET`) | 300 | 10 a second |
 
-A CLI command makes at most three calls and a page polls every few seconds, so neither comes
-near the read budget; an agent sweeping a large fleet may, and waits. Over a budget, a call gets
+A `landfall` command makes at most three calls, but for `status` with no deployment, which reads
+at most 20 pages, 1,000 deployments or 8 MiB of answers, and a page polls every few seconds, so
+neither comes near the read budget; an agent sweeping a large fleet may, and waits. Over a budget, a call gets
 `429 rate_limited` with `Retry-After` in seconds (1 for a read, 5 for a state change), and
 writes nothing. The count of those goes in an `access_throttled` audit row: for state changes, at
 the next state change within the budget, within one watcher interval, or when the controller

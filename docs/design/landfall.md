@@ -416,15 +416,22 @@ anchor is out of scope for v0.
 - Every UI view is one API resource: deployments, releases (with origin story), deploys (steps, checks,
   logs), approvals, hosts, audit events.
 - `GET /api/v1/deploys/{id}/why`: a deploy's outcome in order, written for an agent to act on.
-- CLI `landfall`: `status`, `why`, `logs`, `request deploy`, `approve`, `rollback`, `hosts`. Today it has
-  `verify`, and `host install` and `host upgrade`, which reach a host over SSH and not through this API.
+- CLI `landfall`, built: `status`, `why`, `request deploy`, `rollback`, `cancel`, `approvals`, `hosts`,
+  `history`, `release`, `releases`, `audit` and `whoami`, each with `--json` for an agent. Its token comes
+  from the environment or a file only its owner can read, never argv; with none set it sends no
+  `Authorization` header (8.4). It also has `verify`, and `host install` and `host upgrade`, which reach
+  a host over SSH and not through this API.
+- Not built yet: `landfall logs`, with the logs (section 10), is plan 08. `landfall approve`, which
+  computes the intent hash locally (6.3), is plan 09; until then the assertion is made on the
+  controller's approval page, whose address `landfall` prints.
 
 ## 10. Logs
 
-The agent labels each container `landfall.deployment`, `landfall.deploy`, `landfall.version`. With Docker's
-journald driver (`labels` option) the labels land on each log line, and Vector forwards them to
-VictoriaLogs. The controller queries VictoriaLogs (configured URL, read-only) by deploy id and time
-window. Without VictoriaLogs the logs view says logs aren't configured.
+Today the agent labels each container `dev.landfall.deployment`, `dev.landfall.version` and
+`dev.landfall.commit`, and nothing more is built. Plan 08 settles the final label names, adds the deploy
+id to them, and builds the rest: with Docker's journald driver (`labels` option) the labels land on each
+log line, Vector forwards them to VictoriaLogs, and the controller queries VictoriaLogs (configured URL,
+read-only) by deploy id and time window. Without VictoriaLogs the logs view says logs aren't configured.
 
 ## 11. UI and design language
 
@@ -444,6 +451,7 @@ window. Without VictoriaLogs the logs view says logs aren't configured.
 | Stolen GitHub token vs Homebrew | The tap is filled by hand: the owner checks a release's tag and attestation, and copies one file | that check, and the owner's tap; Homebrew itself checks only the formula's hash |
 | Compromised controller | Host re-verifies origin, signature, rule, approval; upward-only auto; running-digest binding | can trigger allowed auto deploys, delay, lie in UI, mislead an approval to another maintainer-signed release, bypass promotion |
 | Stolen agent API token | Agents can't approve; per-deployment grants; optional warden-only | can request deploys the rules allow |
+| Stolen agent API token reads state | `view` shows only the deployments it grants, and nothing that names another; a read budget per principal's tokens; controller-wide audit rows (tokens, passkeys, sign-ins) never through the API | global sequence, deploy and request numbers show how much happened elsewhere, never what |
 | Replayed approval | Running-digest binding + nonce log | none |
 | Registry swaps an image | Pull by index digest; digest is the attestation subject | none |
 | Container attacks the agent via backups | No symlink following, no special files | none known |

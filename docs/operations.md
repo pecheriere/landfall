@@ -14,9 +14,10 @@ The agent has four commands: `enrol` and `run` connect it to a controller, `stat
 records it as such and waits, and a host runs it only on
 [an approval it verifies itself](#an-approval-is-verified-on-the-host). [From nothing to a first
 deploy](#from-nothing-to-a-first-deploy) has the steps. There is no web UI beyond the three
-minimal pages yet, and no `landfall` command for any of it: a program calls
-[the API](#api-tokens-requests-and-approvals). The `landfall` command does put an agent on a host, and
-upgrade it: see [`landfall host install`](#installing-an-agent-with-landfall-host-install).
+minimal pages yet. [The `landfall` command](#the-landfall-command) reads where things stand and
+asks for a deploy, through [the API](#api-tokens-requests-and-approvals), and the assertion that
+approves one is made on the controller's approval page. `landfall` also puts an agent on a host,
+and upgrades it: see [`landfall host install`](#installing-an-agent-with-landfall-host-install).
 
 ## Running the controller
 
@@ -1088,6 +1089,92 @@ database, costs only itself. The controller's log names its row, it is left out 
 /api/v1/approvals`, and it can't be approved or cancelled by id. It still ends by itself, and a
 rollback can still take its place, and reports from hosts are recorded whatever it holds.
 
+## The `landfall` command
+
+`landfall` is a client of [the API](api.md), for a person at a terminal and for an agent. With a
+token from `token create`:
+
+```sh
+export LANDFALL_CONTROLLER=https://landfall.example.com
+landfall status                            # each deployment: what runs, its newest release
+landfall release app/prod v1.3.0           # that release's story: where it stands, why, what next
+landfall request deploy app/prod v1.3.0    # ask, and print where an approver signs
+landfall approvals                         # what waits for an approver, and where they sign
+landfall why 42                            # why deploy 42 ended as it did, and what to do next
+```
+
+The rest are `whoami`, `history`, `releases`, `hosts`, `audit`, `rollback` and `cancel`; each
+one's `--help` says what it takes. `verify`, `host install` and `host upgrade` don't call the
+controller.
+
+**Its settings** are flags of each command, `landfall status --json` and not
+`landfall --json status`, as `host install` has a `--controller` of its own. Each is read from the
+first place that has it:
+
+| Setting | Flag | Environment | `cli.toml` |
+|---|---|---|---|
+| The controller | `--controller` | `LANDFALL_CONTROLLER` | `controller` |
+| `http://` allowed | `--allow-insecure-controller` | | `allow_insecure_controller` |
+| The token | | `LANDFALL_TOKEN` | |
+| A file holding it | `--token-file` | `LANDFALL_TOKEN_FILE` | `token_file`, an absolute path |
+
+`cli.toml` is `$XDG_CONFIG_HOME/landfall/cli.toml`, or `~/.config/landfall/cli.toml`, and may be
+missing; `--cli-config` names another, which then must exist. A file with any other key is refused.
+
+**The token never goes on the command line,** where other users of the machine can read it in the
+process list. It comes from `LANDFALL_TOKEN`, or from a file, and from one place only: two set is an
+error, so that nothing has to choose between them. The file must be a regular file and not a link,
+owned by the user running `landfall`, readable and writable by them alone (`chmod 600`), and at most
+256 bytes, one line of letters, digits, `_` and `-`. Its contents are never printed, in an error or
+otherwise. **With no token set, none is sent:** no `Authorization` header at all.
+
+**No proxy is used.** `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` are ignored, so nothing in the
+environment can route the token through someone else's machine. No redirect is followed either,
+since a redirect could carry the token to another host: one is an error naming `--controller`. To
+go through something in between, make it the controller's address, as warden does.
+
+**With warden** (design 8.4), the agent holds no token. Set none, and point `--controller` at
+warden's proxy, which adds the token on its way to the controller: `landfall` sends no
+`Authorization` header for it to replace. The proxy's address follows the transport rule below. The
+controller setting that takes agent tokens only from warden's address, `agents_via_warden`, is not
+built yet: today a token works from wherever it is sent.
+
+**The transport rule** is the agent's: `--controller` is `https://`, or, with
+`--allow-insecure-controller`, `http://` to a loopback address, `localhost` or a tailnet name
+(`*.ts.net`), and only a scheme, a host and a port. A bearer token over plain HTTP to anywhere else
+would cross the network in clear, and `landfall` refuses before it sends anything. An `https://`
+controller is never asked over `http://`.
+
+**For an agent,** `--json` prints the controller's answer as it was received, with the fields
+[the API](api.md) documents, laid out and with control, bidi and invisible characters escaped as
+`\uXXXX`. Without it, everything the controller sent is escaped before it reaches the terminal: C0
+and C1 controls, DEL, the bidi and line controls and the invisible characters as `\u{...}`, and a
+backslash doubled, so that a commit message can't move the cursor, rewrite a line or pass for an
+escape. Errors are escaped the same way. The exit status says what to do next:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| 0 | done | |
+| 1 | the controller refused: the problem's `code` says why | act on the code; don't retry as it is |
+| 2 | couldn't ask: settings, credentials (`401`), network, rate limit (`429`) or a server error | fix the setting or the token, or retry later |
+
+**Reads are bounded.** A command makes at most three calls, except `status` with no deployment,
+which reads the deployments a page of 100 at a time and stops at 1,000 deployments, 20 pages, 8 MiB
+of answers or a cursor the controller sends twice, with a line (or `"stopped"` in its JSON) saying
+which. The read budget, 300 calls at once refilling at ten a second for each principal's tokens, is
+far beyond that; over it, a command exits 2 with how long to wait. The `Origin` and
+`Sec-Fetch-Site` checks are for a browser's session, and never apply to a token.
+
+**What an agent can and can't do** is its principal's grants on each deployment, which
+`landfall whoami` lists. With `view` it reads everything about a deployment: its releases and their
+story, its deploys and why each ended as it did, its host and its audit rows. With `request` or
+`rollback` it asks, and `landfall rollback` says it means one, so that an upgrade asked for by
+mistake is refused as `not_a_rollback`. **It never approves,** whatever the file says: `request
+deploy`, `rollback` and `approvals` print where an approver signs, at `/approvals` on the
+controller's pages, with a passkey. `landfall approve`, which computes what is signed on the
+approver's own machine, is planned (plan 09), and until then the assertion is made on the page.
+`landfall logs` is planned too (plan 08).
+
 ## Passkeys and signing in
 
 The pages are `/passkeys/register`, `/sign-in` and `/approvals`. They are served by the
@@ -1155,10 +1242,13 @@ them, and keep the way back in [Losing a passkey](#losing-a-passkey) in mind.
    on the controller and on every host. Restart `serve`.
 5. [Enrol the host](#enrolling-a-host) and start its agent. The watcher looks at releases when it
    starts and every five minutes after that, and records the release as `manual`. Nothing starts.
-6. Ask for the release: `landfall-server token create --principal operator ...` gives a token, which
-   goes with `POST /api/v1/deployments/app/prod/requests`. No page has a button for asking yet.
-7. Sign in at `/sign-in`, open `/approvals`, check what it shows, and approve with your passkey. A
-   token can't do this step. The host checks what you signed for itself, and runs it.
+6. Ask for the release: `landfall-server token create --principal operator ...` gives a token. With
+   it in `LANDFALL_TOKEN`, and the controller's address in `LANDFALL_CONTROLLER`, run
+   `landfall request deploy app/prod v1.2.3` ([the `landfall` command](#the-landfall-command)). No
+   page has a button for asking yet.
+7. `landfall approvals` prints where to sign: sign in at `/sign-in`, open `/approvals`, check what
+   it shows, and approve with your passkey. A token can't do this step. The host checks what you
+   signed for itself, and runs it.
 
 Later releases go by the rule. What takes an approval waits as `needs_approval` or `manual`, and
 steps 6 and 7 are how it goes on. A lower version is [a manual

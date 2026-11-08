@@ -59,9 +59,15 @@ passkey approvals. Agents drive it through a typed API. Design:
   annotation, `ApiJson` is every success, `query` the path and query-string parameters, a query
   string refusing any it doesn't take, with a page's `Limit` and its `Cursor`, `visible`, the
   one place that says what a principal may be told of a deployment (404 or 403, and a deployment
-  shown or unseen), `deployments`, who am I and the deployments, and `openapi` the document's
-  fixed part: its schemes and shared refusals; the document is served at `/api/v1/openapi.json`,
-  printed by `openapi` and checked in as `docs/api/openapi.json`, which a test compares),
+  shown or unseen), `deployments`, who am I and the deployments, `releases`, a deployment's
+  releases and one's story, `story`, the one pure function that says where a release stands and
+  why, `deploys`, the deploys and `why` of one, `why`, the pure function that explains a deploy,
+  `hosts`, the hosts seen through their deployments, `audit` (and `audit/detail`, what a row shows
+  of its detail and host to one principal), the log as far as a principal may see it, and
+  `openapi` the document's fixed part: its schemes and shared refusals; the document is served at
+  `/api/v1/openapi.json`, printed by `openapi` and checked in as `docs/api/openapi.json`, which a
+  test compares: regenerate it with `cargo run -p landfall-server -- openapi >
+  docs/api/openapi.json`, never edit it by hand),
   `requests` (the human API's routes: `asking` for a deploy, `approving` one and `cancelling`
   one), `web` (the browser's side: the static pages and their one script, the security headers
   on every answer, `registration`, `sign_in` and sign-out, and `ceremonies`, the challenges and
@@ -109,12 +115,13 @@ passkey approvals. Agents drive it through a typed API. Design:
   install` has its own `--controller`, and `run_with`, the library entry, which prints every
   failure through `display::safe`), `settings` (where the controller is and which token goes
   to it: flags, then the environment, then `cli.toml`; the token never in argv, a token file
-  regular, not a link, owned by the user and theirs alone), `api_client` (`/api/v1` with the token: no
+  regular, not a link, owned by the user and theirs alone, and with no token no `Authorization`
+  header, for warden), `api_client` (`/api/v1` with the token: no
   proxy from the environment, no redirect followed, bodies capped, `ApiError` and its exit
   status, `segment`, the one way a value goes into a path, and the `Api` trait the commands
   call it through, so tests can use a fake), `display` (`safe` and `write_json`, which escape
-  controls, bidi and invisible characters in whatever the controller sent before a terminal
-  sees it), `whoami` (`landfall whoami`), `read` (`status`, `history`, `release`, `releases`,
+  controls, bidi and invisible characters, and `safe` doubles a backslash, in whatever the
+  controller sent before a terminal sees it), `whoami` (`landfall whoami`), `read` (`status`, `history`, `release`, `releases`,
   `why`, `hosts`, `audit` and `approvals`, over `Api`, used generically; `status` pages within
   1,000 deployments, 20 pages or 8 MiB of answers, the others make at most three calls;
   answers are kept as text, never as a JSON tree; `render`, each view for a person, every
@@ -281,6 +288,12 @@ processes, over loopback and a real SQLite file. The agent has `landfall-server`
 dev-dependency for it; the server depends on nothing of the agent's. `e2e/approvals/` is a
 person's way through it, with a software passkey over the real routes, and has the controller lie by
 writing to its own database: a host's refusal is the point of those.
+
+`crates/cli/tests/controller/` runs `landfall` through `cli::run_with` against a real controller
+in the test's runtime: the server's router and accept loop on loopback, a SQLite file, real tokens
+and a real passkey sign-in with the software authenticator. What the watcher and a host would say is
+written through the store's own functions, so it needs neither Docker nor the network and runs in
+the normal suite. The CLI has `landfall-server` as a dev-dependency for it.
 
 `crates/server/tests/browser/` drives the web pages in a real browser with Chromium's virtual
 authenticator. It is `#[ignore]`d and named with a `browser_` prefix, and needs Node, `openssl`

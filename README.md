@@ -22,9 +22,18 @@ file is documented in [`docs/configuration.md`](docs/configuration.md).
   file you review by pull request; the API and UI only read them.
 - **Checks and rollback always run:** health checks after every deploy, and
   the previous version comes back on its own when they fail.
-- **Agent-first:** a typed OpenAPI and a CLI expose everything the web UI
-  shows, down to the logs of one deploy, so an agent can find out why a
-  release did not land.
+- **Agent-first:** a typed OpenAPI ([`docs/api.md`](docs/api.md)) and the
+  `landfall` CLI show where each deployment stands, a release's story and why
+  a deploy ended as it did, so an agent can find out why a release did not
+  land, and ask for one. It can't approve: that takes a person's passkey.
+  The logs of one deploy come next.
+
+  ```sh
+  landfall status --json                    # the token in LANDFALL_TOKEN, never in argv
+  landfall request deploy app/prod v1.3.0   # prints where an approver signs it
+  ```
+
+  [The guide](docs/operations.md#the-landfall-command) has its settings.
 
 ## Components
 
