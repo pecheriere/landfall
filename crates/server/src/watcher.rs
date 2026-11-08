@@ -31,7 +31,7 @@ use landfall_core::config::{Config, Deployment};
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag, RepoName};
 use landfall_core::protocol::DeployId;
 use landfall_core::release::{RunCandidate, select_release_run};
-use landfall_core::rule::{Decision, Refusal, decide};
+use landfall_core::rule::{Decision, Refusal, decide, reason as rule_reason, refusal_reason};
 use landfall_core::text::{quoted, shown};
 use landfall_origin::fetch::{ComparePage, FetchError, ListedTag, RateLimitReset};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin};
@@ -540,29 +540,13 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
         tag: &ReleaseTag,
         digest: &ImageDigest,
     ) -> Result<(ReleaseDecision, String), StoreError> {
-        let (decision, reason) = match decide(self.d.rule(), self.running_version.as_ref(), version)
-        {
-            Decision::Auto => (
-                ReleaseDecision::Auto,
-                "a higher version within the rule's automatic level",
-            ),
-            Decision::NeedsApproval => (
-                ReleaseDecision::NeedsApproval,
-                "a higher version that needs an approver",
-            ),
-            Decision::Manual => {
-                let reason = match &self.running_version {
-                    None => "nothing has been deployed yet: a first deploy needs an operator",
-                    Some(running) if version < running => {
-                        "lower than the running version: a downgrade needs an operator"
-                    }
-                    Some(_) => "beyond the rule's levels: it needs an operator",
-                };
-                return Ok((ReleaseDecision::Manual, reason.to_owned()));
-            }
-            Decision::Refused(refusal) => {
-                return Ok((ReleaseDecision::Refused, refusal_reason(refusal).to_owned()));
-            }
+        let said = decide(self.d.rule(), self.running_version.as_ref(), version);
+        let reason = rule_reason(said, self.running_version.as_ref(), version);
+        let decision = match said {
+            Decision::Auto => ReleaseDecision::Auto,
+            Decision::NeedsApproval => ReleaseDecision::NeedsApproval,
+            Decision::Manual => return Ok((ReleaseDecision::Manual, reason.to_owned())),
+            Decision::Refused(_) => return Ok((ReleaseDecision::Refused, reason.to_owned())),
         };
         if let Some((no, why)) = self.history_says_no(tag, digest, self.store.now()?) {
             return Ok((no, why.to_owned()));
@@ -748,14 +732,6 @@ impl<S: ReleaseSource> DeploymentWatch<'_, S> {
             break;
         }
         Ok((None, None))
-    }
-}
-
-/// The reason for a refusal by the rule.
-fn refusal_reason(refusal: Refusal) -> &'static str {
-    match refusal {
-        Refusal::Prerelease => "a pre-release, and the rule does not opt in",
-        Refusal::AlreadyRunning => "already running",
     }
 }
 

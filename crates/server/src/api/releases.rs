@@ -35,7 +35,7 @@ use super::openapi::{
     BadRequest, Busy, Internal, NotFound, RateLimited, ReadForbidden, SlowRequest, Unauthenticated,
 };
 use super::query::{ApiQuery, Cursor, CursorList, DeploymentPath, Limit, NoQuery, TagPath};
-use super::story::{Against, StatusExplained, StoryInputs, decided, recorded, status};
+use super::story::{RuleSaid, StatusExplained, StoryInputs, decided, recorded, status};
 use super::visible::{shown_deployment, viewable};
 use crate::agent_api::{ApiProblem, ApiState};
 use crate::auth::{HumanProblem, Principal};
@@ -159,21 +159,21 @@ impl<'a> Standing<'a> {
         let release = &row.release;
         let version = self.deployment.origin().tags().parse_tag(&row.tag).ok();
         let rule = self.deployment.rule();
-        let rule_says = match (&version, &self.running_version) {
-            (Some(version), RunningVersion::Nothing) => {
-                Some((decide(rule, None, version), Against::NothingRuns))
-            }
-            (Some(version), RunningVersion::Readable(running)) => {
-                let against = if version < running {
-                    Against::Below
-                } else {
-                    Against::NotBelow
-                };
-                Some((decide(rule, Some(running), version), against))
-            }
-            _ => None,
+        let running = match &self.running_version {
+            RunningVersion::Nothing => Some(None),
+            RunningVersion::Readable(running) => Some(Some(running)),
+            RunningVersion::Unreadable => None,
         };
-        let lower_than_running = matches!(rule_says, Some((_, Against::Below)));
+        let rule_says = version
+            .as_ref()
+            .zip(running)
+            .map(|(candidate, running)| RuleSaid {
+                decision: decide(rule, running, candidate),
+                running,
+                candidate,
+            });
+        let lower_than_running = rule_says
+            .is_some_and(|said| said.running.is_some_and(|running| said.candidate < running));
         let decided = decided(
             release.decision,
             release.reason(),

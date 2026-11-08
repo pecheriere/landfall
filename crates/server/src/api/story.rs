@@ -26,7 +26,8 @@ use std::borrow::Cow;
 use landfall_api::ReleaseStatus;
 use landfall_api::{Decision as ApiDecision, DeploymentRef, NextAction, NextKind, Outcome};
 use landfall_core::ids::{ImageDigest, ReleaseTag};
-use landfall_core::rule::{Decision, Refusal};
+use landfall_core::rule::{Decision, reason as rule_reason};
+use semver::Version;
 
 use crate::store::views::RunningRow;
 use crate::store::{Hold, ReleaseDecision};
@@ -81,15 +82,16 @@ pub(crate) fn recorded(decision: ReleaseDecision) -> ApiDecision {
     }
 }
 
-/// How a release compares with what runs, when the rule could read both.
+/// What the rule said of a release, and of what versions: `candidate` over `running`, or
+/// over nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Against {
-    /// Nothing runs: it would be the first deploy.
-    NothingRuns,
-    /// It is lower than what runs.
-    Below,
-    /// It is what runs or higher.
-    NotBelow,
+pub(crate) struct RuleSaid<'v> {
+    /// What [`decide`](landfall_core::rule::decide) said.
+    pub(crate) decision: Decision,
+    /// The running version, if anything runs.
+    pub(crate) running: Option<&'v Version>,
+    /// The release's version.
+    pub(crate) candidate: &'v Version,
 }
 
 /// The decision a status goes by, and the reason that decided it.
@@ -111,12 +113,12 @@ pub(crate) struct Decided<'a> {
 /// own. Any other stored reason is never shown: it may say what has changed since, and the
 /// one promotion left names the deployment promoted from, which a reader may not view.
 #[must_use]
-pub(crate) fn decided(
+pub(crate) fn decided<'a>(
     stored: ReleaseDecision,
-    stored_reason: &str,
+    stored_reason: &'a str,
     origin_refused: bool,
-    rule: Option<(Decision, Against)>,
-) -> Decided<'_> {
+    rule: Option<RuleSaid<'_>>,
+) -> Decided<'a> {
     let stored_says = |decision| Decided {
         decision,
         reason: Cow::Borrowed(stored_reason),
@@ -131,43 +133,30 @@ pub(crate) fn decided(
     // A refusal the rule didn't make, nor verification, is the watcher's, for the release's
     // past deploys.
     let by_history = stored == ReleaseDecision::Refused;
-    match rule {
-        None | Some((Decision::Auto, _)) if by_history => stored_says(ApiDecision::Manual),
-        None => match stored {
-            ReleaseDecision::Auto => rule_says(ApiDecision::Auto, "it deploys by itself"),
-            ReleaseDecision::NeedsApproval => {
-                rule_says(ApiDecision::NeedsApproval, "it needs an approver")
-            }
-            ReleaseDecision::Manual | ReleaseDecision::Refused => {
-                rule_says(ApiDecision::Manual, "it deploys only when someone asks")
-            }
-            ReleaseDecision::Deferred => rule_says(ApiDecision::Deferred, "its host said not now"),
-        },
-        Some((Decision::Refused(refusal), _)) => rule_says(
-            ApiDecision::Refused,
-            match refusal {
-                Refusal::Prerelease => "a pre-release, and the rule does not opt in",
-                Refusal::AlreadyRunning => "already running",
-            },
-        ),
-        Some((Decision::Auto, _)) => rule_says(
-            ApiDecision::Auto,
-            "a higher version within the rule's automatic level",
-        ),
-        Some((Decision::NeedsApproval, _)) => rule_says(
-            ApiDecision::NeedsApproval,
-            "a higher version that needs an approver",
-        ),
-        Some((Decision::Manual, against)) => rule_says(
-            ApiDecision::Manual,
-            match against {
-                Against::NothingRuns => {
-                    "nothing has been deployed yet: a first deploy needs an operator"
-                }
-                Against::Below => "lower than the running version: a downgrade needs an operator",
-                Against::NotBelow => "beyond the rule's levels: it needs an operator",
-            },
-        ),
+    // The rule's word decides, but where the watcher refused for history what the rule
+    // would deploy by itself.
+    if let Some(said) = rule.filter(|said| !(by_history && said.decision == Decision::Auto)) {
+        let decision = match said.decision {
+            Decision::Auto => ApiDecision::Auto,
+            Decision::NeedsApproval => ApiDecision::NeedsApproval,
+            Decision::Manual => ApiDecision::Manual,
+            Decision::Refused(_) => ApiDecision::Refused,
+        };
+        return rule_says(
+            decision,
+            rule_reason(said.decision, said.running, said.candidate),
+        );
+    }
+    match stored {
+        _ if by_history => stored_says(ApiDecision::Manual),
+        ReleaseDecision::Auto => rule_says(ApiDecision::Auto, "it deploys by itself"),
+        ReleaseDecision::NeedsApproval => {
+            rule_says(ApiDecision::NeedsApproval, "it needs an approver")
+        }
+        ReleaseDecision::Manual | ReleaseDecision::Refused => {
+            rule_says(ApiDecision::Manual, "it deploys only when someone asks")
+        }
+        ReleaseDecision::Deferred => rule_says(ApiDecision::Deferred, "its host said not now"),
     }
 }
 

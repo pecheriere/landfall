@@ -4,9 +4,10 @@ use landfall_api::{Decision as ApiDecision, DeploymentRef, NextKind, Outcome, Re
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::rule::{Decision, Refusal};
 
-use crate::api::story::{Against, StoryInputs, decided, status};
+use crate::api::story::{RuleSaid, StoryInputs, decided, status};
 use crate::store::views::RunningRow;
 use crate::store::{Hold, ReleaseDecision, Store, WatchedRunning};
+use semver::Version;
 
 fn tag(text: &str) -> ReleaseTag {
     text.parse().unwrap()
@@ -361,6 +362,15 @@ async fn promotion_reason_does_not_name_an_unseen_deployment() {
 const PROMOTION_REASON: &str = "\"waits for promotion: not yet reported healthy for long enough \
                                 on app/canary, or it has gone quiet\"";
 
+/// How the release, `1.3.0`, compares with what runs, in a row of
+/// [`the_status_goes_by_verification_then_the_rule`].
+#[derive(Debug, Clone, Copy)]
+enum Against {
+    NothingRuns,
+    Below,
+    NotBelow,
+}
+
 /// One row of [`the_status_goes_by_verification_then_the_rule`]: what was stored (decision,
 /// reason, refused by verification), what the rule says, and the decision and reason wanted.
 type DecidedRow = (
@@ -503,9 +513,20 @@ fn rule_rows() -> Vec<DecidedRow> {
 
 #[test]
 fn the_status_goes_by_verification_then_the_rule() {
-    for ((stored, reason, origin_refused), rule, (want, want_reason)) in
+    let candidate = Version::new(1, 3, 0);
+    let (lower, higher) = (Version::new(1, 2, 0), Version::new(1, 4, 0));
+    for ((stored, reason, origin_refused), says, (want, want_reason)) in
         refusal_rows().into_iter().chain(rule_rows())
     {
+        let rule = says.map(|(decision, against)| RuleSaid {
+            decision,
+            running: match against {
+                Against::NothingRuns => None,
+                Against::Below => Some(&higher),
+                Against::NotBelow => Some(&lower),
+            },
+            candidate: &candidate,
+        });
         let got = decided(stored, reason, origin_refused, rule);
         assert_eq!(got.decision, want, "{stored:?} {origin_refused} {rule:?}");
         assert_eq!(

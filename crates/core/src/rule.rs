@@ -55,6 +55,33 @@ pub fn decide(rule: &Rule, running: Option<&Version>, candidate: &Version) -> De
     }
 }
 
+/// Why [`decide`] said `decision` of `candidate` over `running`, in the words the controller
+/// records and shows: the one place they are written.
+#[must_use]
+pub fn reason(decision: Decision, running: Option<&Version>, candidate: &Version) -> &'static str {
+    match decision {
+        Decision::Auto => "a higher version within the rule's automatic level",
+        Decision::NeedsApproval => "a higher version that needs an approver",
+        Decision::Manual => match running {
+            None => "nothing has been deployed yet: a first deploy needs an operator",
+            Some(running) if candidate < running => {
+                "lower than the running version: a downgrade needs an operator"
+            }
+            Some(_) => "beyond the rule's levels: it needs an operator",
+        },
+        Decision::Refused(refusal) => refusal_reason(refusal),
+    }
+}
+
+/// Why a candidate is refused outright, in the words the controller records and shows.
+#[must_use]
+pub fn refusal_reason(refusal: Refusal) -> &'static str {
+    match refusal {
+        Refusal::Prerelease => "a pre-release, and the rule does not opt in",
+        Refusal::AlreadyRunning => "already running",
+    }
+}
+
 /// The smallest level that permits moving from `running` up to `candidate`.
 /// Pre-release and build fields are ignored: only major, minor and patch count.
 fn jump(running: &Version, candidate: &Version) -> Level {
@@ -213,5 +240,51 @@ checks = ["container-healthy"]
             decide_str(&open, Some("1.3.0"), "1.3.0-rc.1"),
             Decision::Manual
         );
+    }
+
+    #[test]
+    fn each_decision_has_the_words_the_controller_records() {
+        let v = |text: &str| Version::parse(text).unwrap();
+        let (low, mid, high) = (v("1.2.0"), v("1.3.0"), v("1.4.0"));
+        let rows = [
+            (
+                Decision::Auto,
+                Some(&low),
+                "a higher version within the rule's automatic level",
+            ),
+            (
+                Decision::NeedsApproval,
+                Some(&low),
+                "a higher version that needs an approver",
+            ),
+            (
+                Decision::Manual,
+                None,
+                "nothing has been deployed yet: a first deploy needs an operator",
+            ),
+            (
+                Decision::Manual,
+                Some(&high),
+                "lower than the running version: a downgrade needs an operator",
+            ),
+            (
+                Decision::Manual,
+                Some(&low),
+                "beyond the rule's levels: it needs an operator",
+            ),
+            (
+                Decision::Refused(Refusal::Prerelease),
+                None,
+                "a pre-release, and the rule does not opt in",
+            ),
+            (
+                Decision::Refused(Refusal::AlreadyRunning),
+                Some(&mid),
+                "already running",
+            ),
+        ];
+        for (decision, running, want) in rows {
+            assert_eq!(reason(decision, running, &mid), want, "{decision:?}");
+        }
     }
 }
