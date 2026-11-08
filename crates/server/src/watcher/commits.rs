@@ -9,7 +9,11 @@
 //! with a token and 3 without, and stops while GitHub's count of requests left is
 //! below a floor, or at the first 403 or 429. A failure is recorded as `unavailable`
 //! and tried again after [`COMMIT_RETRY_SECS`]; it holds and refuses nothing, and
-//! writes no audit row, since nothing is decided here.
+//! writes no audit row, since nothing is decided here. A list whose pages don't hold
+//! what GitHub's total says they should is a failure, not a list. The whole pass has
+//! [`COMMITS_DEADLINE`], and none while GitHub has the watcher waiting for its limit.
+
+use std::time::Duration;
 
 use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, ReleaseTag, TagPattern};
@@ -18,6 +22,7 @@ use landfall_origin::fetch::{
     COMPARE_PER_PAGE, ComparePage, CompareStatus, FetchError, KEPT_COMMITS, ListedCommit,
 };
 use landfall_origin::release::ReleaseError;
+use semver::Version;
 
 use super::{ReleaseSource, describe};
 use crate::logger::log;
@@ -26,8 +31,20 @@ use crate::store::{NewRange, RangeState, Store, WantedRange};
 /// How long after a range was unavailable it is tried again, seconds.
 pub(crate) const COMMIT_RETRY_SECS: i64 = 60 * 60;
 
+/// How long the commits of one tick may take, after its verifications and before the
+/// tick ends. The next tick waits for this one, so this is time taken from verification:
+/// a minute is a fifth of the five-minute [`super::TICK_INTERVAL`]. GitHub answers a
+/// compare page in about a second, so a minute fits a tick's 12 requests many times
+/// over, and only a slow or stalling GitHub reaches it. Each request alone may take up
+/// to the fetcher's 30 s. A range cut short by it isn't stored, since a range is stored
+/// only once whole, and the next tick asks for it again.
+pub(crate) const COMMITS_DEADLINE: Duration = Duration::from_mins(1);
+
 /// The most requests one range can need: its first page and the last two.
 const REQUESTS_PER_RANGE: u8 = 3;
+
+// The newest `KEPT_COMMITS` fit in the last two pages.
+const _: () = assert!(KEPT_COMMITS <= COMPARE_PER_PAGE as usize);
 
 /// The most characters of a failure in its log line.
 const FAILURE_SHOWN_CHARS: usize = 256;
@@ -87,24 +104,71 @@ pub(crate) fn pages_for_newest(total: u64) -> Vec<u32> {
     vec![last - 1, last]
 }
 
+/// Settled releases of one deployment in version order, lowest first, each tag read
+/// by the pattern once, with whatever else `X` the caller keeps of each. A tag the
+/// pattern doesn't read is left out: it is never a base.
+pub(crate) struct SettledByVersion<X> {
+    sorted: Vec<(Version, ReleaseTag, CommitSha, X)>,
+}
+
+impl<X> SettledByVersion<X> {
+    /// `settled` in version order, by `pattern`.
+    pub(crate) fn new(
+        pattern: &TagPattern,
+        settled: impl IntoIterator<Item = (ReleaseTag, CommitSha, X)>,
+    ) -> Self {
+        let mut sorted: Vec<_> = settled
+            .into_iter()
+            .filter_map(|(tag, commit, extra)| {
+                Some((pattern.parse_tag(&tag).ok()?, tag, commit, extra))
+            })
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        Self { sorted }
+    }
+
+    /// Each release, lowest version first.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(Version, ReleaseTag, CommitSha, X)> {
+        self.sorted.iter()
+    }
+
+    /// The highest release below `version`, where a pre-release is below its release, as
+    /// semantic versioning says: a binary search.
+    pub(crate) fn base_of(&self, version: &Version) -> Option<(&ReleaseTag, &CommitSha)> {
+        let below = self.sorted.partition_point(|(v, ..)| v < version);
+        below
+            .checked_sub(1)
+            .and_then(|index| self.sorted.get(index))
+            .map(|(_, tag, commit, _)| (tag, commit))
+    }
+}
+
 /// The release a range to `tag` starts from: the highest version of `settled` below
 /// `tag`'s, by `pattern` and semantic versioning, where a pre-release is below its
-/// release. A tag `pattern` doesn't read is never one.
+/// release. A tag `pattern` doesn't read is never one. For one release; many at once
+/// go through one [`SettledByVersion`].
 #[must_use]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the release story's lookup of one release's base; until it reads \
+                  ranges, only tests do, and ranges_wanted uses the sorted form"
+    )
+)]
 pub(crate) fn base_for(
     pattern: &TagPattern,
     tag: &ReleaseTag,
     settled: &[(ReleaseTag, CommitSha)],
 ) -> Option<(ReleaseTag, CommitSha)> {
     let version = pattern.parse_tag(tag).ok()?;
-    settled
-        .iter()
-        .filter_map(|(other, commit)| {
-            let lower = pattern.parse_tag(other).ok().filter(|v| *v < version)?;
-            Some((lower, other, commit))
-        })
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, other, commit)| (other.clone(), commit.clone()))
+    let by_version = SettledByVersion::new(
+        pattern,
+        settled.iter().map(|(t, c)| (t.clone(), c.clone(), ())),
+    );
+    by_version
+        .base_of(&version)
+        .map(|(tag, commit)| (tag.clone(), commit.clone()))
 }
 
 /// What came of asking for one page.
@@ -125,7 +189,9 @@ enum Fetched {
     },
     /// The tick stopped before it was whole: nothing of it is kept.
     Stopped,
-    Failed(ReleaseError),
+    /// It could not be fetched, or its pages didn't hold what GitHub's total says, for
+    /// this reason, hostile text in part.
+    Failed(String),
 }
 
 /// A 403 or a 429 from GitHub, with the rate-limit headers or without.
@@ -184,15 +250,19 @@ async fn fetch_range<S: ReleaseSource>(
             return (whole(RangeState::TooLarge), budget.is_low(rate_remaining));
         }
         Asked::Stop => return (Fetched::Stopped, true),
-        Asked::Failed(error) => return (Fetched::Failed(error), false),
+        Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
     };
     let mut stop = budget.is_low(rate_remaining);
     if matches!(status, CompareStatus::Behind | CompareStatus::Diverged) {
         return (whole(RangeState::BaseNotFound), stop);
     }
+    let pages = pages_for_newest(total);
+    // What the pages asked for must hold: every commit from the first one on.
+    let skipped = u64::from(pages[0] - 1) * u64::from(COMPARE_PER_PAGE);
+    let expected = total.saturating_sub(skipped);
     let mut first = Some(first);
     let mut listed = Vec::new();
-    for page in pages_for_newest(total) {
+    for page in pages {
         if page == 1 {
             listed.extend(first.take().unwrap_or_default());
             continue;
@@ -213,8 +283,15 @@ async fn fetch_range<S: ReleaseSource>(
                 return (whole(RangeState::TooLarge), budget.is_low(rate_remaining));
             }
             Asked::Stop => return (Fetched::Stopped, true),
-            Asked::Failed(error) => return (Fetched::Failed(error), false),
+            Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
         }
+    }
+    if u64::try_from(listed.len()).ok() != Some(expected) {
+        let reason = format!(
+            "GitHub counts {total} commits, and its pages held {} where {expected} were due",
+            listed.len()
+        );
+        return (Fetched::Failed(reason), stop);
     }
     let newest = listed.len().saturating_sub(KEPT_COMMITS);
     let mut kept = listed.split_off(newest);
@@ -228,7 +305,8 @@ async fn fetch_range<S: ReleaseSource>(
 }
 
 /// Fetches the ranges the releases settled under `config` want, newest first, within
-/// this tick's budget, and stores each whole one. The count stored.
+/// this tick's budget, and stores each whole one, or each failure as unavailable. The
+/// count of ranges stored, unavailable ones included.
 pub(crate) async fn after_tick<S: ReleaseSource>(
     store: &Store,
     source: &S,
@@ -256,7 +334,7 @@ pub(crate) async fn after_tick<S: ReleaseSource>(
                 commits,
             } => (state, total, commits),
             Fetched::Stopped => break,
-            Fetched::Failed(error) => {
+            Fetched::Failed(reason) => {
                 // Logged when it first fails, not on each try after.
                 if !range.retry {
                     log(&format!(
@@ -265,7 +343,7 @@ pub(crate) async fn after_tick<S: ReleaseSource>(
                         range.tag,
                         range.base,
                         range.head,
-                        quoted(&describe(&error), FAILURE_SHOWN_CHARS)
+                        quoted(&reason, FAILURE_SHOWN_CHARS)
                     ));
                 }
                 (RangeState::Unavailable, None, Vec::new())

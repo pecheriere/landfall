@@ -17,7 +17,7 @@ use sqlx::Row as _;
 
 use super::deploys::parsed;
 use super::{Store, StoreError};
-use crate::watcher::commits::{COMMIT_RETRY_SECS, base_for};
+use crate::watcher::commits::{COMMIT_RETRY_SECS, SettledByVersion};
 
 /// What came of fetching a range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,10 +265,6 @@ impl Store {
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-            let pairs: Vec<(ReleaseTag, CommitSha)> = settled
-                .iter()
-                .map(|row| (row.tag.clone(), row.commit.clone()))
-                .collect();
             let repo = d.repo().name();
             let ranges = match stored.entry(repo.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -276,15 +272,22 @@ impl Store {
                     entry.insert(stored_ranges(&mut tx, repo).await?)
                 }
             };
-            let pattern = d.origin().tags();
-            for row in settled.iter().filter(|row| row.first_seen_at >= since) {
-                let Ok(version) = pattern.parse_tag(&row.tag) else {
+            // Each tag parsed once and sorted, and each base found by a binary search,
+            // so a deployment with a long history costs n log n a tick, not n squared.
+            let by_version = SettledByVersion::new(
+                d.origin().tags(),
+                settled
+                    .into_iter()
+                    .map(|row| (row.tag, row.commit, row.first_seen_at)),
+            );
+            for (version, tag, head, first_seen_at) in by_version.iter() {
+                if *first_seen_at < since {
+                    continue;
+                }
+                let Some((_, base)) = by_version.base_of(version) else {
                     continue;
                 };
-                let Some((_, base)) = base_for(pattern, &row.tag, &pairs) else {
-                    continue;
-                };
-                let key = (base.as_ref().to_owned(), row.commit.as_ref().to_owned());
+                let key = (base.as_ref().to_owned(), head.as_ref().to_owned());
                 let retry = match ranges.get(&key) {
                     None => false,
                     Some((RangeState::Unavailable, last_try))
@@ -295,13 +298,13 @@ impl Store {
                     Some(_) => continue,
                 };
                 wanted.push((
-                    version,
+                    version.clone(),
                     WantedRange {
                         deployment: d.id().clone(),
-                        tag: row.tag.clone(),
+                        tag: tag.clone(),
                         repo: repo.clone(),
-                        base,
-                        head: row.commit.clone(),
+                        base: base.clone(),
+                        head: head.clone(),
                         retry,
                     },
                 ));

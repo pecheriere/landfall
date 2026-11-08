@@ -16,18 +16,18 @@ use super::{
 };
 use crate::store::{CommitRange, RangeState, ReleaseDecision, Seen, WantedRange};
 
-const T0: i64 = 1_800_000_000;
+pub(super) const T0: i64 = 1_800_000_000;
 
-fn repo() -> RepoName {
+pub(super) fn repo() -> RepoName {
     "example/app".parse().unwrap()
 }
 
-fn sha(n: u64) -> CommitSha {
+pub(super) fn sha(n: u64) -> CommitSha {
     format!("{n:040x}").parse().unwrap()
 }
 
 /// The `n`th commit of a comparison, counting from 1 in GitHub's order, oldest first.
-fn nth(n: u64) -> ListedCommit {
+pub(super) fn nth(n: u64) -> ListedCommit {
     ListedCommit {
         sha: sha(n),
         summary: format!("\"commit {n}\""),
@@ -37,7 +37,7 @@ fn nth(n: u64) -> ListedCommit {
 
 /// A harness whose commits began to be compared at its clock's start, whatever the
 /// time of the machine running it.
-async fn harness(config: &str) -> Harness {
+pub(super) async fn harness(config: &str) -> Harness {
     let h = Harness::new(config).await;
     sqlx::query("UPDATE commits_since SET at = ?")
         .bind(T0)
@@ -48,7 +48,13 @@ async fn harness(config: &str) -> Harness {
 }
 
 /// Records `tag` of `deployment` as verified, at `head`, under `config_hash`.
-async fn settle_at(h: &Harness, deployment: &str, release: &str, head: &CommitSha, hash: &str) {
+pub(super) async fn settle_at(
+    h: &Harness,
+    deployment: &str,
+    release: &str,
+    head: &CommitSha,
+    hash: &str,
+) {
     let seen = Seen {
         tag_object: &head.as_ref()[..40],
         config_hash: hash,
@@ -69,7 +75,7 @@ async fn settle_at(h: &Harness, deployment: &str, release: &str, head: &CommitSh
         .unwrap();
 }
 
-async fn settle(h: &Harness, deployment: &str, release: &str) {
+pub(super) async fn settle(h: &Harness, deployment: &str, release: &str) {
     settle_at(h, deployment, release, &commit(release), h.config.hash()).await;
 }
 
@@ -96,7 +102,7 @@ async fn refuse(h: &Harness, release: &str) {
         .unwrap();
 }
 
-async fn wanted(h: &Harness) -> Vec<WantedRange> {
+pub(super) async fn wanted(h: &Harness) -> Vec<WantedRange> {
     h.store
         .ranges_wanted(&h.config, h.config.hash(), h.store.now().unwrap())
         .await
@@ -117,25 +123,25 @@ async fn wanted_tags(h: &Harness, tags: &[&str]) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn after(h: &Harness) -> usize {
+pub(super) async fn after(h: &Harness) -> usize {
     after_tick(&h.store, h.fake.as_ref(), &h.config, h.store.now().unwrap()).await
 }
 
-async fn range(h: &Harness, base: &str, head: &str) -> Option<CommitRange> {
+pub(super) async fn range(h: &Harness, base: &str, head: &str) -> Option<CommitRange> {
     h.store
         .commit_range(&repo(), &commit(base), &commit(head))
         .await
         .unwrap()
 }
 
-async fn range_count(h: &Harness) -> i64 {
+pub(super) async fn range_count(h: &Harness) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM commit_ranges")
         .fetch_one(h.store.pool())
         .await
         .unwrap()
 }
 
-fn compares(h: &Harness) -> Vec<u32> {
+pub(super) fn compares(h: &Harness) -> Vec<u32> {
     h.fake
         .compares
         .lock()
@@ -146,7 +152,7 @@ fn compares(h: &Harness) -> Vec<u32> {
 }
 
 /// GitHub, comparing any two commits as `total` commits ahead, `rate` requests left.
-fn github(total: u64, rate: u32) -> CompareAnswer {
+pub(super) fn github(total: u64, rate: u32) -> CompareAnswer {
     Box::new(move |_, _, page| {
         let first = u64::from(page - 1) * 100 + 1;
         let last = (u64::from(page) * 100).min(total);
@@ -159,11 +165,11 @@ fn github(total: u64, rate: u32) -> CompareAnswer {
     })
 }
 
-fn answer(h: &Harness, answer: CompareAnswer) {
+pub(super) fn answer(h: &Harness, answer: CompareAnswer) {
     h.fake.locked().compare = Some(answer);
 }
 
-fn with_token(h: &Harness) {
+pub(super) fn with_token(h: &Harness) {
     h.fake.locked().github_token = true;
 }
 

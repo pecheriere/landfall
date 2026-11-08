@@ -159,10 +159,18 @@ pub async fn tick<S: ReleaseSource>(
         }
     }
     // Only now that every verification of the tick is done, so that GitHub's budget
-    // goes to them first.
+    // goes to them first; within a deadline, so that the next tick's don't wait long;
+    // and not while GitHub has a repository waiting for its limit.
     match store.now() {
+        Ok(now) if state.any_rate_limited(now) => {}
         Ok(now) => {
-            commits::after_tick(store, source.as_ref(), config, now).await;
+            let walk = commits::after_tick(store, source.as_ref(), config, now);
+            if tokio::time::timeout(state.commits_deadline, walk)
+                .await
+                .is_err()
+            {
+                log("watcher: commits: the tick's commits ran past their deadline");
+            }
         }
         Err(error) => log(&format!("watcher: commits: {error}")),
     }

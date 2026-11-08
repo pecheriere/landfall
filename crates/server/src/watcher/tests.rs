@@ -1,5 +1,6 @@
 //! The watcher against a fake source, a real store and a clock moved by hand.
 
+mod commit_limits;
 mod commits;
 mod decisions;
 mod failures;
@@ -146,6 +147,8 @@ struct FakeState {
     compare: Option<CompareAnswer>,
     /// Whether it says it has a GitHub token.
     github_token: bool,
+    /// Whether a comparison never answers.
+    compare_hangs: bool,
 }
 
 #[derive(Default)]
@@ -277,6 +280,10 @@ impl ReleaseSource for Fake {
             .lock()
             .unwrap()
             .push((base.clone(), head.clone(), page));
+        let hang = self.locked().compare_hangs;
+        if hang {
+            std::future::pending::<()>().await;
+        }
         match &self.locked().compare {
             Some(answer) => answer(base, head, page),
             None => Ok(ComparePage::Listed {
