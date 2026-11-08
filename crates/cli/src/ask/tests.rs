@@ -186,7 +186,14 @@ fn not_a_rollback_exits_1_with_its_code() {
     assert!(error.to_string().contains("not_a_rollback"), "{error}");
     assert!(error.to_string().contains(title), "{error}");
     assert_eq!(out, "");
-    // Nothing more is asked.
+    // What was asked: that tag, as a rollback. Nothing more is asked.
+    assert_eq!(
+        api.posted(),
+        [(
+            "/api/v1/deployments/app/prod/requests".to_owned(),
+            Some(r#"{"tag":"v1.3.0","rollback":true}"#.to_owned())
+        )]
+    );
     assert_eq!(api.calls(), Vec::new());
 }
 
@@ -220,6 +227,26 @@ fn request_open_exits_1_naming_the_open_request() {
     assert!(text.contains(title), "{text}");
     assert_eq!(out, "");
     assert_eq!(api.calls().len(), 1);
+
+    // One this principal may not cancel is named, and cancelling it isn't suggested.
+    let api = FakeApi::new(move |path, _| match path {
+        "/api/v1/approvals" => {
+            let mut theirs = request();
+            theirs["can_cancel"] = json!(false);
+            Ok(json!({"approvals": [theirs]}))
+        }
+        _ => Err(refused(409, ProblemCode::RequestOpen, title)),
+    });
+    let error = run("request deploy app/prod v1.3.0", &api, false)
+        .0
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    let text = chain(&error);
+    assert!(
+        text.starts_with("request 7 already waits for an approver on app/prod: the controller"),
+        "{text}"
+    );
+    assert!(!text.contains("landfall cancel"), "{text}");
 
     // One this principal can't see, or a list that can't be read, leaves the refusal as it is.
     for readable in [true, false] {

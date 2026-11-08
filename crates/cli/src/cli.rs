@@ -129,14 +129,14 @@ pub enum CliError {
     Api(#[from] ApiError),
     /// The controller refused a request because one already waits on the deployment: this
     /// one, which the principal may see.
-    #[error(
-        "request {request} already waits for an approver on {deployment}: `landfall cancel {request}` ends it"
-    )]
+    #[error("{}", request_open(*.request, .deployment, *.can_cancel))]
     RequestOpen {
         /// The request that waits.
         request: i64,
         /// The deployment it is on.
         deployment: DeploymentId,
+        /// Whether this principal may cancel it, as the controller says.
+        can_cancel: bool,
         /// The controller's refusal.
         #[source]
         source: ApiError,
@@ -224,6 +224,17 @@ fn run_command(cli: Cli, env: &dyn Env, out: &mut dyn Write) -> Result<(), CliEr
         }
     }
     Ok(())
+}
+
+/// What [`CliError::RequestOpen`] says: the request, and how to end it when this principal
+/// may.
+fn request_open(request: i64, deployment: &DeploymentId, can_cancel: bool) -> String {
+    let waits = format!("request {request} already waits for an approver on {deployment}");
+    if can_cancel {
+        format!("{waits}: `landfall cancel {request}` ends it")
+    } else {
+        waits
+    }
 }
 
 /// A client for the controller `args` and `env` name, with the token they give.

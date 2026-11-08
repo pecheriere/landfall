@@ -149,7 +149,7 @@ async fn ask<A: Api>(
 }
 
 /// `refusal`, a `request_open`, naming the request that waits on `deployment` when this
-/// principal may see it. The refusal is what the command ends with either way, so a list that
+/// principal may see it, and saying how to cancel it only when they may. The refusal is what the command ends with either way, so a list that
 /// can't be read or doesn't hold it leaves it as it is.
 async fn open_request<A: Api>(
     client: &A,
@@ -169,12 +169,13 @@ async fn open_request<A: Api>(
                     request.intent.deployment == *deployment
                         && request.state == RequestState::AwaitingApproval
                 })
-                .map(|request| request.id)
+                .map(|request| (request.id, request.can_cancel))
         });
     match open {
-        Some(request) => CliError::RequestOpen {
+        Some((request, can_cancel)) => CliError::RequestOpen {
             request,
             deployment: deployment.clone(),
+            can_cancel,
             source: refusal,
         },
         None => refusal.into(),
