@@ -35,7 +35,7 @@ use super::openapi::{
     BadRequest, Busy, Internal, NotFound, RateLimited, ReadForbidden, SlowRequest, Unauthenticated,
 };
 use super::query::{ApiQuery, Cursor, CursorList, DeploymentPath, Limit, NoQuery, TagPath};
-use super::story::{StatusExplained, StoryInputs, recorded, status, status_decision};
+use super::story::{Against, StatusExplained, StoryInputs, decided, recorded, status};
 use super::visible::{shown_deployment, viewable};
 use crate::agent_api::{ApiProblem, ApiState};
 use crate::auth::{HumanProblem, Principal};
@@ -151,14 +151,27 @@ impl<'a> Standing<'a> {
         let release = &row.release;
         let version = self.deployment.origin().tags().parse_tag(&row.tag).ok();
         let rule = self.deployment.rule();
-        let (rule_says, lower_than_running) = match (&version, &self.running_version) {
-            (Some(version), RunningVersion::Nothing) => (Some(decide(rule, None, version)), false),
-            (Some(version), RunningVersion::Readable(running)) => (
-                Some(decide(rule, Some(running), version)),
-                version < running,
-            ),
-            _ => (None, false),
+        let rule_says = match (&version, &self.running_version) {
+            (Some(version), RunningVersion::Nothing) => {
+                Some((decide(rule, None, version), Against::NothingRuns))
+            }
+            (Some(version), RunningVersion::Readable(running)) => {
+                let against = if version < running {
+                    Against::Below
+                } else {
+                    Against::NotBelow
+                };
+                Some((decide(rule, Some(running), version), against))
+            }
+            _ => None,
         };
+        let lower_than_running = matches!(rule_says, Some((_, Against::Below)));
+        let decided = decided(
+            release.decision,
+            release.reason(),
+            release.origin_refused,
+            rule_says,
+        );
         let last = release
             .digest
             .as_ref()
@@ -180,8 +193,8 @@ impl<'a> Standing<'a> {
         let inputs = StoryInputs {
             tag: &row.tag,
             digest: release.digest.as_ref(),
-            decision: status_decision(release.decision, release.origin_refused, rule_says),
-            decision_reason: release.reason(),
+            decision: decided.decision,
+            decision_reason: &decided.reason,
             running: self.running.as_ref(),
             active_deploy: self.active.as_ref() == Some(&row.tag),
             open_request: self.open.as_ref() == Some(&row.tag),

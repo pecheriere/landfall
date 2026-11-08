@@ -4,7 +4,7 @@ use landfall_api::{Decision as ApiDecision, DeploymentRef, NextKind, Outcome, Re
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::rule::{Decision, Refusal};
 
-use crate::api::story::{StoryInputs, status, status_decision};
+use crate::api::story::{Against, StoryInputs, decided, status};
 use crate::store::views::RunningRow;
 use crate::store::{Hold, ReleaseDecision, Store, WatchedRunning};
 
@@ -356,64 +356,177 @@ async fn promotion_reason_does_not_name_an_unseen_deployment() {
     assert!(!said.contains("app/"), "{said}");
 }
 
-#[test]
-fn the_status_goes_by_verification_then_the_rule() {
-    let rows = [
-        // Refused by verification, whatever the rule says.
+/// A reason the watcher stored while promotion held a release back: it names the deployment
+/// promoted from, which a reader may not be allowed to view.
+const PROMOTION_REASON: &str = "\"waits for promotion: not yet reported healthy for long enough \
+                                on app/canary, or it has gone quiet\"";
+
+/// One row of [`the_status_goes_by_verification_then_the_rule`]: what was stored (decision,
+/// reason, refused by verification), what the rule says, and the decision and reason wanted.
+type DecidedRow = (
+    (ReleaseDecision, &'static str, bool),
+    Option<(Decision, Against)>,
+    (ApiDecision, &'static str),
+);
+
+/// The rows where a refusal decides.
+fn refusal_rows() -> Vec<DecidedRow> {
+    use ReleaseDecision as Stored;
+    vec![
+        // Refused by verification, whatever the rule says: its stored reason decided.
         (
-            ReleaseDecision::Refused,
-            true,
-            Some(Decision::Auto),
-            ApiDecision::Refused,
+            (Stored::Refused, "\"no attestation\"", true),
+            Some((Decision::Auto, Against::NotBelow)),
+            (ApiDecision::Refused, "\"no attestation\""),
         ),
-        // Refused by the rule.
+        // Refused by the rule, in the rule's words.
         (
-            ReleaseDecision::Refused,
-            false,
-            Some(Decision::Refused(Refusal::Prerelease)),
-            ApiDecision::Refused,
+            (Stored::Refused, "\"stale\"", false),
+            Some((Decision::Refused(Refusal::Prerelease), Against::NotBelow)),
+            (
+                ApiDecision::Refused,
+                "a pre-release, and the rule does not opt in",
+            ),
         ),
-        // Refused by the watcher for what became of its deploys: someone must ask now.
+        // Refused by the watcher for what became of its deploys: someone must ask now, and
+        // the stored reason, a fixed text, is what decided.
         (
-            ReleaseDecision::Refused,
-            false,
-            Some(Decision::Auto),
-            ApiDecision::Manual,
+            (
+                Stored::Refused,
+                "\"its deploys kept stopping before they began\"",
+                false,
+            ),
+            Some((Decision::Auto, Against::NotBelow)),
+            (
+                ApiDecision::Manual,
+                "\"its deploys kept stopping before they began\"",
+            ),
         ),
         (
-            ReleaseDecision::Refused,
-            false,
-            Some(Decision::NeedsApproval),
-            ApiDecision::NeedsApproval,
+            (
+                Stored::Refused,
+                "\"it already rolled back on its host\"",
+                false,
+            ),
+            Some((Decision::NeedsApproval, Against::NotBelow)),
+            (
+                ApiDecision::NeedsApproval,
+                "a higher version that needs an approver",
+            ),
         ),
-        // Held back for promotion, which the status tells by itself.
+    ]
+}
+
+/// The rows where the rule's word, or its absence, decides.
+fn rule_rows() -> Vec<DecidedRow> {
+    use ReleaseDecision as Stored;
+    let promoted = PROMOTION_REASON;
+    vec![
+        // Held back for promotion, which the status tells by itself: the stored reason,
+        // which names where it is promoted from, is never shown.
         (
-            ReleaseDecision::Manual,
-            false,
-            Some(Decision::Auto),
-            ApiDecision::Auto,
+            (Stored::Manual, promoted, false),
+            Some((Decision::Auto, Against::NotBelow)),
+            (
+                ApiDecision::Auto,
+                "a higher version within the rule's automatic level",
+            ),
+        ),
+        (
+            (Stored::Manual, promoted, false),
+            Some((Decision::NeedsApproval, Against::NotBelow)),
+            (
+                ApiDecision::NeedsApproval,
+                "a higher version that needs an approver",
+            ),
+        ),
+        (
+            (Stored::Manual, promoted, false),
+            Some((Decision::Manual, Against::NothingRuns)),
+            (
+                ApiDecision::Manual,
+                "nothing has been deployed yet: a first deploy needs an operator",
+            ),
+        ),
+        (
+            (Stored::Manual, promoted, false),
+            Some((Decision::Manual, Against::Below)),
+            (
+                ApiDecision::Manual,
+                "lower than the running version: a downgrade needs an operator",
+            ),
+        ),
+        (
+            (Stored::Manual, promoted, false),
+            Some((Decision::Manual, Against::NotBelow)),
+            (
+                ApiDecision::Manual,
+                "beyond the rule's levels: it needs an operator",
+            ),
         ),
         // Deferred by its host, which the status tells from the deploy.
         (
-            ReleaseDecision::Deferred,
-            false,
-            Some(Decision::Auto),
-            ApiDecision::Auto,
+            (Stored::Deferred, "\"its host said not now\"", false),
+            Some((Decision::Auto, Against::NotBelow)),
+            (
+                ApiDecision::Auto,
+                "a higher version within the rule's automatic level",
+            ),
         ),
-        // Without the rule's word, what was recorded.
+        // Without the rule's word, what was recorded, in words of its own...
         (
-            ReleaseDecision::Deferred,
-            false,
+            (Stored::Deferred, "\"its host said not now\"", false),
             None,
-            ApiDecision::Deferred,
+            (ApiDecision::Deferred, "its host said not now"),
         ),
-        (ReleaseDecision::Manual, false, None, ApiDecision::Manual),
-    ];
-    for (stored, origin_refused, rule, want) in rows {
+        (
+            (Stored::Manual, promoted, false),
+            None,
+            (ApiDecision::Manual, "it deploys only when someone asks"),
+        ),
+        // ...but a refusal the rule didn't make is the watcher's, for what became of its
+        // deploys: the status tells it from them, so it isn't `refused`.
+        (
+            (
+                Stored::Refused,
+                "\"it already rolled back on its host\"",
+                false,
+            ),
+            None,
+            (
+                ApiDecision::Manual,
+                "\"it already rolled back on its host\"",
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn the_status_goes_by_verification_then_the_rule() {
+    for ((stored, reason, origin_refused), rule, (want, want_reason)) in
+        refusal_rows().into_iter().chain(rule_rows())
+    {
+        let got = decided(stored, reason, origin_refused, rule);
+        assert_eq!(got.decision, want, "{stored:?} {origin_refused} {rule:?}");
         assert_eq!(
-            status_decision(stored, origin_refused, rule),
-            want,
+            got.reason, want_reason,
             "{stored:?} {origin_refused} {rule:?}"
         );
+        assert!(!got.reason.contains("app/canary"), "{}", got.reason);
     }
+}
+
+#[test]
+fn a_history_refusal_without_the_rules_word_still_reads_failed() {
+    let release = tag("v1.3.0");
+    let at = digest('3');
+    let refused = "\"it already rolled back on its host\"";
+    let got = decided(ReleaseDecision::Refused, refused, false, None);
+    let explained = status(&StoryInputs {
+        decision: got.decision,
+        decision_reason: &got.reason,
+        last_outcome: Some((Outcome::RolledBack, "check failed")),
+        ..base(&release, &at)
+    });
+    assert_eq!(explained.status, ReleaseStatus::Failed);
 }

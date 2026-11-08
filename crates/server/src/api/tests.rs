@@ -203,6 +203,9 @@ pub(super) const CANARY_VIEWER: &str = "canary-viewer";
 /// Who holds `view` on `app/canary` and `app/beta`.
 pub(super) const FLEET_VIEWER: &str = "fleet-viewer";
 
+/// Who holds `view` on `app/beta`, and not on `app/canary`, which promotes to it.
+pub(super) const BETA_VIEWER: &str = "beta-viewer";
+
 const WORLD_ORIGIN: &str = "https://landfall.example.com";
 const WORLD_RP_ID: &str = "landfall.example.com";
 
@@ -296,6 +299,7 @@ checks = ["container-healthy"]
     sections.push(grant(OUTSIDER, &["app/other"], &["view"]));
     sections.push(grant(CANARY_VIEWER, &["app/canary"], &["view"]));
     sections.push(grant(FLEET_VIEWER, &["app/canary", "app/beta"], &["view"]));
+    sections.push(grant(BETA_VIEWER, &["app/beta"], &["view"]));
     sections.concat()
 }
 
@@ -326,7 +330,8 @@ pub(super) enum Caller<'a> {
 /// - `app/other` has nothing, and [`OUTSIDER`] may view it.
 /// - `app/canary` runs `v3.0.0` and promotes to `app/beta`, which has nothing. Neither is
 ///   `app/prod`, where a promotion would answer `requestDeploy` with `promotion_pending`.
-///   [`CANARY_VIEWER`] may view `app/canary` alone, and [`FLEET_VIEWER`] both.
+///   [`CANARY_VIEWER`] may view `app/canary` alone, [`FLEET_VIEWER`] both, and [`BETA_VIEWER`]
+///   `app/beta` alone.
 ///
 /// Every principal has a token and a session. Time stands still until a test moves `clock`.
 pub(super) struct World {
@@ -387,7 +392,16 @@ impl World {
             .unwrap();
         let request = open_request(&store).await;
         let mut names: Vec<String> = grant_sets().iter().map(|roles| holder(roles)).collect();
-        names.extend([REQUESTER, OUTSIDER, CANARY_VIEWER, FLEET_VIEWER].map(ToOwned::to_owned));
+        names.extend(
+            [
+                REQUESTER,
+                OUTSIDER,
+                CANARY_VIEWER,
+                FLEET_VIEWER,
+                BETA_VIEWER,
+            ]
+            .map(ToOwned::to_owned),
+        );
         let mut tokens = HashMap::new();
         let mut sessions = HashMap::new();
         for name in names {

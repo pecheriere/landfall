@@ -138,9 +138,12 @@ tag holding `/` is sent with it as `%2F`, and a tag the controller hasn't record
 - `commits`, below;
 - its newest 20 requests and its newest 20 deploys, newest first.
 
-`reasons` quote stored text: a hold's reason, a host's reason for a deploy's outcome, the
-watcher's reason for its decision. Like every text from GitHub or a host, escape it before
-showing it.
+`reasons` quote stored text: a hold's reason, a host's reason for a deploy's outcome, and the
+watcher's reason for its decision where that reason is what decided, such as a refusal by
+verification. Otherwise a decision is put in the rule's words, so that a reason recorded
+before something changed is never shown, and a deployment the principal can't view is never
+named: it reads "a deployment you can't view". Like every text from GitHub or a host, escape
+it before showing it.
 
 A release's `status` is the first of these that applies:
 

@@ -17,13 +17,16 @@
 //! 12. `waiting`: it deploys by itself, and nothing known stands in the way.
 //!
 //! Each status comes with its reasons, in order, and one next action. Reasons and actions are
-//! the controller's own words, with the stored text they quote: a hold's, a decision's or a
-//! host's reason, each quoted when it was recorded.
+//! the controller's own words, with the stored text they quote: a hold's or a host's reason,
+//! or a decision's where it is what decided, each quoted when it was recorded. A deployment
+//! is named only as the reader may see it.
+
+use std::borrow::Cow;
 
 use landfall_api::ReleaseStatus;
 use landfall_api::{Decision as ApiDecision, DeploymentRef, NextAction, NextKind, Outcome};
 use landfall_core::ids::{ImageDigest, ReleaseTag};
-use landfall_core::rule::Decision;
+use landfall_core::rule::{Decision, Refusal};
 
 use crate::store::views::RunningRow;
 use crate::store::{Hold, ReleaseDecision};
@@ -35,9 +38,9 @@ pub(crate) struct StoryInputs<'a> {
     pub(crate) tag: &'a ReleaseTag,
     /// Its digest, if it verified.
     pub(crate) digest: Option<&'a ImageDigest>,
-    /// The decision the status goes by: see [`status_decision`].
+    /// The decision the status goes by: see [`decided`].
     pub(crate) decision: ApiDecision,
-    /// Why it was decided so, as recorded: quoted.
+    /// Why it was decided so: see [`decided`].
     pub(crate) decision_reason: &'a str,
     /// What its deployment's host last said, if that host is the deployment's now.
     pub(crate) running: Option<&'a RunningRow>,
@@ -78,28 +81,93 @@ pub(crate) fn recorded(decision: ReleaseDecision) -> ApiDecision {
     }
 }
 
-/// The decision a status goes by: a refusal by verification, then what the rule says with
-/// what runs now (`rule`, `None` when either version can't be read). What the watcher
-/// recorded of the release's deploys is told by the status from the deploys themselves, as
-/// asking leaves it to an approver: so a release that would deploy by itself, and that the
-/// watcher refused for what became of it, now deploys only when someone asks. Without the
-/// rule's word, what the watcher recorded.
+/// How a release compares with what runs, when the rule could read both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Against {
+    /// Nothing runs: it would be the first deploy.
+    NothingRuns,
+    /// It is lower than what runs.
+    Below,
+    /// It is what runs or higher.
+    NotBelow,
+}
+
+/// The decision a status goes by, and the reason that decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Decided<'a> {
+    /// The decision.
+    pub(crate) decision: ApiDecision,
+    /// Why: the rule's words, or a stored reason where that is what decided.
+    pub(crate) reason: Cow<'a, str>,
+}
+
+/// The decision a status goes by, and why: a refusal by verification, with its stored
+/// reason; then what the rule says with what runs now (`rule`, `None` when either version
+/// can't be read), in the rule's words. What the watcher recorded of the release's deploys
+/// is told by the status from the deploys themselves, as asking leaves a retry to an
+/// approver: so a release the watcher refused for what became of it, and that the rule
+/// wouldn't refuse, now deploys only when someone asks, for the stored reason, one of the
+/// watcher's fixed texts. Without the rule's word, what the watcher recorded, in words of its
+/// own. Any other stored reason is never shown: it may say what has changed since, and the
+/// one promotion left names the deployment promoted from, which a reader may not view.
 #[must_use]
-pub(crate) fn status_decision(
+pub(crate) fn decided(
     stored: ReleaseDecision,
+    stored_reason: &str,
     origin_refused: bool,
-    rule: Option<Decision>,
-) -> ApiDecision {
+    rule: Option<(Decision, Against)>,
+) -> Decided<'_> {
+    let stored_says = |decision| Decided {
+        decision,
+        reason: Cow::Borrowed(stored_reason),
+    };
+    let rule_says = |decision, reason: &'static str| Decided {
+        decision,
+        reason: Cow::Borrowed(reason),
+    };
     if origin_refused {
-        return ApiDecision::Refused;
+        return stored_says(ApiDecision::Refused);
     }
+    // A refusal the rule didn't make, nor verification, is the watcher's, for the release's
+    // past deploys.
+    let by_history = stored == ReleaseDecision::Refused;
     match rule {
-        None => recorded(stored),
-        Some(Decision::Refused(_)) => ApiDecision::Refused,
-        Some(Decision::Auto) if stored == ReleaseDecision::Refused => ApiDecision::Manual,
-        Some(Decision::Auto) => ApiDecision::Auto,
-        Some(Decision::NeedsApproval) => ApiDecision::NeedsApproval,
-        Some(Decision::Manual) => ApiDecision::Manual,
+        None | Some((Decision::Auto, _)) if by_history => stored_says(ApiDecision::Manual),
+        None => match stored {
+            ReleaseDecision::Auto => rule_says(ApiDecision::Auto, "it deploys by itself"),
+            ReleaseDecision::NeedsApproval => {
+                rule_says(ApiDecision::NeedsApproval, "it needs an approver")
+            }
+            ReleaseDecision::Manual | ReleaseDecision::Refused => {
+                rule_says(ApiDecision::Manual, "it deploys only when someone asks")
+            }
+            ReleaseDecision::Deferred => rule_says(ApiDecision::Deferred, "its host said not now"),
+        },
+        Some((Decision::Refused(refusal), _)) => rule_says(
+            ApiDecision::Refused,
+            match refusal {
+                Refusal::Prerelease => "a pre-release, and the rule does not opt in",
+                Refusal::AlreadyRunning => "already running",
+            },
+        ),
+        Some((Decision::Auto, _)) => rule_says(
+            ApiDecision::Auto,
+            "a higher version within the rule's automatic level",
+        ),
+        Some((Decision::NeedsApproval, _)) => rule_says(
+            ApiDecision::NeedsApproval,
+            "a higher version that needs an approver",
+        ),
+        Some((Decision::Manual, against)) => rule_says(
+            ApiDecision::Manual,
+            match against {
+                Against::NothingRuns => {
+                    "nothing has been deployed yet: a first deploy needs an operator"
+                }
+                Against::Below => "lower than the running version: a downgrade needs an operator",
+                Against::NotBelow => "beyond the rule's levels: it needs an operator",
+            },
+        ),
     }
 }
 

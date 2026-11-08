@@ -8,7 +8,9 @@ use semver::Version;
 use serde_json::{Value, json};
 
 use super::deployments::open_request;
-use super::{Answer, Caller, FLEET_VIEWER, OUTSIDER, World, holder, verified, world_digest};
+use super::{
+    Answer, BETA_VIEWER, Caller, FLEET_VIEWER, OUTSIDER, World, holder, verified, world_digest,
+};
 use crate::api::query::{Cursor, CursorList};
 use crate::store::{NewRange, RangeState, ReleaseDecision, Seen};
 
@@ -355,6 +357,82 @@ async fn a_release_promoted_from_elsewhere_waits_for_it() {
         "{body}"
     );
     assert_eq!(body["next"]["kind"], "wait");
+}
+
+/// The story of `v3.1.0` on `app/beta`, as [`BETA_VIEWER`] reads it: who may view `app/beta`
+/// and not `app/canary`, which promotes to it.
+async fn beta_story(world: &World) -> Value {
+    let answer = world
+        .send(
+            Method::GET,
+            "/api/v1/deployments/app/beta/releases/v3.1.0",
+            Caller::Token(BETA_VIEWER),
+            None,
+        )
+        .await;
+    assert_eq!(answer.status, StatusCode::OK, "{answer:?}");
+    answer.json()
+}
+
+#[tokio::test]
+async fn an_unseen_promotion_source_is_not_named() {
+    let world = World::seed().await;
+    verified(
+        &world.store,
+        world.state.config(),
+        "app/beta",
+        "v3.1.0",
+        'e',
+    )
+    .await;
+    let body = beta_story(&world).await;
+    assert_eq!(body["release"]["status"], "promotion_pending");
+    let text = body.to_string();
+    assert!(text.contains("a deployment you can't view"), "{text}");
+    assert!(!text.contains("app/canary"), "{text}");
+}
+
+#[tokio::test]
+async fn a_stale_promotion_reason_never_names_an_unseen_deployment() {
+    let world = World::seed().await;
+    verified(
+        &world.store,
+        world.state.config(),
+        "app/beta",
+        "v3.1.0",
+        'e',
+    )
+    .await;
+    // What the watcher records while promotion holds it back: its reason names the source.
+    world
+        .store
+        .record_release(
+            (
+                &"app/beta".parse().unwrap(),
+                &"home-1".parse().unwrap(),
+                &"v3.1.0".parse().unwrap(),
+            ),
+            ReleaseDecision::Manual,
+            "waits for promotion: not yet reported healthy for long enough on app/canary, or \
+             it has gone quiet (enforced by the controller only)",
+            None,
+        )
+        .await
+        .unwrap();
+    // Then `app/canary` had it healthy for long enough, before the watcher looked again.
+    sqlx::query(
+        "INSERT INTO replaced_releases (deployment, host, tag, digest, healthy_secs)
+         VALUES ('app/canary', 'home-1', 'v3.1.0', ?, 7200)",
+    )
+    .bind(world_digest('e').as_ref())
+    .execute(world.store.pool())
+    .await
+    .unwrap();
+    let body = beta_story(&world).await;
+    assert_eq!(body["release"]["status"], "needs_request");
+    let text = body.to_string();
+    assert!(!text.contains("app/canary"), "{text}");
+    assert!(text.contains("a first deploy needs an operator"), "{text}");
 }
 
 /// The tags of a page of releases, and its cursor.
