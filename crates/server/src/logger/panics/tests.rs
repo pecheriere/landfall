@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 
-use super::{Style, frames};
+use super::{NO_SYMBOLS, Style, frames};
 
 /// A backtrace as `Backtrace` writes one from a panic hook, cut down.
 const CAPTURED: &str = "   0: std::backtrace_rs::backtrace::libunwind::trace
@@ -60,4 +60,27 @@ fn a_full_backtrace_is_every_frame_one_a_line() {
 fn a_short_backtrace_without_its_markers_keeps_every_frame() {
     let unmarked = "   0: a\n             at a.rs:1:1\n   1: b\n";
     assert_eq!(frames(unmarked, Style::Short), ["0: a at a.rs:1:1", "1: b"]);
+}
+
+/// A stripped build, as releases are, names no frame: rather than a line of nothing each, it says
+/// so once.
+#[test]
+fn a_backtrace_with_no_symbols_says_so_once() {
+    let stripped = "   0: <unknown>\n   1: <unknown>\n   2: <unknown>\n";
+    for style in [Style::Short, Style::Full] {
+        assert_eq!(frames(stripped, style), [NO_SYMBOLS], "{style:?}");
+    }
+    let mac = "   0: __mh_execute_header\n   1: __mh_execute_header\n";
+    assert_eq!(frames(mac, Style::Short), [NO_SYMBOLS]);
+}
+
+/// Frames with no symbol among those with one are left out.
+#[test]
+fn frames_with_no_symbol_are_left_out() {
+    let partly = "   0: <unknown>\n   1: landfall_server::watcher::tick\n             at ./w.rs:1:1\n   \
+                  2: <unknown>\n";
+    assert_eq!(
+        frames(partly, Style::Full),
+        ["1: landfall_server::watcher::tick at ./w.rs:1:1"]
+    );
 }

@@ -4,6 +4,7 @@
 use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use super::super::{
     CliError, EXIT_COULD_NOT_RUN, Ending, FLUSH_TIMEOUT, FailureTo, Logger, on_a_runtime_ending,
@@ -153,36 +154,62 @@ fn serves_failure_goes_to_the_log() {
     assert_eq!(stderr, [] as [u8; 0]);
 }
 
-/// Any other command's failure goes straight to stderr, once what was logged is written.
+/// Any other command's failure goes straight to stderr, once what was logged is written. The log's
+/// stderr takes nothing until the flush has begun, so a failure said before the flush would see
+/// nothing written.
 #[test]
 fn another_commands_failure_goes_straight_to_stderr_after_the_log() {
-    let gate = Gate::opened();
-    let log = Logger::start(gate.clone(), 8).unwrap();
+    let gate = Gate::default();
+    let log = Logger::start(gate.clone(), 1).unwrap();
     let mut stderr = Seeing {
         log: gate.clone(),
         log_by_then: None,
         said: Vec::new(),
     };
-    let code = on_a_runtime_ending(
-        async {
-            log.log("logged");
-            Err(CliError::GitHubToken)
-        },
-        Ending {
-            log: Some(&log),
-            flush_timeout: PATIENCE,
-            failure: FailureTo::Stderr,
-            stderr: &mut stderr,
-        },
-    );
+    let (dropped_one, has_dropped_one) = mpsc::channel();
+    let (watched, opener) = (&log, gate.clone());
+    let code = std::thread::scope(|scope| {
+        // Opens the gate once a flush has taken the count of the line dropped below.
+        scope.spawn(move || {
+            has_dropped_one.recv().unwrap();
+            let started = Instant::now();
+            while watched.drops_waiting() > 0 {
+                assert!(started.elapsed() < PATIENCE, "no flush began");
+                std::thread::yield_now();
+            }
+            opener.open();
+        });
+        on_a_runtime_ending(
+            async {
+                log.log("held");
+                gate.wait_for_a_write();
+                log.log("queued");
+                log.log("lost");
+                dropped_one.send(()).unwrap();
+                Err(CliError::GitHubToken)
+            },
+            Ending {
+                log: Some(&log),
+                flush_timeout: PATIENCE,
+                failure: FailureTo::Stderr,
+                stderr: &mut stderr,
+            },
+        )
+    });
     assert_eq!(code, EXIT_COULD_NOT_RUN);
+    let logged = [
+        "landfall-server: held",
+        "landfall-server: queued",
+        "landfall-server: 1 more log lines were not written, as stderr was not taking them",
+    ];
     assert_eq!(
-        stderr.log_by_then,
-        Some(vec!["landfall-server: logged".to_owned()])
+        stderr.log_by_then.unwrap(),
+        logged,
+        "said before the log was written"
     );
     assert_eq!(
         String::from_utf8(stderr.said).unwrap(),
         format!("{FAILURE}\n")
     );
-    assert_eq!(gate.lines(), ["landfall-server: logged"]);
+    assert_eq!(gate.lines(), logged);
 }

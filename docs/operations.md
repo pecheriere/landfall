@@ -66,7 +66,9 @@ are here alone.
 A panic while serving goes to the same log, as `thread '<name>' panicked at <file:line:column>:
 <message>`. `RUST_BACKTRACE` is read as Rust's own panic message reads it: with `1`, the frames of
 the code that panicked follow, one `backtrace: <n>: <function> at <file:line:column>` line each, and
-with `full`, every frame. If `serve` fails, it says why as the last line of this log. Any other command
+with `full`, every frame. Frames with no symbol are left out. Release binaries are stripped, so
+from one the backtrace is the single line `backtrace: it has no symbols, as in a stripped build`, and
+only a build of your own with symbols names frames. If `serve` fails, it says why as the last line of this log. Any other command
 says why straight on stderr, waiting for it as long as it takes.
 
 So when nothing deploys, look there first. The whole story is in the audit log, which

@@ -55,9 +55,17 @@ pub(crate) fn log_panics() {
     }));
 }
 
+/// What a backtrace says when none of its frames has a symbol.
+const NO_SYMBOLS: &str = "it has no symbols, as in a stripped build";
+
+/// What a frame with no symbol is named: on Linux, and on macOS the nearest symbol a stripped
+/// binary keeps, which says nothing either.
+const UNSYMBOLISED: [&str; 2] = ["<unknown>", "__mh_execute_header"];
+
 /// A backtrace as [`Backtrace`] writes it, one frame a line with where it is, and with
 /// [`Style::Short`] only the frames between the panic machinery and the start of the thread, as
-/// the default hook shows them.
+/// the default hook shows them. Frames with no symbol are left out, and if that is all of them, as
+/// in a release build, which is stripped, it says only [`NO_SYMBOLS`].
 fn frames(backtrace: &str, style: Style) -> Vec<String> {
     let mut frames: Vec<String> = Vec::new();
     for line in backtrace.lines().map(str::trim) {
@@ -83,6 +91,16 @@ fn frames(backtrace: &str, style: Style) -> Vec<String> {
         {
             frames.truncate(begin);
         }
+    }
+    let any = !frames.is_empty();
+    frames.retain(|frame| {
+        let name = frame
+            .split_once(": ")
+            .map_or(frame.as_str(), |(_, name)| name);
+        !UNSYMBOLISED.contains(&name)
+    });
+    if any && frames.is_empty() {
+        frames.push(NO_SYMBOLS.to_owned());
     }
     frames
 }

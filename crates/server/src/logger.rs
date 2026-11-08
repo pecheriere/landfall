@@ -99,6 +99,12 @@ impl Logger {
         }
     }
 
+    /// How many dropped lines wait to be said: a flush takes them, so a test can tell when one began.
+    #[cfg(test)]
+    pub(crate) fn drops_waiting(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     /// Waits up to `limit` for everything queued so far to be written, with the count of what was
     /// dropped since. True if it was. This blocks its thread, so it is for once the runtime is
     /// gone, never for a runtime's thread.
