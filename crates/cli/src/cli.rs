@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::api_client::{ApiClient, ApiError};
 use crate::display::safe;
+use crate::read::{self, ReadCommand};
 use crate::settings::{self, Env, ProcessEnv, SettingsError, SystemFiles};
 use crate::{host, verify, whoami};
 
@@ -38,7 +39,7 @@ Environment:
 
 /// The exit statuses of the commands that call the controller's API, and where they find
 /// it, shown in their `--help`.
-const API_EXIT_STATUS: &str = "\
+pub(crate) const API_EXIT_STATUS: &str = "\
 Exit status:
   0  done
   1  the controller refused: its problem code says why
@@ -91,6 +92,9 @@ pub enum Command {
     /// Who the controller takes this token for, and what it may do to each deployment.
     #[command(after_help = API_EXIT_STATUS)]
     Whoami(ApiArgs),
+    /// A command that reads the controller's state.
+    #[command(flatten)]
+    Read(ReadCommand),
     /// Install an agent on a host, over SSH.
     Host {
         /// What to do.
@@ -124,7 +128,7 @@ pub enum CliError {
 }
 
 impl CliError {
-    fn exit_code(&self) -> u8 {
+    pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Self::Verify(error) => error.exit_code(),
             Self::Host(error) => error.exit_code(),
@@ -176,15 +180,24 @@ fn run_command(cli: Cli, env: &dyn Env, out: &mut dyn Write) -> Result<(), CliEr
             writeln!(out).map_err(CliError::Output)?;
         }
         Command::Whoami(args) => {
-            let settings = settings::resolve(&args, env, &SystemFiles)?;
-            let client = ApiClient::new(&settings)?;
-            whoami::run(&runtime, &client, args.json, out)?;
+            whoami::run(&runtime, &client(&args, env)?, args.json, out)?;
+        }
+        Command::Read(command) => {
+            let args = command.api();
+            let client = client(args, env)?;
+            runtime.block_on(read::run_with(&command, &client, out, args.json))?;
         }
         Command::Host { command } => {
             host::run(command, &runtime, out)?;
         }
     }
     Ok(())
+}
+
+/// A client for the controller `args` and `env` name, with the token they give.
+fn client(args: &ApiArgs, env: &dyn Env) -> Result<ApiClient, CliError> {
+    let settings = settings::resolve(args, env, &SystemFiles)?;
+    Ok(ApiClient::new(&settings)?)
 }
 
 /// Displays an error and its sources as `error: source: source`.

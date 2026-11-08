@@ -11,6 +11,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use super::{Chain, Cli, run, run_with};
+use crate::read::tests::{CALLS, Call};
 use crate::settings::Env;
 
 #[test]
@@ -48,7 +49,7 @@ fn host_install_help() -> String {
 }
 
 #[test]
-fn help_documents_the_exit_statuses() {
+fn host_install_help_documents_the_exit_statuses() {
     let help = host_install_help();
     for line in [
         "0  the agent is installed",
@@ -327,4 +328,70 @@ fn whoami_json_prints_the_body_as_received() {
     let out = String::from_utf8(out).unwrap();
     assert!(out.contains("\"new\": \"\\u009b\""), "{out}");
     assert!(out.contains("\"via\": \"teleport\""), "{out}");
+}
+
+fn help_of(name: &str) -> String {
+    let mut command = Cli::command();
+    command
+        .find_subcommand_mut(name)
+        .unwrap_or_else(|| panic!("no command {name}"))
+        .render_long_help()
+        .to_string()
+}
+
+/// Every API command's `--help` gives the exit statuses from the Rulings, and `status` says
+/// how far it pages.
+#[test]
+fn help_documents_the_exit_statuses() {
+    for name in [
+        "whoami",
+        "status",
+        "history",
+        "release",
+        "releases",
+        "why",
+        "hosts",
+        "audit",
+        "approvals",
+    ] {
+        let help = help_of(name);
+        for line in [
+            "0  done",
+            "1  the controller refused",
+            "2  could not ask",
+            "LANDFALL_TOKEN",
+            "--json",
+        ] {
+            assert!(
+                help.contains(line),
+                "{name}: {line:?} missing from:\n{help}"
+            );
+        }
+    }
+    let help = help_of("status");
+    assert!(help.contains("1,000 deployments or 20 pages"), "{help}");
+}
+
+/// Each call a command makes is an operation of the checked-in document, with that method.
+#[test]
+fn every_cli_call_is_in_the_openapi_document() {
+    let document: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../docs/api/openapi.json")).unwrap();
+    let whoami: &[Call] = &[("GET", "/api/v1/me", "/api/v1/me")];
+    let calls = CALLS
+        .iter()
+        .map(|(line, calls)| (*line, *calls))
+        .chain([("whoami", whoami)]);
+    let mut seen = 0;
+    for (line, calls) in calls {
+        for (method, _, template) in calls {
+            let operation = &document["paths"][template][method.to_ascii_lowercase()];
+            assert!(
+                operation["operationId"].is_string(),
+                "{line}: {method} {template} is not in docs/api/openapi.json"
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen >= 12, "{seen}");
 }

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod display;
 pub mod host;
 pub mod project;
+pub mod read;
 pub mod settings;
 pub mod verify;
 mod whoami;

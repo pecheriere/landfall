@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use landfall_api::{Problem, ProblemCode};
 use landfall_core::controller_url::ControllerUrl;
+use landfall_core::ids::DeploymentId;
 use landfall_core::protocol::PROBLEM_CONTENT_TYPE;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, redirect};
@@ -153,6 +154,31 @@ impl ApiClient {
             _ => server,
         }
     }
+}
+
+/// `text` as one segment of a path: every byte percent-encoded but the unreserved ones,
+/// ASCII letters and digits, `-`, `.`, `_` and `~`, so that nothing in it, a `/`, `?`, `#` or
+/// `%` included, is read as part of the path's structure.
+pub(crate) fn segment(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0xf)]));
+        }
+    }
+    out
+}
+
+/// `/api/v1/deployments/{name}/{stage}` for `deployment`. Its grammar is two labels around
+/// one `/`, so each part between slashes is a segment.
+pub(crate) fn deployment_path(deployment: &DeploymentId) -> String {
+    let parts: Vec<String> = deployment.as_ref().split('/').map(segment).collect();
+    format!("/api/v1/deployments/{}", parts.join("/"))
 }
 
 /// Whether the answer says it is the API's problem document.

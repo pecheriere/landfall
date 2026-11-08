@@ -110,10 +110,13 @@ passkey approvals. Agents drive it through a typed API. Design:
   to it: flags, then the environment, then `cli.toml`; the token never in argv, a token file
   regular, not a link, owned by the user and theirs alone), `api_client` (`/api/v1` with the token: no
   proxy from the environment, no redirect followed, bodies capped, `ApiError` and its exit
-  status), `display` (`safe` and `write_json`, which escape controls, bidi and invisible
-  characters in whatever the controller sent before a terminal sees it), `whoami` (`landfall
-  whoami`), `verify` (`landfall verify`), `access` (the trust root's cache and the
-  operator's token), `project` (what landfall trusts about its own releases: its
+  status, and `segment`, the one way a value goes into a path), `display` (`safe` and `write_json`,
+  which escape controls, bidi and invisible characters in whatever the controller sent before a
+  terminal sees it), `whoami` (`landfall whoami`), `read` (`status`, `history`, `release`,
+  `releases`, `why`, `hosts`, `audit` and `approvals`, over the `Api` trait, used generically so
+  tests can use a fake; `status` pages within 1,000 deployments or 20 pages, the others make at
+  most three calls; `render`, each view for a person, every server string escaped), `verify`
+  (`landfall verify`), `access` (the trust root's cache and the operator's token), `project` (what landfall trusts about its own releases: its
   repository, ids and workflow as constants, and `assets/release-signers`, read by the
   same rule as `release_preflight.py`, whose test keeps the keys in the two test tables
   equal), `agent_release` (the names of an agent's files, and `AgentSource`, which

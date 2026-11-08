@@ -13,7 +13,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::{ApiClient, ApiError, BODY_CAP};
+use super::{ApiClient, ApiError, BODY_CAP, deployment_path, segment};
 use crate::cli::ApiArgs;
 use crate::settings::{Env, Files, Settings, TokenFileError, resolve};
 
@@ -496,4 +496,33 @@ async fn proxy_child() {
         .await
         .unwrap();
     assert_eq!(answer, json!({"direct": true}));
+}
+
+#[test]
+fn segments_are_percent_encoded() {
+    assert_eq!(segment("v1.2.3-rc.1_x~y"), "v1.2.3-rc.1_x~y");
+    assert_eq!(
+        segment("release/../v1?x#y%41 +"),
+        "release%2F..%2Fv1%3Fx%23y%2541%20%2B"
+    );
+    assert_eq!(segment("é"), "%C3%A9");
+    assert_eq!(
+        deployment_path(&"app/prod".parse().unwrap()),
+        "/api/v1/deployments/app/prod"
+    );
+
+    // The encoded tag stays one segment of the URL sent: nothing in it is a separator.
+    let settings = settings("https://landfall.example.com", None);
+    let path = format!(
+        "{}/releases/{}",
+        deployment_path(&"app/prod".parse().unwrap()),
+        segment("release/../v1?x#y%41")
+    );
+    let url = settings.controller.join(&path);
+    assert_eq!(
+        url.path(),
+        "/api/v1/deployments/app/prod/releases/release%2F..%2Fv1%3Fx%23y%2541"
+    );
+    assert_eq!(url.query(), None);
+    assert_eq!(url.fragment(), None);
 }
