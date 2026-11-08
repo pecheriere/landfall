@@ -29,7 +29,6 @@ _loader.exec_module(release_tag)
 REPO = "owner/landfall"
 SHA = "c" * 40
 OTHER_SHA = "d" * 40
-PREVIOUS_SHA = "e" * 40
 VERSION = "1.2.3"
 TAG = "v1.2.3"
 PREVIOUS = "v1.2.2"
@@ -56,7 +55,6 @@ TAG_LIST = (
 LOG = ("git", "log", "--format=%H %G? %an %s", "--stat", f"{PREVIOUS}..{SHA}")
 SENSITIVE = (SIGNERS, ".github/", "scripts/release-tag", "Cargo.toml", "Cargo.lock")
 DIFF = ("git", "diff", "--no-ext-diff", "--no-color", PREVIOUS, SHA, "--", *SENSITIVE)
-SIGNERS_SAME = ("git", "diff", "--quiet", PREVIOUS, SHA, "--", SIGNERS)
 
 
 def manifest(version: str) -> str:
@@ -128,14 +126,8 @@ class FakeRun:
             ("git", "rev-parse", "--quiet", "--verify", f"refs/tags/{TAG}"): done(returncode=1),
             ("git", "ls-remote", "--tags", "origin", f"refs/tags/{TAG}"): done(),
             TAG_LIST: done(f"{PREVIOUS} tag\nv1.2.1 tag\n"),
-            ("git", "rev-parse", "--verify", f"refs/tags/{PREVIOUS}^{{commit}}"): done(
-                f"{PREVIOUS_SHA}\n"
-            ),
-            ("git", "show", f"{PREVIOUS_SHA}:{SIGNERS}"): done(f"{KEY}\n"),
-            ("git", "show", f"{PREVIOUS}:{SIGNERS}"): done(f"{KEY}\n"),
             LOG: done(f"{SHA} G Owner bump to 1.2.3\n Cargo.toml | 2 +-\n"),
             DIFF: done("diff --git a/Cargo.toml b/Cargo.toml\n"),
-            SIGNERS_SAME: done(),
             TAG_ARGS: done(),
             ("git", "rev-parse", "--verify", f"refs/tags/{TAG}^{{commit}}"): done(f"{SHA}\n"),
             ("git", "tag", "--delete", TAG): done(),
@@ -166,6 +158,16 @@ class FakeRun:
             message = f"unexpected command: {call}"
             raise AssertionError(message)
         return self.answers[call]
+
+
+def trusted_file(case: unittest.TestCase, text: str, mode: int = 0o600) -> Path:
+    """Write an owner's trusted signers file for one test, and return its path."""
+    directory = tempfile.TemporaryDirectory()
+    case.addCleanup(directory.cleanup)
+    path = Path(directory.name) / "release-signers"
+    path.write_text(text, encoding="utf-8")
+    path.chmod(mode)
+    return path
 
 
 class FakeTerminal:
@@ -207,10 +209,11 @@ class FlowTests(unittest.TestCase):
         """Answer as a clean checkout, ready to tag, with the owner at a terminal."""
         self.fake = FakeRun()
         self.owner = FakeTerminal(self.fake)
+        self.trusted = trusted_file(self, f"# mine\n{KEY}\n")
 
     def release(self, version: str = VERSION, commit: str = SHA, **options: object) -> str:
         """Run the whole command against the fakes."""
-        request = release_tag.Request(version, commit, **options)
+        request = release_tag.Request(version, commit, self.trusted, **options)
         return release_tag.release_tag(request, self.fake, self.owner.terminal())
 
     def refused(self, reason: str, version: str = VERSION, **options: object) -> None:
@@ -361,6 +364,35 @@ class FlowTests(unittest.TestCase):
         self.fake.jobs(jobs)
         self.refused("built nothing")
 
+    def test_what_git_prints_is_shown_with_its_controls_escaped(self) -> None:
+        """A commit subject can't move the cursor or erase what was shown."""
+        self.fake.answers[LOG] = done(f"{SHA} G Owner tidy\x1b[1A\x1b[2K\u202e\n")
+        self.release()
+        shown = self.owner.shown()
+        self.assertIn("tidy\\x1b[1A\\x1b[2K\\u202e", shown)
+        self.assertNotIn("\x1b", shown)
+
+    def test_a_trusted_file_that_isnt_the_owners_alone_is_refused_before_anything_runs(
+        self,
+    ) -> None:
+        """Missing, writable by others, a link, empty, or holding something else."""
+        good = trusted_file(self, f"{KEY}\n")
+        link = good.with_name("link")
+        link.symlink_to(good)
+        for path, reason in (
+            (good.with_name("absent"), "no trusted signers file"),
+            (trusted_file(self, f"{KEY}\n", 0o620), "written by others"),
+            (trusted_file(self, f"{KEY}\n", 0o602), "written by others"),
+            (link, "a link"),
+            (trusted_file(self, "# none\n\n"), "holds no key"),
+            (trusted_file(self, f"{KEY} comment\n"), "isn't ssh-ed25519"),
+        ):
+            with self.subTest(reason=reason, path=path.name):
+                self.setUp()
+                self.trusted = path
+                self.refused(reason)
+                self.assertEqual(self.fake.calls, [])
+
     def test_a_tag_that_fails_its_check_is_deleted(self) -> None:
         """Signed by a key preflight would refuse: deleted here, before it can spend a number."""
         self.fake.verified[f"refs/tags/{TAG}"] = done(returncode=1, stderr="no principal matched")
@@ -374,69 +406,88 @@ class FlowTests(unittest.TestCase):
         self.assertNotIn(PUSH_ARGS, self.fake.calls)
 
 
-class SignersChangeTests(unittest.TestCase):
-    """A change to who may sign releases, which is never signed in passing."""
+class TrustTests(unittest.TestCase):
+    """The repository's signers against the owner's own, and tags no trusted key signed."""
 
     def setUp(self) -> None:
-        """Answer as a commit that adds a key since the last release."""
+        """Answer as a commit that adds a key the owner doesn't hold."""
         self.fake = FakeRun()
         self.owner = FakeTerminal(self.fake)
+        self.trusted = trusted_file(self, f"{KEY}\n")
         self.fake.answers[("git", "show", f"{SHA}:{SIGNERS}")] = done(f"{KEY}\n{NEW_KEY}\n")
-        self.fake.answers[SIGNERS_SAME] = done(returncode=1)
 
-    def release(self, **options: object) -> str:
+    def release(self) -> str:
         """Run the whole command against the fakes."""
-        request = release_tag.Request(VERSION, SHA, **options)
+        request = release_tag.Request(VERSION, SHA, self.trusted)
         return release_tag.release_tag(request, self.fake, self.owner.terminal())
 
-    def test_an_added_key_is_refused_without_the_flag(self) -> None:
+    def test_keys_the_owner_doesnt_trust_are_refused_with_both_sets_shown(self) -> None:
         """Adding a key keeps the owner's signature valid, so only this check would notice."""
-        with self.assertRaisesRegex(release_tag.RefusedError, "--signers-change"):
+        with self.assertRaisesRegex(release_tag.RefusedError, "update your trusted signers"):
             self.release()
         self.assertNotIn(TAG_ARGS, self.fake.calls)
         self.assertIsNone(self.owner.calls_when_asked)
-
-    def test_with_the_flag_both_sets_of_fingerprints_are_shown_before_asking(self) -> None:
-        """Old and new, to compare with SECURITY.md and a copy got some other way."""
-        self.release(signers_change=True)
         shown = self.owner.shown()
-        old = release_tag.fingerprint(KEY)
-        new = release_tag.fingerprint(NEW_KEY)
-        self.assertIn(f"Signers at {PREVIOUS}: {old}", shown)
-        self.assertIn(f"Signers at {SHA}: {old}, {new}", shown)
-        self.assertIn("SECURITY.md", shown)
-        self.assertEqual(self.owner.events[-2][0], "ask")
-        self.assertIn(TAG_ARGS, self.fake.calls)
+        self.assertIn(release_tag.fingerprint(NEW_KEY), shown)
+        self.assertEqual(shown.count(release_tag.fingerprint(KEY)), 2)
 
-    def test_with_no_signed_release_behind_it_everything_counts_as_a_change(self) -> None:
-        """An unsigned or lightweight `v*` tag can't stand in for the last release."""
-        listed = f"v1.2.9 commit\nv1.2.8 tag\n{PREVIOUS} tag\n"
-        self.fake.answers[TAG_LIST] = done(listed)
-        self.fake.answers[("git", "rev-parse", "--verify", "refs/tags/v1.2.8^{commit}")] = done(
-            f"{OTHER_SHA}\n"
-        )
-        self.fake.answers[("git", "show", f"{OTHER_SHA}:{SIGNERS}")] = done(f"{KEY}\n")
+    def test_a_removed_key_is_refused_too(self) -> None:
+        """Exactly the trusted set, either way."""
+        self.trusted = trusted_file(self, f"{KEY}\n{NEW_KEY}\n")
+        self.fake.answers[("git", "show", f"{SHA}:{SIGNERS}")] = done(f"{KEY}\n")
+        with self.assertRaisesRegex(release_tag.RefusedError, "aren't the keys you trust"):
+            self.release()
+
+    def test_tags_above_the_last_trusted_release_are_named(self) -> None:
+        """A lightweight one, and one no trusted key signed, whatever their numbers."""
+        self.fake.answers[("git", "show", f"{SHA}:{SIGNERS}")] = done(f"{KEY}\n")
+        self.fake.answers[TAG_LIST] = done(f"v1.2.9 commit\nv1.2.8\x1b[2K tag\n{PREVIOUS} tag\n")
+        self.release()
+        shown = self.owner.shown()
+        self.assertIn("WARNING", shown)
+        self.assertIn("v1.2.9, v1.2.8\\x1b[2K", shown)
+        self.assertIn(f"Since {PREVIOUS}", shown)
+
+    def test_with_no_trusted_release_behind_it_the_signers_are_shown_whole(self) -> None:
+        """And `.github/` and `Cargo.lock` by name only, as whole they can't be read."""
+        self.fake.answers[("git", "show", f"{SHA}:{SIGNERS}")] = done(f"{KEY}\n")
         self.fake.verified[f"refs/tags/{PREVIOUS}"] = done(returncode=1)
         self.fake.answers[("git", "log", "--format=%H %G? %an %s", "--stat", SHA)] = done("all\n")
-        everything = (
-            "git",
-            "diff",
-            "--no-ext-diff",
-            "--no-color",
-            release_tag.EMPTY_TREE,
-            SHA,
-            "--",
-            *SENSITIVE,
-        )
-        self.fake.answers[everything] = done("")
-        with self.assertRaisesRegex(release_tag.RefusedError, "changed since the start"):
-            self.release()
-        self.assertIn("no earlier release tag is signed", self.owner.shown())
-        self.assertNotIn(("git", "show", "refs/tags/v1.2.9^{commit}"), self.fake.calls)
+        diff = ("git", "diff", "--no-ext-diff", "--no-color")
+        listed = (*diff, "--stat", release_tag.EMPTY_TREE, SHA, "--", ".github/", "Cargo.lock")
+        self.fake.answers[listed] = done(" .github/workflows/release.yml | 400 +++\n")
+        whole = (*diff, release_tag.EMPTY_TREE, SHA, "--", "scripts/release-tag", "Cargo.toml")
+        self.fake.answers[whole] = done("+[workspace]\n")
+        self.release()
+        shown = self.owner.shown()
+        self.assertIn("no release behind it is signed by a key you trust", shown)
+        self.assertIn(release_tag.fingerprint(KEY), shown)
+        self.assertIn("release.yml | 400", shown)
+        self.assertIn("+[workspace]", shown)
+        self.assertIn(TAG_ARGS, self.fake.calls)
 
 
 class ReadingTests(unittest.TestCase):
     """The pieces that read what git and GitHub say."""
+
+    def test_controls_are_escaped_and_text_is_kept(self) -> None:
+        """C0 but newline and tab, DEL, C1 and bidi controls; anything else as it is."""
+        self.assertEqual(
+            release_tag.print_safe("a\x1b[2Kb\x07\x7f\x9b\u202e\u2066c\n\td é"),
+            "a\\x1b[2Kb\\x07\\x7f\\x9b\\u202e\\u2066c\n\td é",
+        )
+
+    def test_the_trusted_file_defaults_under_the_owners_config(self) -> None:
+        """`$XDG_CONFIG_HOME` if set, else `~/.config`."""
+        home = Path("/home/owner")
+        self.assertEqual(
+            release_tag.default_trusted_signers({}, home),
+            home / ".config" / "landfall" / "release-signers",
+        )
+        self.assertEqual(
+            release_tag.default_trusted_signers({"XDG_CONFIG_HOME": "/cfg"}, home),
+            Path("/cfg/landfall/release-signers"),
+        )
 
     def test_origin_urls(self) -> None:
         """HTTPS and SSH, with or without `.git`; nothing else."""
@@ -540,8 +591,8 @@ class SignedTagTests(unittest.TestCase):
             env=self.env,
         )
 
-    def sign_with(self, key: Path) -> None:
-        """Make the tag as the script does, signed by this key."""
+    def sign_with(self, key: Path, tag: str = TAG) -> None:
+        """Make a tag as the script does, signed by this key, at `self.sha`."""
         self.git(
             "-c",
             "gpg.format=ssh",
@@ -550,8 +601,8 @@ class SignedTagTests(unittest.TestCase):
             "tag",
             "--sign",
             "--message",
-            TAG,
-            TAG,
+            tag,
+            tag,
             self.sha,
         )
 
@@ -569,38 +620,59 @@ class SignedTagTests(unittest.TestCase):
                 self.in_repository, TAG, self.sha, [Keys.public(self.keys.first)]
             )
 
-    def commit_with_signers(self, signers: str, parent: str | None = None) -> str:
+    def commit_with_signers(
+        self, signers: str, parent: str | None = None, message: str = "a commit"
+    ) -> str:
         """Make a commit whose only file is the signers file, and return it."""
         blob = self.git("hash-object", "-w", "--stdin", stdin=signers).strip()
         tree = self.git("mktree", stdin=f"100644 blob {blob}\trelease-signers\n").strip()
         for name in ("assets", "cli", "crates"):
             tree = self.git("mktree", stdin=f"040000 tree {tree}\t{name}\n").strip()
         parents = ["-p", parent] if parent else []
-        return self.git("commit-tree", tree, *parents, "-m", "a commit").strip()
+        return self.git("commit-tree", tree, *parents, "-m", message).strip()
 
-    def test_the_previous_release_is_the_highest_tag_a_release_key_signed(self) -> None:
-        """Not a lightweight tag, nor one another key signed, whatever its number."""
-        first = f"{Keys.public(self.keys.first)}\n"
-        released = self.commit_with_signers(first)
-        head = self.commit_with_signers(first, parent=released)
+    def test_a_key_added_in_the_repository_cant_certify_a_tag_or_hide_itself(self) -> None:
+        """The reviewers' case, with real git and real keys.
+
+        A commit adds the stranger's key to the signers file, and the stranger signs a higher tag
+        at it, so by the repository's own file that tag looks like the last release. The helper
+        picks the genuine older tag, names the stranger's, shows the commit that added the key and
+        the line it added, and refuses because the keys aren't the ones the owner trusts.
+        """
+        first = Keys.public(self.keys.first)
+        stranger = Keys.public(self.keys.stranger)
+        released = self.commit_with_signers(f"{first}\n", message="release 1.2.2")
+        added = self.commit_with_signers(f"{first}\n{stranger}\n", released, "tidy the assets")
+        head = self.commit_with_signers(f"{first}\n{stranger}\n", added, "bump to 1.3.0")
         self.sha = released
-        self.sign_with(self.keys.first)
-        self.git("tag", "v1.2.9", released)
-        self.git(
-            "-c",
-            "gpg.format=ssh",
-            "-c",
-            f"user.signingkey={self.keys.stranger}",
-            "tag",
-            "--sign",
-            "--message",
-            "v1.2.8",
-            "v1.2.8",
-            released,
+        self.sign_with(self.keys.first, "v1.2.2")
+        self.sha = added
+        self.sign_with(self.keys.stranger, "v1.2.9")
+
+        previous, unverified = release_tag.previous_release(self.in_repository, head, [first])
+        self.assertEqual((previous, unverified), ("v1.2.2", ["v1.2.9"]))
+
+        said: list[str] = []
+        state = release_tag.Ready(
+            "v1.3.0", head, "42", [first, stranger], [first], previous, unverified
         )
-        self.assertEqual(release_tag.previous_release(self.in_repository, head), TAG)
-        self.git("tag", "--delete", TAG)
-        self.assertIsNone(release_tag.previous_release(self.in_repository, head))
+        with self.assertRaisesRegex(release_tag.RefusedError, "aren't the keys you trust"):
+            release_tag.show(state, self.in_repository, said.append)
+        shown = "\n".join(said)
+        self.assertIn("v1.2.9", shown.split("\n")[1])
+        self.assertIn("tidy the assets", shown)
+        self.assertIn(f"+{stranger}", shown)
+        self.assertIn(release_tag.fingerprint(stranger), shown)
+
+    def test_with_no_trusted_tag_there_is_no_previous_release(self) -> None:
+        """A tag only the stranger signed is named, and doesn't count."""
+        first = Keys.public(self.keys.first)
+        head = self.commit_with_signers(f"{first}\n")
+        self.sha = head
+        self.sign_with(self.keys.stranger, "v1.2.9")
+        self.git("tag", "v1.3.0", head)
+        found = release_tag.previous_release(self.in_repository, head, [first])
+        self.assertEqual(found, (None, ["v1.3.0", "v1.2.9"]))
 
     def test_fingerprints_are_the_ones_ssh_keygen_shows(self) -> None:
         """What the owner compares with SECURITY.md has to be in the same form."""
