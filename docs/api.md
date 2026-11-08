@@ -210,7 +210,10 @@ again from its new commit, and two deployments of one repository share one list.
   tick's verifications are done. With the controller's `GITHUB_TOKEN` a tick makes at most 12
   requests, and only while GitHub reports at least 1,000 requests left; without one, at most 3,
   one list, and only while it reports at least 30. A list needs at most 3 requests, and is
-  stored only once all of them came back. The first 403 or 429 stops it until the next tick.
+  stored only once all of them came back. Once GitHub reports fewer requests left than that, or
+  answers 403 or 429, no commits are asked for until its rate-limit window ends
+  (`x-ratelimit-reset` or `Retry-After`, believed for a day at most), or for an hour when it
+  doesn't say.
   Only releases first recorded after the controller was upgraded to this version are compared:
   nothing is fetched for the history it already had.
 

@@ -12,6 +12,8 @@
 //! writes no audit row, since nothing is decided here. A list whose pages don't hold
 //! what GitHub's total says they should is a failure, not a list. The whole pass has
 //! [`COMMITS_DEADLINE`], and none while GitHub has the watcher waiting for its limit.
+//! Below the floor, or refused, commits wait for GitHub's window to end, across ticks:
+//! until its `x-ratelimit-reset`, or an hour when it doesn't say.
 
 use std::time::Duration;
 
@@ -20,10 +22,12 @@ use landfall_core::ids::{CommitSha, ReleaseTag, TagPattern};
 use landfall_core::text::quoted;
 use landfall_origin::fetch::{
     COMPARE_PER_PAGE, ComparePage, CompareStatus, FetchError, KEPT_COMMITS, ListedCommit,
+    RateLimitReset,
 };
 use landfall_origin::release::ReleaseError;
 use semver::Version;
 
+use super::backoff::WatcherState;
 use super::{ReleaseSource, describe};
 use crate::logger::log;
 use crate::store::{NewRange, RangeState, Store, WantedRange};
@@ -146,10 +150,48 @@ impl<X> SettledByVersion<X> {
     }
 }
 
+/// What one tick's commits ask of GitHub, and what they learn of its limit.
+struct Asking<'a> {
+    budget: GitHubBudget,
+    state: &'a WatcherState,
+    now: i64,
+}
+
+impl Asking<'_> {
+    /// Whether a page that left GitHub `rate_remaining` requests is below the floor; if
+    /// so, commits wait for `rate_reset`, or an hour without one.
+    fn is_low(&self, rate_remaining: Option<u32>, rate_reset: Option<i64>) -> bool {
+        let low = self.budget.is_low(rate_remaining);
+        if low {
+            let until = rate_reset.unwrap_or(self.now.saturating_add(COMMIT_RETRY_SECS));
+            self.state.pause_commits(until, self.now);
+        }
+        low
+    }
+
+    /// Commits wait as long as GitHub's refusal says, or an hour when it doesn't.
+    fn refused(&self, error: &ReleaseError) {
+        let until = match error.fetch_error() {
+            Some(FetchError::RateLimited {
+                reset: RateLimitReset::At(at),
+                ..
+            }) => at.as_second(),
+            Some(FetchError::RateLimited {
+                reset: RateLimitReset::After(seconds),
+                ..
+            }) => self
+                .now
+                .saturating_add(i64::try_from(*seconds).unwrap_or(i64::MAX)),
+            _ => self.now.saturating_add(COMMIT_RETRY_SECS),
+        };
+        self.state.pause_commits(until, self.now);
+    }
+}
+
 /// What came of asking for one page.
 enum Asked {
     Page(ComparePage),
-    /// GitHub refused for its limit: nothing more this tick.
+    /// GitHub refused for its limit: nothing more until it lifts.
     Stop,
     Failed(ReleaseError),
 }
@@ -187,15 +229,18 @@ async fn ask<S: ReleaseSource>(
     source: &S,
     range: &WantedRange,
     page: u32,
-    budget: &mut GitHubBudget,
+    asking: &mut Asking<'_>,
 ) -> Asked {
-    budget.spend();
+    asking.budget.spend();
     match source
         .compare_page(&range.deployment, &range.base, &range.head, page)
         .await
     {
         Ok(answer) => Asked::Page(answer),
-        Err(error) if is_refusal_for_limit(&error) => Asked::Stop,
+        Err(error) if is_refusal_for_limit(&error) => {
+            asking.refused(&error);
+            Asked::Stop
+        }
         Err(error) => Asked::Failed(error),
     }
 }
@@ -212,22 +257,27 @@ fn whole(state: RangeState) -> Fetched {
 async fn fetch_range<S: ReleaseSource>(
     source: &S,
     range: &WantedRange,
-    budget: &mut GitHubBudget,
+    asking: &mut Asking<'_>,
 ) -> (Fetched, bool) {
-    let (status, total, first, rate_remaining) = match ask(source, range, 1, budget).await {
-        Asked::Page(ComparePage::Listed {
-            status,
-            total,
-            commits,
-            rate_remaining,
-        }) => (status, total, commits, rate_remaining),
-        Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
-            return (whole(RangeState::TooLarge), budget.is_low(rate_remaining));
-        }
-        Asked::Stop => return (Fetched::Stopped, true),
-        Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
-    };
-    let mut stop = budget.is_low(rate_remaining);
+    let (status, total, first, rate_remaining, rate_reset) =
+        match ask(source, range, 1, asking).await {
+            Asked::Page(ComparePage::Listed {
+                status,
+                total,
+                commits,
+                rate_remaining,
+                rate_reset,
+            }) => (status, total, commits, rate_remaining, rate_reset),
+            Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
+                return (
+                    whole(RangeState::TooLarge),
+                    asking.is_low(rate_remaining, None),
+                );
+            }
+            Asked::Stop => return (Fetched::Stopped, true),
+            Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
+        };
+    let mut stop = asking.is_low(rate_remaining, rate_reset);
     if matches!(status, CompareStatus::Behind | CompareStatus::Diverged) {
         return (whole(RangeState::BaseNotFound), stop);
     }
@@ -245,17 +295,21 @@ async fn fetch_range<S: ReleaseSource>(
         if stop {
             return (Fetched::Stopped, true);
         }
-        match ask(source, range, page, budget).await {
+        match ask(source, range, page, asking).await {
             Asked::Page(ComparePage::Listed {
                 commits,
                 rate_remaining,
+                rate_reset,
                 ..
             }) => {
                 listed.extend(commits);
-                stop = budget.is_low(rate_remaining);
+                stop = asking.is_low(rate_remaining, rate_reset);
             }
             Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
-                return (whole(RangeState::TooLarge), budget.is_low(rate_remaining));
+                return (
+                    whole(RangeState::TooLarge),
+                    asking.is_low(rate_remaining, None),
+                );
             }
             Asked::Stop => return (Fetched::Stopped, true),
             Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
@@ -286,9 +340,19 @@ pub(crate) async fn after_tick<S: ReleaseSource>(
     store: &Store,
     source: &S,
     config: &Config,
+    state: &WatcherState,
     now: i64,
 ) -> usize {
-    let mut budget = GitHubBudget::for_tick(source.has_github_token());
+    // What GitHub said of its limit in an earlier tick still holds: no request is sent
+    // to learn it again.
+    if state.commits_paused(now) {
+        return 0;
+    }
+    let mut asking = Asking {
+        budget: GitHubBudget::for_tick(source.has_github_token()),
+        state,
+        now,
+    };
     let wanted = match store.ranges_wanted(config, config.hash(), now).await {
         Ok(wanted) => wanted,
         Err(error) => {
@@ -298,10 +362,10 @@ pub(crate) async fn after_tick<S: ReleaseSource>(
     };
     let mut stored = 0;
     for range in &wanted {
-        if !budget.covers(REQUESTS_PER_RANGE) {
+        if !asking.budget.covers(REQUESTS_PER_RANGE) {
             break;
         }
-        let (fetched, stop) = fetch_range(source, range, &mut budget).await;
+        let (fetched, stop) = fetch_range(source, range, &mut asking).await;
         let (state, total, commits) = match fetched {
             Fetched::Whole {
                 state,

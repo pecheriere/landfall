@@ -18,6 +18,9 @@ use crate::store::{CommitRange, RangeState, ReleaseDecision, Seen, WantedRange};
 
 pub(super) const T0: i64 = 1_800_000_000;
 
+/// When GitHub's rate-limit window ends, as [`github`] says: ten minutes in.
+pub(super) const RESET: i64 = T0 + 600;
+
 pub(super) fn repo() -> RepoName {
     "example/app".parse().unwrap()
 }
@@ -124,7 +127,14 @@ async fn wanted_tags(h: &Harness, tags: &[&str]) -> Vec<(String, String)> {
 }
 
 pub(super) async fn after(h: &Harness) -> usize {
-    after_tick(&h.store, h.fake.as_ref(), &h.config, h.store.now().unwrap()).await
+    after_tick(
+        &h.store,
+        h.fake.as_ref(),
+        &h.config,
+        &h.state,
+        h.store.now().unwrap(),
+    )
+    .await
 }
 
 pub(super) async fn range(h: &Harness, base: &str, head: &str) -> Option<CommitRange> {
@@ -161,6 +171,7 @@ pub(super) fn github(total: u64, rate: u32) -> CompareAnswer {
             total,
             commits: (first..=last).map(nth).collect(),
             rate_remaining: Some(rate),
+            rate_reset: Some(RESET),
         })
     })
 }
@@ -385,6 +396,7 @@ async fn behind_or_diverged_is_base_not_found() {
                 total: 2,
                 commits: vec![nth(1), nth(2)],
                 rate_remaining: Some(5000),
+                rate_reset: None,
             })
         }),
     );
@@ -432,7 +444,9 @@ async fn a_range_is_never_stored_half_done() {
     assert_eq!(compares(&h), [1]);
     assert_eq!(range_count(&h).await, 0);
 
+    // Once GitHub's window has ended, it is fetched whole.
     answer(&h, github(250, 5000));
+    h.clock.advance(RESET - T0);
     assert_eq!(after(&h).await, 1);
     assert_eq!(compares(&h), [1, 1, 2, 3]);
     let stored = range(&h, "v1.2.0", "v1.3.0").await.unwrap();
@@ -507,7 +521,9 @@ async fn compares_stop_when_the_rate_limit_is_low() {
     assert_eq!(compares(&h), [1]);
     assert!(range(&h, "v1.4.0", "v1.5.0").await.is_some());
 
+    // It goes on once GitHub's window has ended.
     answer(&h, github(5, 4000));
+    h.clock.advance(RESET - T0);
     assert_eq!(after(&h).await, 2);
     assert_eq!(compares(&h), [1, 1, 1]);
     assert!(range(&h, "v1.2.0", "v1.3.0").await.is_some());
@@ -525,8 +541,10 @@ async fn a_bare_403_stops_the_tick() {
         h.fake.compares.lock().unwrap().clear();
         assert_eq!(after(&h).await, 0, "{status}");
         assert_eq!(compares(&h), [1], "{status}");
-        // Nothing is stored, not even as unavailable: the next tick asks again.
+        // Nothing is stored, not even as unavailable: it is asked again once the
+        // hour a refusal without a reset waits for has passed.
         assert_eq!(range_count(&h).await, 0, "{status}");
+        h.clock.advance(3600);
     }
     answer(&h, github(1, 5000));
     assert_eq!(after(&h).await, 2);
@@ -678,7 +696,7 @@ async fn a_configuration_change_does_not_make_old_releases_eligible() {
         .await
         .unwrap();
     assert_eq!(wanted, []);
-    after_tick(&h.store, h.fake.as_ref(), &changed, now).await;
+    after_tick(&h.store, h.fake.as_ref(), &changed, &h.state, now).await;
     assert_eq!(compares(&h), Vec::<u32>::new());
 }
 

@@ -14,7 +14,7 @@ use reqwest::header::HeaderMap;
 use serde::Deserialize;
 
 use super::http::{join, parse};
-use super::{FetchError, Fetcher, RATELIMIT_REMAINING};
+use super::{FetchError, Fetcher, RATELIMIT_REMAINING, RATELIMIT_RESET};
 
 /// Cap on one page of a comparison: its patches can be large, and a page over it is
 /// [`ComparePage::TooLarge`].
@@ -86,6 +86,9 @@ pub enum ComparePage {
         commits: Vec<ListedCommit>,
         /// GitHub's `x-ratelimit-remaining`, if it said.
         rate_remaining: Option<u32>,
+        /// GitHub's `x-ratelimit-reset`, when its window ends, in Unix seconds, if it
+        /// said. Like the rest of the answer it is hostile: whoever acts on it bounds it.
+        rate_reset: Option<i64>,
     },
     /// The page is over [`COMPARE_PAGE_LIMIT`], or GitHub answered 422: the comparison
     /// is too large to list. [`compare_url`] is where to read it.
@@ -146,6 +149,17 @@ fn summary(message: &str) -> String {
 fn rate_remaining(headers: &HeaderMap) -> Option<u32> {
     headers
         .get(RATELIMIT_REMAINING)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// GitHub's end of its rate-limit window, if it is a number of Unix seconds.
+fn rate_reset(headers: &HeaderMap) -> Option<i64> {
+    headers
+        .get(RATELIMIT_RESET)?
         .to_str()
         .ok()?
         .trim()
@@ -235,6 +249,7 @@ impl Fetcher {
             total: body.total_commits,
             commits,
             rate_remaining: rate_remaining(&fetched.headers),
+            rate_reset: rate_reset(&fetched.headers),
         })
     }
 }

@@ -247,6 +247,7 @@ impl ReleaseSource for FileSource {
             total: 0,
             commits: Vec::new(),
             rate_remaining: Some(5000),
+            rate_reset: None,
         }))
     }
 

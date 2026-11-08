@@ -104,6 +104,7 @@ async fn mount_page(server: &MockServer, page: u32, response: ResponseTemplate) 
 fn ok(body: &Value) -> ResponseTemplate {
     ResponseTemplate::new(200)
         .insert_header("x-ratelimit-remaining", "4321")
+        .insert_header("x-ratelimit-reset", "1800003600")
         .set_body_json(body)
 }
 
@@ -154,6 +155,7 @@ async fn compare_page_is_parsed() {
                 author: Some("example-dev".to_owned()),
             }],
             rate_remaining: Some(4321),
+            rate_reset: Some(1_800_003_600),
         }
     );
 }

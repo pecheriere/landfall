@@ -32,6 +32,10 @@ pub struct WatcherState {
     backoffs: Mutex<HashMap<u64, Backoff>>,
     /// Whose turn it is to go first in each repository, as a count of looks.
     turns: Mutex<HashMap<u64, usize>>,
+    /// Until when no commits are asked of GitHub, in Unix seconds: its window's reset,
+    /// once it had fewer requests left than the floor or refused one. Kept across ticks,
+    /// so a new tick's budget doesn't spend a request to learn it again.
+    commits_paused_until: Mutex<i64>,
     pub(super) repo_deadline: Duration,
     /// How long a tick's commits may take.
     pub(super) commits_deadline: Duration,
@@ -69,6 +73,7 @@ impl WatcherState {
         Self {
             backoffs: Mutex::default(),
             turns: Mutex::default(),
+            commits_paused_until: Mutex::new(i64::MIN),
             repo_deadline: REPO_DEADLINE,
             commits_deadline: COMMITS_DEADLINE,
             cooldown_start: i64::try_from(interval.as_secs()).unwrap_or(i64::MAX),
@@ -105,6 +110,29 @@ impl WatcherState {
 
     pub(super) fn succeeded(&self, repo: u64) {
         self.locked().remove(&repo);
+    }
+
+    /// Whether commits wait for GitHub's rate-limit window to end.
+    pub(super) fn commits_paused(&self, now: i64) -> bool {
+        now < *self
+            .commits_paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Commits wait until `until`, as far as a server's word is believable: at least a
+    /// second and at most [`RATE_LIMIT_MAX_SECS`] from `now`. A later pause already set
+    /// stands.
+    pub(super) fn pause_commits(&self, until: i64, now: i64) {
+        let until = until.clamp(
+            now.saturating_add(1),
+            now.saturating_add(RATE_LIMIT_MAX_SECS),
+        );
+        let mut paused = self
+            .commits_paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *paused = (*paused).max(until);
     }
 
     /// The repository waits longer the more often it fails in a row.

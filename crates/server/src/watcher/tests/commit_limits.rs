@@ -5,15 +5,15 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use landfall_origin::fetch::{ComparePage, CompareStatus};
+use landfall_origin::fetch::{ComparePage, CompareStatus, FetchError, Service};
 
 use super::commits::{
-    T0, after, answer, compares, github, harness, nth, range, range_count, settle, sha, wanted,
-    with_token,
+    RESET, T0, after, answer, compares, github, harness, nth, range, range_count, settle, sha,
+    wanted, with_token,
 };
 use super::{
-    HOST, Harness, OTHER, PATCH_RULE, PROD, RateLimitReset, WatcherState, config_text, id,
-    rate_limited, server_error,
+    CompareAnswer, HOST, Harness, OTHER, PATCH_RULE, PROD, RateLimitReset, ReleaseError,
+    WatcherState, config_text, id, rate_limited, server_error,
 };
 use crate::store::RangeState;
 
@@ -113,6 +113,7 @@ async fn a_short_page_is_not_a_list() {
                         .map(nth)
                         .collect(),
                     rate_remaining: Some(5000),
+                    rate_reset: None,
                 })
             }),
         );
@@ -199,4 +200,124 @@ async fn heads_with_a_stored_range_are_not_returned() {
             ("v1.0.500".to_owned(), sha(500).to_string()),
         ]
     );
+}
+
+/// Two releases of `app/prod` wanting a range each, `v1.2.0` to `v1.4.0`.
+async fn three_releases(h: &Harness) {
+    for release in ["v1.2.0", "v1.3.0", "v1.4.0"] {
+        settle(h, PROD, release).await;
+    }
+}
+
+/// GitHub listing one commit with `rate` requests left and the window ending at `reset`.
+fn one_commit(rate: u32, reset: Option<i64>) -> CompareAnswer {
+    Box::new(move |_, _, _| {
+        Ok(ComparePage::Listed {
+            status: CompareStatus::Ahead,
+            total: 1,
+            commits: vec![nth(1)],
+            rate_remaining: Some(rate),
+            rate_reset: reset,
+        })
+    })
+}
+
+#[tokio::test]
+async fn below_the_floor_carries_over_to_the_next_tick() {
+    let h = harness(&config_text(PATCH_RULE)).await;
+    three_releases(&h).await;
+    // Untokened: 29 left is below the floor of 30.
+    answer(&h, github(1, 29));
+    assert_eq!(after(&h).await, 1);
+    assert_eq!(compares(&h), [1]);
+
+    // The next ticks send nothing, though a new tick has a new budget.
+    answer(&h, github(1, 5000));
+    for _ in 0..(RESET - T0) / 300 - 1 {
+        h.clock.advance(300);
+        h.tick().await;
+    }
+    assert_eq!(compares(&h), [1]);
+    assert_eq!(range_count(&h).await, 1);
+
+    // From GitHub's reset on, it goes on.
+    h.clock.advance(RESET - h.store.now().unwrap());
+    h.tick().await;
+    assert_eq!(compares(&h), [1, 1]);
+    assert_eq!(range_count(&h).await, 2);
+}
+
+#[tokio::test]
+async fn below_the_floor_without_a_reset_waits_an_hour() {
+    let h = harness(&config_text(PATCH_RULE)).await;
+    three_releases(&h).await;
+    answer(&h, one_commit(29, None));
+    assert_eq!(after(&h).await, 1);
+
+    answer(&h, one_commit(5000, None));
+    h.clock.advance(3599);
+    assert_eq!(after(&h).await, 0);
+    assert_eq!(compares(&h), [1]);
+    h.clock.advance(1);
+    assert_eq!(after(&h).await, 1);
+    assert_eq!(compares(&h), [1, 1]);
+}
+
+#[tokio::test]
+async fn a_reset_far_off_is_believed_for_a_day_at_most() {
+    let h = harness(&config_text(PATCH_RULE)).await;
+    three_releases(&h).await;
+    answer(&h, one_commit(0, Some(i64::MAX)));
+    assert_eq!(after(&h).await, 1);
+
+    answer(&h, one_commit(5000, None));
+    h.clock.advance(24 * 60 * 60 - 1);
+    assert_eq!(after(&h).await, 0);
+    h.clock.advance(1);
+    assert_eq!(after(&h).await, 1);
+}
+
+fn refusal(status: u16, reset: Option<RateLimitReset>) -> ReleaseError {
+    let url = "https://example.test/compare".to_owned();
+    ReleaseError::Compare(match reset {
+        Some(reset) => FetchError::RateLimited {
+            service: Service::GitHubApi,
+            url,
+            status,
+            reset,
+        },
+        None => FetchError::Status { url, status },
+    })
+}
+
+#[tokio::test]
+async fn a_403_or_429_from_compare_backs_off_across_ticks() {
+    let cases = [
+        (429, Some(RateLimitReset::After(120)), 120),
+        (
+            403,
+            Some(RateLimitReset::At(
+                jiff::Timestamp::from_second(T0 + 900).unwrap(),
+            )),
+            900,
+        ),
+        (403, None, 3600),
+        (429, None, 3600),
+        (429, Some(RateLimitReset::Unknown), 3600),
+    ];
+    for (status, reset, wait) in cases {
+        let h = harness(&config_text(PATCH_RULE)).await;
+        three_releases(&h).await;
+        answer(&h, Box::new(move |_, _, _| Err(refusal(status, reset))));
+        assert_eq!(after(&h).await, 0, "{status} {reset:?}");
+        assert_eq!(compares(&h), [1], "{status} {reset:?}");
+
+        answer(&h, one_commit(5000, None));
+        h.clock.advance(wait - 1);
+        h.tick().await;
+        assert_eq!(compares(&h), [1], "{status} {reset:?}");
+        h.clock.advance(1);
+        h.tick().await;
+        assert_eq!(compares(&h), [1, 1], "{status} {reset:?}");
+    }
 }
