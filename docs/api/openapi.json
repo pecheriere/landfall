@@ -1308,7 +1308,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Outcome",
-                "description": "How it went, `null` until it finished."
+                "description": "How it went, `null` until it finished. `null` with `state` `finished` is an outcome\nthis controller can't read, recorded by a newer one."
               },
               {
                 "type": "null"
@@ -1410,7 +1410,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Outcome",
-                "description": "How it went, `null` until it finished."
+                "description": "How it went, `null` until it finished. `null` with `state` `finished` is an outcome\nthis controller can't read, recorded by a newer one."
               },
               {
                 "type": "null"
@@ -1954,7 +1954,7 @@
                   "oneOf": [
                     {
                       "$ref": "#/components/schemas/Outcome",
-                      "description": "How it went, `null` until it finished."
+                      "description": "How it went, `null` until it finished. `null` with `state` `finished` is an outcome\nthis controller can't read, recorded by a newer one."
                     },
                     {
                       "type": "null"
@@ -2709,7 +2709,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Outcome",
-                "description": "How it went, `null` until it finished."
+                "description": "How it went, `null` until it finished. `null` once finished is an outcome this\ncontroller can't read, recorded by a newer one."
               },
               {
                 "type": "null"

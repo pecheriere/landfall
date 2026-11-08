@@ -105,7 +105,7 @@ pub(crate) struct DeployRow {
     pub(crate) commit: CommitSha,
     /// Where it stands.
     pub(crate) state: DeployState,
-    /// How it went, once finished.
+    /// How it went, once finished and if this version knows the stored name.
     pub(crate) outcome: Option<Outcome>,
     /// What its host said of it, quoted and bounded, if anything.
     pub(crate) reason: Option<String>,
@@ -151,12 +151,11 @@ pub(crate) struct LastFinished {
     pub(crate) reason: Option<String>,
 }
 
-/// A finished deploy's outcome, by its stored name.
-///
-/// # Errors
-/// [`StoreError::Corrupt`] for a name this version doesn't know.
-pub(crate) fn outcome(name: &str) -> Result<Outcome, StoreError> {
-    Ok(match name {
+/// A finished deploy's outcome, by its stored name: `None` for a name this version doesn't
+/// know, as a newer controller's database could hold, so that one such row doesn't stop an
+/// answer.
+pub(crate) fn outcome(name: &str) -> Option<Outcome> {
+    Some(match name {
         "deployed" => Outcome::Deployed,
         "rolled_back" => Outcome::RolledBack,
         "nothing_changed" => Outcome::NothingChanged,
@@ -164,7 +163,7 @@ pub(crate) fn outcome(name: &str) -> Result<Outcome, StoreError> {
         "rollback_failed" => Outcome::RollbackFailed,
         "refused" => Outcome::Refused,
         "deferred" => Outcome::Deferred,
-        _ => return Err(StoreError::Corrupt("outcome")),
+        _ => return None,
     })
 }
 
@@ -198,11 +197,11 @@ fn deploy_from(row: &SqliteRow) -> Result<DeployRow, StoreError> {
         digest: parsed(row, "digest")?,
         commit: parsed(row, "commit_sha")?,
         state: deploy_state(&row.try_get::<String, _>("state")?)?,
+        // An outcome this version doesn't know is shown as none: the row is still `finished`.
         outcome: row
             .try_get::<Option<String>, _>("outcome")?
             .as_deref()
-            .map(outcome)
-            .transpose()?,
+            .and_then(outcome),
         reason: row.try_get("reason")?,
         rollback_reason: row.try_get("rollback_reason")?,
         request_id: row.try_get("request_id")?,
@@ -348,18 +347,29 @@ impl Store {
             .collect()
     }
 
-    /// The deploy numbered `id`, if there is one, whatever its deployment.
+    /// The deploy numbered `id`, if there is one and `check` passes its deployment, which is
+    /// `None` when the stored id isn't one. `check` runs before anything else of the row is
+    /// read, so that a row someone may not see answers as `check` says, readable or not.
     ///
     /// # Errors
-    /// A database failure, or [`StoreError::Corrupt`] for an unreadable row.
-    pub(crate) async fn deploy(&self, id: i64) -> Result<Option<DeployRow>, StoreError> {
-        sqlx::query(DEPLOY_BY_ID)
+    /// `check`'s refusal, a database failure, or [`StoreError::Corrupt`] for an unreadable row
+    /// that `check` passed.
+    pub(crate) async fn deploy<E: From<StoreError>>(
+        &self,
+        id: i64,
+        check: impl FnOnce(Option<&DeploymentId>) -> Result<(), E>,
+    ) -> Result<Option<DeployRow>, E> {
+        let Some(row) = sqlx::query(DEPLOY_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
-            .await?
-            .as_ref()
-            .map(deploy_from)
-            .transpose()
+            .await
+            .map_err(StoreError::from)?
+        else {
+            return Ok(None);
+        };
+        let deployment: Option<DeploymentId> = parsed(&row, "deployment").ok();
+        check(deployment.as_ref())?;
+        Ok(Some(deploy_from(&row)?))
     }
 
     /// `deployment`'s deploys numbered below `before`, or all of them, newest first, at most

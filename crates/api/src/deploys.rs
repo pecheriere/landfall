@@ -63,7 +63,8 @@ pub struct DeployView {
     pub commit: CommitSha,
     /// Where it stands.
     pub state: DeployState,
-    /// How it went, `null` until it finished.
+    /// How it went, `null` until it finished. `null` with `state` `finished` is an outcome
+    /// this controller can't read, recorded by a newer one.
     #[cfg_attr(feature = "openapi", schema(required = true))]
     pub outcome: Option<Outcome>,
     /// Why, as its host said, quoted, or `null`. Hostile: escape it before showing it.
@@ -150,7 +151,8 @@ pub struct WhyEvent {
 pub struct Why {
     /// The deploy's number.
     pub deploy: i64,
-    /// How it went, `null` until it finished.
+    /// How it went, `null` until it finished. `null` once finished is an outcome this
+    /// controller can't read, recorded by a newer one.
     #[cfg_attr(feature = "openapi", schema(required = true))]
     pub outcome: Option<Outcome>,
     /// One sentence to act on, with the host's text quoted in it. Escape it before showing it.

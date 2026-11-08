@@ -250,6 +250,11 @@ stands if it hasn't:
   `wait` while it is queued or claimed, after the host said not now, or after it changed
   nothing; `none` once it runs.
 
+An `outcome` of `null` on a deploy whose `state` is `finished` is an outcome this controller
+can't read, recorded by a newer one: the deploy is still listed and shown, here and in a
+release's story, and `why` says it can't explain it. The controller never sends an outcome
+name its own document doesn't list.
+
 A step's name and failure, and a host's reasons, are the host's words, quoted when they were
 stored, and `events` and `summary` quote them: escape them before showing them.
 

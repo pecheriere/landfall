@@ -308,7 +308,8 @@ pub struct DeployBrief {
     pub id: i64,
     /// Where it stands.
     pub state: DeployState,
-    /// How it went, `null` until it finished.
+    /// How it went, `null` until it finished. `null` with `state` `finished` is an outcome
+    /// this controller can't read, recorded by a newer one.
     #[cfg_attr(feature = "openapi", schema(required = true))]
     pub outcome: Option<Outcome>,
     /// When it was queued, in seconds since the Unix epoch.

@@ -83,8 +83,12 @@ async fn named_deploy(
         .and_then(|Path(path)| path.number())
         .ok_or(HumanProblem::NotFound)?;
     let store = state.store();
-    let row = store.deploy(id).await?.ok_or(HumanProblem::NotFound)?;
-    viewable_by_id(state.config(), principal, Some(&row.deployment))?;
+    let row = store
+        .deploy(id, |deployment| {
+            viewable_by_id(state.config(), principal, deployment).map(drop)
+        })
+        .await?
+        .ok_or(HumanProblem::NotFound)?;
     let steps = store.deploy_steps(id).await?;
     Ok((row, steps))
 }

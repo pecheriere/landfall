@@ -2,9 +2,11 @@
 //! steps, for each outcome and for a deploy not yet finished.
 
 use landfall_api::{DeployState, NextKind, Outcome, WhyKind};
+use landfall_core::protocol::DeployReportBody;
 use serde_json::json;
 
 use crate::api::why::explain;
+use crate::report::BoundedReport;
 use crate::store::history::{DeployRow, StepRow};
 
 const AT: i64 = 1_800_000_000;
@@ -197,25 +199,47 @@ fn next_says_what_to_run_and_where() {
 
 #[test]
 fn a_step_failure_is_quoted_not_raw() {
-    let stored = "\"line one\\nline two \\u{1b}[31mred\"";
-    let mut failing = step(0, "checks", None);
-    failing.failure = Some(stored.to_owned());
-    let row = deploy(DeployState::Finished, Some(Outcome::RolledBack));
+    // What a hostile host sends: raw line breaks, an escape sequence and a bidi override.
+    let hostile = "line one\nline two\r \u{1b}[31mred \u{202e}desrever";
+    let report: DeployReportBody = serde_json::from_value(json!({
+        "deploy_id": 7,
+        "deployment": "app/prod",
+        "tag": "v1.3.0",
+        "digest": format!("sha256:{}", "3".repeat(64)),
+        "outcome": { "kind": "rolled_back", "reason": hostile },
+        "steps": [{ "name": hostile, "millis": 100, "failure": hostile }],
+    }))
+    .unwrap();
+    // As the controller stores it.
+    let bounded = BoundedReport::new(&report);
+    let stored = &bounded.steps[0];
+    let failing = StepRow {
+        position: 0,
+        name: stored.name.clone(),
+        millis: stored.millis,
+        failure: stored.failure.clone(),
+        detail: None,
+    };
+    let mut row = deploy(DeployState::Finished, Some(Outcome::RolledBack));
+    row.reason.clone_from(&bounded.reason);
     let why = explain(&row, &[failing]);
     let event = why
         .events
         .iter()
         .find(|event| event.what == WhyKind::StepFailed)
         .unwrap();
-    assert!(event.text.contains(stored), "{}", event.text);
-    for text in why
+    let failure = stored.failure.as_deref().unwrap();
+    assert!(event.text.contains(failure), "{}", event.text);
+    let next = why.next.as_ref().unwrap();
+    let shown = why
         .events
         .iter()
         .map(|event| &event.text)
-        .chain([&why.summary])
-    {
-        assert!(!text.contains('\n'), "{text}");
-        assert!(!text.contains('\u{1b}'), "{text}");
+        .chain([&why.summary, &next.detail]);
+    for text in shown {
+        for raw in ['\n', '\r', '\u{1b}', '\u{202e}'] {
+            assert!(!text.contains(raw), "{raw:?} in {text}");
+        }
     }
 }
 

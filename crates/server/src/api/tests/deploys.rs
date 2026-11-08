@@ -310,3 +310,84 @@ can = [\"view\"]
         assert_eq!(answer.body, missing.body, "{path}");
     }
 }
+
+/// A finished deploy of `tag` on `deployment`, sent to `host`, whose stored outcome is a name
+/// this version doesn't know, as a newer controller could leave one.
+async fn unreadable_deploy(world: &World, deployment: &str, tag: &str, host: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO deploys (deployment, host, tag, digest, commit_sha, state, outcome,
+                              created_at, finished_at)
+         VALUES (?, ?, ?, ?, ?, 'finished', 'teleported', 1800000000, 1800000000)
+         RETURNING id",
+    )
+    .bind(deployment)
+    .bind(host)
+    .bind(tag)
+    .bind(format!("sha256:{}", "3".repeat(64)))
+    .bind("3".repeat(40))
+    .fetch_one(world.store.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_outcome_this_version_cannot_read_is_shown_as_none() {
+    let world = World::seed().await;
+    let id = unreadable_deploy(&world, "app/prod", "v1.3.0", "home-1").await;
+    let (ids, _) = page(&get_as(&world, PROD_DEPLOYS, &viewer()).await);
+    assert_eq!(ids, [id, world.deploy]);
+    let body = get_as(&world, PROD_DEPLOYS, &viewer()).await.json();
+    let item = &body["items"][0];
+    assert_eq!(item["state"], "finished");
+    assert_eq!(item["outcome"], Value::Null);
+
+    let one = get_as(&world, &format!("/api/v1/deploys/{id}"), &viewer()).await;
+    assert_eq!(one.status, StatusCode::OK, "{one:?}");
+    assert_eq!(one.json()["outcome"], Value::Null);
+    let why = get_as(&world, &format!("/api/v1/deploys/{id}/why"), &viewer()).await;
+    assert_eq!(why.status, StatusCode::OK, "{why:?}");
+    let why = why.json();
+    assert_eq!(why["outcome"], Value::Null);
+    assert!(why["summary"].as_str().unwrap().contains("v1.3.0"));
+
+    // The release's story lists it the same way.
+    let story = get_as(
+        &world,
+        "/api/v1/deployments/app/prod/releases/v1.3.0",
+        &viewer(),
+    )
+    .await;
+    assert_eq!(story.status, StatusCode::OK, "{story:?}");
+    assert_eq!(story.json()["deploys"][0]["outcome"], Value::Null);
+}
+
+#[tokio::test]
+async fn an_unreadable_deploy_of_a_removed_deployment_is_not_found() {
+    let world = World::seed().await;
+    world
+        .store
+        .record_release(
+            (
+                &"app/old".parse().unwrap(),
+                &"home-1".parse().unwrap(),
+                &"v1.0.0".parse().unwrap(),
+            ),
+            ReleaseDecision::Manual,
+            "it deploys only when someone asks",
+            None,
+        )
+        .await
+        .unwrap();
+    // Neither its outcome nor its host can be read, and neither is anyone's business.
+    let old = unreadable_deploy(&world, "app/old", "v1.0.0", "not a host!").await;
+    let reader = holder(&["view", "request", "approve", "rollback"]);
+    let missing = get_as(&world, "/api/v1/deploys/999999", &reader).await;
+    for path in [
+        format!("/api/v1/deploys/{old}"),
+        format!("/api/v1/deploys/{old}/why"),
+    ] {
+        let answer = get_as(&world, &path, &reader).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}: {answer:?}");
+        assert_eq!(answer.body, missing.body, "{path}");
+    }
+}

@@ -183,12 +183,10 @@ impl<'a> Standing<'a> {
             .digest
             .as_ref()
             .and_then(|digest| last.get(&(row.tag.to_string(), digest.to_string())));
-        let last_outcome = last
-            .map(|last| {
-                outcome(&last.outcome)
-                    .map(|outcome| (outcome, last.reason.as_deref().unwrap_or("")))
-            })
-            .transpose()?;
+        // A last outcome this version can't read says nothing it could go by.
+        let last_outcome = last.and_then(|last| {
+            outcome(&last.outcome).map(|outcome| (outcome, last.reason.as_deref().unwrap_or("")))
+        });
         // As asking goes by it: a rollback doesn't wait for promotion.
         let promotion_waits_for = match release.settled() {
             Some((_, digest)) if self.promoted_to && !lower_than_running => store
