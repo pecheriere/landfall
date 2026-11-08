@@ -206,10 +206,12 @@ cargo deny check
   could approve a deployment through the API but can't forge the signature. The owner
   signs the tag with `scripts/release-tag <version> --commit <sha>`, which agents never run,
   and which refuses without a terminal. Its anchor is the owner's own signers file outside
-  the clone (`--trusted-signers`): the last release is the highest `v*` tag a key there
+  the clone (`--trusted-signers`, opened with `O_NOFOLLOW` and checked on the open file: the
+  owner's or root's, writable by its owner alone): the last release is the highest `v*` tag a key there
   signed, the repository's signers must equal those keys, and other `v*` tags above it are
   named. It shows the range since then and any change to the signers file, `.github/`,
-  itself and `Cargo.*`, with control characters escaped, and wants the version typed. Its tests are
+  itself, `Cargo.*` and the code that reads signers or checks tags and attestations
+  (`TRUST_CODE`), with control characters escaped, and wants the version typed. Its tests are
   `test_release_tag.py`, with the terminal injected. `CONTRIBUTING.md` has the procedure, and
   `test_release_workflow.py` holds what the workflow must keep doing: edit the two
   together.

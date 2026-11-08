@@ -87,17 +87,30 @@ its own key.
    does, and the pull request merges once the tap's checks pass. Every later stable release
    reaches the tap on its own.
 6. **If a `release` environment is left from before,** delete it: nothing names it any more.
-7. **Keep your own copy of the release keys,** outside any clone, which `scripts/release-tag`
-   trusts and the repository can't change: `${XDG_CONFIG_HOME:-~/.config}/landfall/release-signers`,
-   written as `crates/cli/assets/release-signers` is, writable by you alone (`chmod 600`), and not
-   a link. Make it from the keys in `SECURITY.md`, after comparing their fingerprints with a copy
-   you got some other way, such as the one you keep with the key itself. The helper refuses to sign
-   when the repository's signers differ from it, so for a rotation you change this file first, on
-   purpose.
+7. **Keep your own copy of the release keys,** which `scripts/release-tag` trusts and the
+   repository can't change, written as `crates/cli/assets/release-signers` is. Make it from the keys
+   in `SECURITY.md`, after comparing their fingerprints with a copy you got some other way, such as
+   the one you keep with the key itself. The helper refuses it inside the checkout, through a link,
+   owned by anyone but you or root, or writable by anyone but its owner, and it refuses to sign when
+   the repository's signers differ from it, so for a rotation you change this file first, on purpose.
+   - **Owned by you**, at the default `${XDG_CONFIG_HOME:-~/.config}/landfall/release-signers` with
+     `chmod 600`, it holds against a stolen GitHub token, which can't reach your machine. It doesn't
+     hold against code running as you, such as an agent you leave running unattended: that can edit
+     the file, and then land a matching commit and tag.
+   - **Owned by root** closes that: for example
+     `sudo install -D -m 0644 -o root <copy> /usr/local/etc/landfall/release-signers`, then
+     `scripts/release-tag ... --trusted-signers /usr/local/etc/landfall/release-signers`. Code
+     running as you can't change it without `sudo`.
 
-To rotate the key, let two overlap: release N carries both and is signed by the old one, and
-release N+1 is signed by the new one. Add the new key to your own copy (step 7) before release N,
-and drop the old one from it with the release that drops it from the repository.
+To rotate the key, let two overlap: release N carries both keys and is signed by the old one, and
+release N+1 is signed by the new one. Add the new key to your own copy (step 7) before release N.
+Drop the old key from the repository in a release after N+1, and from your copy at the same time.
+From then on the tags the old key signed no longer verify against your copy, which is harmless:
+they are all below N+1, which the new key signed and the helper still finds as a release behind
+the commit, so it warns about none of them. If you drop the old key at N+1 itself, N+1's
+own run finds no release behind it that your copy verifies: it warns about every earlier tag and
+shows the whole history. That is expected then, and the way to avoid it is to keep the old key, in
+the repository and in your copy, until N+1 is out.
 
 ### For each release
 
