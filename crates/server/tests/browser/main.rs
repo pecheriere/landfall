@@ -32,7 +32,7 @@ use clap::Parser as _;
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, ReleaseTag};
 use landfall_core::protocol::{DeployedRelease, Phase, RunningState};
 use landfall_core::release::RunCandidate;
-use landfall_origin::fetch::ListedTag;
+use landfall_origin::fetch::{ComparePage, CompareStatus, ListedTag};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin};
 use landfall_server::cli::{self, Cli};
 use landfall_server::store::{ReleaseDecision, Seen, Store};
@@ -74,6 +74,25 @@ impl ReleaseSource for NoReleases {
         _: &ImageDigest,
     ) -> Result<Vec<RunCandidate>, ReleaseError> {
         std::future::pending().await
+    }
+
+    fn compare_page(
+        &self,
+        _: &DeploymentId,
+        _: &CommitSha,
+        _: &CommitSha,
+        _: u32,
+    ) -> impl Future<Output = Result<ComparePage, ReleaseError>> + Send {
+        std::future::ready(Ok(ComparePage::Listed {
+            status: CompareStatus::Ahead,
+            total: 0,
+            commits: Vec::new(),
+            rate_remaining: Some(5000),
+        }))
+    }
+
+    fn has_github_token(&self) -> bool {
+        false
     }
 }
 

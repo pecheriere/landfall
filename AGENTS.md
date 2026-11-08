@@ -33,7 +33,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   or a named release file (`attestation/file.rs`, the name and digest checked
   together), and their Fulcio certificate identity, the TUF trust root, and the
   fetchers for
-  signed tag objects, a repository's tags and a release's files (GitHub API), image
+  signed tag objects, a repository's tags, a release's files and the commits between two
+  commits (`fetch/commits.rs`, GitHub's compare, a page at a time) (GitHub API), image
   indexes, bundles and referrer tags (GHCR), `verify_release`, which composes them for
   one release, `candidates`, which finds every digest attested for it, and `artifact`,
   whose `verify_release_file` returns one file of a release once its signed tag, the
@@ -45,8 +46,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   the audit log, serves the API and the web UI. A library plus a thin binary;
   modules: `store` (the only code that touches SQLite: migrations, transactions, appending to
   and verifying the audit log, enrolment codes, hosts, nonces, deploys, running state, release
-  decisions and holds, API tokens, sessions, deploy requests, and `views`, what the API reads to
-  show deployments), `audit` (audit events and the hash-chain encoding), `report` (bounding a
+  decisions and holds, API tokens, sessions, deploy requests, `commits`, the commit ranges
+  between verified releases, and `views`, what the API reads to show deployments), `audit` (audit events and the hash-chain encoding), `report` (bounding a
   deploy report before it is stored), `agent_api` (the routes agents call: signed-request
   extractor, handlers, problem answers, rate limit, and `client_source`, who a request is from,
   which every per-source limit and the capped log go by), `auth` (the `Principal` extractor,
@@ -65,7 +66,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   on every answer, `registration`, `sign_in` and sign-out, and `ceremonies`, the challenges and
   failure counts in memory), `watcher`
   (release discovery, origin verification, rule decisions and queueing, behind a
-  `ReleaseSource` trait),
+  `ReleaseSource` trait, and `commits`, which fetches the commits between verified releases
+  after each tick, within GitHub's budget),
   `serve` (the accept loop, with header timeouts and a connection cap), `logger` (the only code
   that writes to stderr while serving: a bounded queue to a thread of its own, which drops and
   counts what doesn't fit, so that logging never blocks a runtime thread; `panics`, the hook

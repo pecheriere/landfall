@@ -7,6 +7,7 @@
 mod agent;
 mod auth;
 mod ceremonies;
+mod commits;
 mod deploys;
 mod releases;
 mod requests;
@@ -33,6 +34,7 @@ use tokio::sync::watch;
 pub use self::agent::NONCE_LIFETIME_SECS;
 pub use self::ceremonies::SESSION_LIFETIME_SECS;
 pub(crate) use self::ceremonies::{NewPasskey, Redeemed};
+pub use self::commits::{CommitRange, NewRange, RangeState, WantedRange};
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
     FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,
@@ -261,6 +263,11 @@ fn migrator() -> Migrator {
             5,
             "read_indexes",
             include_str!("../migrations/0005_read_indexes.sql"),
+        ),
+        migration(
+            6,
+            "commit_ranges",
+            include_str!("../migrations/0006_commit_ranges.sql"),
         ),
     ])
 }

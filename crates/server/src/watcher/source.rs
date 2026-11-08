@@ -14,7 +14,7 @@ use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::RunCandidate;
 use landfall_core::text::shown;
 use landfall_origin::candidates::{CandidateCache, attested_digests};
-use landfall_origin::fetch::{Fetcher, ListedTag};
+use landfall_origin::fetch::{ComparePage, Fetcher, ListedTag};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin, verify_release_origin};
 use landfall_origin::trust::{Refresh, TrustRoot, load_trusted_root};
 use tokio::sync::Mutex;
@@ -194,6 +194,27 @@ impl ReleaseSource for LiveSource {
             ));
         }
         Ok(answer.verified)
+    }
+
+    async fn compare_page(
+        &self,
+        deployment: &DeploymentId,
+        base: &CommitSha,
+        head: &CommitSha,
+        page: u32,
+    ) -> Result<ComparePage, ReleaseError> {
+        let d = self
+            .config
+            .deployment(deployment)
+            .ok_or_else(|| ReleaseError::UnknownDeployment(deployment.clone()))?;
+        self.fetcher
+            .compare_page(d.repo().name(), base, head, page)
+            .await
+            .map_err(ReleaseError::Compare)
+    }
+
+    fn has_github_token(&self) -> bool {
+        self.fetcher.has_github_token()
     }
 }
 

@@ -10,7 +10,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use super::{
-    REPOS_AT_ONCE, ReleaseSource, Stop, TickSummary, WatcherState, settle_whole_hold,
+    REPOS_AT_ONCE, ReleaseSource, Stop, TickSummary, WatcherState, commits, settle_whole_hold,
     watch_deployment,
 };
 use crate::logger::log;
@@ -157,6 +157,14 @@ pub async fn tick<S: ReleaseSource>(
                 summary.failed += 1;
             }
         }
+    }
+    // Only now that every verification of the tick is done, so that GitHub's budget
+    // goes to them first.
+    match store.now() {
+        Ok(now) => {
+            commits::after_tick(store, source.as_ref(), config, now).await;
+        }
+        Err(error) => log(&format!("watcher: commits: {error}")),
     }
     summary
 }

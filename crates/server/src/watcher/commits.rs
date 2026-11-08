@@ -1,0 +1,291 @@
+//! The commits between verified releases, fetched from GitHub after each tick's
+//! verifications and within a budget of GitHub's requests.
+//!
+//! An approver reads a release's commits to decide, so a list never passes for more
+//! than it is: a range is fetched whole within one tick or not stored, keeps its
+//! newest [`KEPT_COMMITS`] and GitHub's total, and says when it is too large to list
+//! or its base isn't an ancestor of its head. Verification has GitHub first: this
+//! runs only once a tick's verifications are done, makes at most 12 requests a tick
+//! with a token and 3 without, and stops while GitHub's count of requests left is
+//! below a floor, or at the first 403 or 429. A failure is recorded as `unavailable`
+//! and tried again after [`COMMIT_RETRY_SECS`]; it holds and refuses nothing, and
+//! writes no audit row, since nothing is decided here.
+
+use landfall_core::config::Config;
+use landfall_core::ids::{CommitSha, ReleaseTag, TagPattern};
+use landfall_core::text::quoted;
+use landfall_origin::fetch::{
+    COMPARE_PER_PAGE, ComparePage, CompareStatus, FetchError, KEPT_COMMITS, ListedCommit,
+};
+use landfall_origin::release::ReleaseError;
+
+use super::{ReleaseSource, describe};
+use crate::logger::log;
+use crate::store::{NewRange, RangeState, Store, WantedRange};
+
+/// How long after a range was unavailable it is tried again, seconds.
+pub(crate) const COMMIT_RETRY_SECS: i64 = 60 * 60;
+
+/// The most requests one range can need: its first page and the last two.
+const REQUESTS_PER_RANGE: u8 = 3;
+
+/// The most characters of a failure in its log line.
+const FAILURE_SHOWN_CHARS: usize = 256;
+
+/// What one tick may ask of GitHub for commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GitHubBudget {
+    /// Requests left this tick.
+    requests_left: u8,
+    /// The fewest requests GitHub may have left for this to go on asking.
+    floor: u32,
+}
+
+impl GitHubBudget {
+    /// The budget of a tick: 12 requests while GitHub has at least 1,000 left with a
+    /// token, and 3, one range, while it has at least 30 without, of its 60 an hour.
+    #[must_use]
+    pub(crate) fn for_tick(has_token: bool) -> Self {
+        if has_token {
+            Self {
+                requests_left: 12,
+                floor: 1_000,
+            }
+        } else {
+            Self {
+                requests_left: 3,
+                floor: 30,
+            }
+        }
+    }
+
+    /// Whether `requests` more fit in what is left.
+    fn covers(self, requests: u8) -> bool {
+        self.requests_left >= requests
+    }
+
+    fn spend(&mut self) {
+        self.requests_left = self.requests_left.saturating_sub(1);
+    }
+
+    /// Whether GitHub's count of requests left is below the floor.
+    fn is_low(self, rate_remaining: Option<u32>) -> bool {
+        rate_remaining.is_some_and(|left| left < self.floor)
+    }
+}
+
+/// The pages holding the newest [`KEPT_COMMITS`] of a comparison of `total` commits,
+/// in GitHub's order, oldest first: page 1 for a comparison of one page, else the last
+/// two pages.
+#[must_use]
+pub(crate) fn pages_for_newest(total: u64) -> Vec<u32> {
+    let per_page = u64::from(COMPARE_PER_PAGE);
+    if total <= per_page {
+        return vec![1];
+    }
+    let last = u32::try_from(total.div_ceil(per_page)).unwrap_or(u32::MAX);
+    vec![last - 1, last]
+}
+
+/// The release a range to `tag` starts from: the highest version of `settled` below
+/// `tag`'s, by `pattern` and semantic versioning, where a pre-release is below its
+/// release. A tag `pattern` doesn't read is never one.
+#[must_use]
+pub(crate) fn base_for(
+    pattern: &TagPattern,
+    tag: &ReleaseTag,
+    settled: &[(ReleaseTag, CommitSha)],
+) -> Option<(ReleaseTag, CommitSha)> {
+    let version = pattern.parse_tag(tag).ok()?;
+    settled
+        .iter()
+        .filter_map(|(other, commit)| {
+            let lower = pattern.parse_tag(other).ok().filter(|v| *v < version)?;
+            Some((lower, other, commit))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, other, commit)| (other.clone(), commit.clone()))
+}
+
+/// What came of asking for one page.
+enum Asked {
+    Page(ComparePage),
+    /// GitHub refused for its limit: nothing more this tick.
+    Stop,
+    Failed(ReleaseError),
+}
+
+/// What came of fetching one range.
+enum Fetched {
+    /// All its pages came back.
+    Whole {
+        state: RangeState,
+        total: Option<u64>,
+        commits: Vec<ListedCommit>,
+    },
+    /// The tick stopped before it was whole: nothing of it is kept.
+    Stopped,
+    Failed(ReleaseError),
+}
+
+/// A 403 or a 429 from GitHub, with the rate-limit headers or without.
+fn is_refusal_for_limit(error: &ReleaseError) -> bool {
+    matches!(
+        error.fetch_error(),
+        Some(
+            FetchError::RateLimited { .. }
+                | FetchError::Status {
+                    status: 403 | 429,
+                    ..
+                }
+        )
+    )
+}
+
+async fn ask<S: ReleaseSource>(
+    source: &S,
+    range: &WantedRange,
+    page: u32,
+    budget: &mut GitHubBudget,
+) -> Asked {
+    budget.spend();
+    match source
+        .compare_page(&range.deployment, &range.base, &range.head, page)
+        .await
+    {
+        Ok(answer) => Asked::Page(answer),
+        Err(error) if is_refusal_for_limit(&error) => Asked::Stop,
+        Err(error) => Asked::Failed(error),
+    }
+}
+
+fn whole(state: RangeState) -> Fetched {
+    Fetched::Whole {
+        state,
+        total: None,
+        commits: Vec::new(),
+    }
+}
+
+/// Fetches `range` whole, and says whether the tick should stop after it.
+async fn fetch_range<S: ReleaseSource>(
+    source: &S,
+    range: &WantedRange,
+    budget: &mut GitHubBudget,
+) -> (Fetched, bool) {
+    let (status, total, first, rate_remaining) = match ask(source, range, 1, budget).await {
+        Asked::Page(ComparePage::Listed {
+            status,
+            total,
+            commits,
+            rate_remaining,
+        }) => (status, total, commits, rate_remaining),
+        Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
+            return (whole(RangeState::TooLarge), budget.is_low(rate_remaining));
+        }
+        Asked::Stop => return (Fetched::Stopped, true),
+        Asked::Failed(error) => return (Fetched::Failed(error), false),
+    };
+    let mut stop = budget.is_low(rate_remaining);
+    if matches!(status, CompareStatus::Behind | CompareStatus::Diverged) {
+        return (whole(RangeState::BaseNotFound), stop);
+    }
+    let mut first = Some(first);
+    let mut listed = Vec::new();
+    for page in pages_for_newest(total) {
+        if page == 1 {
+            listed.extend(first.take().unwrap_or_default());
+            continue;
+        }
+        if stop {
+            return (Fetched::Stopped, true);
+        }
+        match ask(source, range, page, budget).await {
+            Asked::Page(ComparePage::Listed {
+                commits,
+                rate_remaining,
+                ..
+            }) => {
+                listed.extend(commits);
+                stop = budget.is_low(rate_remaining);
+            }
+            Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
+                return (whole(RangeState::TooLarge), budget.is_low(rate_remaining));
+            }
+            Asked::Stop => return (Fetched::Stopped, true),
+            Asked::Failed(error) => return (Fetched::Failed(error), false),
+        }
+    }
+    let newest = listed.len().saturating_sub(KEPT_COMMITS);
+    let mut kept = listed.split_off(newest);
+    kept.reverse();
+    let fetched = Fetched::Whole {
+        state: RangeState::Listed,
+        total: Some(total),
+        commits: kept,
+    };
+    (fetched, stop)
+}
+
+/// Fetches the ranges the releases settled under `config` want, newest first, within
+/// this tick's budget, and stores each whole one. The count stored.
+pub(crate) async fn after_tick<S: ReleaseSource>(
+    store: &Store,
+    source: &S,
+    config: &Config,
+    now: i64,
+) -> usize {
+    let mut budget = GitHubBudget::for_tick(source.has_github_token());
+    let wanted = match store.ranges_wanted(config, config.hash(), now).await {
+        Ok(wanted) => wanted,
+        Err(error) => {
+            log(&format!("watcher: commits: {error}"));
+            return 0;
+        }
+    };
+    let mut stored = 0;
+    for range in &wanted {
+        if !budget.covers(REQUESTS_PER_RANGE) {
+            break;
+        }
+        let (fetched, stop) = fetch_range(source, range, &mut budget).await;
+        let (state, total, commits) = match fetched {
+            Fetched::Whole {
+                state,
+                total,
+                commits,
+            } => (state, total, commits),
+            Fetched::Stopped => break,
+            Fetched::Failed(error) => {
+                // Logged when it first fails, not on each try after.
+                if !range.retry {
+                    log(&format!(
+                        "watcher: {}: commits of {} {}...{}: unavailable: {}",
+                        range.deployment,
+                        range.tag,
+                        range.base,
+                        range.head,
+                        quoted(&describe(&error), FAILURE_SHOWN_CHARS)
+                    ));
+                }
+                (RangeState::Unavailable, None, Vec::new())
+            }
+        };
+        let new = NewRange {
+            state,
+            total,
+            commits: &commits,
+        };
+        match store
+            .record_commit_range(&range.repo, &range.base, &range.head, &new)
+            .await
+        {
+            Ok(()) => stored += 1,
+            Err(error) => log(&format!("watcher: commits: {error}")),
+        }
+        if stop {
+            break;
+        }
+    }
+    stored
+}

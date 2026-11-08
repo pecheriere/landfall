@@ -278,12 +278,13 @@ impl Store {
             None => (None, None, None, None, None),
         };
         // Without a `seen`, whatever is known of its origin stays as it is. A commit
-        // or digest already recorded is never overwritten by none.
+        // or digest already recorded is never overwritten by none. `first_seen_at` is
+        // set here and never on conflict: what is compared goes by it.
         sqlx::query(
             "INSERT INTO releases
                  (deployment, tag, commit_sha, digest, decision, reason, seen_at,
-                  tag_object, config_hash, origin, origin_refused)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12)
+                  tag_object, config_hash, origin, origin_refused, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?7)
              ON CONFLICT (deployment, tag) DO UPDATE SET
                  decision = excluded.decision,
                  reason = excluded.reason,

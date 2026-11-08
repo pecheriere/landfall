@@ -13,6 +13,9 @@
 //! feature is enabled in the HTTP client), so a cap applies to the bytes on the
 //! wire.
 //!
+//! A comparison of two commits is streamed under its own, larger cap, as its patches
+//! can be large ([`compare_url`] is where a person reads one too large to list).
+//!
 //! The client follows no redirect. `Fetcher::get` does, and a credential goes no
 //! further than the host it is for, on any hop.
 
@@ -22,6 +25,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, redirect};
 
 mod assets;
+mod commits;
 mod endpoints;
 mod error;
 mod github;
@@ -32,6 +36,10 @@ mod registry;
 mod tests;
 
 pub use assets::{BINARY_LIMIT, ReleaseAsset, SUMS_LIMIT};
+pub use commits::{
+    COMMIT_SUMMARY_CHARS, COMPARE_PAGE_LIMIT, COMPARE_PER_PAGE, ComparePage, CompareStatus,
+    KEPT_COMMITS, ListedCommit, compare_url,
+};
 pub use endpoints::Endpoints;
 pub use error::{FetchError, RateLimitReset, Service};
 pub(crate) use http::hex;
@@ -141,5 +149,12 @@ impl Fetcher {
         value.set_sensitive(true);
         self.github_token = Some(value);
         Ok(self)
+    }
+
+    /// Whether requests to the GitHub API carry a token, and so have its higher
+    /// rate limit.
+    #[must_use]
+    pub fn has_github_token(&self) -> bool {
+        self.github_token.is_some()
     }
 }

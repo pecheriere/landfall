@@ -19,6 +19,7 @@
 //! asked again.
 
 mod backoff;
+pub(crate) mod commits;
 mod source;
 mod ticking;
 
@@ -32,7 +33,7 @@ use landfall_core::protocol::DeployId;
 use landfall_core::release::{RunCandidate, select_release_run};
 use landfall_core::rule::{Decision, Refusal, decide};
 use landfall_core::text::{quoted, shown};
-use landfall_origin::fetch::{FetchError, ListedTag, RateLimitReset};
+use landfall_origin::fetch::{ComparePage, FetchError, ListedTag, RateLimitReset};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin};
 use semver::Version;
 use serde_json::{Value, json};
@@ -119,6 +120,19 @@ pub trait ReleaseSource: Send + Sync + 'static {
         commit: &CommitSha,
         version_digest: &ImageDigest,
     ) -> impl Future<Output = Result<Vec<RunCandidate>, ReleaseError>> + Send;
+
+    /// Page `page` of GitHub's comparison of `base` and `head` in `deployment`'s
+    /// repository, read only once a tick's verifications are done.
+    fn compare_page(
+        &self,
+        deployment: &DeploymentId,
+        base: &CommitSha,
+        head: &CommitSha,
+        page: u32,
+    ) -> impl Future<Output = Result<ComparePage, ReleaseError>> + Send;
+
+    /// Whether requests to GitHub carry a token, which sets the budget for commits.
+    fn has_github_token(&self) -> bool;
 }
 
 /// What one tick did.

@@ -112,6 +112,39 @@ on to (`promote_to`) and come from (`promoted_from`), and its holds: the newest 
 report from a host the configuration no longer pairs with the deployment is ignored, as the
 watcher ignores it, so a deployment moved to a host that hasn't reported it shows `null`.
 
+## Commits between releases
+
+The controller keeps the commits between each verified release and the one below it, for a
+release's story to show. Both ends must be releases verified under the current configuration
+and not refused since: a refused or unsigned tag gets no list and is never the start of one.
+The start is the highest lower version of the same deployment, where a pre-release is below
+its release. A list is kept by repository and commit, not by tag, so a moved tag is compared
+again from its new commit, and two deployments of one repository share one list.
+
+- **Source.** The list is GitHub's compare (`GET /repos/{repo}/compare/{base}...{head}`), which
+  is exact: every commit reachable from the release and not from the one below it, merged
+  branches included. It says `"source": "github"`.
+- **Author.** Each commit keeps its id, the first line of its message (200 characters,
+  quoted) and the login GitHub attributes it to by its email. Nothing verifies that login, so
+  it says `"verified": false`; only the release commit itself is verified.
+- **The newest 100.** A list keeps the newest 100 commits, newest first, and GitHub's total,
+  so a longer one reads as the newest 100 of N and never as the whole.
+- **`too_large`.** When a page of GitHub's answer is over 8 MiB, or GitHub says the comparison
+  is too large to compute (422), there is no list, only a link to GitHub's compare page,
+  `https://github.com/{repo}/compare/{base}...{head}`, built from the configured repository
+  name and the two commit ids.
+- **`base_not_found`.** When the release below isn't an ancestor of this one (GitHub says
+  `behind` or `diverged`), the history was rewritten between them, and there is no list.
+- **Not yet, or unavailable.** A list that wasn't fetched yet, or couldn't be, is unknown, never
+  an empty list. A failure is tried again after an hour; it holds and refuses nothing.
+- **The budget.** Verification has GitHub first: commits are fetched only after a watcher
+  tick's verifications are done. With the controller's `GITHUB_TOKEN` a tick makes at most 12
+  requests, and only while GitHub reports at least 1,000 requests left; without one, at most 3,
+  one list, and only while it reports at least 30. A list needs at most 3 requests, and is
+  stored only once all of them came back. The first 403 or 429 stops it until the next tick.
+  Only releases first recorded after the controller was upgraded to this version are compared:
+  nothing is fetched for the history it already had.
+
 ## Refusals
 
 Every answer that isn't a success is `application/problem+json` (RFC 9457):
