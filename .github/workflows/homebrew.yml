@@ -1,0 +1,101 @@
+name: Homebrew
+
+# Proposes a stable release's formula to the owner's tap, as a pull request that merges itself once
+# the tap's checks pass. The tap decides: its CI verifies the formula's attestation and the signed
+# tag against its own copy of the key, refuses a downgrade and a release candidate, and nothing
+# merges unless that is green. `release.yml` starts this on the tag once `publish` is done, since a
+# release published with a run's own token starts no workflow; `release: published` covers one the
+# owner publishes by hand. Release candidates never reach the tap. CONTRIBUTING.md has the owner's
+# setup, and test_homebrew_workflow.py holds what this file must keep doing.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: homebrew-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # No secret here: everything that can refuse a release does so before the tap's token is in reach.
+  formula:
+    if: >-
+      github.ref_type == 'tag' && !contains(github.ref_name, '-') &&
+      (github.event_name != 'release' || !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # for the checkout and the release's files
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        name: Require a published, stable release of the workspace version at this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease > "$RUNNER_TEMP/release.json"
+          python3 -I .github/scripts/homebrew_tap.py check --tag "$GITHUB_REF_NAME" \
+            --release "$RUNNER_TEMP/release.json" --output "$GITHUB_OUTPUT"
+      - name: Download the formula and its attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: >-
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir formula
+          --pattern landfall.rb --pattern "landfall-$VERSION.sigstore.json"
+      # As the tap's README does by hand, so a broken release never opens a pull request. The tap
+      # checks it again, with the signed tag, which this doesn't.
+      - name: Verify the formula against the release's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: >-
+          gh attestation verify formula/landfall.rb
+          --bundle "formula/landfall-$VERSION.sigstore.json"
+          --repo "$GITHUB_REPOSITORY"
+          --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          --source-ref "refs/tags/$GITHUB_REF_NAME"
+          --source-digest "$GITHUB_SHA"
+          --deny-self-hosted-runners
+      - id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: formula
+          path: formula/landfall.rb
+          retention-days: 1
+          if-no-files-found: error
+
+  # The tap's token lives in the `homebrew-tap` environment, whose only deployment rule is the tag
+  # `v[0-9]*`, and reaches only the step that opens the pull request. The tap is never checked
+  # out, and none of its code runs here.
+  tap:
+    needs: formula
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: homebrew-tap
+    permissions:
+      contents: read # for the checkout of this repository's script
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # By id: anything else in the run holding a runtime token could overwrite it by name.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.formula.outputs.artifact-id }}
+          path: formula
+      - name: Open the tap's pull request, to merge once its checks pass
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.formula.outputs.version }}
+        run: >-
+          python3 -I .github/scripts/homebrew_tap.py propose --formula formula/landfall.rb
+          --version "$VERSION" --repo "$GITHUB_REPOSITORY"

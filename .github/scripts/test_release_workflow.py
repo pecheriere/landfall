@@ -1,10 +1,10 @@
 """What release.yml must keep doing, whatever a later edit does to it.
 
-A manual run skips `publish`, so a change that dropped the approval or the tag proof would still
-show green there: this holds those properties instead. The standard library has no YAML parser, so
-jobs and steps are read by their indentation, as in `test_buildkit_pin.py`, and anything that isn't
-the expected shape fails. It reads the workflow's text, so it holds what's written here and can't
-say what GitHub will do with it.
+A dry run skips `publish`, so a change that dropped the tag proof, or let a push to main reach
+`publish`, would still show green there: this holds those properties instead. The standard
+library has no YAML parser, so jobs and steps are read by their indentation, as in
+`test_buildkit_pin.py`, and anything that isn't the expected shape fails. It reads the workflow's
+text, so it holds what's written here and can't say what GitHub will do with it.
 
 A text test can't be complete: someone can always write something it didn't think of. A person
 reading a diff of `release.yml` is the last line, and this doesn't replace them.
@@ -14,31 +14,38 @@ import re
 import unittest
 from pathlib import Path
 
+from workflow_text import block, job, job_names, needed, significant, step_index, step_label, steps
+
 WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "release.yml"
-JOB_INDENT = 2
-STEP_INDENT = 6
 # Any way of asking for a cache. `cache-binary: false` is how buildx is told not to keep one.
 CACHE = re.compile(r"cache", re.IGNORECASE)
 NO_CACHE_SETTING = "cache-binary: false"
 PUBLISH_NEEDS = {
+    "version",
     "on-main",
     "crate-age",
     "ci",
     "preflight",
-    "environment-guard",
     "build-linux",
     "build-macos",
     "smoke",
 }
 ATTEMPT_CHECK = '[ "$GITHUB_RUN_ATTEMPT" != 1 ]'
-TAG_EVENT = "if: github.event_name == 'push'"
+TAG_EVENT = "if: github.event_name == 'push' && github.ref_type == 'tag'"
+BUILD_CONDITION = "if: needs.version.outputs.build == 'true'"
 RUN = re.compile(r"\s*(?:- )?run:")
 CONDITION = re.compile(r"\s*(?:- )?if:")
 WRITE = re.compile(r":\s*write\b|write-all")
-JOBS = PUBLISH_NEEDS | {"publish"}
+JOBS = PUBLISH_NEEDS | {"publish", "homebrew"}
+HOMEBREW_CONDITION = f"{TAG_EVENT} && !contains(github.ref_name, '-')"
+HOMEBREW_STEP = [
+    "      - name: Start the Homebrew workflow on this tag",
+    "        env:",
+    "          GH_TOKEN: ${{ github.token }}",
+    "          GH_REPO: ${{ github.repository }}",
+    '        run: gh workflow run homebrew.yml --ref "$GITHUB_REF_NAME"',
+]
 FORBIDDEN_KEY = re.compile(r"\s*(?:- )?(?:ref|repository|run-id|digest-mismatch|defaults):")
-USES = re.compile(r"\s*(?:- )?uses: ([^@\s]+)")
-NAME = re.compile(r"\s*(?:- )?name: (.+)")
 LOGIN_LINE = "          password: ${{ secrets.GITHUB_TOKEN }}"
 CHECKOUT = "actions/checkout"
 DOWNLOAD = "actions/download-artifact"
@@ -49,10 +56,13 @@ ATTEST = "actions/attest-build-provenance"
 SECOND_ATTEMPT = "Refuse a second attempt"
 # Each job's steps, by action without its pin or by name, so that a step added anywhere fails.
 JOB_STEPS = {
-    "on-main": [CHECKOUT, "Require the tagged commit to be on main"],
+    "version": [
+        CHECKOUT,
+        "Build on a tag, a manual run, or a push to main that changes the version",
+    ],
+    "on-main": [CHECKOUT, "Require the commit to be on main"],
     "crate-age": [CHECKOUT, "Refuse crate versions published less than 7 days ago"],
     "preflight": [SECOND_ATTEMPT, CHECKOUT, "Prove the tag"],
-    "environment-guard": [CHECKOUT, "Refuse an environment that holds nothing back"],
     "build-linux": [CHECKOUT, BUILDX, BUILD, "Check the static binaries", UPLOAD],
     "build-macos": [
         CHECKOUT,
@@ -80,6 +90,7 @@ JOB_STEPS = {
         ATTEST,
         "Publish the draft, and read it back",
     ],
+    "homebrew": ["Start the Homebrew workflow on this tag"],
 }
 PUBLISH_WRITES = (
     "contents: write",
@@ -87,78 +98,6 @@ PUBLISH_WRITES = (
     "id-token: write",
     "attestations: write",
 )
-
-
-def indent_of(line: str) -> int:
-    """Return how far a line is indented."""
-    return len(line) - len(line.lstrip())
-
-
-def strip_comment(line: str) -> str:
-    """Return a line without a comment after a space, in a value that holds no `#` itself."""
-    return line.split(" # ", 1)[0].rstrip()
-
-
-def significant(text: str) -> list[str]:
-    """Return the lines that hold something, without comments."""
-    return [
-        strip_comment(line)
-        for line in text.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-
-
-def job(lines: list[str], name: str) -> list[str]:
-    """Return the lines under one job, which must exist."""
-    start = lines.index(f"{' ' * JOB_INDENT}{name}:") + 1
-    end = start
-    while end < len(lines) and indent_of(lines[end]) > JOB_INDENT:
-        end += 1
-    return lines[start:end]
-
-
-def steps(job_lines: list[str]) -> list[list[str]]:
-    """Return a job's steps, each as its lines."""
-    start = job_lines.index(f"{' ' * (STEP_INDENT - 2)}steps:") + 1
-    found: list[list[str]] = []
-    for line in job_lines[start:]:
-        if line.startswith(f"{' ' * STEP_INDENT}- "):
-            found.append([])
-        if indent_of(line) < STEP_INDENT:
-            break
-        found[-1].append(line)
-    return found
-
-
-def block(job_lines: list[str], key: str) -> list[str]:
-    """Return the stripped lines of a mapping or list directly under a job's key."""
-    outer = f"{' ' * (STEP_INDENT - 2)}{key}:"
-    start = job_lines.index(outer) + 1
-    found = []
-    for line in job_lines[start:]:
-        if indent_of(line) <= STEP_INDENT - 2:
-            break
-        found.append(line.strip())
-    return found
-
-
-def step_label(step: list[str]) -> str:
-    """Return what a step is: its action without the pin, its name, or else its command."""
-    for pattern in (USES, NAME):
-        for line in step:
-            found = pattern.match(line)
-            if found:
-                return found.group(1)
-    return step[0].strip().removeprefix("- run: ")
-
-
-def step_index(step_list: list[list[str]], piece: str) -> int:
-    """Return the index of the one step holding this text."""
-    matching = [i for i, step in enumerate(step_list) if piece in "\n".join(step)]
-    if len(matching) != 1:
-        message = f"{piece!r} is in {len(matching)} steps, where one was wanted"
-        raise AssertionError(message)
-    return matching[0]
 
 
 class WorkflowCase(unittest.TestCase):
@@ -178,19 +117,36 @@ class PublishGateTests(WorkflowCase):
         """Losing one would still look right on a manual run, where `publish` is skipped."""
         self.assertEqual(set(block(self.publish, "needs")), {f"- {n}" for n in PUBLISH_NEEDS})
 
-    def test_publish_runs_only_on_a_tag_push_and_in_the_environment(self) -> None:
-        """The environment is where the person is, and a push is only ever a tag here."""
+    def test_publish_runs_only_on_a_tag_push(self) -> None:
+        """A push to main is a push too, and a manual run can be started on a tag."""
         self.assertIn(f"    {TAG_EVENT}", self.publish)
-        self.assertIn("    environment: release", self.publish)
 
-    def test_a_push_can_only_be_a_tag(self) -> None:
-        """A branch push here would be read as a release."""
+    def test_no_job_waits_for_an_approval(self) -> None:
+        """The signed tag is the gate: a stolen token can approve a deployment through the API."""
+        self.assertEqual([line for line in self.lines if "environment:" in line], [])
+
+    def test_a_push_is_to_main_or_a_tag(self) -> None:
+        """Main for the dry run, a tag for a release, and no other branch."""
         trigger = self.lines[self.lines.index("on:") + 1 :]
         trigger = trigger[: trigger.index("permissions:")]
         self.assertEqual(
             [line.strip() for line in trigger],
-            ["push:", "tags: ['v[0-9]*']", "workflow_dispatch:"],
+            ["push:", "branches: [main]", "tags: ['v[0-9]*']", "workflow_dispatch:"],
         )
+
+    def test_a_push_to_main_never_reaches_what_a_tag_does(self) -> None:
+        """Every job that a tag adds wants a tag push, and only `publish` attests."""
+        self.assertIn(f"    {TAG_EVENT}", job(self.lines, "preflight"))
+        self.assertIn(f"    {HOMEBREW_CONDITION}", job(self.lines, "homebrew"))
+        attesting = [
+            name
+            for name in JOBS - {"ci"}
+            if f"{ATTEST}@" in "\n".join(job(self.lines, name))
+            or "id-token" in "\n".join(job(self.lines, name))
+        ]
+        self.assertEqual(attesting, ["publish"])
+        smoke = "\n".join(job(self.lines, "smoke"))
+        self.assertIn('if [ "$GITHUB_REF_TYPE" = tag ]; then', smoke)
 
     def test_permissions_are_the_least_each_needs(self) -> None:
         """Read-only at the top, and write only in `publish`."""
@@ -207,6 +163,7 @@ class PublishGateTests(WorkflowCase):
             },
         )
         for name in (
+            "version",
             "on-main",
             "crate-age",
             "preflight",
@@ -216,8 +173,13 @@ class PublishGateTests(WorkflowCase):
         ):
             with self.subTest(job=name):
                 self.assertNotIn("    permissions:", job(self.lines, name))
-        guard = set(block(job(self.lines, "environment-guard"), "permissions"))
-        self.assertEqual(guard, {"actions: read", "contents: read"})
+        self.assertEqual(block(job(self.lines, "homebrew"), "permissions"), ["actions: write"])
+
+    def test_homebrew_only_starts_the_workflow_once_published(self) -> None:
+        """After `publish`, one step, with no checkout and nothing of the tap's."""
+        homebrew = job(self.lines, "homebrew")
+        self.assertIn("    needs: publish", homebrew)
+        self.assertEqual(steps(homebrew), [HOMEBREW_STEP])
 
     def test_a_second_attempt_is_refused_first_and_early(self) -> None:
         """First in `publish`, and first in `preflight` so a re-run stops in seconds."""
@@ -241,19 +203,18 @@ class PublishGateTests(WorkflowCase):
             '--tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"', text
         )
 
-    def test_the_guard_reads_both_answers_and_no_condition_can_skip_it(self) -> None:
-        """A skipped guard would skip `publish`, but this says what was meant."""
-        guard = job(self.lines, "environment-guard")
-        self.assertFalse([line for line in guard if line.startswith("    if:")])
-        text = "\n".join(guard)
-        self.assertIn('"repos/$GITHUB_REPOSITORY/environments/release"', text)
-        self.assertIn(
-            '"repos/$GITHUB_REPOSITORY/environments/release/deployment-branch-policies"', text
+    def test_only_a_version_change_on_main_builds_with_no_tag(self) -> None:
+        """`on-main` is what everything else needs, so its condition decides the whole run."""
+        on_main = job(self.lines, "on-main")
+        self.assertIn("    needs: version", on_main)
+        self.assertIn(f"    {BUILD_CONDITION}", on_main)
+        self.assertEqual(
+            block(job(self.lines, "version"), "outputs"),
+            ["build: ${{ steps.decide.outputs.build }}"],
         )
-        self.assertIn('> "$RUNNER_TEMP/environment.json"', text)
-        self.assertIn('> "$RUNNER_TEMP/policies.json"', text)
-        self.assertIn('check_environment.py "$RUNNER_TEMP/environment.json"', text)
-        self.assertIn('"$RUNNER_TEMP/policies.json"\n', text + "\n")
+        for name in JOBS - {"version", "on-main"}:
+            with self.subTest(job=name):
+                self.assertIn("on-main", needed(self.lines, name))
 
     def test_crate_age_checks_the_whole_lock_file(self) -> None:
         """A spent tag can't be the base: what it refused would pass, as unchanged, next time."""
@@ -415,7 +376,7 @@ class ArtifactTests(WorkflowCase):
                 )
                 upload = steps(build)[step_index(steps(build), "actions/upload-artifact@")]
                 self.assertEqual(upload[0].strip(), "- id: upload")
-                self.assertIn("          retention-days: 7", upload)
+                self.assertIn("          retention-days: 1", upload)
                 self.assertIn("          if-no-files-found: error", upload)
 
     def test_every_download_is_by_id(self) -> None:
@@ -480,18 +441,12 @@ class WholeFileTests(WorkflowCase):
 
     def test_the_jobs_are_exactly_these(self) -> None:
         """A new job has none of the gates `publish` has, whatever it's given."""
-        start = self.lines.index("jobs:") + 1
-        names = {
-            line.strip().removesuffix(":")
-            for line in self.lines[start:]
-            if indent_of(line) == JOB_INDENT
-        }
-        self.assertEqual(names, JOBS)
+        self.assertEqual(job_names(self.lines), JOBS)
 
-    def test_only_publish_can_write(self) -> None:
-        """Four lines, all in that job, and no broader form anywhere."""
+    def test_only_publish_can_write_but_for_starting_homebrew(self) -> None:
+        """Four lines in `publish`, `actions: write` in `homebrew`, and no broader form anywhere."""
         writing = [line.strip() for line in self.lines if WRITE.search(line)]
-        self.assertEqual(sorted(writing), sorted(PUBLISH_WRITES))
+        self.assertEqual(sorted(writing), sorted([*PUBLISH_WRITES, "actions: write"]))
         self.assertEqual(
             sorted(line.strip() for line in self.publish if WRITE.search(line)),
             sorted(PUBLISH_WRITES),
@@ -502,18 +457,26 @@ class WholeFileTests(WorkflowCase):
         self.assertEqual([line for line in self.lines if "continue-on-error" in line], [])
         self.assertEqual([line for line in self.lines if "set +e" in line], [])
 
-    def test_the_conditions_are_exactly_the_two(self) -> None:
+    def test_the_conditions_are_exactly_these(self) -> None:
         """An `if:` on any job or step is a way of not running it."""
         found = [line for line in self.lines if CONDITION.match(line)]
-        self.assertEqual(found, [f"    {TAG_EVENT}", f"    {TAG_EVENT}"])
+        self.assertEqual(
+            found,
+            [
+                f"    {BUILD_CONDITION}",
+                f"    {TAG_EVENT}",
+                f"    {TAG_EVENT}",
+                f"    {HOMEBREW_CONDITION}",
+            ],
+        )
 
     def test_a_failure_is_swallowed_only_where_it_is_then_refused(self) -> None:
-        """The policy list's 404 and a failed listing: the next lines refuse an empty answer."""
+        """A failed listing: the next lines refuse an empty answer."""
         found = [line.strip() for line in self.lines if "||" in line]
         self.assertEqual(
             found,
             [
-                '> "$RUNNER_TEMP/policies.json" || true',
+                'if [ "$GITHUB_EVENT_NAME" != push ] || [ "$GITHUB_REF_TYPE" = tag ]; then',
                 """'.[] | select(.draft and .html_url == $url) | .id') || matches=\"\"""",
             ],
         )
@@ -538,7 +501,7 @@ class WholeFileTests(WorkflowCase):
         self.assertEqual(
             on_main[1],
             [
-                "      - name: Require the tagged commit to be on main",
+                "      - name: Require the commit to be on main",
                 '        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main',
             ],
         )
@@ -579,7 +542,7 @@ class WholeFileTests(WorkflowCase):
                 '            chmod +x "binaries/$binary"',
                 '            actual=$("binaries/$binary" --version)',
                 '            echo "$binary: $actual"',
-                '            if [ "$GITHUB_EVENT_NAME" = push ]; then',
+                '            if [ "$GITHUB_REF_TYPE" = tag ]; then',
                 '              test "$actual" = "${binary##*/} ${GITHUB_REF_NAME#v}"',
                 "            fi",
                 "          done",
@@ -608,30 +571,33 @@ class WholeFileTests(WorkflowCase):
             with self.subTest(job=name):
                 self.assertEqual(steps(job(self.lines, name))[-1], expected)
 
-    def test_the_guard_and_the_verify_step_are_held_whole(self) -> None:
-        """The two gates a text test can most cheaply protect, against an early `exit 0`."""
+    def test_the_build_decision_and_the_verify_step_are_held_whole(self) -> None:
+        """What decides a dry run, and the gate a text test can most cheaply protect."""
+        version = steps(job(self.lines, "version"))
+        self.assertIn("          fetch-depth: 0", version[0])
         self.assertEqual(
-            steps(job(self.lines, "environment-guard"))[-1],
+            version[-1],
             [
-                "      - name: Refuse an environment that holds nothing back",
+                "      - id: decide",
+                (
+                    "        name: Build on a tag, a manual run, or a push to main that changes "
+                    "the version"
+                ),
                 "        shell: bash",
                 "        env:",
-                "          GH_TOKEN: ${{ github.token }}",
+                "          BEFORE: ${{ github.event.before }}",
                 "        run: |",
                 (
-                    '          gh api "repos/$GITHUB_REPOSITORY/environments/release" '
-                    '> "$RUNNER_TEMP/environment.json"'
+                    '          if [ "$GITHUB_EVENT_NAME" != push ] || '
+                    '[ "$GITHUB_REF_TYPE" = tag ]; then'
                 ),
+                '            echo "build=true" >> "$GITHUB_OUTPUT"',
+                "          else",
                 (
-                    '          gh api "repos/$GITHUB_REPOSITORY/environments/release/'
-                    'deployment-branch-policies" \\'
+                    "            python3 -I .github/scripts/version_bump.py "
+                    '--before "$BEFORE" --output "$GITHUB_OUTPUT"'
                 ),
-                '            > "$RUNNER_TEMP/policies.json" || true',
-                (
-                    "          python3 -I .github/scripts/check_environment.py "
-                    '"$RUNNER_TEMP/environment.json" \\'
-                ),
-                '            "$RUNNER_TEMP/policies.json"',
+                "          fi",
             ],
         )
         self.assertEqual(
@@ -715,53 +681,6 @@ class WholeFileTests(WorkflowCase):
         )
         self.assertIn("      RUSTUP_TOOLCHAIN: 1.99.0", macos)
         self.assertIn("          path: target/aarch64-apple-darwin/release/landfall", macos)
-
-
-class ReadingTests(unittest.TestCase):
-    """The reader must find what's there, or the tests above prove nothing."""
-
-    TEXT = """on:
-jobs:
-  first:
-    needs:
-      - a
-      - b
-    steps:
-      - name: One # a comment
-        run: |
-          echo one
-      - run: echo two
-  second:
-    steps:
-      - run: echo three
-"""
-
-    def test_jobs_and_steps_are_read_by_indentation(self) -> None:
-        """Each step whole, and a job stopping where the next starts."""
-        lines = significant(self.TEXT)
-        first = job(lines, "first")
-        self.assertEqual(block(first, "needs"), ["- a", "- b"])
-        self.assertEqual(
-            steps(first),
-            [
-                ["      - name: One", "        run: |", "          echo one"],
-                ["      - run: echo two"],
-            ],
-        )
-        self.assertEqual(steps(job(lines, "second")), [["      - run: echo three"]])
-
-    def test_a_job_that_is_not_there_fails(self) -> None:
-        """A renamed job isn't a job that passes."""
-        with self.assertRaises(ValueError):
-            job(significant(self.TEXT), "third")
-
-    def test_a_piece_in_no_step_or_two_fails(self) -> None:
-        """The order test can't pass by finding nothing."""
-        step_list = steps(job(significant(self.TEXT), "first"))
-        with self.assertRaises(AssertionError):
-            step_index(step_list, "absent")
-        with self.assertRaises(AssertionError):
-            step_index(step_list, "echo")
 
 
 if __name__ == "__main__":
