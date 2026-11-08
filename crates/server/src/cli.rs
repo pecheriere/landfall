@@ -3,6 +3,7 @@
 //! audit log, or a backup's, failed verification, 2 could not run (usage included,
 //! which is clap's own status).
 
+use std::backtrace::{Backtrace, BacktraceStatus};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::future::Future;
@@ -27,7 +28,7 @@ use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
 use crate::audit::AuditReport;
 use crate::auth::{flush_dropped, keep_flushing};
-use crate::logger::{self, Logger, hides_text};
+use crate::logger::{self, Logger, hides_text, push_escaped};
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 use crate::watcher::{self, LiveSource, ReleaseSource};
@@ -426,14 +427,24 @@ async fn serve_watching<S: ReleaseSource>(
 }
 
 /// Sends what a panic says to the log, rather than having the runtime's thread write it to stderr
-/// itself, where it could block. The rest of what a panic does is unchanged.
+/// itself, where it could block: the thread, the place and the message, and the backtrace when
+/// `RUST_BACKTRACE` asks for one, each escaped and cut short as any line is. The rest of what a
+/// panic does is unchanged.
 fn log_panics() {
     std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
         let location = info
             .location()
             .map_or_else(|| "an unknown place".to_owned(), ToString::to_string);
         let message = info.payload_as_str().unwrap_or("with no message");
-        logger::log(&format!("a thread panicked at {location}: {message}"));
+        logger::log(&format!(
+            "thread '{thread}' panicked at {location}: {message}"
+        ));
+        let backtrace = Backtrace::capture();
+        if backtrace.status() == BacktraceStatus::Captured {
+            logger::log(&format!("backtrace: {backtrace}"));
+        }
     }));
 }
 
@@ -576,17 +587,14 @@ async fn audit_show(args: AuditShowArgs, out: &mut impl Write) -> Result<u8, Cli
 }
 
 /// A line of JSON with what JSON leaves as it is, and a terminal doesn't, escaped: the
-/// delete and C1 controls, and what reorders text or breaks a line unseen. They can
-/// only be inside strings, where the escape reads back as the same character.
+/// delete and C1 controls, and what [`hides_text`]: what reorders text, breaks a line or
+/// isn't seen. They can only be inside strings, where the escape, a surrogate pair past the
+/// first plane, reads back as the same character.
 fn safe_to_print(line: &str) -> String {
     let mut safe = String::with_capacity(line.len());
     for character in line.chars() {
         if matches!(character, '\u{7f}'..='\u{9f}') || hides_text(character) {
-            // Writing to a String cannot fail.
-            let _ = std::fmt::Write::write_fmt(
-                &mut safe,
-                format_args!("\\u{:04x}", u32::from(character)),
-            );
+            push_escaped(&mut safe, character);
         } else {
             safe.push(character);
         }
@@ -632,7 +640,8 @@ async fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
 /// Runs a parsed command line and gives the process's exit status.
 #[must_use]
 pub fn run(cli: Cli) -> u8 {
-    on_a_runtime(execute(cli, &mut io::stdout()))
+    let failure = FailureTo::for_command(&cli.command);
+    on_a_runtime(execute(cli, &mut io::stdout()), failure)
 }
 
 /// [`run`], with `serve` watching `source` every `interval`, for the end-to-end
@@ -656,25 +665,65 @@ pub fn run_watching_within<S: ReleaseSource>(
     drain_timeout: Duration,
 ) -> u8 {
     match cli.command {
-        Command::Serve(args) => on_a_runtime(async move {
-            let config = load_config(&args.config)?;
-            let source = |_: &ServeArgs, _| Ok(source);
-            serve_watching(args, config, source, interval, limits, drain_timeout).await
-        }),
+        Command::Serve(args) => on_a_runtime(
+            async move {
+                let config = load_config(&args.config)?;
+                let source = |_: &ServeArgs, _| Ok(source);
+                serve_watching(args, config, source, interval, limits, drain_timeout).await
+            },
+            FailureTo::Log,
+        ),
         command => run(Cli { command }),
     }
 }
 
-fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
-    on_a_runtime_logging(work, logger::global())
+/// Where a command's failure is said, once its runtime is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureTo {
+    /// Straight to stderr, waiting as long as it takes, as any command line tool does.
+    Stderr,
+    /// To the log, after what was logged before it, with [`FLUSH_TIMEOUT`] to be written. For
+    /// `serve`: a service whose stderr isn't read must end, and be restarted, rather than hang on
+    /// its way out.
+    Log,
+}
+
+impl FailureTo {
+    fn for_command(command: &Command) -> Self {
+        match command {
+            Command::Serve(_) => Self::Log,
+            _ => Self::Stderr,
+        }
+    }
+}
+
+/// Gives the log its [`FLUSH_TIMEOUT`] to write what's queued when dropped, so that a panic
+/// unwinding out of the work, whose message is queued, is written too.
+struct FlushOnDrop<'a>(Option<&'a Logger>);
+
+impl Drop for FlushOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(log) = self.0 {
+            // If it couldn't in time, stderr isn't taking lines, so there is nowhere to say so.
+            let _ = log.flush_within(FLUSH_TIMEOUT);
+        }
+    }
+}
+
+fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>, failure: FailureTo) -> u8 {
+    on_a_runtime_logging(work, logger::global(), failure)
 }
 
 /// [`on_a_runtime`], with what is logged going to `log`, which then has [`FLUSH_TIMEOUT`] to write
-/// it, as the runtime's threads can no longer be blocked by it.
+/// it, as the runtime's threads can no longer be blocked by it, and the failure said as `failure`
+/// says.
 fn on_a_runtime_logging(
     work: impl Future<Output = Result<u8, CliError>>,
     log: Option<&Logger>,
+    failure: FailureTo,
 ) -> u8 {
+    // Made first, so that it is dropped last, the runtime gone, whether this returns or unwinds.
+    let flushing = FlushOnDrop(log);
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -684,23 +733,21 @@ fn on_a_runtime_logging(
             runtime.shutdown_timeout(LET_GO_TIMEOUT);
             result
         });
-    let code = match result {
-        Ok(code) => code,
-        Err(error) => {
-            match log {
-                Some(log) => log.log_as_is(&error.to_string()),
-                // With no log, nothing else is writing to stderr, and no runtime is left to block.
-                // Nothing is left to tell if stderr itself is gone.
-                None => drop(writeln!(io::stderr(), "landfall-server: {error}")),
-            }
-            EXIT_COULD_NOT_RUN
-        }
+    let error = match result {
+        Ok(code) => return code,
+        Err(error) => error,
     };
-    if let Some(log) = log {
-        // If it couldn't in time, stderr isn't taking lines, so there is nowhere to say so.
-        let _ = log.flush_within(FLUSH_TIMEOUT);
+    match (failure, log) {
+        (FailureTo::Log, Some(log)) => log.log_as_is(&error.to_string()),
+        // With no log, nothing else is writing to stderr. Either way no runtime is left to block.
+        (FailureTo::Stderr, _) | (FailureTo::Log, None) => {
+            // What was logged comes first.
+            drop(flushing);
+            // Nothing is left to tell if stderr itself is gone.
+            drop(writeln!(io::stderr(), "landfall-server: {error}"));
+        }
     }
-    code
+    EXIT_COULD_NOT_RUN
 }
 
 #[cfg(test)]

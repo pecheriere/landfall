@@ -8,8 +8,8 @@
 //! written. The queue holds at most [`CAPACITY`] lines of at most about [`MAX_LINE_BYTES`] each.
 //!
 //! Each line is `landfall-server: ` and then the line, on one line: a control character, or one
-//! that reorders text or breaks a line unseen, is written as an escape, so that nothing passed in
-//! can make a line that looks like another.
+//! that [hides text](hides_text), is written as a `\uXXXX` escape, and a backslash as `\\`, so that
+//! nothing passed in can make a line that looks like another, or pass for an escape.
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -37,8 +37,12 @@ const PREFIX: &str = "landfall-server: ";
 enum Entry {
     /// A line ready to write, and how many were dropped since the line before it.
     Line { text: String, dropped_before: u64 },
-    /// Told once everything queued before it is written.
-    Flush(mpsc::Sender<()>),
+    /// Told once everything queued before it is written, and how many were dropped since the line
+    /// before it, which it says even with no line after it.
+    Flush {
+        done: mpsc::Sender<()>,
+        dropped_before: u64,
+    },
 }
 
 /// A log whose lines a thread of its own writes to a sink. Logging never waits.
@@ -75,6 +79,12 @@ impl Logger {
         self.queue_text(text.to_owned());
     }
 
+    /// Queues `text` with the count of lines dropped before it, or adds it to that count.
+    ///
+    /// With several threads logging at once, a count can be taken by one line and land a line or
+    /// so away from where the lines were dropped, as two threads can queue in the other order from
+    /// the one they took the count in. The total said is always right, and nothing is counted
+    /// twice; keeping the order exact would need a lock around the queue.
     fn queue_text(&self, text: String) {
         let dropped_before = self.dropped.swap(0, Ordering::Relaxed);
         if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
@@ -88,23 +98,29 @@ impl Logger {
         }
     }
 
-    /// Waits up to `limit` for everything queued so far to be written. True if it was. This blocks
-    /// its thread, so it is for once the runtime is gone, never for a runtime's thread.
+    /// Waits up to `limit` for everything queued so far to be written, with the count of what was
+    /// dropped since. True if it was. This blocks its thread, so it is for once the runtime is
+    /// gone, never for a runtime's thread.
     pub(crate) fn flush_within(&self, limit: Duration) -> bool {
         let deadline = Instant::now() + limit;
         let (done, flushed) = mpsc::channel();
-        let mut mark = Entry::Flush(done);
+        let mut mark = Entry::Flush {
+            done,
+            dropped_before: self.dropped.swap(0, Ordering::Relaxed),
+        };
         loop {
             match self.queue.try_send(mark) {
                 Ok(()) => break,
-                Err(TrySendError::Full(back)) => {
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
+                Err(TrySendError::Full(back)) if Instant::now() < deadline => {
                     mark = back;
                     std::thread::sleep(FLUSH_RETRY);
                 }
-                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(back) | TrySendError::Disconnected(back)) => {
+                    if let Entry::Flush { dropped_before, .. } = back {
+                        self.dropped.fetch_add(dropped_before, Ordering::Relaxed);
+                    }
+                    return false;
+                }
             }
         }
         flushed
@@ -119,55 +135,88 @@ impl Logger {
 fn write_all(entries: &Receiver<Entry>, mut sink: impl Write) {
     let mut failed: u64 = 0;
     while let Ok(entry) = entries.recv() {
-        match entry {
+        let (text, dropped_before, done) = match entry {
             Entry::Line {
                 text,
                 dropped_before,
-            } => {
-                let missed = dropped_before.saturating_add(failed);
-                let mut out = String::with_capacity(text.len() + 2 * PREFIX.len() + 80);
-                if missed > 0 {
-                    // Writing to a String cannot fail.
-                    let _ = writeln!(
-                        out,
-                        "{PREFIX}{missed} more log lines were not written, as stderr was not \
-                         taking them"
-                    );
-                }
-                out.push_str(PREFIX);
-                out.push_str(&text);
-                out.push('\n');
-                failed = match sink.write_all(out.as_bytes()).and_then(|()| sink.flush()) {
-                    Ok(()) => 0,
-                    // Nothing is left to tell if stderr itself is gone, but if it comes back, it
-                    // hears how much it missed.
-                    Err(_) => missed.saturating_add(1),
-                };
-            }
-            Entry::Flush(done) => {
-                let _ = done.send(());
-            }
+            } => (Some(text), dropped_before, None),
+            Entry::Flush {
+                done,
+                dropped_before,
+            } => (None, dropped_before, Some(done)),
+        };
+        let missed = dropped_before.saturating_add(failed);
+        let mut out = String::new();
+        if missed > 0 {
+            // Writing to a String cannot fail.
+            let _ = writeln!(
+                out,
+                "{PREFIX}{missed} more log lines were not written, as stderr was not taking them"
+            );
+        }
+        if let Some(text) = &text {
+            out.push_str(PREFIX);
+            out.push_str(text);
+            out.push('\n');
+        }
+        if !out.is_empty() {
+            failed = match sink.write_all(out.as_bytes()).and_then(|()| sink.flush()) {
+                Ok(()) => 0,
+                // Nothing is left to tell if stderr itself is gone, but if it comes back, it hears
+                // how much it missed.
+                Err(_) => missed.saturating_add(u64::from(text.is_some())),
+            };
+        }
+        if let Some(done) = done {
+            let _ = done.send(());
         }
     }
 }
 
-/// Whether `character` reorders text or breaks a line without being seen: what a terminal or a log
-/// viewer shows differently from what is there.
+/// Whether `character` reorders text, breaks a line, or is there without being seen: what a
+/// terminal or a log viewer shows differently from what is there. Every format character (Unicode's
+/// `Cf`, as of Unicode 17), the line and paragraph separators, and the variation selectors.
 #[must_use]
 pub(crate) fn hides_text(character: char) -> bool {
     matches!(
         character,
-        '\u{61c}'
-            | '\u{200e}'
-            | '\u{200f}'
+        '\u{ad}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61c}'
+            | '\u{6dd}'
+            | '\u{70f}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}'
     )
 }
 
-/// `line` on one line: controls and what [`hides_text`] escaped, and cut short past
-/// [`MAX_LINE_BYTES`].
+/// Writes `character` as `\uXXXX`, two of them, a UTF-16 surrogate pair, past the first plane: as
+/// JSON writes it, and never followed by a digit that could be read as part of it.
+pub(crate) fn push_escaped(out: &mut String, character: char) {
+    let mut units = [0; 2];
+    for unit in character.encode_utf16(&mut units) {
+        // Writing to a String cannot fail.
+        let _ = write!(out, "\\u{unit:04x}");
+    }
+}
+
+/// `line` on one line: controls and what [`hides_text`] escaped, a backslash doubled, and cut short
+/// past [`MAX_LINE_BYTES`].
 fn one_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len().min(MAX_LINE_BYTES + CUT_SHORT.len()));
     for character in line.chars() {
@@ -175,9 +224,10 @@ fn one_line(line: &str) -> String {
             out.push_str(CUT_SHORT);
             break;
         }
-        if character.is_control() || hides_text(character) {
-            // Writing to a String cannot fail.
-            let _ = write!(out, "\\u{:04x}", u32::from(character));
+        if character == '\\' {
+            out.push_str("\\\\");
+        } else if character.is_control() || hides_text(character) {
+            push_escaped(&mut out, character);
         } else {
             out.push(character);
         }

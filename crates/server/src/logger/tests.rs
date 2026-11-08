@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{CUT_SHORT, Logger, MAX_LINE_BYTES};
+use super::{CUT_SHORT, Logger, MAX_LINE_BYTES, hides_text};
 
 /// A wait that only a hung test waits out.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -150,6 +150,47 @@ fn what_did_not_fit_is_said_before_the_next_line_written() {
     );
 }
 
+/// A flush says what was dropped, even with no line after it to say it before.
+#[test]
+fn a_flush_says_what_was_dropped_with_no_line_after_it() {
+    let gate = Gate::default();
+    let logger = Logger::start(gate.clone(), 1).unwrap();
+    logger.log("held");
+    gate.wait_for_a_write();
+    logger.log("queued");
+    for _ in 0..3 {
+        logger.log("lost");
+    }
+
+    gate.open();
+    assert!(logger.flush_within(PATIENCE));
+    assert_eq!(
+        gate.lines(),
+        [
+            "landfall-server: held",
+            "landfall-server: queued",
+            "landfall-server: 3 more log lines were not written, as stderr was not taking them",
+        ]
+    );
+}
+
+/// The same for a line that failed to write, with nothing logged after it.
+#[test]
+fn a_flush_says_what_failed_to_write_with_no_line_after_it() {
+    let gate = Gate::opened();
+    let sink = FailsFirst {
+        failing: 1,
+        gate: gate.clone(),
+    };
+    let logger = Logger::start(sink, 8).unwrap();
+    logger.log("gone");
+    assert!(logger.flush_within(PATIENCE));
+    assert_eq!(
+        gate.lines(),
+        ["landfall-server: 1 more log lines were not written, as stderr was not taking them"]
+    );
+}
+
 #[test]
 fn a_line_that_failed_to_write_is_counted_once_stderr_takes_lines_again() {
     let gate = Gate::opened();
@@ -171,20 +212,60 @@ fn a_line_that_failed_to_write_is_counted_once_stderr_takes_lines_again() {
     );
 }
 
-/// Nothing passed in can start a line of its own, or hide what's on it.
+/// Nothing passed in can start a line of its own, hide what's on it, or pass for an escape.
 #[test]
 fn a_line_stays_one_line_whatever_it_holds() {
     let gate = Gate::opened();
     let logger = Logger::start(gate.clone(), 8).unwrap();
     logger.log("refused x\nlandfall-server: decision: forged\r\u{1b}[2J\u{202e}txt\u{7f}");
+    logger.log(r"a literal \u000a, and a \ alone");
+    logger.log("zw\u{200b}\u{200d} shy\u{ad} wj\u{2060} vs\u{fe0f} tag\u{e0041} mvs\u{180e} ok é");
     assert!(logger.flush_within(PATIENCE));
     assert_eq!(
         gate.lines(),
         [
             "landfall-server: refused x\\u000alandfall-server: decision: forged\\u000d\\u001b[2J\
-             \\u202etxt\\u007f"
+             \\u202etxt\\u007f",
+            r"landfall-server: a literal \\u000a, and a \\ alone",
+            r"landfall-server: zw\u200b\u200d shy\u00ad wj\u2060 vs\ufe0f tag\udb40\udc41 mvs\u180e ok é",
         ]
     );
+}
+
+/// Every format character is escaped, whatever plane it is on, and nothing printable is.
+#[test]
+fn every_format_character_hides_text_and_nothing_printable_does() {
+    // Unicode 17's `Cf`, as `unicodedata` lists it.
+    let format = [
+        0xad..=0xad,
+        0x600..=0x605,
+        0x61c..=0x61c,
+        0x6dd..=0x6dd,
+        0x70f..=0x70f,
+        0x890..=0x891,
+        0x8e2..=0x8e2,
+        0x180e..=0x180e,
+        0x200b..=0x200f,
+        0x202a..=0x202e,
+        0x2060..=0x2064,
+        0x2066..=0x206f,
+        0xfeff..=0xfeff,
+        0xfff9..=0xfffb,
+        0x110bd..=0x110bd,
+        0x110cd..=0x110cd,
+        0x13430..=0x1343f,
+        0x1bca0..=0x1bca3,
+        0x1d173..=0x1d17a,
+        0xe0001..=0xe0001,
+        0xe0020..=0xe007f,
+    ];
+    for code in format.into_iter().flatten() {
+        let character = char::from_u32(code).unwrap();
+        assert!(hides_text(character), "U+{code:04X}");
+    }
+    for character in ['a', 'é', '\u{2014}', '\u{4e2d}', '\u{1f600}', ' '] {
+        assert!(!hides_text(character), "{character:?}");
+    }
 }
 
 #[test]

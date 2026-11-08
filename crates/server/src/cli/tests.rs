@@ -1,3 +1,4 @@
+mod runtime;
 mod tokens;
 
 use std::sync::{Arc, Mutex};
@@ -7,11 +8,10 @@ use clap::{CommandFactory as _, Parser as _};
 use landfall_core::config::ConfigError;
 
 use super::{
-    ApiState, CLOSE_TIMEOUT, Cli, CliError, Command, DeploymentId, Duration, EXIT_COULD_NOT_RUN,
-    EXIT_OK, EXIT_TAMPERED, FLUSH_TIMEOUT, HostId, LET_GO_TIMEOUT, Limits, Logger, OsString, Path,
-    PathBuf, ServeArgs, ServeOptions, Store, TASKS_TIMEOUT, execute, finish_stopping, github_token,
-    load_config, on_a_runtime, on_a_runtime_logging, real_limits, release_fetcher, trust_cache_dir,
-    wait_for_tasks,
+    ApiState, CLOSE_TIMEOUT, Cli, CliError, Command, DeploymentId, Duration, EXIT_OK,
+    EXIT_TAMPERED, FLUSH_TIMEOUT, HostId, LET_GO_TIMEOUT, Limits, OsString, Path, PathBuf,
+    ServeArgs, ServeOptions, Store, TASKS_TIMEOUT, execute, finish_stopping, github_token,
+    load_config, real_limits, release_fetcher, trust_cache_dir, wait_for_tasks,
 };
 
 #[test]
@@ -348,8 +348,8 @@ async fn audit_show_escapes_what_a_terminal_would_act_on_and_it_reads_back_the_s
         .execute(store.pool())
         .await
         .unwrap();
-    let hostile =
-        "del\u{7f} c1\u{80}\u{85}\u{9f} rlo\u{202e} lri\u{2066} alm\u{61c} ls\u{2028} ok é";
+    let hostile = "del\u{7f} c1\u{80}\u{85}\u{9f} rlo\u{202e} lri\u{2066} alm\u{61c} ls\u{2028} \
+                   zw\u{200b} shy\u{ad} vs\u{fe0f} tag\u{e0041} ok é";
     sqlx::query("UPDATE audit_events SET detail = ?")
         .bind(serde_json::json!({ "reason": hostile }).to_string())
         .execute(store.pool())
@@ -369,11 +369,24 @@ async fn audit_show_escapes_what_a_terminal_would_act_on_and_it_reads_back_the_s
     let printed = String::from_utf8(out).unwrap();
 
     for raw in [
-        '\u{7f}', '\u{80}', '\u{85}', '\u{9f}', '\u{202e}', '\u{2066}', '\u{61c}', '\u{2028}',
+        '\u{7f}',
+        '\u{80}',
+        '\u{85}',
+        '\u{9f}',
+        '\u{202e}',
+        '\u{2066}',
+        '\u{61c}',
+        '\u{2028}',
+        '\u{200b}',
+        '\u{ad}',
+        '\u{fe0f}',
+        '\u{e0041}',
     ] {
         assert!(!printed.contains(raw), "{raw:?} in {printed}");
     }
     assert!(printed.contains("\\u202e"), "{printed}");
+    // Past the first plane, as JSON has it: a surrogate pair.
+    assert!(printed.contains("\\udb40\\udc41"), "{printed}");
     assert!(printed.contains('é'), "ordinary text stays as it is");
     let read: serde_json::Value = serde_json::from_str(&printed).unwrap();
     assert_eq!(read["detail"]["reason"], hostile);
@@ -566,28 +579,6 @@ async fn serve_refuses_a_missing_configuration_before_touching_the_database() {
     assert!(!path.exists());
 }
 
-/// The process ends, with a task blocking its thread, as a handler on a stuck stderr does.
-#[test]
-fn a_task_blocking_its_thread_cant_keep_the_process() {
-    let (blocked_for_good, blocked) = std::sync::mpsc::channel::<()>();
-    let (result, ended) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let code = on_a_runtime(async move {
-            let (started, has_started) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                started.send(()).unwrap();
-                let _ = blocked.recv();
-            });
-            has_started.await.unwrap();
-            Ok(7)
-        });
-        result.send(code).unwrap();
-    });
-    let code = ended.recv_timeout(std::time::Duration::from_secs(60));
-    assert_eq!(code, Ok(7));
-    drop(blocked_for_good);
-}
-
 /// What `docs/operations.md` says of stopping, and what the real `serve` goes by. These have no
 /// other test: the end-to-end tests wait for nothing this long, and those holding a request open
 /// set their own.
@@ -652,44 +643,6 @@ async fn the_operator_is_told_of_requests_left_running_and_of_nothing_else() {
     let (say, said) = kept_saying();
     finish_stopping(&state, &store, 0, say).await;
     assert_eq!(*said.lock().unwrap(), [] as [String; 0]);
-}
-
-/// A stderr that takes nothing, for as long as its sender is held.
-struct Stuck(std::sync::mpsc::Receiver<()>);
-
-impl std::io::Write for Stuck {
-    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-        let _ = self.0.recv();
-        Err(std::io::ErrorKind::BrokenPipe.into())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// With a stderr that takes nothing, what's logged, the failure included, can't keep the process:
-/// the log has its limit, and no more, once the runtime is gone.
-#[test]
-fn a_stderr_that_takes_nothing_cant_keep_the_process() {
-    let (stuck_for_good, stuck) = std::sync::mpsc::channel::<()>();
-    let log = Logger::start(Stuck(stuck), 4).unwrap();
-    let (result, ended) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let code = on_a_runtime_logging(
-            async {
-                for _ in 0..100 {
-                    log.log("a line from a runtime's thread");
-                }
-                Err(CliError::GitHubToken)
-            },
-            Some(&log),
-        );
-        result.send(code).unwrap();
-    });
-    let code = ended.recv_timeout(std::time::Duration::from_secs(60));
-    assert_eq!(code, Ok(EXIT_COULD_NOT_RUN));
-    drop(stuck_for_good);
 }
 
 /// A task stuck past its limit can't keep the last flush from running.
