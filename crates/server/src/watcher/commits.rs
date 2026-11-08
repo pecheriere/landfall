@@ -7,7 +7,9 @@
 //! or its base isn't an ancestor of its head. Verification has GitHub first: this
 //! runs only once a tick's verifications are done, makes at most 12 requests a tick
 //! with a token and 3 without, and stops while GitHub's count of requests left is
-//! below a floor, or at the first 403 or 429. A failure is recorded as `unavailable`
+//! below a floor, or at the first 403 or 429, which it logs once, with the repository and
+//! when commits go on, so that a refusal that never lifts isn't silent. A failure is
+//! recorded as `unavailable`
 //! and tried again after [`COMMIT_RETRY_SECS`]; it holds and refuses nothing, and
 //! writes no audit row, since nothing is decided here. A list whose pages don't hold
 //! what GitHub's total says they should is a failure, not a list. The whole pass has
@@ -18,7 +20,7 @@
 use std::time::Duration;
 
 use landfall_core::config::Config;
-use landfall_core::ids::{CommitSha, ReleaseTag, TagPattern};
+use landfall_core::ids::{CommitSha, ReleaseTag, RepoName, TagPattern};
 use landfall_core::text::quoted;
 use landfall_origin::fetch::{
     COMPARE_PER_PAGE, ComparePage, CompareStatus, FetchError, KEPT_COMMITS, ListedCommit,
@@ -29,7 +31,6 @@ use semver::Version;
 
 use super::backoff::WatcherState;
 use super::{ReleaseSource, describe};
-use crate::logger::log;
 use crate::store::{NewRange, RangeState, Store, WantedRange};
 
 /// How long after a range was unavailable it is tried again, seconds.
@@ -155,6 +156,8 @@ struct Asking<'a> {
     budget: GitHubBudget,
     state: &'a WatcherState,
     now: i64,
+    /// Where the pass's lines go: the controller's log.
+    log: &'a (dyn Fn(&str) + Sync),
 }
 
 impl Asking<'_> {
@@ -169,8 +172,10 @@ impl Asking<'_> {
         low
     }
 
-    /// Commits wait as long as GitHub's refusal says, or an hour when it doesn't.
-    fn refused(&self, error: &ReleaseError) {
+    /// Commits wait as long as GitHub's refusal of a compare in `repo` with `status` says,
+    /// or an hour when it doesn't, and the log says so: the repository, the status and
+    /// when commits go on, and nothing of the request, which could name a credential.
+    fn refused(&self, error: &ReleaseError, repo: &RepoName, status: u16) {
         let until = match error.fetch_error() {
             Some(FetchError::RateLimited {
                 reset: RateLimitReset::At(at),
@@ -184,7 +189,8 @@ impl Asking<'_> {
                 .saturating_add(i64::try_from(*seconds).unwrap_or(i64::MAX)),
             _ => self.now.saturating_add(COMMIT_RETRY_SECS),
         };
-        self.state.pause_commits(until, self.now);
+        let until = self.state.pause_commits(until, self.now);
+        (self.log)(&paused_line(repo, status, until));
     }
 }
 
@@ -211,17 +217,24 @@ enum Fetched {
     Failed(String),
 }
 
-/// A 403 or a 429 from GitHub, with the rate-limit headers or without.
-fn is_refusal_for_limit(error: &ReleaseError) -> bool {
-    matches!(
-        error.fetch_error(),
-        Some(
-            FetchError::RateLimited { .. }
-                | FetchError::Status {
-                    status: 403 | 429,
-                    ..
-                }
-        )
+/// The status of a 403 or a 429 from GitHub, with the rate-limit headers or without.
+fn refusal_for_limit(error: &ReleaseError) -> Option<u16> {
+    match error.fetch_error()? {
+        FetchError::RateLimited { status, .. }
+        | FetchError::Status {
+            status: status @ (403 | 429),
+            ..
+        } => Some(*status),
+        _ => None,
+    }
+}
+
+/// The line logged when GitHub's refusal of a compare in `repo` pauses commits until
+/// `until`, in Unix seconds.
+fn paused_line(repo: &RepoName, status: u16, until: i64) -> String {
+    format!(
+        "watcher: commits: GitHub answered {status} to a compare in {repo}: no commits are \
+         fetched until {until} (Unix seconds)"
     )
 }
 
@@ -237,11 +250,13 @@ async fn ask<S: ReleaseSource>(
         .await
     {
         Ok(answer) => Asked::Page(answer),
-        Err(error) if is_refusal_for_limit(&error) => {
-            asking.refused(&error);
-            Asked::Stop
-        }
-        Err(error) => Asked::Failed(error),
+        Err(error) => match refusal_for_limit(&error) {
+            Some(status) => {
+                asking.refused(&error, &range.repo, status);
+                Asked::Stop
+            }
+            None => Asked::Failed(error),
+        },
     }
 }
 
@@ -268,12 +283,7 @@ async fn fetch_range<S: ReleaseSource>(
                 rate_remaining,
                 rate_reset,
             }) => (status, total, commits, rate_remaining, rate_reset),
-            Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
-                return (
-                    whole(RangeState::TooLarge),
-                    asking.is_low(rate_remaining, None),
-                );
-            }
+            Asked::Page(ComparePage::TooLarge) => return (whole(RangeState::TooLarge), false),
             Asked::Stop => return (Fetched::Stopped, true),
             Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
         };
@@ -305,12 +315,7 @@ async fn fetch_range<S: ReleaseSource>(
                 listed.extend(commits);
                 stop = asking.is_low(rate_remaining, rate_reset);
             }
-            Asked::Page(ComparePage::TooLarge { rate_remaining }) => {
-                return (
-                    whole(RangeState::TooLarge),
-                    asking.is_low(rate_remaining, None),
-                );
-            }
+            Asked::Page(ComparePage::TooLarge) => return (whole(RangeState::TooLarge), false),
             Asked::Stop => return (Fetched::Stopped, true),
             Asked::Failed(error) => return (Fetched::Failed(describe(&error)), false),
         }
@@ -334,14 +339,15 @@ async fn fetch_range<S: ReleaseSource>(
 }
 
 /// Fetches the ranges the releases settled under `config` want, newest first, within
-/// this tick's budget, and stores each whole one, or each failure as unavailable. The
-/// count of ranges stored, unavailable ones included.
+/// this tick's budget, and stores each whole one, or each failure as unavailable, its
+/// lines going to `log`. The count of ranges stored, unavailable ones included.
 pub(crate) async fn after_tick<S: ReleaseSource>(
     store: &Store,
     source: &S,
     config: &Config,
     state: &WatcherState,
     now: i64,
+    log: &(dyn Fn(&str) + Sync),
 ) -> usize {
     // What GitHub said of its limit in an earlier tick still holds: no request is sent
     // to learn it again.
@@ -352,6 +358,7 @@ pub(crate) async fn after_tick<S: ReleaseSource>(
         budget: GitHubBudget::for_tick(source.has_github_token()),
         state,
         now,
+        log,
     };
     let wanted = match store.ranges_wanted(config, config.hash(), now).await {
         Ok(wanted) => wanted,

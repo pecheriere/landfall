@@ -133,8 +133,24 @@ pub(super) async fn after(h: &Harness) -> usize {
         &h.config,
         &h.state,
         h.store.now().unwrap(),
+        &|_| {},
     )
     .await
+}
+
+/// [`after`], with the lines it logged.
+pub(super) async fn after_logged(h: &Harness) -> (usize, Vec<String>) {
+    let lines = std::sync::Mutex::new(Vec::new());
+    let stored = after_tick(
+        &h.store,
+        h.fake.as_ref(),
+        &h.config,
+        &h.state,
+        h.store.now().unwrap(),
+        &|line| lines.lock().unwrap().push(line.to_owned()),
+    )
+    .await;
+    (stored, lines.into_inner().unwrap())
 }
 
 pub(super) async fn range(h: &Harness, base: &str, head: &str) -> Option<CommitRange> {
@@ -415,20 +431,20 @@ async fn behind_or_diverged_is_base_not_found() {
 #[tokio::test]
 async fn too_large_is_recorded_without_a_list() {
     let h = harness(&config_text(PATCH_RULE)).await;
-    answer(
-        &h,
-        Box::new(|_, _, _| {
-            Ok(ComparePage::TooLarge {
-                rate_remaining: None,
-            })
-        }),
-    );
-    settle(&h, PROD, "v1.2.0").await;
-    settle(&h, PROD, "v1.3.0").await;
-    assert_eq!(after(&h).await, 1);
-    let stored = range(&h, "v1.2.0", "v1.3.0").await.unwrap();
-    assert_eq!(stored.state, RangeState::TooLarge);
-    assert_eq!((stored.total, stored.commits.len()), (None, 0));
+    with_token(&h);
+    answer(&h, Box::new(|_, _, _| Ok(ComparePage::TooLarge)));
+    for release in ["v1.2.0", "v1.3.0", "v1.4.0"] {
+        settle(&h, PROD, release).await;
+    }
+    // A too-large answer says nothing of GitHub's limit, so the tick goes on to the next
+    // range within its budget.
+    assert_eq!(after(&h).await, 2);
+    assert_eq!(compares(&h), [1, 1]);
+    for (base, head) in [("v1.2.0", "v1.3.0"), ("v1.3.0", "v1.4.0")] {
+        let stored = range(&h, base, head).await.unwrap();
+        assert_eq!(stored.state, RangeState::TooLarge, "{head}");
+        assert_eq!((stored.total, stored.commits.len()), (None, 0));
+    }
     assert_eq!(wanted(&h).await, []);
 }
 
@@ -696,7 +712,7 @@ async fn a_configuration_change_does_not_make_old_releases_eligible() {
         .await
         .unwrap();
     assert_eq!(wanted, []);
-    after_tick(&h.store, h.fake.as_ref(), &changed, &h.state, now).await;
+    after_tick(&h.store, h.fake.as_ref(), &changed, &h.state, now, &|_| {}).await;
     assert_eq!(compares(&h), Vec::<u32>::new());
 }
 

@@ -224,7 +224,8 @@ again from its new commit, and two deployments of one repository share one list.
   stored only once all of them came back. Once GitHub reports fewer requests left than that, or
   answers 403 or 429, no commits are asked for until its rate-limit window ends
   (`x-ratelimit-reset` or `Retry-After`, believed for a day at most), or for an hour when it
-  doesn't say.
+  doesn't say. A 403 or 429 is logged once each time, with the repository and when commits go
+  on, so a refusal that never lifts shows in the controller's log.
   Only releases first recorded after the controller was upgraded to this version are compared:
   nothing is fetched for the history it already had.
 

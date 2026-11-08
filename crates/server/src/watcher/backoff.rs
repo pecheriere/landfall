@@ -122,8 +122,8 @@ impl WatcherState {
 
     /// Commits wait until `until`, as far as a server's word is believable: at least a
     /// second and at most [`RATE_LIMIT_MAX_SECS`] from `now`. A later pause already set
-    /// stands.
-    pub(super) fn pause_commits(&self, until: i64, now: i64) {
+    /// stands. Returns when they wait until now.
+    pub(super) fn pause_commits(&self, until: i64, now: i64) -> i64 {
         let until = until.clamp(
             now.saturating_add(1),
             now.saturating_add(RATE_LIMIT_MAX_SECS),
@@ -133,6 +133,7 @@ impl WatcherState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         *paused = (*paused).max(until);
+        *paused
     }
 
     /// The repository waits longer the more often it fails in a row.
