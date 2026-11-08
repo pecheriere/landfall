@@ -47,8 +47,10 @@ pub(crate) enum HumanProblem {
     AssertionRefused,
     /// The configuration has no `[approval]`.
     ApprovalsNotConfigured,
-    /// This principal has asked for too many state changes.
+    /// This credential has asked for too many state changes.
     OverBudget,
+    /// This credential has made too many reads.
+    ReadsOverBudget,
     /// An invite's code that is wrong, used or expired: the same answer for every way of that.
     InviteRefused,
     /// A registration with a good code whose ceremony didn't check out.
@@ -161,6 +163,7 @@ impl HumanProblem {
             ),
             Self::ApprovalsNotConfigured
             | Self::OverBudget
+            | Self::ReadsOverBudget
             | Self::InviteRefused
             | Self::RegistrationRefused
             | Self::SignInRefused
@@ -183,6 +186,11 @@ impl HumanProblem {
                 StatusCode::TOO_MANY_REQUESTS,
                 ProblemCode::RateLimited,
                 "too many state changes by this principal",
+            ),
+            Self::ReadsOverBudget => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ProblemCode::RateLimited,
+                "too many reads by this credential",
             ),
             Self::InviteRefused => (
                 StatusCode::FORBIDDEN,
@@ -243,6 +251,12 @@ impl IntoResponse for HumanProblem {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        // Reads refill many a second, so the next comes within one.
+        if self == Self::ReadsOverBudget {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         if let Self::SignInsSpent { retry_after_secs } = self {
             response

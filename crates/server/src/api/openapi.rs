@@ -27,6 +27,7 @@ use utoipa::{Modify, ToResponse};
         responses(
             Unauthenticated,
             Forbidden,
+            BadOrigin,
             NotFound,
             RateLimited,
             BadRequest,
@@ -65,7 +66,8 @@ impl Modify for Schemes {
             SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
                 "__Host-landfall-session",
                 "A passkey sign-in on the controller's own pages. A state change also needs \
-                 the configured `Origin`.",
+                 the configured `Origin`, and a read a `Sec-Fetch-Site` of `same-origin` or \
+                 `none`, or none at all.",
             ))),
         );
     }
@@ -103,6 +105,11 @@ refusal!(
     Forbidden,
     "The principal may see this and no grant lets it do that, or a session's state change \
      didn't come from the controller's origin: `forbidden`, `bad_origin`."
+);
+refusal!(
+    BadOrigin,
+    "A session's read that its `Sec-Fetch-Site` says another site sent: anything but \
+     `same-origin` or `none`, when it is there. `bad_origin`."
 );
 refusal!(
     NotFound,

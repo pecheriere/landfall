@@ -22,9 +22,35 @@ There are two kinds, the document's two security schemes:
   `Authorization: Bearer <token>`. A token is for a program or an agent, and never approves.
 - `session`: the `__Host-landfall-session` cookie that a passkey sign-in on the controller's
   own pages sets. A state change with a session must also send the configured `[approval]`
-  origin as `Origin`, or it is refused with `bad_origin`.
+  origin as `Origin`, or it is refused with `403 bad_origin`. A read with a session is refused
+  the same way when it carries a `Sec-Fetch-Site` that is anything but `same-origin` or `none`,
+  or carries it twice. A browser sends that header itself, and `SameSite=Strict` doesn't stop a
+  page on a sibling subdomain from sending the cookie with a `GET`, as that is the same site.
+  A client that isn't a browser sends no such header and is read as usual. A token is never
+  checked for either.
+
+A call refused for where it came from costs nothing from a budget, and writes no row of its own:
+it is counted, with a bad `Origin`, in one `access_refused` audit row each watcher interval.
 
 No answer carries a CORS header, so a page on another origin can't read one.
+
+## Budgets
+
+Each credential has two budgets: one for state changes and one for reads, so that neither can
+use up the other. Each session has its own, and all of a principal's tokens share one.
+
+| | At once | Refills |
+|---|---|---|
+| State changes (`POST`) | 120 | 1 a second |
+| Reads (`GET`) | 300 | 10 a second |
+
+A CLI command makes at most three calls and a page polls every few seconds, so neither comes
+near the read budget; an agent sweeping a large fleet may, and waits. Over a budget, a call gets
+`429 rate_limited` with `Retry-After` in seconds (1 for a read, 5 for a state change), and
+writes nothing. The count of those goes in an `access_throttled` audit row, with `"reads": true`
+for reads, at the next call of the same kind within the budget, within one watcher interval, or
+when the controller stops, whichever is first. The budgets are kept in memory, so a restart gives
+them back.
 
 ## Grants
 
@@ -67,8 +93,8 @@ Act on `code`, which never changes its meaning; the document's `ProblemCode` sch
 every one. `title` is for people and may change. A `429 rate_limited` and a `503 busy` come
 with `Retry-After`, in seconds. Each operation's `responses` lists every refusal it can give,
 with the codes each status can carry. The answers operations share are the document's reusable
-responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden` (403), `NotFound` (404),
-`SlowRequest` (408), `BodyTooLarge` (413), `RateLimited` (429), `Internal` and
+responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden` and `BadOrigin` (403),
+`NotFound` (404), `SlowRequest` (408), `BodyTooLarge` (413), `RateLimited` (429), `Internal` and
 `InternalOrUnreadable` (500), and `Busy` (503).
 
 ## Paths and query strings

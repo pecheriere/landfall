@@ -45,7 +45,7 @@ pub(crate) enum FailureKind {
     SignIn,
     /// A sign-in whose signature did verify, by a key that may not sign in.
     SignInBarred,
-    /// A session's state change from another origin.
+    /// A session's state change from another origin, or its read sent by another site.
     BadOrigin,
 }
 

@@ -26,7 +26,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub(crate) use self::openapi::{
-    BadRequest, BodyTooLarge, Busy, Forbidden, Internal, InternalOrUnreadable, NotFound,
+    BadOrigin, BadRequest, BodyTooLarge, Busy, Forbidden, Internal, InternalOrUnreadable, NotFound,
     RateLimited, SlowRequest, Unauthenticated,
 };
 pub(crate) use self::query::{ApiQuery, DeploymentPath, IdPath, NoQuery};

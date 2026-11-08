@@ -50,7 +50,7 @@ pub(crate) use self::problem::{ApiProblem, problem_response};
 pub(crate) use self::rate_limit::{RateLimiter, source_key};
 pub(crate) use self::refusal_log::RefusalLog;
 pub(crate) use self::signed::{DRAIN_BYTES, read_body};
-use crate::auth::{Budget, Spender, Spent};
+use crate::auth::{Budget, Dropped, Spender, Spent};
 use crate::store::Store;
 use crate::web::Ceremonies;
 
@@ -88,6 +88,18 @@ pub struct Limits {
     /// deployment holds one open request: this leaves room for that across a large fleet, with
     /// retries, and refills in two minutes.
     pub principal_burst: u32,
+    /// Reads one credential may make each second, sustained, on the human API: each session on
+    /// its own, and a principal's tokens as one, apart from the state changes above. A read
+    /// writes nothing, but each one is a query, and every list is paged at a hundred rows on an
+    /// index, so this is what a credential gone wrong can keep the database busy with: ten
+    /// bounded queries a second, and sixteen times that for a principal's sessions, plus a whole
+    /// burst for each sign-in. A CLI command makes at most three calls and a page polls every few
+    /// seconds, so neither comes near it, and an agent sweeping a large fleet that goes over
+    /// waits a second.
+    pub read_rate_per_second: u32,
+    /// Reads one credential may make at once: room for an agent to page through a large fleet's
+    /// lists before it waits, refilled in thirty seconds.
+    pub read_burst: u32,
     /// Sign-ins one principal may make at once, each after a signature verified. A person signs
     /// in a few times a day. Each one makes a new session with a whole burst above, so this and
     /// the next are what a passkey in the wrong hands can buy with: 120 state changes for each.
@@ -121,6 +133,8 @@ impl Default for Limits {
             max_sources: 4096,
             principal_rate_per_second: 1,
             principal_burst: 120,
+            read_rate_per_second: 10,
+            read_burst: 300,
             sign_in_burst: 10,
             sign_in_refill_secs: 300,
             ceremony_rate_per_second: 2,
@@ -245,6 +259,15 @@ impl ApiState {
             .spend(spender, now)
     }
 
+    /// Takes the cost of one read from a budget for reads.
+    pub(crate) fn spend_read_budget(&self, spender: &Spender, now: i64) -> Spent {
+        self.budget
+            .lock()
+            // Counts, valid at every step.
+            .unwrap_or_else(PoisonError::into_inner)
+            .spend_read(spender, now)
+    }
+
     /// Lets go of the budgets of sessions that ended.
     pub(crate) fn forget_sessions(&self, ended: &[[u8; 32]]) {
         self.budget
@@ -253,9 +276,9 @@ impl ApiState {
             .forget_sessions(ended);
     }
 
-    /// How many sessions have a budget, for a test.
+    /// How many sessions have a budget, for a test: of state changes, and of reads.
     #[cfg(test)]
-    pub(crate) fn session_budgets(&self) -> usize {
+    pub(crate) fn session_budgets(&self) -> (usize, usize) {
         self.budget
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -263,7 +286,7 @@ impl ApiState {
     }
 
     /// Takes every count of dropped calls there is, to write down.
-    pub(crate) fn take_dropped(&self) -> Vec<(Spender, u64)> {
+    pub(crate) fn take_dropped(&self) -> Vec<Dropped> {
         self.budget
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -271,11 +294,11 @@ impl ApiState {
     }
 
     /// Puts back a count of dropped calls that couldn't be written down.
-    pub(crate) fn keep_dropped(&self, spender: Spender, count: u64) {
+    pub(crate) fn keep_dropped(&self, dropped: Dropped) {
         self.budget
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .keep_dropped(spender, count);
+            .keep_dropped(dropped);
     }
 
     /// Ends every long poll now, with whatever it has, and makes later ones

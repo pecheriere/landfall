@@ -4,9 +4,11 @@
 mod document;
 mod grants;
 mod query;
+mod reads;
 mod schemas;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
@@ -23,7 +25,7 @@ use tower::ServiceExt as _;
 
 use crate::agent_api::{ApiState, Limits};
 use crate::auth::{ApiToken, SessionToken};
-use crate::store::{NewRequest, ReleaseDecision, Seen, Store};
+use crate::store::{ManualClock, NewRequest, ReleaseDecision, Seen, Store};
 
 /// `operator` may view `app/prod` and ask for its releases, and is its approver by key, with
 /// no grant to approve.
@@ -302,10 +304,12 @@ pub(super) enum Caller<'a> {
 ///   the open request `approveRequest` and `cancelRequest` act on.
 /// - `app/other` has nothing, and [`OUTSIDER`] may view it.
 ///
-/// Every principal has a token and a session.
+/// Every principal has a token and a session. Time stands still until a test moves `clock`.
 pub(super) struct World {
     pub(super) app: Router,
+    pub(super) state: ApiState,
     pub(super) store: Store,
+    pub(super) clock: Arc<ManualClock>,
     pub(super) tokens: HashMap<String, ApiToken>,
     pub(super) sessions: HashMap<String, SessionToken>,
     keys: HashMap<String, SoftwareAuthenticator>,
@@ -321,7 +325,11 @@ impl World {
             .map(|roles| (holder(roles), SoftwareAuthenticator::es256().unwrap()))
             .collect();
         let config = landfall_approval::parse_config(world_config(&keys).as_bytes()).unwrap();
-        let store = Store::open_in_memory().await.unwrap();
+        let clock = ManualClock::at(1_800_000_000);
+        let store = Store::open_in_memory()
+            .await
+            .unwrap()
+            .with_clock(clock.clone());
         let state = ApiState::new(store.clone(), config.clone(), Limits::default());
         for (deployment, tag, fill) in [
             ("app/prod", "v1.1.0", '1'),
@@ -362,8 +370,10 @@ impl World {
             );
         }
         Self {
-            app: crate::router(state),
+            app: crate::router(state.clone()),
+            state,
             store,
+            clock,
             tokens,
             sessions,
             keys,

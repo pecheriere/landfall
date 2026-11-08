@@ -183,6 +183,7 @@ fn every_human_problem() -> Vec<HumanProblem> {
         HumanProblem::AssertionRefused,
         HumanProblem::ApprovalsNotConfigured,
         HumanProblem::OverBudget,
+        HumanProblem::ReadsOverBudget,
         HumanProblem::InviteRefused,
         HumanProblem::RegistrationRefused,
         HumanProblem::SignInRefused,
@@ -213,6 +214,7 @@ fn every_human_problem() -> Vec<HumanProblem> {
             | HumanProblem::AssertionRefused
             | HumanProblem::ApprovalsNotConfigured
             | HumanProblem::OverBudget
+            | HumanProblem::ReadsOverBudget
             | HumanProblem::InviteRefused
             | HumanProblem::RegistrationRefused
             | HumanProblem::SignInRefused

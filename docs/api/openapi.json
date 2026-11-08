@@ -36,6 +36,9 @@
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
           },
+          "403": {
+            "$ref": "#/components/responses/BadOrigin"
+          },
           "408": {
             "$ref": "#/components/responses/SlowRequest"
           },
@@ -695,6 +698,16 @@
       }
     },
     "responses": {
+      "BadOrigin": {
+        "description": "A session's read that its `Sec-Fetch-Site` says another site sent: anything but `same-origin` or `none`, when it is there. `bad_origin`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
       "BadRequest": {
         "description": "The body or the query string isn't what this operation takes, or the query string is over 2 KiB: `bad_request`.",
         "content": {
@@ -815,7 +828,7 @@
         "type": "apiKey",
         "in": "cookie",
         "name": "__Host-landfall-session",
-        "description": "A passkey sign-in on the controller's own pages. A state change also needs the configured `Origin`."
+        "description": "A passkey sign-in on the controller's own pages. A state change also needs the configured `Origin`, and a read a `Sec-Fetch-Site` of `same-origin` or `none`, or none at all."
       },
       "token": {
         "type": "http",

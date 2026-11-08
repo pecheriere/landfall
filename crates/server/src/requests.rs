@@ -54,8 +54,8 @@ use utoipa_axum::routes;
 
 use crate::agent_api::{ApiProblem, ApiState, read_body};
 use crate::api::{
-    ApiJson, ApiQuery, BadRequest, Busy, IdPath, Internal, NoQuery, RateLimited, SlowRequest,
-    Unauthenticated,
+    ApiJson, ApiQuery, BadOrigin, BadRequest, Busy, IdPath, Internal, NoQuery, RateLimited,
+    SlowRequest, Unauthenticated,
 };
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
@@ -315,6 +315,7 @@ fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
         ),
         (status = 400, response = BadRequest),
         (status = 401, response = Unauthenticated),
+        (status = 403, response = BadOrigin),
         (status = 408, response = SlowRequest),
         (status = 429, response = RateLimited),
         (status = 500, response = Internal),

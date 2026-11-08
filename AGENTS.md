@@ -49,9 +49,10 @@ passkey approvals. Agents drive it through a typed API. Design:
   a deploy report before it is stored), `agent_api` (the routes agents call:
   signed-request extractor, handlers, problem answers, rate limit, and `client_source`, who a
   request is from, which every per-source limit and the capped log go by), `auth` (the
-  `Principal` extractor, which makes the exact-`Origin` check for a session, `can`,
-  the one place that says what a principal may do, each principal's budget for state
-  changes, secrets that are only stored hashed, and the human API's problem answers),
+  `Principal` extractor, which makes the exact-`Origin` check on a session's state change
+  and the `Sec-Fetch-Site` check on its read, `can`, the one place that says what a principal
+  may do, each credential's budgets for state changes and for reads, secrets that are only
+  stored hashed, and the human API's problem answers),
   `api` (`/api/v1`: one `OpenApiRouter` registers each route with its annotation, `ApiJson` is
   every success, `query` the path and query-string parameters, a query string refusing any it
   doesn't take, and `openapi` the document's fixed part: its schemes and shared refusals; the
