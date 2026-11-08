@@ -49,18 +49,20 @@ fn assert_escaped(view: &str, text: &str, fields: usize) {
 fn hostile_text_is_escaped_in_human_output() {
     let hostile = json!(HOSTILE);
 
-    // release: a commit's summary and author, reasons naming a check and a host's words, the
-    // origin's identity and run, the next step, and why a request closed.
-    let mut commits = listed(1, 1);
+    // release: a commit's summary and author, the compare link, reasons naming a check and a
+    // host's words, the origin's identity and run, the next step, and why a request closed.
+    // The list is cut, so GitHub's compare link prints too.
+    let mut commits = listed(1, 2);
     commits["commits"][0]["summary"] = hostile.clone();
     commits["commits"][0]["author"] = hostile.clone();
+    commits["compare_url"] = hostile.clone();
     let mut value = story(commits);
     value["reasons"] = json!([HOSTILE, HOSTILE]);
     value["origin"]["san"] = hostile.clone();
     value["origin"]["run_url"] = hostile.clone();
     value["next"]["detail"] = hostile.clone();
     value["requests"][0]["closed_reason"] = hostile.clone();
-    assert_escaped("release", &story_text(value), 8);
+    assert_escaped("release", &story_text(value), 9);
 
     // history: the host's reason, why going back failed, and a failed step's name and words.
     let mut value = deploy();
