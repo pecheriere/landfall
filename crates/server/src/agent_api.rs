@@ -49,7 +49,7 @@ pub(crate) use self::handlers::json;
 pub(crate) use self::problem::{ApiProblem, problem_response};
 pub(crate) use self::rate_limit::{RateLimiter, source_key};
 pub(crate) use self::refusal_log::RefusalLog;
-pub(crate) use self::signed::read_body;
+pub(crate) use self::signed::{DRAIN_BYTES, read_body};
 use crate::auth::{Budget, Spender, Spent};
 use crate::store::Store;
 use crate::web::Ceremonies;

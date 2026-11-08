@@ -589,8 +589,12 @@ fn a_report_stays_under_the_limits_of_the_wire() {
     assert!(bounded(&long).ends_with("..."));
 }
 
-/// A report of `steps` steps, each saying `text` in a failure and in 64 checks.
-fn wordy_report(steps: usize, text: &str) -> deploy::DeployReport {
+/// A report of `steps` steps, each saying `text` in a failure and in `checks` checks.
+///
+/// Every copy of `text` is bounded character by character and serialised, more than once as the
+/// body is cut down, so a test asks for only what takes it over the limit at the stage it's
+/// about: 400 steps of 64 checks each took one test 15 s in a debug build.
+fn wordy_report(steps: usize, checks: usize, text: &str) -> deploy::DeployReport {
     let step = deploy::Step {
         name: "checks".to_owned(),
         started_at: Timestamp::UNIX_EPOCH,
@@ -605,7 +609,7 @@ fn wordy_report(steps: usize, text: &str) -> deploy::DeployReport {
                     attempts: 1,
                     millis: 1,
                 };
-                64
+                checks
             ],
         }),
     };
@@ -627,7 +631,8 @@ fn wordy_report(steps: usize, text: &str) -> deploy::DeployReport {
 fn a_body_over_the_limit_loses_details_first_and_says_so() {
     // Control characters serialise to six bytes each, and this emoji to four.
     for text in ["\u{1}".repeat(5000), "\u{1F600}".repeat(5000)] {
-        let body = reported(DeployId(7), &wordy_report(8, &text));
+        // The checks take it over: the 8 failures alone are under 250 KB.
+        let body = reported(DeployId(7), &wordy_report(8, 64, &text));
         let wire = serde_json::to_vec(&body).unwrap();
         assert!(wire.len() <= MAX_BODY_BYTES, "{}", wire.len());
         assert!(body.steps[..8].iter().all(|step| step.detail.is_none()));
@@ -646,7 +651,8 @@ fn a_body_over_the_limit_loses_details_first_and_says_so() {
 #[test]
 fn a_body_still_over_the_limit_loses_what_the_steps_say() {
     let text = "\u{1}".repeat(5000);
-    let body = reported(DeployId(7), &wordy_report(100, &text));
+    // With no details, 100 failures of 4096 characters at six bytes each are still about 2.5 MB.
+    let body = reported(DeployId(7), &wordy_report(100, 1, &text));
     let wire = serde_json::to_vec(&body).unwrap();
     assert!(wire.len() <= MAX_BODY_BYTES, "{}", wire.len());
     assert!(
@@ -663,9 +669,10 @@ fn a_body_still_over_the_limit_loses_what_the_steps_say() {
 #[test]
 fn a_body_that_small_steps_can_not_save_keeps_its_outcome() {
     let text = "\u{1}".repeat(5000);
-    let mut report = wordy_report(1, &text);
+    let mut report = wordy_report(1, 1, &text);
     report.steps[0].name = text.clone();
-    report.steps = vec![report.steps[0].clone(); 400];
+    // With nothing else, 100 names of 4096 characters at six bytes each are about 2.5 MB.
+    report.steps = vec![report.steps[0].clone(); 100];
     let body = reported(DeployId(7), &report);
     let wire = serde_json::to_vec(&body).unwrap();
     assert!(wire.len() <= MAX_BODY_BYTES, "{}", wire.len());
