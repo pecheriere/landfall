@@ -12,7 +12,7 @@ use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use landfall_api::{
     DeploymentRef, DeploymentSummary, DeploymentView, GrantView, HoldView, MeView, Page,
-    Permission as Granted, PromotionView, RuleView, RunningView, Via,
+    Permission as Granted, PromotionView, ReleaseBrief, RuleView, RunningView, Via,
 };
 use landfall_core::config::{Config, Deployment, Permission};
 use landfall_core::ids::{DeploymentId, HostId, RepoName};
@@ -27,7 +27,8 @@ use super::openapi::{
     Unauthenticated,
 };
 use super::query::{ApiQuery, Cursor, CursorList, DeploymentPath, Limit, NoQuery};
-use super::visible::{shown_deployment, visibility};
+use super::releases::{self, open_tag};
+use super::visible::{shown_deployment, viewable};
 use crate::agent_api::ApiState;
 use crate::auth::{HumanProblem, Principal, can, sees};
 use crate::store::StoredRequest;
@@ -126,27 +127,54 @@ struct DeploymentsQuery {
     cursor: Option<String>,
 }
 
+/// What `deployment`'s host, as the configuration has it now, last said about it, among
+/// `running`.
+pub(super) fn host_said<'a>(
+    running: &'a HashMap<DeploymentId, RunningRow>,
+    deployment: &Deployment,
+) -> Option<&'a RunningRow> {
+    running
+        .get(deployment.id())
+        .filter(|row| row.host == *deployment.host())
+}
+
 /// What every deployment's summary is read from, read once for a whole answer.
 struct Facts {
     running: HashMap<DeploymentId, RunningRow>,
     open: Vec<StoredRequest>,
+    /// Each deployment's newest release and where it stands, if it has one.
+    latest: HashMap<DeploymentId, ReleaseBrief>,
 }
 
 impl Facts {
-    /// The open requests now, and what the hosts last said about `deployments`.
-    async fn of(state: &ApiState, deployments: &[&Deployment]) -> Result<Self, HumanProblem> {
-        let open = open_requests(state).await?;
+    /// What the hosts last said about `deployments`, the open requests, `open`, and each
+    /// one's newest release.
+    async fn of(
+        state: &ApiState,
+        principal: &Principal,
+        deployments: &[&Deployment],
+        open: Vec<StoredRequest>,
+    ) -> Result<Self, HumanProblem> {
         let ids: Vec<&DeploymentId> = deployments.iter().map(|d| d.id()).collect();
         let running = state.store().running_states(&ids).await?;
-        Ok(Self { running, open })
+        let mut latest = HashMap::new();
+        for d in deployments {
+            let running = host_said(&running, d).cloned();
+            let newest = releases::latest(state, principal, d, running, open_tag(&open, d)).await?;
+            if let Some(newest) = newest {
+                latest.insert(d.id().clone(), newest);
+            }
+        }
+        Ok(Self {
+            running,
+            open,
+            latest,
+        })
     }
 
     /// What `deployment`'s host, as the configuration has it now, last said about it.
     fn running(&self, deployment: &Deployment) -> Option<RunningView> {
-        let row = self
-            .running
-            .get(deployment.id())
-            .filter(|row| row.host == *deployment.host())?;
+        let row = host_said(&self.running, deployment)?;
         Some(RunningView {
             tag: row.running.tag.clone(),
             digest: row.running.digest.clone(),
@@ -161,7 +189,7 @@ impl Facts {
 }
 
 /// Every request waiting for an approver now: one at most for each deployment.
-async fn open_requests(state: &ApiState) -> Result<Vec<StoredRequest>, HumanProblem> {
+pub(super) async fn open_requests(state: &ApiState) -> Result<Vec<StoredRequest>, HumanProblem> {
     let store = state.store();
     Ok(store.open_requests(store.now()?).await?)
 }
@@ -193,8 +221,7 @@ fn summary(
         repo: deployment.repo().name().clone(),
         host: deployment.host().clone(),
         running: facts.running(deployment),
-        // Where a release stands is the story's to say, which comes with releases.
-        latest: None,
+        latest: facts.latest.get(deployment.id()).cloned(),
         open_request,
         needs_you,
     }
@@ -270,11 +297,7 @@ async fn list(
         .then(|| shown.last())
         .flatten()
         .map(|last| Cursor::new(CursorList::Deployments, last.id().as_ref()).encode());
-    let ids: Vec<&DeploymentId> = shown.iter().map(|d| d.id()).collect();
-    let facts = Facts {
-        running: state.store().running_states(&ids).await?,
-        open,
-    };
+    let facts = Facts::of(&state, &principal, &shown, open).await?;
     let items = shown
         .iter()
         .map(|d| summary(config, &principal, d, &facts))
@@ -359,20 +382,9 @@ async fn get(
     path: Result<Path<DeploymentPath>, PathRejection>,
 ) -> Result<ApiJson<DeploymentView>, HumanProblem> {
     let config = state.config();
-    // A path that doesn't decode names nothing, as one that isn't an id doesn't.
-    let id = path
-        .ok()
-        .and_then(|Path(path)| path.raw().parse::<DeploymentId>().ok());
-    let deployment = id.as_ref().and_then(|id| config.deployment(id));
-    let Some(deployment) = deployment.filter(|d| can(config, &principal, d.id(), Permission::View))
-    else {
-        return Err(visibility(
-            config,
-            &principal,
-            deployment.map(Deployment::id),
-        ));
-    };
-    let facts = Facts::of(&state, &[deployment]).await?;
+    let deployment = viewable(config, &principal, path.ok().map(|Path(path)| path.raw()))?;
+    let open = open_requests(&state).await?;
+    let facts = Facts::of(&state, &principal, &[deployment], open).await?;
     let (holds, holds_total) = state
         .store()
         .holds_of_deployment(deployment.id(), HOLDS_SHOWN)

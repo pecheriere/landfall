@@ -12,6 +12,8 @@
 mod deployments;
 mod openapi;
 mod query;
+mod releases;
+mod story;
 mod visible;
 
 use std::sync::LazyLock;
@@ -54,6 +56,7 @@ impl<T: Serialize> IntoResponse for ApiJson<T> {
 fn operations() -> OpenApiRouter<ApiState> {
     OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
         .merge(deployments::routes())
+        .merge(releases::routes())
         .merge(requests::routes())
         .routes(routes!(document))
 }

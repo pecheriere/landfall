@@ -223,7 +223,7 @@ impl Fleet {
 }
 
 /// Records a request for `tag` on `deployment`, on `home-1`, as asking does.
-async fn open_request(store: &Store, deployment: &str, tag: &str, fill: char) -> i64 {
+pub(super) async fn open_request(store: &Store, deployment: &str, tag: &str, fill: char) -> i64 {
     let by: PrincipalId = "viewer".parse().unwrap();
     let host: HostId = "home-1".parse().unwrap();
     let request = NewRequest {

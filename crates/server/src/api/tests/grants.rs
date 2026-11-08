@@ -44,6 +44,14 @@ fn prod(_: &World) -> String {
     "/api/v1/deployments/app/prod".to_owned()
 }
 
+fn prod_releases(_: &World) -> String {
+    "/api/v1/deployments/app/prod/releases".to_owned()
+}
+
+fn prod_release(_: &World) -> String {
+    "/api/v1/deployments/app/prod/releases/v1.3.0".to_owned()
+}
+
 fn prod_requests(_: &World) -> String {
     "/api/v1/deployments/app/prod/requests".to_owned()
 }
@@ -106,6 +114,20 @@ pub(super) const CASES: &[Case] = &[
         role: "view",
         method: Method::GET,
         path: prod,
+        body: None,
+    },
+    Case {
+        operation: "listReleases",
+        role: "view",
+        method: Method::GET,
+        path: prod_releases,
+        body: None,
+    },
+    Case {
+        operation: "getRelease",
+        role: "view",
+        method: Method::GET,
+        path: prod_release,
         body: None,
     },
     Case {

@@ -6,7 +6,7 @@
 //! Seeing a deployment's state takes `view`.
 
 use landfall_api::DeploymentRef;
-use landfall_core::config::{Config, Permission};
+use landfall_core::config::{Config, Deployment, Permission};
 use landfall_core::ids::DeploymentId;
 
 use crate::auth::{HumanProblem, Principal, can, sees};
@@ -37,4 +37,20 @@ pub(crate) fn shown_deployment(
     } else {
         DeploymentRef::Unseen
     }
+}
+
+/// The deployment a path names as `raw`, if this principal may view it: `None` is a path that
+/// didn't decode, which names nothing, as one that isn't an id doesn't. Otherwise the refusal
+/// [`visibility`] gives.
+pub(crate) fn viewable<'a>(
+    config: &'a Config,
+    principal: &Principal,
+    raw: Option<String>,
+) -> Result<&'a Deployment, HumanProblem> {
+    let deployment = raw
+        .and_then(|raw| raw.parse::<DeploymentId>().ok())
+        .and_then(|id| config.deployment(&id));
+    deployment
+        .filter(|d| can(config, principal, d.id(), Permission::View))
+        .ok_or_else(|| visibility(config, principal, deployment.map(Deployment::id)))
 }

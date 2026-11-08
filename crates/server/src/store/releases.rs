@@ -116,6 +116,12 @@ impl StoredRelease {
     pub fn verified_under(&self, config_hash: &str) -> bool {
         self.config_hash.as_deref() == Some(config_hash)
     }
+
+    /// Why it was decided so, as recorded: quoted, and bounded.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
 }
 
 /// What a release was found to be, the first time, or when its inputs changed.
@@ -655,7 +661,9 @@ impl Store {
     }
 }
 
-fn stored_release(row: &SqliteRow) -> Result<StoredRelease, StoreError> {
+/// A release, from a row with `commit_sha`, `digest`, `decision`, `reason`, `tag_object`,
+/// `config_hash` and `origin_refused`.
+pub(super) fn stored_release(row: &SqliteRow) -> Result<StoredRelease, StoreError> {
     let optional = |column: &'static str| row.try_get::<Option<String>, _>(column);
     Ok(StoredRelease {
         commit: optional("commit_sha")?

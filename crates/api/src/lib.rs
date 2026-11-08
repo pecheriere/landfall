@@ -13,6 +13,7 @@
 mod deployments;
 mod page;
 mod problem;
+mod releases;
 mod requests;
 
 pub use deployments::{
@@ -21,6 +22,10 @@ pub use deployments::{
 };
 pub use page::Page;
 pub use problem::{Problem, ProblemCode};
+pub use releases::{
+    CommitSource, CommitView, CommitsState, CommitsView, Decision, DeployBrief, DeployState,
+    NextAction, NextKind, OriginView, Outcome, ReleaseStory, ReleaseView, RequestBrief,
+};
 pub use requests::{
     ApprovalsView, Approved, AssertionBody, Cancelled, IntentView, NewApproval, NewRequest,
     RequestState, RequestView,

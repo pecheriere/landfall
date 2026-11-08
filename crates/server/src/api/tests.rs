@@ -7,7 +7,9 @@ mod grants;
 mod promotions;
 mod query;
 mod reads;
+mod releases;
 mod schemas;
+mod story;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -465,6 +467,24 @@ impl World {
     }
 }
 
+/// Where a release verified at `fill`'s commit and digest came from, as the watcher records
+/// it in the `origin` column.
+fn origin_of(tag: &str, fill: char) -> Value {
+    json!({
+        "tag": tag,
+        "tag_object": "object",
+        "commit": fill.to_string().repeat(40),
+        "digest": world_digest(fill),
+        "signer": null,
+        "san": format!(
+            "\"https://github.com/example/app/.github/workflows/release.yml@refs/tags/{tag}\""
+        ),
+        "run_url": "\"https://github.com/example/app/actions/runs/7\"",
+        "rekor_log_index": 42,
+        "integrated_time": 1_799_999_000,
+    })
+}
+
 /// Records a release as the watcher does once it verified one.
 async fn verified(store: &Store, config: &Config, deployment: &str, tag: &str, fill: char) {
     let commit = fill.to_string().repeat(40).parse().unwrap();
@@ -476,7 +496,7 @@ async fn verified(store: &Store, config: &Config, deployment: &str, tag: &str, f
         digest: Some(&digest),
         refused: false,
         detail: json!({}),
-        origin: json!({}),
+        origin: origin_of(tag, fill),
     };
     store
         .record_release(

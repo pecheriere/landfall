@@ -4,8 +4,9 @@ use landfall_core::intent::DeployIntent;
 use serde_json::json;
 
 use crate::{
-    DeploymentRef, IntentView, NewApproval, NewRequest, Permission, Problem, ProblemCode,
-    PromotionView, ReleaseStatus, RequestState, Via,
+    CommitSource, CommitsState, CommitsView, Decision, DeployState, DeploymentRef, IntentView,
+    NewApproval, NewRequest, NextKind, Outcome, Permission, Problem, ProblemCode, PromotionView,
+    ReleaseStatus, RequestState, Via,
 };
 
 fn intent(expected_running: Option<&str>) -> DeployIntent {
@@ -101,4 +102,40 @@ fn what_a_client_sends_refuses_fields_the_controller_does_not_know() {
     assert!(serde_json::from_value::<NewApproval>(json!({ "assertion": extra })).is_err());
     let outer = json!({ "assertion": assertion, "intent": {} });
     assert!(serde_json::from_value::<NewApproval>(outer).is_err());
+}
+
+#[test]
+fn release_values_from_a_newer_controller_read_as_unknown_and_are_never_sent() {
+    fn unknown<T>(value: &str, want: &T)
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize + PartialEq + std::fmt::Debug,
+    {
+        let read: T = serde_json::from_value(json!(value)).unwrap();
+        assert_eq!(&read, want);
+        assert!(serde_json::to_value(&read).is_err(), "{read:?} was sent");
+    }
+    unknown("teleported", &Decision::Unknown);
+    unknown("teleport", &NextKind::Unknown);
+    unknown("gitlab", &CommitSource::Unknown);
+    unknown("guessed", &CommitsState::Unknown);
+    unknown("vanished", &DeployState::Unknown);
+    unknown("exploded", &Outcome::Unknown);
+}
+
+#[test]
+fn a_story_reads_with_fields_it_does_not_know() {
+    let commits = json!({
+        "source": "github",
+        "verified": false,
+        "state": "listed",
+        "base": "v1.2.0",
+        "total": 250,
+        "compare_url": "https://github.com/example/app/compare/a...b",
+        "commits": [],
+        "signed": "a field from a newer controller",
+    });
+    let read: CommitsView = serde_json::from_value(commits).unwrap();
+    assert_eq!(read.state, CommitsState::Listed);
+    assert_eq!(read.total, Some(250));
+    assert!(!read.verified);
 }

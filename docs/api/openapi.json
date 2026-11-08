@@ -444,6 +444,198 @@
         ]
       }
     },
+    "/api/v1/deployments/{name}/{stage}/releases": {
+      "get": {
+        "tags": [
+          "releases"
+        ],
+        "summary": "A deployment's releases",
+        "description": "The releases the controller recorded for a deployment, each with where it stands, a page at a time: highest semantic version first by the deployment's tag pattern, then the tags it doesn't read, in string order. At most the 5,000 first recorded most recently are listed.",
+        "operationId": "listReleases",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many releases a page holds: from 1 to 100, 50 if left out.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The last page's `next_cursor`, to get the page after it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the releases.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ReleaseView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{name}/{stage}/releases/{tag}": {
+      "get": {
+        "tags": [
+          "releases"
+        ],
+        "summary": "One release, and its story",
+        "description": "One release the controller recorded: where it stands and why, what to do next, where it came from, the commits it brings over the verified release below it as GitHub lists them, and its newest 20 requests and deploys. A tag the controller hasn't recorded is `404`.",
+        "operationId": "getRelease",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          },
+          {
+            "name": "tag",
+            "in": "path",
+            "description": "The release's tag.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "v1.3.0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The release's story.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseStory"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v1/deployments/{name}/{stage}/requests": {
       "post": {
         "tags": [
@@ -717,6 +909,180 @@
             "description": "Where it stands now: `cancelled`."
           }
         }
+      },
+      "CommitSource": {
+        "type": "string",
+        "description": "Where a release's commits come from.",
+        "enum": [
+          "github"
+        ]
+      },
+      "CommitView": {
+        "type": "object",
+        "description": "One commit, as GitHub lists it.",
+        "required": [
+          "sha",
+          "summary",
+          "author"
+        ],
+        "properties": {
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The login GitHub attributes it to by its email, which nothing verifies, or `null`.",
+            "example": "octocat"
+          },
+          "sha": {
+            "type": "string",
+            "description": "Its id.",
+            "example": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "summary": {
+            "type": "string",
+            "description": "The first line of its message, quoted and cut at 200 characters. Hostile: escape it\nbefore showing it."
+          }
+        }
+      },
+      "CommitsState": {
+        "type": "string",
+        "description": "What is known of a release's commits.",
+        "enum": [
+          "listed",
+          "too_large",
+          "base_not_found",
+          "first",
+          "not_yet",
+          "unavailable",
+          "not_recorded"
+        ]
+      },
+      "CommitsView": {
+        "type": "object",
+        "description": "The commits a release brings over the verified release below it.",
+        "required": [
+          "source",
+          "verified",
+          "state",
+          "base",
+          "total",
+          "compare_url",
+          "commits"
+        ],
+        "properties": {
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The verified release below this one, where the list starts, `null` for none.",
+            "example": "v1.2.0"
+          },
+          "commits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CommitView"
+            },
+            "description": "The commits, newest first: the newest 100 at most."
+          },
+          "compare_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "GitHub's page comparing the two, whenever there is a base.",
+            "example": "https://github.com/example/app/compare/0123456789abcdef0123456789abcdef01234567...89abcdef0123456789abcdef0123456789abcdef"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CommitSource",
+            "description": "Where the list comes from."
+          },
+          "state": {
+            "$ref": "#/components/schemas/CommitsState",
+            "description": "What is known of them. Only `listed` carries commits; every other state but `first`\nmeans unknown, not none."
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many commits GitHub counts between them, for a listed range: more than `commits`\nholds when only the newest 100 are kept.",
+            "minimum": 0
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Always `false`: GitHub's list is shown as GitHub gave it, and only the release commit itself is verified.",
+            "const": false
+          }
+        }
+      },
+      "Decision": {
+        "type": "string",
+        "description": "What the controller's watcher last recorded of a release.",
+        "enum": [
+          "auto",
+          "needs_approval",
+          "manual",
+          "refused",
+          "deferred"
+        ]
+      },
+      "DeployBrief": {
+        "type": "object",
+        "description": "A deploy of a release, in its story.",
+        "required": [
+          "id",
+          "state",
+          "outcome",
+          "created_at",
+          "finished_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was queued, in seconds since the Unix epoch."
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it finished, in seconds since the Unix epoch, or `null`."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deploy's number."
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Outcome",
+                "description": "How it went, `null` until it finished."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeployState",
+            "description": "Where it stands."
+          }
+        }
+      },
+      "DeployState": {
+        "type": "string",
+        "description": "Where a deploy stands.",
+        "enum": [
+          "queued",
+          "claimed",
+          "finished"
+        ]
       },
       "DeploymentRef": {
         "type": "object",
@@ -1023,6 +1389,109 @@
         },
         "additionalProperties": false
       },
+      "NextAction": {
+        "type": "object",
+        "description": "The one thing to do next about a release.",
+        "required": [
+          "kind",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "The controller's own words for it, such as the command to run.",
+            "example": "ask for a deploy of v1.3.0 with `landfall request`"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NextKind",
+            "description": "What kind of thing it is."
+          }
+        }
+      },
+      "NextKind": {
+        "type": "string",
+        "description": "What a person or agent can do next about a release.",
+        "enum": [
+          "request",
+          "rollback",
+          "approve",
+          "wait",
+          "fix_host",
+          "recover",
+          "none"
+        ]
+      },
+      "OriginView": {
+        "type": "object",
+        "description": "Where a verified release came from, as the controller verified it.",
+        "required": [
+          "commit",
+          "digest",
+          "signer",
+          "san",
+          "run_url",
+          "rekor_log_index",
+          "integrated_time"
+        ],
+        "properties": {
+          "commit": {
+            "type": "string",
+            "description": "The release commit.",
+            "example": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "digest": {
+            "type": "string",
+            "description": "The image digest its build attested.",
+            "example": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "integrated_time": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the transparency log took it, in seconds since the Unix epoch, if it did."
+          },
+          "rekor_log_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Its attestation's index in the transparency log, if it has one.",
+            "minimum": 0
+          },
+          "run_url": {
+            "type": "string",
+            "description": "The run that built it, quoted. Hostile: escape it before showing it."
+          },
+          "san": {
+            "type": "string",
+            "description": "The workflow identity in the attestation's certificate, quoted. Hostile: escape it\nbefore showing it."
+          },
+          "signer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who signed its tag, `null` when the deployment doesn't require signed tags.",
+            "example": "operator"
+          }
+        }
+      },
+      "Outcome": {
+        "type": "string",
+        "description": "How a finished deploy went, as its host said.",
+        "enum": [
+          "deployed",
+          "rolled_back",
+          "nothing_changed",
+          "failed_no_previous",
+          "rollback_failed",
+          "refused",
+          "deferred"
+        ]
+      },
       "Page_DeploymentSummary": {
         "type": "object",
         "description": "Some of a list, in its order, and where the rest begins.",
@@ -1093,6 +1562,62 @@
                       "type": "null"
                     }
                   ]
+                }
+              }
+            },
+            "description": "This page's items."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to send as `cursor` for the next page, opaque; `null` on the last one."
+          }
+        }
+      },
+      "Page_ReleaseView": {
+        "type": "object",
+        "description": "Some of a list, in its order, and where the rest begins.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A release of a deployment, and where it stands.",
+              "required": [
+                "tag",
+                "status",
+                "decision",
+                "first_seen_at",
+                "seen_at"
+              ],
+              "properties": {
+                "decision": {
+                  "$ref": "#/components/schemas/Decision",
+                  "description": "What the watcher last recorded of it."
+                },
+                "first_seen_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "When the controller first recorded it, in seconds since the Unix epoch."
+                },
+                "seen_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "When it was last verified, in seconds since the Unix epoch."
+                },
+                "status": {
+                  "$ref": "#/components/schemas/ReleaseStatus",
+                  "description": "Where it stands now."
+                },
+                "tag": {
+                  "type": "string",
+                  "description": "The tag.",
+                  "example": "v1.3.0"
                 }
               }
             },
@@ -1245,11 +1770,164 @@
           "waiting"
         ]
       },
+      "ReleaseStory": {
+        "type": "object",
+        "description": "One release, and why it stands where it does.",
+        "required": [
+          "release",
+          "reasons",
+          "next",
+          "origin",
+          "commits",
+          "requests",
+          "deploys"
+        ],
+        "properties": {
+          "commits": {
+            "$ref": "#/components/schemas/CommitsView",
+            "description": "The commits it brings."
+          },
+          "deploys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeployBrief"
+            },
+            "description": "The newest 20 deploys of it, newest first."
+          },
+          "next": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NextAction",
+                "description": "What to do next, if anything."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "origin": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OriginView",
+                "description": "Where it came from, `null` unless it verified."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why it stands where it does, in order: the controller's words, with hostile text\nquoted in them. Escape them before showing them."
+          },
+          "release": {
+            "$ref": "#/components/schemas/ReleaseView",
+            "description": "The release."
+          },
+          "requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestBrief"
+            },
+            "description": "The newest 20 requests for it, newest first."
+          }
+        }
+      },
+      "ReleaseView": {
+        "type": "object",
+        "description": "A release of a deployment, and where it stands.",
+        "required": [
+          "tag",
+          "status",
+          "decision",
+          "first_seen_at",
+          "seen_at"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/Decision",
+            "description": "What the watcher last recorded of it."
+          },
+          "first_seen_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the controller first recorded it, in seconds since the Unix epoch."
+          },
+          "seen_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was last verified, in seconds since the Unix epoch."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ReleaseStatus",
+            "description": "Where it stands now."
+          },
+          "tag": {
+            "type": "string",
+            "description": "The tag.",
+            "example": "v1.3.0"
+          }
+        }
+      },
+      "RequestBrief": {
+        "type": "object",
+        "description": "A request for a release, in its story.",
+        "required": [
+          "id",
+          "state",
+          "requested_by",
+          "approved_by",
+          "created_at",
+          "closed_reason"
+        ],
+        "properties": {
+          "approved_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who signed it, `null` unless it was approved.",
+            "example": "operator"
+          },
+          "closed_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it was closed unsigned, in the controller's words, or `null`."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was asked, in seconds since the Unix epoch."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The request's number."
+          },
+          "requested_by": {
+            "type": "string",
+            "description": "Who asked.",
+            "example": "ci"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RequestState",
+            "description": "Where it stands."
+          }
+        }
+      },
       "RequestState": {
         "type": "string",
         "description": "Where a request stands. Values are added as answers come to carry them.",
         "enum": [
           "awaiting_approval",
+          "approved",
+          "stale",
+          "expired",
           "cancelled"
         ]
       },

@@ -82,6 +82,29 @@ impl DeploymentPath {
     }
 }
 
+/// A release of a deployment, by the two parts of the deployment's id and the tag. A tag
+/// holding `/` is sent with it as `%2F`.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Path)]
+pub(crate) struct TagPath {
+    /// The deployment's name.
+    #[param(example = "app")]
+    pub(crate) name: String,
+    /// The deployment's stage.
+    #[param(example = "prod")]
+    pub(crate) stage: String,
+    /// The release's tag.
+    #[param(example = "v1.3.0")]
+    pub(crate) tag: String,
+}
+
+impl TagPath {
+    /// The deployment's id as a client wrote it, which may not be one.
+    pub(crate) fn raw_deployment(&self) -> String {
+        format!("{}/{}", self.name, self.stage)
+    }
+}
+
 /// A row by its number.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]

@@ -9,6 +9,7 @@ mod auth;
 mod ceremonies;
 mod commits;
 mod deploys;
+pub(crate) mod history;
 mod releases;
 mod requests;
 pub(crate) mod views;

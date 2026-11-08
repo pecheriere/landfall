@@ -102,7 +102,8 @@ the principal may view, by id, a page at a time. `host`, `repo` and `needs_you` 
 that match. Each shows what its host last said (`running`), its request waiting for an approver
 (`open_request`) and `needs_you`, whether that request is one this principal could sign. A token
 never approves, so `needs_you` is always `false` for a token, and `needs_you=true` lists nothing
-for one. `latest` is `null` until the controller says where releases stand.
+for one. `latest` is its newest release, the first `listReleases` shows, with where it stands,
+or `null` when the controller has recorded none.
 
 `getDeployment` (`GET /api/v1/deployments/{name}/{stage}`) adds the rule, where its releases go
 on to (`promote_to`) and come from (`promoted_from`), and its holds: the newest 50, with
@@ -111,6 +112,60 @@ on to (`promote_to`) and come from (`promoted_from`), and its holds: the newest 
 `running` is what the deployment's host, as the configuration has it now, last reported. A
 report from a host the configuration no longer pairs with the deployment is ignored, as the
 watcher ignores it, so a deployment moved to a host that hasn't reported it shows `null`.
+
+## Releases and their story
+
+`listReleases` (`GET /api/v1/deployments/{name}/{stage}/releases`) lists the releases the
+controller recorded for a deployment, each with its `status`, the `decision` the watcher last
+recorded, when it was first recorded (`first_seen_at`) and when it was last verified
+(`seen_at`). It is in the order of semantic versions, highest first, by the deployment's tag
+pattern, where a pre-release is below its release; tags the pattern doesn't read come last, in
+string order. No index holds that order, so each page sorts the deployment's releases in memory:
+at most 5,000 of them, the bound the watcher keeps on a deployment's tags, and those first
+recorded most recently when there are more.
+
+`getRelease` (`GET /api/v1/deployments/{name}/{stage}/releases/{tag}`) is a release's story. A
+tag holding `/` is sent with it as `%2F`, and a tag the controller hasn't recorded is
+`404 not_found`. The story has:
+
+- `release`, as the list shows it;
+- `reasons`, why it stands where it does, in order, and `next`, the one thing to do next: its
+  `kind` (`request`, `rollback`, `approve`, `wait`, `fix_host`, `recover` or `none`) and a
+  `detail` in the controller's words, such as the command to run;
+- `origin`, where it came from as the controller verified it: the release commit, the digest,
+  the tag's signer, the attestation's workflow identity and run, and its transparency-log
+  entry. It is `null` unless the release verified and hasn't been refused since;
+- `commits`, below;
+- its newest 20 requests and its newest 20 deploys, newest first.
+
+`reasons` quote stored text: a hold's reason, a host's reason for a deploy's outcome, the
+watcher's reason for its decision. Like every text from GitHub or a host, escape it before
+showing it.
+
+A release's `status` is the first of these that applies:
+
+1. `running`: its host runs this tag at this digest.
+2. `deploying`: a deploy of it is queued or claimed.
+3. `awaiting_approval`: a request for it waits for an approver. `next` says where an approver
+   signs it; agents can't.
+4. `refused`: verification refused it, or the rule does with what runs now.
+5. `held`: something it needs couldn't be read yet, for it or the whole deployment. The
+   controller tries again by itself.
+6. `superseded`: a higher version runs. When asking is how it would deploy, `next` is a
+   `rollback`, through `landfall rollback`.
+7. `failed`: its last deploy rolled back, failed with nothing to go back to, or failed and so
+   did going back. It isn't tried again by itself: a request is how to try again.
+8. `host_refused`: its host refused its last deploy.
+9. `deferred`: its host said not now, and is asked again after a while.
+10. `promotion_pending`: it waits to be reported healthy for long enough on the deployment it
+    is promoted from, which is named only to a principal who may view it.
+11. `needs_request`: it deploys only when someone asks; `next` is always a `request`.
+12. `waiting`: it deploys by itself, and nothing known stands in the way.
+
+A status goes by verification, then by what the rule says with what runs now. What the watcher
+recorded from a release's past deploys shows in the status from the deploys themselves: so a
+release the rule would deploy by itself, which the watcher won't try again after a failed
+deploy, needs a request, as asking allows.
 
 ## Commits between releases
 
@@ -137,6 +192,15 @@ again from its new commit, and two deployments of one repository share one list.
   `behind` or `diverged`), the history was rewritten between them, and there is no list.
 - **Not yet, or unavailable.** A list that wasn't fetched yet, or couldn't be, is unknown, never
   an empty list. A failure is tried again after an hour; it holds and refuses nothing.
+- **In a story.** `commits` has `source` (`github`), `verified` (always `false`), `state`,
+  `base` (the release below, where the list starts), `total`, `compare_url` and `commits`. Only
+  `listed` carries commits, newest first: all of them when `total` is their count, else the
+  newest 100 of `total`, which `reasons` also says. `first` means no verified release is below
+  it. `too_large`, `base_not_found`, `not_yet` (not fetched yet), `unavailable` (tried, and
+  tried again later) and `not_recorded` (never fetched: the release isn't verified under this
+  configuration, or was recorded before the controller compared commits) carry none, and mean
+  unknown, not empty. `compare_url` is GitHub's page comparing the two whenever there is a
+  base; `too_large` and `base_not_found` each add a line to `reasons`.
 - **The budget.** Verification has GitHub first: commits are fetched only after a watcher
   tick's verifications are done. With the controller's `GITHUB_TOKEN` a tick makes at most 12
   requests, and only while GitHub reports at least 1,000 requests left; without one, at most 3,
@@ -180,7 +244,7 @@ A cursor is opaque: it belongs to the list that gave it, and one from another li
 was changed, is refused with `400 bad_request`. A page is never short of what the principal
 may see: what they may not see is left out before the page is cut, not after.
 
-`listDeployments` is paged in order of deployment id. `listApprovals` isn't paged, as the
+`listDeployments` is paged in order of deployment id, and `listReleases` in order of version. `listApprovals` isn't paged, as the
 configuration bounds it: a deployment has at most one open request.
 
 ## Versions
