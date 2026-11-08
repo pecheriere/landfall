@@ -53,7 +53,28 @@ TAG_LIST = (
     "--format=%(refname:strip=2) %(objecttype)",
 )
 LOG = ("git", "log", "--format=%H %G? %an %s", "--stat", f"{PREVIOUS}..{SHA}")
-SENSITIVE = (SIGNERS, ".github/", "scripts/release-tag", "Cargo.toml", "Cargo.lock")
+TRUST_CODE = (
+    "crates/cli/src/project.rs",
+    "crates/cli/src/agent_release.rs",
+    "crates/core/src/tag.rs",
+    "crates/core/src/config/signer.rs",
+    "crates/origin/src/attestation.rs",
+    "crates/origin/src/attestation/file.rs",
+    "crates/origin/src/release.rs",
+    "crates/origin/src/artifact.rs",
+    "crates/origin/src/candidates.rs",
+    "crates/origin/src/trust.rs",
+)
+SENSITIVE = (
+    SIGNERS,
+    ".github/",
+    "scripts/release-tag",
+    "Cargo.toml",
+    "Cargo.lock",
+    *TRUST_CODE,
+)
+CHECKOUT = "/nonexistent/landfall-checkout"
+TOPLEVEL = ("git", "rev-parse", "--show-toplevel")
 DIFF = ("git", "diff", "--no-ext-diff", "--no-color", PREVIOUS, SHA, "--", *SENSITIVE)
 
 
@@ -110,6 +131,7 @@ class FakeRun:
         # `git verify-tag` by the ref it checks; the allowed-signers path differs each time.
         self.verified = {f"refs/tags/{TAG}": done(), f"refs/tags/{PREVIOUS}": done()}
         self.answers: dict[tuple[str, ...], subprocess.CompletedProcess] = {
+            TOPLEVEL: done(f"{CHECKOUT}\n"),
             ("git", "status", "--porcelain", "--untracked-files=normal"): done(),
             ("git", "remote", "get-url", "origin"): done(f"git@github.com:{REPO}.git\n"),
             (
@@ -301,7 +323,7 @@ class FlowTests(unittest.TestCase):
             "?? stray\n"
         )
         self.refused("changes or untracked files")
-        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(len(self.fake.calls), 2)
 
     def test_an_origin_that_isnt_github_is_refused(self) -> None:
         """Its runs are what the tag rests on."""
@@ -391,7 +413,13 @@ class FlowTests(unittest.TestCase):
                 self.setUp()
                 self.trusted = path
                 self.refused(reason)
-                self.assertEqual(self.fake.calls, [])
+                self.assertEqual(self.fake.calls, [TOPLEVEL])
+
+    def test_a_trusted_file_inside_the_checkout_is_refused(self) -> None:
+        """The repository's own signers file can't be what it is compared with."""
+        self.fake.answers[TOPLEVEL] = done(f"{self.trusted.parent}\n")
+        self.refused("inside the checkout")
+        self.assertEqual(self.fake.calls, [TOPLEVEL])
 
     def test_a_tag_that_fails_its_check_is_deleted(self) -> None:
         """Signed by a key preflight would refuse: deleted here, before it can spend a number."""
@@ -454,7 +482,16 @@ class TrustTests(unittest.TestCase):
         self.fake.verified[f"refs/tags/{PREVIOUS}"] = done(returncode=1)
         self.fake.answers[("git", "log", "--format=%H %G? %an %s", "--stat", SHA)] = done("all\n")
         diff = ("git", "diff", "--no-ext-diff", "--no-color")
-        listed = (*diff, "--stat", release_tag.EMPTY_TREE, SHA, "--", ".github/", "Cargo.lock")
+        listed = (
+            *diff,
+            "--stat",
+            release_tag.EMPTY_TREE,
+            SHA,
+            "--",
+            ".github/",
+            "Cargo.lock",
+            *TRUST_CODE,
+        )
         self.fake.answers[listed] = done(" .github/workflows/release.yml | 400 +++\n")
         whole = (*diff, release_tag.EMPTY_TREE, SHA, "--", "scripts/release-tag", "Cargo.toml")
         self.fake.answers[whole] = done("+[workspace]\n")
@@ -469,6 +506,33 @@ class TrustTests(unittest.TestCase):
 
 class ReadingTests(unittest.TestCase):
     """The pieces that read what git and GitHub say."""
+
+    def test_the_code_that_decides_trust_is_shown_and_exists(self) -> None:
+        """Each path is the script's, and a file or folder here, so a rename can't drop one."""
+        self.assertEqual(release_tag.SENSITIVE, SENSITIVE)
+        root = SCRIPT.parents[1]
+        for path in SENSITIVE:
+            with self.subTest(path=path):
+                self.assertTrue((root / path).exists(), path)
+
+    def test_a_trusted_file_owned_by_someone_else_is_refused(self) -> None:
+        """Root or the owner only: anyone else could change what's trusted."""
+        if os.getuid() == 0:
+            self.skipTest("running as root, whose files are always accepted")
+        path = trusted_file(self, f"{KEY}\n")
+        checkout = Path(CHECKOUT)
+        self.assertEqual(release_tag.read_trusted(path, checkout, os.getuid()), [KEY])
+        with self.assertRaisesRegex(release_tag.RefusedError, "belongs to someone else"):
+            release_tag.read_trusted(path, checkout, os.getuid() + 1)
+
+    def test_a_trusted_path_that_isnt_a_file_is_refused(self) -> None:
+        """A folder, and a pipe, which is opened without waiting for a writer."""
+        directory = trusted_file(self, f"{KEY}\n").parent
+        pipe = directory / "pipe"
+        os.mkfifo(pipe, 0o600)
+        for path in (directory, pipe):
+            with self.subTest(path=path.name), self.assertRaises(release_tag.RefusedError):
+                release_tag.read_trusted(path, Path(CHECKOUT), os.getuid())
 
     def test_controls_are_escaped_and_text_is_kept(self) -> None:
         """C0 but newline and tab, DEL, C1 and bidi controls; anything else as it is."""

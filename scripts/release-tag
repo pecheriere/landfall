@@ -15,18 +15,21 @@ unless all of these hold, and changes nothing until they do:
 - a run of the Release workflow for exactly that commit, on main, succeeded, with every build
   and check of the dry run green: the automatic one that a version bump starts, or a manual one;
 - the keys in the repository's release signers file at that commit are exactly the keys in the
-  owner's trusted signers file, which they keep outside any clone (`--trusted-signers`, by
-  default `$XDG_CONFIG_HOME/landfall/release-signers`), theirs alone to write, and not a link.
+  owner's trusted signers file (`--trusted-signers`, by default
+  `$XDG_CONFIG_HOME/landfall/release-signers`): outside the checkout, not a link, owned by the
+  owner or by root, and writable by its owner alone. A root-owned one is out of reach of code
+  running as the owner too.
 
 What the repository says can be written by anyone who lands a commit, so the trusted file is the
 anchor. The last release is the highest `v*` tag behind the commit that a trusted key signed: a
 key added to the repository's file can't certify a tag here, and every `v*` tag above it that no
 trusted key signed is named in a warning. Before asking, it shows the commit, the dry run, every
 commit since that release with its signature status and files, and in full any change to the
-signers file, `.github/`, this script, `Cargo.toml` and `Cargo.lock`. With no such release behind
-it, it shows the signers file whole with its fingerprints, lists `.github/` and `Cargo.lock` by
-name, and shows the rest whole. Control characters in anything git prints are shown as escapes,
-so a commit can't rewrite what the owner reads.
+signers file, `.github/`, this script, `Cargo.toml`, `Cargo.lock`, and the code that reads the
+signers or checks tags, attestations and release files (`TRUST_CODE`). With no such release
+behind it, it shows the signers file whole with its fingerprints, lists `.github/`, `Cargo.lock`
+and that code by name, and shows the rest whole. Control characters in anything git prints are
+shown as escapes, so a commit can't rewrite what the owner reads.
 
 Then it runs `git tag -s vVERSION <commit> -m vVERSION` with git's signing key, or the one given by
 `--signing-key`, checks the tag's signature against the signers file at that commit, and deletes
@@ -80,11 +83,33 @@ MAIN = "main"
 # tag that differs from origin's fails the fetch.
 FETCH_REFSPECS = (f"+refs/heads/{MAIN}:refs/remotes/origin/{MAIN}", "refs/tags/v*:refs/tags/v*")
 # What decides what a release trusts or how it's built, shown in full before signing.
-SENSITIVE = (SIGNERS_FILE, ".github/", "scripts/release-tag", "Cargo.toml", "Cargo.lock")
+# The code that reads the signers or checks a tag, an attestation or a release's files is in it too:
+# a release can change whom its binaries trust without touching the signers file.
+TRUST_CODE = (
+    "crates/cli/src/project.rs",
+    "crates/cli/src/agent_release.rs",
+    "crates/core/src/tag.rs",
+    "crates/core/src/config/signer.rs",
+    "crates/origin/src/attestation.rs",
+    "crates/origin/src/attestation/file.rs",
+    "crates/origin/src/release.rs",
+    "crates/origin/src/artifact.rs",
+    "crates/origin/src/candidates.rs",
+    "crates/origin/src/trust.rs",
+)
+SENSITIVE = (
+    SIGNERS_FILE,
+    ".github/",
+    "scripts/release-tag",
+    "Cargo.toml",
+    "Cargo.lock",
+    *TRUST_CODE,
+)
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 # Listed by name, not in full, when no release came before: whole, they are thousands of lines.
-LISTED_FIRST = (".github/", "Cargo.lock")
+LISTED_FIRST = (".github/", "Cargo.lock", *TRUST_CODE)
 TRUSTED_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]{68}")
+MAX_TRUSTED_BYTES = 64 * 1024
 # What git prints can come from anyone who lands a commit. These would let it move the cursor,
 # erase what was shown or reorder it: C0 but newline and tab, DEL, C1, and Unicode's bidi controls.
 UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
@@ -396,10 +421,14 @@ def default_trusted_signers(environ: dict[str, str], home: Path) -> Path:
     return Path(config) / "landfall" / "release-signers"
 
 
-def read_trusted(path: Path) -> list[str]:
-    """Return the keys in the owner's own signers file, which must be theirs alone to change."""
+def open_trusted(path: Path, checkout: Path) -> int:
+    """Open the owner's trusted signers file, outside the checkout, never through a link."""
+    if (path.parent.resolve() / path.name).is_relative_to(checkout.resolve()):
+        msg = f"the trusted signers file at {path} is inside the checkout, which it must not trust"
+        raise RefusedError(msg)
     try:
-        status = path.lstat()
+        # Not waiting on a pipe; O_NOFOLLOW makes a link fail, with ELOOP.
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError as error:
         msg = (
             f"there is no trusted signers file at {path}. Make it from SECURITY.md, after "
@@ -407,20 +436,57 @@ def read_trusted(path: Path) -> list[str]:
         )
         raise RefusedError(msg) from error
     except OSError as error:
-        msg = f"the trusted signers file at {path} can't be read: {shown(error)}"
+        msg = f"the trusted signers file at {path} is a link or can't be read: {shown(error)}"
         raise RefusedError(msg) from error
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-        msg = f"the trusted signers file at {path} is a link or not a file"
+
+
+def check_trusted(status: os.stat_result, path: Path, uid: int) -> None:
+    """Refuse an open file that isn't regular, the owner's or root's, and theirs alone to write."""
+    if not stat.S_ISREG(status.st_mode):
+        msg = f"the trusted signers file at {path} is not a file"
+        raise RefusedError(msg)
+    if status.st_uid not in {0, uid}:
+        msg = f"the trusted signers file at {path} belongs to someone else (uid {status.st_uid})"
         raise RefusedError(msg)
     if status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         msg = f"the trusted signers file at {path} can be written by others: chmod go-w it"
         raise RefusedError(msg)
-    keys = [k for k in path.read_text(encoding="utf-8").split("\n") if k and not k.startswith("#")]
+
+
+def trusted_text(path: Path, checkout: Path, uid: int) -> str:
+    """Return the owner's trusted signers file, checked and read through one open descriptor.
+
+    The checks are made on the open file, so nothing can be swapped in between them and the read.
+    """
+    descriptor = open_trusted(path, checkout)
+    try:
+        check_trusted(os.fstat(descriptor), path, uid)
+        content = b""
+        while len(content) <= MAX_TRUSTED_BYTES:
+            chunk = os.read(descriptor, MAX_TRUSTED_BYTES + 1 - len(content))
+            if not chunk:
+                break
+            content += chunk
+    finally:
+        os.close(descriptor)
+    if len(content) > MAX_TRUSTED_BYTES:
+        msg = f"the trusted signers file at {path} is too large to be a list of keys"
+        raise RefusedError(msg)
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        msg = f"the trusted signers file at {path} isn't text"
+        raise RefusedError(msg) from error
+
+
+def read_trusted(path: Path, checkout: Path, uid: int) -> list[str]:
+    """Return the keys in the owner's own signers file, which the repository can't change."""
+    text = trusted_text(path, checkout, uid)
+    keys = [k for k in text.split("\n") if k and not k.startswith("#")]
     if not keys:
         msg = f"the trusted signers file at {path} holds no key"
         raise RefusedError(msg)
-    bad = [k for k in keys if not TRUSTED_KEY.fullmatch(k)]
-    if bad:
+    if not all(TRUSTED_KEY.fullmatch(k) for k in keys):
         msg = f"the trusted signers file at {path} has a line that isn't ssh-ed25519 <base64>"
         raise RefusedError(msg)
     return keys
@@ -459,8 +525,8 @@ class Ready:
     unverified: list[str]
 
 
-def check_request(request: Request, terminal: Terminal) -> list[str]:
-    """Refuse a request that can't be right, before anything runs. Return the trusted keys."""
+def check_request(request: Request, terminal: Terminal) -> None:
+    """Refuse a request that can't be right, before anything runs."""
     if not VERSION.fullmatch(request.version):
         msg = f"{shown(request.version)} is not a version a release can have"
         raise RefusedError(msg)
@@ -473,7 +539,6 @@ def check_request(request: Request, terminal: Terminal) -> list[str]:
     if not terminal.is_tty():
         msg = "this asks the owner to type the version, and stdin isn't a terminal"
         raise RefusedError(msg)
-    return read_trusted(request.trusted_signers)
 
 
 def ready(request: Request, trusted: list[str], run: Run) -> Ready:
@@ -552,7 +617,9 @@ def show(state: Ready, run: Run, say: Callable[[str], None]) -> None:
 
 def release_tag(request: Request, run: Run, terminal: Terminal) -> str:
     """Make, check and maybe push the tag, once the owner has seen it and typed the version."""
-    trusted = check_request(request, terminal)
+    check_request(request, terminal)
+    checkout = Path(output_of(run, ["git", "rev-parse", "--show-toplevel"]).strip())
+    trusted = read_trusted(request.trusted_signers, checkout, os.getuid())
     state = ready(request, trusted, run)
     show(state, run, terminal.say)
     try:
