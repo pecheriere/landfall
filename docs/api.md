@@ -393,9 +393,9 @@ responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden`, `BadOrigin`
 A query string is at most 2 KiB, and a parameter the operation doesn't take is refused with
 `400 bad_request`, not ignored. An operation with no parameters refuses any query string.
 
-An id in a path, such as a request's number, is plain digits with no leading zero, so one row
-has one path. Any other way of writing a number, such as `01`, `+1` or `1.0`, or one too large
-to be an id, names nothing and is `404 not_found`.
+An id in a path, such as a request's number, is plain digits with no leading zero. A path is
+percent-decoded first, so `%31` is the same `1`. Any other way of writing a number, such as
+`01`, `+1` or `1.0`, or one too large to be an id, names nothing and is `404 not_found`.
 
 ## Pages
 

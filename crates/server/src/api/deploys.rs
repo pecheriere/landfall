@@ -179,8 +179,8 @@ async fn list(
     tag = "deploys",
     summary = "One deploy",
     description = "One deploy, with the steps its host reported. A deploy of a deployment the \
-                   principal can't view, or the configuration no longer has, is `404`, as a \
-                   number no deploy has.",
+                   principal holds no grant on, or the configuration no longer has, is `404`, \
+                   as a number no deploy has; with some other grant there, it is `403`.",
     params(IdPath, NoQuery),
     security(("token" = ["view"]), ("session" = ["view"])),
     responses(

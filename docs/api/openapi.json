@@ -958,7 +958,7 @@
           "deploys"
         ],
         "summary": "One deploy",
-        "description": "One deploy, with the steps its host reported. A deploy of a deployment the principal can't view, or the configuration no longer has, is `404`, as a number no deploy has.",
+        "description": "One deploy, with the steps its host reported. A deploy of a deployment the principal holds no grant on, or the configuration no longer has, is `404`, as a number no deploy has; with some other grant there, it is `403`.",
         "operationId": "getDeploy",
         "parameters": [
           {

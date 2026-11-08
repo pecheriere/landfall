@@ -206,7 +206,7 @@ pub(crate) fn deploys(page: &Page<DeployView>, out: &mut dyn Write) -> io::Resul
         let host = deploy
             .host
             .as_ref()
-            .map_or_else(|| "a host you can't see".to_owned(), ToString::to_string);
+            .map_or_else(|| "a host you can't view".to_owned(), ToString::to_string);
         writeln!(
             out,
             "deploy {}: {} on {}, {}, queued {}",
@@ -270,7 +270,8 @@ fn link(commits: &CommitsView) -> String {
 }
 
 /// The commits a release brings, or why they're unknown: never "no commits" unless GitHub
-/// listed none.
+/// listed none. A list that is cut, too large or has no base is explained once, by the
+/// story's reasons above it, so this adds only GitHub's compare link when they don't have it.
 fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
     let base = commits.base.as_ref().map_or_else(
         || "the release below".to_owned(),
@@ -279,7 +280,7 @@ fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
     let unknown = match commits.state {
         CommitsState::Listed => None,
         CommitsState::TooLarge => {
-            return writeln!(out, "commits: too large to list here: {}", link(commits));
+            return writeln!(out, "commits: none listed, for the reason above");
         }
         CommitsState::First => {
             return writeln!(
@@ -287,11 +288,13 @@ fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
                 "commits: the first verified release, with none below to compare with"
             );
         }
-        CommitsState::BaseNotFound => Some(format!(
-            "{base} isn't an ancestor of this release: the history was rewritten between them; \
-             compare at {}",
-            link(commits)
-        )),
+        CommitsState::BaseNotFound => {
+            return writeln!(
+                out,
+                "commits: unknown, for the reason above; compare at {}",
+                link(commits)
+            );
+        }
         CommitsState::NotYet => Some("not fetched from GitHub yet".to_owned()),
         CommitsState::Unavailable => {
             Some("GitHub couldn't be asked; it is tried again later".to_owned())
@@ -328,11 +331,7 @@ fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
     }
     let shown = u64::try_from(commits.commits.len()).unwrap_or(u64::MAX);
     if let Some(total) = commits.total.filter(|total| *total > shown) {
-        writeln!(
-            out,
-            "the newest {shown} of {total}; all of them at {}",
-            link(commits)
-        )?;
+        writeln!(out, "  all {total} at {}", link(commits))?;
     }
     Ok(())
 }
