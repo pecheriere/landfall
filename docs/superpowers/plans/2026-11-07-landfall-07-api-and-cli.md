@@ -264,7 +264,7 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   - `RunningView { tag: Option<ReleaseTag>, digest: Option<ImageDigest>, phase: String, busy: bool, drift: bool, config_drift: bool, healthy_secs: Option<i64>, last_report: Option<i64> }`.
   - `ReleaseBrief { tag: ReleaseTag, status: ReleaseStatus }`.
   - `DeploymentView { summary: DeploymentSummary, rule: RuleView, promote_to: Option<PromotionView>, promoted_from: Vec<PromotionView>, holds: Vec<HoldView>, holds_total: u32 }`, holding the newest 50 holds.
-  - `RuleView { auto: Option<String>, approve: Option<String>, approvers: Vec<PrincipalId>, prerelease: bool }`.
+  - `RuleView { auto: Option<String>, approve: Option<String>, approvers: Vec<PrincipalId>, prereleases: bool }`.
   - `PromotionView { deployment: DeploymentRef, healthy_for_secs: u64 }`.
   - `HoldView { tag: Option<ReleaseTag>, reason: String, since: i64, last_try: i64 }`.
   - `ReleaseStatus`, declared here with the twelve values of the Rulings plus `Unknown`. Task 6 computes it; until then `latest` is `None`.
