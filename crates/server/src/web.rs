@@ -49,10 +49,9 @@ use serde::de::DeserializeOwned;
 
 pub(crate) use self::ceremonies::{Ceremonies, FailureKind};
 pub(crate) use self::headers::security_headers;
-use crate::agent_api::{
-    ApiProblem, ApiState, deadline, log, note_client_source, read_body, source_of,
-};
+use crate::agent_api::{ApiProblem, ApiState, deadline, note_client_source, read_body, source_of};
 use crate::auth::{HumanProblem, origin_matches};
+use crate::logger::log;
 
 /// What a ceremony's answer says about being kept.
 const NO_STORE: [(header::HeaderName, &str); 1] = [(header::CACHE_CONTROL, "no-store")];

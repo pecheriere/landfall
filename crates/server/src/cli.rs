@@ -20,13 +20,14 @@ use landfall_origin::fetch::{Endpoints, FetchError, Fetcher};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
 use crate::audit::AuditReport;
 use crate::auth::{flush_dropped, keep_flushing};
+use crate::logger::{self, Logger, hides_text};
 use crate::serve::ServeOptions;
 use crate::store::{Store, StoreError};
 use crate::watcher::{self, LiveSource, ReleaseSource};
@@ -38,11 +39,12 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long stopping waits for the watcher and the flushing to let go. `docs/operations.md` adds up
 /// what stopping can take, against `TimeoutStopSec=30`.
 const TASKS_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long stopping waits for each of its last lines to be taken by stderr.
-const SAY_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the runtime gets for its threads to end, once the work is done. Without a limit, a task
 /// blocking its thread would keep the process until something killed it.
 const LET_GO_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long the log then has to write what's queued. A stderr that takes nothing can't keep the
+/// process from ending: what's left is lost.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The command succeeded.
 pub const EXIT_OK: u8 = 0;
@@ -387,7 +389,8 @@ async fn serve_watching<S: ReleaseSource>(
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
     // Says the real port, if it was asked for port 0, and that signals are heard from here on.
     let listening = listener.local_addr().map_err(serve_error)?;
-    crate::agent_api::log(&format!("listening on {listening}"));
+    log_panics();
+    logger::log(&format!("listening on {listening}"));
 
     let (stop_watcher, stop_watching) = watch::channel(false);
     let stop_flushing = stop_watching.clone();
@@ -418,8 +421,20 @@ async fn serve_watching<S: ReleaseSource>(
     };
     let left_running = crate::serve::run(listener, app, options, shutdown).await;
     wait_for_tasks(watching, flushing, TASKS_TIMEOUT).await;
-    finish_stopping(&draining, &closing, left_running, crate::agent_api::log).await;
+    finish_stopping(&draining, &closing, left_running, logger::log).await;
     Ok(EXIT_OK)
+}
+
+/// Sends what a panic says to the log, rather than having the runtime's thread write it to stderr
+/// itself, where it could block. The rest of what a panic does is unchanged.
+fn log_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map_or_else(|| "an unknown place".to_owned(), ToString::to_string);
+        let message = info.payload_as_str().unwrap_or("with no message");
+        logger::log(&format!("a thread panicked at {location}: {message}"));
+    }));
 }
 
 /// Waits for the watcher and the flushing, told to stop as the serving began to. They let go at
@@ -429,13 +444,9 @@ async fn wait_for_tasks<A, B>(watching: JoinHandle<A>, flushing: JoinHandle<B>, 
     drop(tokio::time::timeout(limit, async { tokio::join!(watching, flushing) }).await);
 }
 
-/// The last of stopping: writes the counts down, closes the database, and says what went wrong.
-async fn finish_stopping(
-    state: &ApiState,
-    store: &Store,
-    left_running: usize,
-    say: impl Fn(&str) + Clone + Send + 'static,
-) {
+/// The last of stopping: writes the counts down, closes the database, and says what went wrong with
+/// `say`, which mustn't wait: the log only queues a line.
+async fn finish_stopping(state: &ApiState, store: &Store, left_running: usize, say: impl Fn(&str)) {
     // It stopped as the draining began, and a request finishing since may have counted something.
     // No request is running now, so nothing can count anything after this, but for what `run` said
     // was left, whose count is lost if it goes on to make one.
@@ -447,11 +458,10 @@ async fn finish_stopping(
         .await
         .is_err()
     {
-        let line = "the database did not close in time; it stays whole, with its -wal";
-        say_in_time(say.clone(), line.to_owned()).await;
+        say("the database did not close in time; it stays whole, with its -wal");
     }
     if let Some(line) = left_running_line(left_running) {
-        say_in_time(say, line).await;
+        say(&line);
     }
 }
 
@@ -464,22 +474,8 @@ fn left_running_line(left_running: usize) -> Option<String> {
     };
     Some(format!(
         "stopped with {requests} still running, each blocking its thread: anything counted from \
-         here on isn't written down. If this repeats, look at what reads this log, as a stuck \
-         stderr is what can block one"
+         here on isn't written down"
     ))
-}
-
-/// Says `line` on a thread of its own, without waiting long: what can leave a request running is a
-/// stderr that doesn't take what it's given, and that mustn't keep the process from ending.
-async fn say_in_time(say: impl FnOnce(&str) + Send + 'static, line: String) {
-    let (said, has_said) = oneshot::channel::<()>();
-    let saying = std::thread::Builder::new().spawn(move || {
-        say(&line);
-        let _ = said.send(());
-    });
-    if saying.is_ok() {
-        drop(tokio::time::timeout(SAY_TIMEOUT, has_said).await);
-    }
 }
 
 /// The database `serve` uses, which must exist.
@@ -585,16 +581,7 @@ async fn audit_show(args: AuditShowArgs, out: &mut impl Write) -> Result<u8, Cli
 fn safe_to_print(line: &str) -> String {
     let mut safe = String::with_capacity(line.len());
     for character in line.chars() {
-        if matches!(
-            character,
-            '\u{7f}'..='\u{9f}'
-                | '\u{61c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}'
-        ) {
+        if matches!(character, '\u{7f}'..='\u{9f}') || hides_text(character) {
             // Writing to a String cannot fail.
             let _ = std::fmt::Write::write_fmt(
                 &mut safe,
@@ -679,6 +666,15 @@ pub fn run_watching_within<S: ReleaseSource>(
 }
 
 fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
+    on_a_runtime_logging(work, logger::global())
+}
+
+/// [`on_a_runtime`], with what is logged going to `log`, which then has [`FLUSH_TIMEOUT`] to write
+/// it, as the runtime's threads can no longer be blocked by it.
+fn on_a_runtime_logging(
+    work: impl Future<Output = Result<u8, CliError>>,
+    log: Option<&Logger>,
+) -> u8 {
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -688,14 +684,23 @@ fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>) -> u8 {
             runtime.shutdown_timeout(LET_GO_TIMEOUT);
             result
         });
-    match result {
+    let code = match result {
         Ok(code) => code,
         Err(error) => {
-            // Nothing is left to tell if stderr itself is gone.
-            drop(writeln!(io::stderr(), "landfall-server: {error}"));
+            match log {
+                Some(log) => log.log_as_is(&error.to_string()),
+                // With no log, nothing else is writing to stderr, and no runtime is left to block.
+                // Nothing is left to tell if stderr itself is gone.
+                None => drop(writeln!(io::stderr(), "landfall-server: {error}")),
+            }
             EXIT_COULD_NOT_RUN
         }
+    };
+    if let Some(log) = log {
+        // If it couldn't in time, stderr isn't taking lines, so there is nowhere to say so.
+        let _ = log.flush_within(FLUSH_TIMEOUT);
     }
+    code
 }
 
 #[cfg(test)]

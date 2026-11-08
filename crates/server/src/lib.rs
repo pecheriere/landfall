@@ -5,6 +5,7 @@ pub mod agent_api;
 pub mod audit;
 pub mod auth;
 pub mod cli;
+mod logger;
 pub mod report;
 mod requests;
 pub mod serve;

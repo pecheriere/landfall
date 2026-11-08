@@ -50,6 +50,14 @@ landfall-server: decision: app/prod v1.3.0: manual: "beyond the rule's levels: i
 landfall-server: hold: app/prod everything: "its host's configuration differs from the controller's"
 ```
 
+A control character in a line, or one that reorders text or breaks a line unseen, is written as an
+escape such as `\u000a`, and a line past 4 KiB is cut short. Its lines are written by a thread of
+their own, so that whatever reads stderr can't hold up the controller by not reading: up to 256 wait
+for it, and those that don't fit are dropped and counted, as
+`landfall-server: 12 more log lines were not written, as stderr was not taking them`, said before the
+next line written. Decisions, holds and every refusal someone can be held to are in the audit log
+too: only refusals that could come from anyone, already capped at 60 a minute, are here alone.
+
 So when nothing deploys, look there first. The whole story is in the audit log, which
 this prints as JSON lines, newest last, without writing to the database, whether or not
 `serve` is running:
@@ -107,14 +115,14 @@ something going wrong, and each goes on to the next step whatever happened:
 | Step | Limit | What it's for |
 |---|---|---|
 | Drain | 5 s | Requests in flight finish. Those that don't get no answer. |
-| Cut-off | 5 s | What's left is dropped at once, unless a handler is blocking its thread. |
+| Cut-off | 5 s | What's left is dropped at once, unless a handler is blocking its thread, which nothing is known to do. |
 | Watcher and flushing tasks | 5 s | They were told to stop when the drain began. |
 | The last flush | Up to 5 s a row, on a busy database | Writes down counted failures and dropped calls. |
 | Closing the database | 5 s | So that the main file holds everything. |
-| Its last log lines | 1 s each, for at most 2 | Said only if something went wrong. |
 | The runtime's threads | 1 s | Any still blocked are left behind as the process ends. |
+| The log | 1 s | What's waiting for stderr is written. If stderr isn't taking it, it's lost. |
 
-That's 23 s before the flush's own time, so give it **30 s**, which leaves a row's wait or two:
+That's 22 s before the flush's own time, so give it **30 s**, which leaves a row's wait or two:
 
 - **systemd:** `TimeoutStopSec=30`, as in the unit above. The agent's unit has `TimeoutStopSec=3h`,
   which is about deploys and is [its own matter](#stopping-the-unit).
@@ -129,8 +137,8 @@ with a blocked handler is killed before its last flush.
 and the next start reads what's left in the write-ahead log. Failed sign-ins and dropped calls
 counted since the last flush aren't written down, so that's up to five minutes' worth of them. The
 log line `stopped with 1 request still running` means a handler was still blocked after all this,
-and that anything it counts from then on is lost in the same way. If every thread is blocked, stopping
-can't get as far as this: only the signal that kills it ends it.
+and that anything it counts from then on is lost in the same way. A stderr that isn't read, from a
+stalled journald or log driver, can't block one: logging never waits for it.
 
 ### `GITHUB_TOKEN`
 

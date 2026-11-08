@@ -1,25 +1,17 @@
 //! Error answers: `application/problem+json` with the codes in
 //! [`landfall_core::protocol::ProblemCode`].
 
-use std::io::{self, Write as _};
-
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use landfall_core::protocol::{PROBLEM_CONTENT_TYPE, Problem, ProblemCode};
 
+use crate::logger::log;
 use crate::store::StoreError;
 
 /// How long to tell a client to wait when the controller is refusing for load,
 /// in seconds.
 const RETRY_AFTER_SECS: &str = "5";
-
-/// Writes a line to the controller's log. Callers pass only validated values or
-/// the controller's own messages, never an agent's text unquoted.
-pub(crate) fn log(line: &str) {
-    // Nothing is left to tell if stderr itself is gone.
-    drop(writeln!(io::stderr(), "landfall-server: {line}"));
-}
 
 /// Every way the API refuses a request. No variant carries anything the client
 /// sent, so no answer can repeat it.

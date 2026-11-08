@@ -17,8 +17,8 @@ use sqlx::sqlite::SqliteRow;
 
 use super::deploys::{NewDeploy, observed_secs, parsed};
 use super::{Store, StoreError};
-use crate::agent_api::log;
 use crate::audit::{AuditEvent, EventKind};
+use crate::logger::log;
 use crate::report::MAX_STORED_TEXT_CHARS;
 
 /// How recently a host must have reported for its deployment to count as healthy,

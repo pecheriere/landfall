@@ -46,7 +46,7 @@ use tokio::sync::{oneshot, watch};
 use self::client_source::ClientSource;
 pub(crate) use self::client_source::{note_client_source, source_of};
 pub(crate) use self::handlers::json;
-pub(crate) use self::problem::{ApiProblem, log, problem_response};
+pub(crate) use self::problem::{ApiProblem, problem_response};
 pub(crate) use self::rate_limit::{RateLimiter, source_key};
 pub(crate) use self::refusal_log::RefusalLog;
 pub(crate) use self::signed::read_body;

@@ -7,10 +7,11 @@ use clap::{CommandFactory as _, Parser as _};
 use landfall_core::config::ConfigError;
 
 use super::{
-    ApiState, CLOSE_TIMEOUT, Cli, CliError, Command, DeploymentId, Duration, EXIT_OK,
-    EXIT_TAMPERED, HostId, LET_GO_TIMEOUT, Limits, OsString, Path, PathBuf, SAY_TIMEOUT, ServeArgs,
-    ServeOptions, Store, TASKS_TIMEOUT, execute, finish_stopping, github_token, load_config,
-    on_a_runtime, real_limits, release_fetcher, trust_cache_dir, wait_for_tasks,
+    ApiState, CLOSE_TIMEOUT, Cli, CliError, Command, DeploymentId, Duration, EXIT_COULD_NOT_RUN,
+    EXIT_OK, EXIT_TAMPERED, FLUSH_TIMEOUT, HostId, LET_GO_TIMEOUT, Limits, Logger, OsString, Path,
+    PathBuf, ServeArgs, ServeOptions, Store, TASKS_TIMEOUT, execute, finish_stopping, github_token,
+    load_config, on_a_runtime, on_a_runtime_logging, real_limits, release_fetcher, trust_cache_dir,
+    wait_for_tasks,
 };
 
 #[test]
@@ -602,8 +603,11 @@ fn the_real_limits_are_the_documented_ones_and_fit_the_units_stop_timeout() {
     assert_eq!(TASKS_TIMEOUT, Duration::from_secs(5));
     assert_eq!(CLOSE_TIMEOUT, Duration::from_secs(5));
 
-    let all = drain + cut_off + TASKS_TIMEOUT + CLOSE_TIMEOUT + SAY_TIMEOUT * 2 + LET_GO_TIMEOUT;
-    assert_eq!(all, Duration::from_secs(23), "the sum in the guide");
+    assert_eq!(LET_GO_TIMEOUT, Duration::from_secs(1));
+    assert_eq!(FLUSH_TIMEOUT, Duration::from_secs(1));
+
+    let all = drain + cut_off + TASKS_TIMEOUT + CLOSE_TIMEOUT + LET_GO_TIMEOUT + FLUSH_TIMEOUT;
+    assert_eq!(all, Duration::from_secs(22), "the sum in the guide");
     assert!(
         all + Duration::from_secs(5) < Duration::from_secs(30),
         "`TimeoutStopSec=30` must leave the last flush a row's wait for the database"
@@ -650,23 +654,41 @@ async fn the_operator_is_told_of_requests_left_running_and_of_nothing_else() {
     assert_eq!(*said.lock().unwrap(), [] as [String; 0]);
 }
 
-/// With the stderr stuck that left the request running, saying so can't keep the process.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_stderr_that_takes_nothing_cant_hold_up_the_end_of_stopping() {
-    let dir = tempfile::tempdir().unwrap();
-    let (state, store) = stopping_state(dir.path()).await;
+/// A stderr that takes nothing, for as long as its sender is held.
+struct Stuck(std::sync::mpsc::Receiver<()>);
+
+impl std::io::Write for Stuck {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.recv();
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// With a stderr that takes nothing, what's logged, the failure included, can't keep the process:
+/// the log has its limit, and no more, once the runtime is gone.
+#[test]
+fn a_stderr_that_takes_nothing_cant_keep_the_process() {
     let (stuck_for_good, stuck) = std::sync::mpsc::channel::<()>();
-    let stuck = Arc::new(Mutex::new(stuck));
-    let say = move |_: &str| {
-        let _ = stuck.lock().unwrap().recv();
-    };
-
-    let stopping = tokio::spawn(async move { finish_stopping(&state, &store, 1, say).await });
-
-    tokio::time::timeout(Duration::from_secs(60), stopping)
-        .await
-        .expect("it waited for stderr")
-        .unwrap();
+    let log = Logger::start(Stuck(stuck), 4).unwrap();
+    let (result, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let code = on_a_runtime_logging(
+            async {
+                for _ in 0..100 {
+                    log.log("a line from a runtime's thread");
+                }
+                Err(CliError::GitHubToken)
+            },
+            Some(&log),
+        );
+        result.send(code).unwrap();
+    });
+    let code = ended.recv_timeout(std::time::Duration::from_secs(60));
+    assert_eq!(code, Ok(EXIT_COULD_NOT_RUN));
     drop(stuck_for_good);
 }
 

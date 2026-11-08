@@ -35,8 +35,9 @@ use landfall_core::ids::PrincipalId;
 use serde_json::json;
 use tokio::sync::watch;
 
-use crate::agent_api::{ApiState, Limits, RateLimiter, log};
+use crate::agent_api::{ApiState, Limits, RateLimiter};
 use crate::audit::{AuditEvent, EventKind};
+use crate::logger::log;
 
 /// How many sessions one principal keeps. Signing in anew past this ends the oldest, so a
 /// passkey signing in over and over can't grow the table of sessions, or this one.

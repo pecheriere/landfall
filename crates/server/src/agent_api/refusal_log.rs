@@ -8,7 +8,7 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use super::problem::log;
+use crate::logger::log;
 
 /// The most lines written in one [`WINDOW_SECS`].
 const LINES_PER_WINDOW: u32 = 60;

@@ -17,8 +17,8 @@ use sqlx::{Row as _, Sqlite, SqliteConnection, Transaction};
 use super::deploys::{NewDeploy, parsed};
 use super::releases::{StoredRelease, WatchedRunning, release_of, running_of};
 use super::{Store, StoreError};
-use crate::agent_api::log;
 use crate::audit::{AuditEvent, EventKind};
+use crate::logger::log;
 
 /// How long a request waits for an approver, in seconds, by the controller's clock. The
 /// host uses none of this: it goes by the nonce and the running digest. This is only so
