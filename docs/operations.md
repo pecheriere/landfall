@@ -1047,9 +1047,10 @@ So if a session is being used up, the person can still end it. Reads have a budg
 300 at once refilling at ten a second, which state changes never touch (see
 [`api.md`](api.md#budgets)), and neither use comes near either in normal work. Over a budget, a
 call gets `429 rate_limited` with `Retry-After`, and writes nothing. The count of those goes in an
-`access_throttled` audit row, with how many were `dropped` and `"reads": true` for reads, at the
-next call of the same kind within the budget or within one watcher interval, whichever is first,
-and when the controller stops. It names the principal and whether by `token`, `session` or
+`access_throttled` audit row, with how many were `dropped`, at the next state change within the
+budget or within one watcher interval, whichever is first, and when the controller stops. A count
+of reads says `"reads": true` and waits for the watcher interval or stopping, as a read never
+writes. It names the principal and whether by `token`, `session` or
 `sign_in`, and no particular token, since it can be another of the principal's that comes next: to
 find which, look at the rows around it. The count is kept in memory, so a crash loses one not yet
 written.

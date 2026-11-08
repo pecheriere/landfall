@@ -47,10 +47,11 @@ use up the other. Each session has its own, and all of a principal's tokens shar
 A CLI command makes at most three calls and a page polls every few seconds, so neither comes
 near the read budget; an agent sweeping a large fleet may, and waits. Over a budget, a call gets
 `429 rate_limited` with `Retry-After` in seconds (1 for a read, 5 for a state change), and
-writes nothing. The count of those goes in an `access_throttled` audit row, with `"reads": true`
-for reads, at the next call of the same kind within the budget, within one watcher interval, or
-when the controller stops, whichever is first. The budgets are kept in memory, so a restart gives
-them back.
+writes nothing. The count of those goes in an `access_throttled` audit row: for state changes, at
+the next state change within the budget, within one watcher interval, or when the controller
+stops, whichever is first; for reads, with `"reads": true`, within one watcher interval or when
+the controller stops, so that a read never writes. The budgets are kept in memory, so a restart
+gives them back.
 
 ## Grants
 

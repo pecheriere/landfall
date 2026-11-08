@@ -259,8 +259,8 @@ impl ApiState {
             .spend(spender, now)
     }
 
-    /// Takes the cost of one read from a budget for reads.
-    pub(crate) fn spend_read_budget(&self, spender: &Spender, now: i64) -> Spent {
+    /// Takes the cost of one read from a budget for reads, and says whether it was within it.
+    pub(crate) fn spend_read_budget(&self, spender: &Spender, now: i64) -> bool {
         self.budget
             .lock()
             // Counts, valid at every step.

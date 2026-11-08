@@ -183,13 +183,12 @@ async fn read_throttles_are_counted_with_reads_true() {
         })]
     );
 
-    // A session's count, said by its next read within the budget.
+    // A session's count, by the flush too.
     assert_eq!(
         reads(&world, Reader::Session(&name), burst() + 2).await,
         (burst(), 2)
     );
-    world.clock.advance(1);
-    assert_eq!(reads(&world, Reader::Session(&name), 1).await, (1, 0));
+    flush_dropped(&world.state).await;
     let rows = audited(&world, "access_throttled").await;
     assert_eq!(rows.len(), 2);
     assert_eq!(
@@ -201,6 +200,43 @@ async fn read_throttles_are_counted_with_reads_true() {
         })
     );
     assert_eq!(world.store.verify_audit().await.unwrap().first_bad, None);
+}
+
+/// A read back within its budget leaves the count for the flush: it writes nothing, so it can't
+/// be refused for a write that fails, as it would be with the audit log refusing every row.
+#[tokio::test]
+async fn a_read_back_within_its_budget_writes_nothing_and_the_flush_writes_the_count() {
+    let world = World::seed().await;
+    let name = holder(&["view"]);
+    assert_eq!(
+        reads(&world, Reader::Token(&name), burst() + 3).await,
+        (burst(), 3)
+    );
+    let before = audit_rows(&world).await;
+    let refuse_rows = "CREATE TRIGGER no_rows BEFORE INSERT ON audit_events
+                       BEGIN SELECT RAISE(ABORT, 'not now'); END";
+    sqlx::query(refuse_rows)
+        .execute(world.store.pool())
+        .await
+        .unwrap();
+    world.clock.advance(1);
+    assert_eq!(reads(&world, Reader::Token(&name), 10).await, (10, 0));
+    sqlx::query("DROP TRIGGER no_rows")
+        .execute(world.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(audit_rows(&world).await, before);
+
+    flush_dropped(&world.state).await;
+    assert_eq!(audit_rows(&world).await, before + 1);
+    assert_eq!(
+        audited(&world, "access_throttled").await,
+        vec![json!({
+            "by": { "principal": name, "via": "token" },
+            "dropped": 3,
+            "reads": true,
+        })]
+    );
 }
 
 #[tokio::test]

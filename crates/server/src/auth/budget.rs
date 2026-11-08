@@ -27,12 +27,13 @@
 //! ceremonies, in [`crate::web`]. The limits are in [`Limits`](crate::agent_api::Limits), with
 //! why they are what they are.
 //!
-//! Going over writes nothing. The count is kept here, reads' apart from state changes', and
-//! whichever comes first writes it to the log: the next call of the same kind within the budget,
-//! the flush each watcher interval, or stopping. So nothing is lost in silence, even if the
-//! spender goes quiet or the call writing it is cut off, as it goes back unless it was written. A
-//! principal's tokens' count names no token, as another of them may be the one to write it. It
-//! lives in memory: a crash loses a count not yet written, and a restart gives every budget back.
+//! Going over writes nothing. The count is kept here, reads' apart from state changes'. A count of
+//! state changes is written by whichever comes first: the next state change within the budget,
+//! the flush each watcher interval, or stopping. A count of reads waits for the flush or for
+//! stopping, so that a read never writes. So nothing is lost in silence, even if the spender goes
+//! quiet or the call writing it is cut off, as it goes back unless it was written. A principal's
+//! tokens' count names no token, as another of them may be the one to write it. It lives in
+//! memory: a crash loses a count not yet written, and a restart gives every budget back.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -197,11 +198,17 @@ impl Budget {
         counted(&mut self.dropped, spender, allowed)
     }
 
-    /// Takes the cost of one read, at `now`, from the spender's bucket for reads. A session's or
-    /// tokens' only: a sign-in is no read.
-    pub(crate) fn spend_read(&mut self, spender: &Spender, now: i64) -> Spent {
+    /// Takes the cost of one read, at `now`, from the spender's bucket for reads, and says whether
+    /// it was within the budget. A session's or tokens' only: a sign-in is no read. One over the
+    /// budget adds to the count, which stays here for the flush to write, whatever comes next:
+    /// so a read never writes, and never fails for want of writing.
+    pub(crate) fn spend_read(&mut self, spender: &Spender, now: i64) -> bool {
         let allowed = self.reads.allow_key(spender.clone(), now);
-        counted(&mut self.dropped_reads, spender, allowed)
+        if !allowed {
+            let dropped = self.dropped_reads.entry(spender.clone()).or_insert(0);
+            *dropped = dropped.saturating_add(1);
+        }
+        allowed
     }
 
     /// Lets go of the budgets of sessions that ended. A count not yet written stays, for the next
@@ -439,10 +446,10 @@ mod tests {
         assert_eq!(budget.spend(&alice, 100), Spent::Within { dropped: 0 });
         assert_eq!(budget.spend(&alice, 100), Spent::Over);
         // State changes spent, reads whole.
-        assert_eq!(budget.spend_read(&alice, 100), Spent::Within { dropped: 0 });
-        assert_eq!(budget.spend_read(&alice, 100), Spent::Within { dropped: 0 });
-        assert_eq!(budget.spend_read(&alice, 100), Spent::Over);
-        assert_eq!(budget.spend_read(&alice, 100), Spent::Over);
+        assert!(budget.spend_read(&alice, 100));
+        assert!(budget.spend_read(&alice, 100));
+        assert!(!budget.spend_read(&alice, 100));
+        assert!(!budget.spend_read(&alice, 100));
         let mut counts = budget.take_dropped();
         counts.sort_by_key(|dropped| dropped.reads);
         assert_eq!(
@@ -460,12 +467,19 @@ mod tests {
                 },
             ]
         );
-        // Each kind's count goes back to its own.
+        // Each kind's count goes back to its own. A read within the budget leaves its count for
+        // the flush, and a state change takes its own.
         for dropped in counts {
             budget.keep_dropped(dropped);
         }
-        assert_eq!(budget.spend_read(&alice, 101), Spent::Within { dropped: 2 });
+        assert!(budget.spend_read(&alice, 101));
         assert_eq!(budget.spend(&alice, 101), Spent::Within { dropped: 1 });
+        let reads = Dropped {
+            spender: alice.clone(),
+            reads: true,
+            count: 2,
+        };
+        assert_eq!(budget.take_dropped(), vec![reads]);
     }
 
     #[test]

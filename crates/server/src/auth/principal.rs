@@ -82,7 +82,6 @@ impl Principal {
 struct CountBeingWritten<'a> {
     state: &'a ApiState,
     spender: &'a Spender,
-    reads: bool,
     dropped: u64,
     written: bool,
 }
@@ -92,7 +91,7 @@ impl Drop for CountBeingWritten<'_> {
         if !self.written {
             self.state.keep_dropped(Dropped {
                 spender: self.spender.clone(),
-                reads: self.reads,
+                reads: false,
                 count: self.dropped,
             });
         }
@@ -119,44 +118,37 @@ pub(crate) async fn spend_budget(
                 _ => HumanProblem::OverBudget,
             })
         }
-        Spent::Within { dropped } => write_down(state, spender, dropped, false).await,
+        Spent::Within { dropped } => write_down(state, spender, dropped).await,
     }
 }
 
-/// The same for a read, from the budget for reads: over it, the read is refused and writes
-/// nothing, and the first read back within it writes down how many were.
-async fn spend_read_budget(
+/// The same for a read, from the budget for reads: over it, the read is refused. A read writes
+/// nothing either way: how many were refused waits for the flush, so a read can't fail on that.
+fn spend_read_budget(
     state: &ApiState,
     extensions: &Extensions,
     spender: &Spender,
 ) -> Result<(), HumanProblem> {
-    match state.spend_read_budget(spender, state.store().now()?) {
-        Spent::Over => {
-            state.note_refusal(extensions, "a read over its budget");
-            Err(HumanProblem::ReadsOverBudget)
-        }
-        Spent::Within { dropped } => write_down(state, spender, dropped, true).await,
+    if state.spend_read_budget(spender, state.store().now()?) {
+        Ok(())
+    } else {
+        state.note_refusal(extensions, "a read over its budget");
+        Err(HumanProblem::ReadsOverBudget)
     }
 }
 
-/// Writes down a count taken from the table, of reads if `reads`, or puts it back if that fails.
-async fn write_down(
-    state: &ApiState,
-    spender: &Spender,
-    dropped: u64,
-    reads: bool,
-) -> Result<(), HumanProblem> {
+/// Writes down a count of state changes taken from the table, or puts it back if that fails.
+async fn write_down(state: &ApiState, spender: &Spender, dropped: u64) -> Result<(), HumanProblem> {
     if dropped == 0 {
         return Ok(());
     }
     let mut count = CountBeingWritten {
         state,
         spender,
-        reads,
         dropped,
         written: false,
     };
-    let event = throttled_event(spender, dropped, reads);
+    let event = throttled_event(spender, dropped, false);
     state.store().record(&event).await?;
     count.written = true;
     Ok(())
@@ -322,7 +314,7 @@ impl FromRequestParts<ApiState> for Principal {
             None => Spender::Tokens(principal.id.clone()),
         };
         if is_safe(&parts.method) {
-            spend_read_budget(state, &parts.extensions, &spender).await?;
+            spend_read_budget(state, &parts.extensions, &spender)?;
         } else {
             spend_budget(state, &parts.extensions, &spender).await?;
         }
