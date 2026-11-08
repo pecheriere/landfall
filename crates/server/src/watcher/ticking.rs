@@ -164,7 +164,7 @@ pub async fn tick<S: ReleaseSource>(
     match store.now() {
         Ok(now) if state.any_rate_limited(now) => {}
         Ok(now) => {
-            let walk = commits::after_tick(store, source.as_ref(), config, state, now);
+            let walk = commits::after_tick(store, source.as_ref(), config, state, now, &log);
             if tokio::time::timeout(state.commits_deadline, walk)
                 .await
                 .is_err()

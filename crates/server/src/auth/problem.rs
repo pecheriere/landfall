@@ -23,6 +23,9 @@ pub(crate) enum HumanProblem {
     MethodNotAllowed,
     /// The deployment already has a request waiting for an approver.
     RequestOpen,
+    /// A request meant as a rollback whose tag isn't lower than what runs, or with nothing
+    /// running, or what runs not a version.
+    NotARollback,
     /// The deployment has a deploy queued or running.
     DeploymentBusy,
     /// Its host hasn't reported it, or can't take a deploy as it stands.
@@ -75,7 +78,6 @@ impl HumanProblem {
     /// The answer's status, stable code and text for people. `None` for a shared one,
     /// which knows its own.
     fn parts(self) -> Option<(StatusCode, ProblemCode, &'static str)> {
-        let conflict = StatusCode::CONFLICT;
         Some(match self {
             Self::Unauthenticated => (
                 StatusCode::UNAUTHORIZED,
@@ -102,10 +104,46 @@ impl HumanProblem {
                 ProblemCode::MethodNotAllowed,
                 "this path does not take this method",
             ),
+            Self::RequestOpen
+            | Self::NotARollback
+            | Self::DeploymentBusy
+            | Self::HostNotReady
+            | Self::ReleaseNotVerified
+            | Self::ReleaseRefused
+            | Self::PromotionPending
+            | Self::RequestStale
+            | Self::RequestExpired
+            | Self::RequestClosed
+            | Self::RequestCancelled
+            | Self::RequestUnreadable
+            | Self::AssertionRefused => return self.request_parts(),
+            Self::ApprovalsNotConfigured
+            | Self::OverBudget
+            | Self::ReadsOverBudget
+            | Self::AuditTooWide
+            | Self::InviteRefused
+            | Self::RegistrationRefused
+            | Self::SignInRefused
+            | Self::CeremoniesBusy
+            | Self::SignInsSpent { .. }
+            | Self::Shared(_) => return self.ceremony_parts(),
+        })
+    }
+
+    /// The same, for what asking for, approving and cancelling a request refuse. `None` for
+    /// anything else.
+    fn request_parts(self) -> Option<(StatusCode, ProblemCode, &'static str)> {
+        let conflict = StatusCode::CONFLICT;
+        Some(match self {
             Self::RequestOpen => (
                 conflict,
                 ProblemCode::RequestOpen,
                 "this deployment already has a request waiting for an approver",
+            ),
+            Self::NotARollback => (
+                conflict,
+                ProblemCode::NotARollback,
+                "this release is not lower than what runs, so it is not a rollback",
             ),
             Self::DeploymentBusy => (
                 conflict,
@@ -163,16 +201,7 @@ impl HumanProblem {
                 ProblemCode::AssertionRefused,
                 "this assertion is not one by you for this request",
             ),
-            Self::ApprovalsNotConfigured
-            | Self::OverBudget
-            | Self::ReadsOverBudget
-            | Self::AuditTooWide
-            | Self::InviteRefused
-            | Self::RegistrationRefused
-            | Self::SignInRefused
-            | Self::CeremoniesBusy
-            | Self::SignInsSpent { .. }
-            | Self::Shared(_) => return self.ceremony_parts(),
+            _ => return None,
         })
     }
 

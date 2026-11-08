@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use landfall_origin::fetch::{ComparePage, CompareStatus, FetchError, Service};
 
 use super::commits::{
-    RESET, T0, after, answer, compares, github, harness, nth, range, range_count, settle, sha,
-    wanted, with_token,
+    RESET, T0, after, after_logged, answer, compares, github, harness, nth, range, range_count,
+    settle, sha, wanted, with_token,
 };
 use super::{
     CompareAnswer, HOST, Harness, OTHER, PATCH_RULE, PROD, RateLimitReset, ReleaseError,
@@ -277,8 +277,11 @@ async fn a_reset_far_off_is_believed_for_a_day_at_most() {
     assert_eq!(after(&h).await, 1);
 }
 
+/// The URL a refusal names: what was asked, which no log line repeats.
+const REFUSED_URL: &str = "https://example.test/compare?secret";
+
 fn refusal(status: u16, reset: Option<RateLimitReset>) -> ReleaseError {
-    let url = "https://example.test/compare".to_owned();
+    let url = REFUSED_URL.to_owned();
     ReleaseError::Compare(match reset {
         Some(reset) => FetchError::RateLimited {
             service: Service::GitHubApi,
@@ -309,8 +312,27 @@ async fn a_403_or_429_from_compare_backs_off_across_ticks() {
         let h = harness(&config_text(PATCH_RULE)).await;
         three_releases(&h).await;
         answer(&h, Box::new(move |_, _, _| Err(refusal(status, reset))));
-        assert_eq!(after(&h).await, 0, "{status} {reset:?}");
+        let (stored, lines) = after_logged(&h).await;
+        assert_eq!(stored, 0, "{status} {reset:?}");
         assert_eq!(compares(&h), [1], "{status} {reset:?}");
+        // One line says so, with the repository and when commits go on, and nothing of
+        // the request: a refusal that never lifts is seen, an hour at a time.
+        assert_eq!(
+            lines,
+            [format!(
+                "watcher: commits: GitHub answered {status} to a compare in example/app: no \
+                 commits are fetched until {} (Unix seconds)",
+                T0 + wait
+            )],
+            "{status} {reset:?}"
+        );
+        assert!(!lines[0].contains("secret"), "{lines:?}");
+        // While paused, nothing is asked and nothing more is logged.
+        assert_eq!(
+            after_logged(&h).await,
+            (0, Vec::new()),
+            "{status} {reset:?}"
+        );
 
         answer(&h, one_commit(5000, None));
         h.clock.advance(wait - 1);

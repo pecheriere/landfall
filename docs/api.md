@@ -11,7 +11,9 @@ cargo run -p landfall-server -- openapi > docs/api/openapi.json
 ```
 
 How to make a token and ask for a first deploy is in
-[`operations.md`](operations.md#api-tokens-requests-and-approvals).
+[`operations.md`](operations.md#api-tokens-requests-and-approvals). The `landfall` command is a
+client of this API, and [its section there](operations.md#the-landfall-command) says how it finds
+the controller and its token; its `--json` prints these answers as they were received.
 
 ## Authentication
 
@@ -44,8 +46,9 @@ use up the other. Each session has its own, and all of a principal's tokens shar
 | State changes (`POST`) | 120 | 1 a second |
 | Reads (`GET`) | 300 | 10 a second |
 
-A CLI command makes at most three calls and a page polls every few seconds, so neither comes
-near the read budget; an agent sweeping a large fleet may, and waits. Over a budget, a call gets
+A `landfall` command makes at most three calls, but for `status` with no deployment, which reads
+at most 20 pages, 1,000 deployments or 8 MiB of answers, and a page polls every few seconds, so
+neither comes near the read budget; an agent sweeping a large fleet may, and waits. Over a budget, a call gets
 `429 rate_limited` with `Retry-After` in seconds (1 for a read, 5 for a state change), and
 writes nothing. The count of those goes in an `access_throttled` audit row: for state changes, at
 the next state change within the budget, within one watcher interval, or when the controller
@@ -221,7 +224,8 @@ again from its new commit, and two deployments of one repository share one list.
   stored only once all of them came back. Once GitHub reports fewer requests left than that, or
   answers 403 or 429, no commits are asked for until its rate-limit window ends
   (`x-ratelimit-reset` or `Retry-After`, believed for a day at most), or for an hour when it
-  doesn't say.
+  doesn't say. A 403 or 429 is logged once each time, with the repository and when commits go
+  on, so a refusal that never lifts shows in the controller's log.
   Only releases first recorded after the controller was upgraded to this version are compared:
   nothing is fetched for the history it already had.
 
@@ -346,6 +350,28 @@ Sequence numbers, like deploy and request numbers, are shared by the whole contr
 between two rows a principal sees is activity they can't see. That is accepted: it tells them
 how much happened, never what.
 
+## Asking for a deploy
+
+`requestDeploy` (`POST /api/v1/deployments/{name}/{stage}/requests`) takes the tag to deploy,
+`{"tag": "v1.3.0"}`, and makes the intent from the controller's own records. A tag above what
+runs, or a first deploy, takes `request`; a tag below takes `rollback`, and a rollback by
+someone with that grant takes the place of a request already open on the deployment.
+
+`"rollback": true` says the request means a rollback, as `landfall rollback` sends. Then a tag
+that isn't lower than what runs is refused with `409 not_a_rollback`, and so is any tag when
+nothing runs or what runs isn't a version, so nobody asks for an upgrade under the `rollback`
+grant's name by mistake. That is decided before an open request is looked at, so the refusal
+changes nothing but its `request_refused` audit row, and, as every request does, ends the open
+requests whose 24 hours have passed: an open request still in its time stays open. Without the
+flag, or with it `false`, the tag alone decides, as before. A client leaves the flag out when
+it is `false`, as `landfall` does, so a controller that doesn't know it, which refuses a field
+it doesn't know with `400 bad_request`, is sent it only by a rollback.
+
+Each request in an answer, from `requestDeploy` and in `listApprovals`, has `approve_url`:
+where an approver signs it with a passkey, the configured `[approval]` origin and
+`/approvals`, or `null` without `[approval]`. Approving takes a session; an agent's token
+can't. `cancelRequest` (`POST /api/v1/approvals/{id}/cancel`) takes no body.
+
 ## Refusals
 
 Every answer that isn't a success is `application/problem+json` (RFC 9457):
@@ -368,9 +394,9 @@ responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden`, `BadOrigin`
 A query string is at most 2 KiB, and a parameter the operation doesn't take is refused with
 `400 bad_request`, not ignored. An operation with no parameters refuses any query string.
 
-An id in a path, such as a request's number, is plain digits with no leading zero, so one row
-has one path. Any other way of writing a number, such as `01`, `+1` or `1.0`, or one too large
-to be an id, names nothing and is `404 not_found`.
+An id in a path, such as a request's number, is plain digits with no leading zero. A path is
+percent-decoded first, so `%31` is the same `1`. Any other way of writing a number, such as
+`01`, `+1` or `1.0`, or one too large to be an id, names nothing and is `404 not_found`.
 
 ## Pages
 

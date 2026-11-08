@@ -336,7 +336,7 @@ async fn over_the_cap_is_too_large_with_a_link() {
     .await;
 
     let answer = page(&github, 1).await.unwrap();
-    assert!(matches!(answer, ComparePage::TooLarge { .. }), "{answer:?}");
+    assert!(matches!(answer, ComparePage::TooLarge), "{answer:?}");
     assert_eq!(
         compare_url(&repo(), &sha(BASE), &sha(HEAD)),
         format!("https://github.com/example/app/compare/{BASE}...{HEAD}")
@@ -357,7 +357,7 @@ async fn a_422_is_too_large() {
     .await;
 
     let answer = page(&github, 1).await.unwrap();
-    assert!(matches!(answer, ComparePage::TooLarge { .. }), "{answer:?}");
+    assert!(matches!(answer, ComparePage::TooLarge), "{answer:?}");
 }
 
 #[tokio::test]

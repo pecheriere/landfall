@@ -105,6 +105,17 @@ pub struct RequestView {
     pub can_approve: bool,
     /// Whether this principal could cancel it.
     pub can_cancel: bool,
+    /// Where an approver signs it with a passkey: the configured `[approval]` origin and
+    /// `/approvals`, or `null` without one. Agents can't approve.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(
+            value_type = Option<String>,
+            required = true,
+            example = "https://landfall.example.com/approvals"
+        )
+    )]
+    pub approve_url: Option<String>,
 }
 
 /// What waits for an approver, as far as this principal may see.
@@ -115,7 +126,8 @@ pub struct ApprovalsView {
     pub approvals: Vec<RequestView>,
 }
 
-/// A request for a deploy: a tag, and nothing the controller would take on trust.
+/// A request for a deploy: a tag, whether it is meant as a rollback, and nothing the
+/// controller would take on trust.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -123,6 +135,13 @@ pub struct NewRequest {
     /// The release to deploy.
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "v1.3.0"))]
     pub tag: ReleaseTag,
+    /// That this is meant as a rollback: then a tag that isn't lower than what runs, or any
+    /// tag when nothing runs or what runs isn't a version, is refused as `not_a_rollback`.
+    /// Left out when `false`, so that a controller that doesn't know it is never sent it
+    /// unless it is meant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default = false))]
+    pub rollback: bool,
 }
 
 /// An approval: a passkey's assertion over the request's challenge.

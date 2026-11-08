@@ -44,7 +44,7 @@ use axum::extract::State;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use landfall_api::{ApprovalsView, IntentView, RequestState as RequestStateView, RequestView};
-use landfall_core::config::{Deployment, Permission};
+use landfall_core::config::{Config, Deployment, Permission};
 use landfall_core::ids::ReleaseTag;
 use landfall_core::text::shown;
 use serde_json::json;
@@ -55,7 +55,7 @@ use utoipa_axum::routes;
 use crate::agent_api::{ApiProblem, ApiState, read_body};
 use crate::api::{
     ApiJson, ApiQuery, BadOrigin, BadRequest, Busy, IdPath, Internal, NoQuery, RateLimited,
-    SlowRequest, Unauthenticated, visibility,
+    SlowRequest, Unauthenticated, approve_url, visibility,
 };
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
@@ -65,8 +65,13 @@ use crate::store::{RequestSnapshot, RequestState, StoreError, StoredRequest, Wat
 const BAD_BODY: &str = "the body is not a valid request";
 const UNREADABLE_BODY: &str = "the body could not be read within its limits";
 
-/// A request, as a principal may see it, with what a passkey signs.
-fn view(request: &StoredRequest, can_approve: bool, can_cancel: bool) -> RequestView {
+/// A request, as a principal may see it, with what a passkey signs and where.
+fn view(
+    config: &Config,
+    request: &StoredRequest,
+    can_approve: bool,
+    can_cancel: bool,
+) -> RequestView {
     RequestView {
         id: request.id,
         host: request.host.clone(),
@@ -78,6 +83,7 @@ fn view(request: &StoredRequest, can_approve: bool, can_cancel: bool) -> Request
         expires_at: request.expires_at,
         can_approve,
         can_cancel,
+        approve_url: approve_url(config),
     }
 }
 
@@ -322,6 +328,7 @@ async fn list(
             let approves = can(config, &principal, id, Permission::Approve);
             (approves || can(config, &principal, id, Permission::View)).then(|| {
                 view(
+                    config,
                     request,
                     approves,
                     cancelling::may_cancel(&state, &principal, request),

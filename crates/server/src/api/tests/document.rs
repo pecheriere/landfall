@@ -170,6 +170,7 @@ fn every_human_problem() -> Vec<HumanProblem> {
         HumanProblem::NotFound,
         HumanProblem::MethodNotAllowed,
         HumanProblem::RequestOpen,
+        HumanProblem::NotARollback,
         HumanProblem::DeploymentBusy,
         HumanProblem::HostNotReady,
         HumanProblem::ReleaseNotVerified,
@@ -202,6 +203,7 @@ fn every_human_problem() -> Vec<HumanProblem> {
             | HumanProblem::NotFound
             | HumanProblem::MethodNotAllowed
             | HumanProblem::RequestOpen
+            | HumanProblem::NotARollback
             | HumanProblem::DeploymentBusy
             | HumanProblem::HostNotReady
             | HumanProblem::ReleaseNotVerified
@@ -331,6 +333,7 @@ async fn approvals_json_is_unchanged() {
         "expires_at",
         "can_approve",
         "can_cancel",
+        "approve_url",
     ];
     assert_eq!(keys(request), shipped.map(str::to_owned).into());
     let intent = [
@@ -344,6 +347,10 @@ async fn approvals_json_is_unchanged() {
     assert_eq!(keys(&request["intent"]), intent.map(str::to_owned).into());
     assert_eq!(request["state"], "awaiting_approval");
     assert_eq!(request["intent"]["nonce"], "07".repeat(32));
+    assert_eq!(
+        request["approve_url"],
+        "https://landfall.example.com/approvals"
+    );
 }
 
 #[tokio::test]

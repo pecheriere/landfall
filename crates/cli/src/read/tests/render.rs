@@ -108,12 +108,17 @@ fn hostile_text_is_escaped_in_human_output() {
     assert_escaped("audit", &text, 3);
     assert!(text.contains("nested=[\"h\\\\u001b]0;owned"), "{text}");
 
-    // approvals: the nonce, and where /me says an approver signs.
+    // approvals: the nonce, and where the request says an approver signs.
     let mut value = request();
     value["intent"]["nonce"] = hostile.clone();
-    let view = typed(&json!({"approvals": [value]}));
-    let text = printed(|out| render::approvals(&view, Some(HOSTILE), out));
+    value["approve_url"] = hostile.clone();
+    let view = typed(&json!({"approvals": [value.clone()]}));
+    let text = printed(|out| render::approvals(&view, out));
     assert_escaped("approvals", &text, 2);
+
+    // request deploy and rollback: the same request, alone.
+    let view = typed(&value);
+    assert_escaped("request", &printed(|out| render::request(&view, out)), 2);
 }
 
 #[test]
@@ -152,13 +157,53 @@ fn story_heads_commits_as_unverified_and_says_how_many() {
     assert!(text.contains("\"change 0\" (dev)"), "{text}");
     assert!(!text.contains("the newest"), "{text}");
 
-    let text = story_text(&story(listed(100, 250)));
+    // A cut list: the controller's reason says how many, and the list adds only the link.
+    let mut value = story(listed(100, 250));
+    value["reasons"] = json!(["the commits listed since v1.2.0 are the newest 100 of 250"]);
+    let text = story_text(&value);
+    assert_eq!(text.matches("100 of 250").count(), 1, "{text}");
     assert!(
-        text.contains(
-            "the newest 100 of 250; all of them at https://github.com/example/app/compare/a...b"
-        ),
+        text.contains("  all 250 at https://github.com/example/app/compare/a...b\n"),
         "{text}"
     );
+}
+
+/// What the controller puts in `reasons` for a list that is too large or has no base is said
+/// once, and the commits section only points at it.
+#[test]
+fn a_commits_reason_is_printed_once() {
+    let compare = "https://github.com/example/app/compare/a...b";
+    for (state, reason, says) in [
+        (
+            "too_large",
+            format!(
+                "its commits since v1.2.0 are too many for GitHub to list: read them at {compare}"
+            ),
+            "commits: none listed, for the reason above\n".to_owned(),
+        ),
+        (
+            "base_not_found",
+            "its commits aren't listed: the commit of v1.2.0, the release below it, isn't an \
+             ancestor of this one's, so the history was rewritten between them"
+                .to_owned(),
+            format!("commits: unknown, for the reason above; compare at {compare}\n"),
+        ),
+    ] {
+        let mut commits = listed(0, 0);
+        commits["state"] = json!(state);
+        commits["total"] = Value::Null;
+        let mut value = story(commits);
+        value["reasons"] = json!([reason]);
+        let text = story_text(&value);
+        assert!(text.contains(&says), "{state}: {text}");
+        assert_eq!(text.matches(compare).count(), 1, "{state}: {text}");
+        for phrase in ["too many", "too large", "ancestor", "rewritten"] {
+            assert!(
+                text.matches(phrase).count() <= 1,
+                "{state}, {phrase}: {text}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -167,10 +212,7 @@ fn unknown_commit_state_is_not_printed_as_none() {
         ("not_yet", "unknown: not fetched from GitHub yet"),
         ("unavailable", "unknown: GitHub couldn't be asked"),
         ("not_recorded", "unknown: never fetched"),
-        (
-            "base_not_found",
-            "unknown: v1.2.0 isn't an ancestor of this release",
-        ),
+        ("base_not_found", "unknown, for the reason above"),
         ("teleporting", "unknown: a state this CLI doesn't know"),
     ] {
         let mut commits = listed(0, 0);
@@ -194,9 +236,7 @@ fn too_large_prints_the_link_and_no_list() {
     commits["total"] = Value::Null;
     let text = story_text(&story(commits));
     assert!(
-        text.contains(
-            "commits: too large to list here: https://github.com/example/app/compare/a...b"
-        ),
+        text.contains("commits: none listed, for the reason above"),
         "{text}"
     );
     assert!(!text.contains("change 0"), "{text}");
@@ -261,4 +301,14 @@ fn human_output_ignores_unknown_fields() {
         printed(|out| render::deployments(std::slice::from_ref(&with_extra), out)),
         printed(|out| render::deployments(std::slice::from_ref(&line), out))
     );
+}
+
+/// A deploy whose host the reader can't view says so in the controller's words.
+#[test]
+fn history_names_an_unseen_host_as_the_controller_does() {
+    let mut value = deploy();
+    value["host"] = Value::Null;
+    let page = typed(&json!({"items": [value], "next_cursor": null}));
+    let text = printed(|out| render::deploys(&page, out));
+    assert!(text.contains("v1.3.0 on a host you can't view, "), "{text}");
 }

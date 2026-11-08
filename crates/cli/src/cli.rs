@@ -6,9 +6,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use landfall_core::ids::DeploymentId;
 use thiserror::Error;
 
 use crate::api_client::{ApiClient, ApiError};
+use crate::ask::{self, AskCommand};
 use crate::display::safe;
 use crate::read::{self, ReadCommand};
 use crate::settings::{self, Env, ProcessEnv, SettingsError, SystemFiles};
@@ -95,6 +97,9 @@ pub enum Command {
     /// A command that reads the controller's state.
     #[command(flatten)]
     Read(ReadCommand),
+    /// A command that asks the controller for something.
+    #[command(flatten)]
+    Ask(AskCommand),
     /// Install an agent on a host, over SSH.
     Host {
         /// What to do.
@@ -122,6 +127,27 @@ pub enum CliError {
     /// A call to the controller's API failed.
     #[error(transparent)]
     Api(#[from] ApiError),
+    /// The controller refused a request because one already waits on the deployment: this
+    /// one, which the principal may see.
+    #[error("{}", request_open(*.request, .deployment, *.can_cancel))]
+    RequestOpen {
+        /// The request that waits.
+        request: i64,
+        /// The deployment it is on.
+        deployment: DeploymentId,
+        /// Whether this principal may cancel it, as the controller says.
+        can_cancel: bool,
+        /// The controller's refusal.
+        #[source]
+        source: ApiError,
+    },
+    /// The controller took a rollback for a bad request. One older than this CLI refuses the
+    /// `rollback` field it doesn't know that way, but its answer is the one it gives any body it
+    /// can't read, so this can only say it may be that.
+    #[error(
+        "the controller took this for a bad request: that may be because it is older than this landfall and doesn't know `rollback`, and if so, upgrading it fixes this"
+    )]
+    RollbackNotUnderstood(#[source] ApiError),
     /// The result could not be written to stdout.
     #[error("cannot write the result")]
     Output(#[source] std::io::Error),
@@ -132,7 +158,9 @@ impl CliError {
         match self {
             Self::Verify(error) => error.exit_code(),
             Self::Host(error) => error.exit_code(),
-            Self::Api(error) => error.exit_code(),
+            Self::Api(error)
+            | Self::RequestOpen { source: error, .. }
+            | Self::RollbackNotUnderstood(error) => error.exit_code(),
             Self::Runtime(_) | Self::Output(_) | Self::Settings(_) => verify::EXIT_UNVERIFIED,
         }
     }
@@ -187,11 +215,27 @@ fn run_command(cli: Cli, env: &dyn Env, out: &mut dyn Write) -> Result<(), CliEr
             let client = client(args, env)?;
             runtime.block_on(read::run_with(&command, &client, out, args.json))?;
         }
+        Command::Ask(command) => {
+            let args = command.api();
+            let client = client(args, env)?;
+            runtime.block_on(ask::run_with(&command, &client, out, args.json))?;
+        }
         Command::Host { command } => {
             host::run(command, &runtime, out)?;
         }
     }
     Ok(())
+}
+
+/// What [`CliError::RequestOpen`] says: the request, and how to end it when this principal
+/// may.
+fn request_open(request: i64, deployment: &DeploymentId, can_cancel: bool) -> String {
+    let waits = format!("request {request} already waits for an approver on {deployment}");
+    if can_cancel {
+        format!("{waits}: `landfall cancel {request}` ends it")
+    } else {
+        waits
+    }
 }
 
 /// A client for the controller `args` and `env` name, with the token they give.
@@ -201,7 +245,7 @@ fn client(args: &ApiArgs, env: &dyn Env) -> Result<ApiClient, CliError> {
 }
 
 /// Displays an error and its sources as `error: source: source`.
-struct Chain<'a>(&'a (dyn Error + 'static));
+pub(crate) struct Chain<'a>(pub(crate) &'a (dyn Error + 'static));
 
 impl fmt::Display for Chain<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

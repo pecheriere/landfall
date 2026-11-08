@@ -32,6 +32,9 @@ pub enum ProblemCode {
     MethodNotAllowed,
     /// The deployment already has a request waiting for an approver.
     RequestOpen,
+    /// A request meant as a rollback for a tag that isn't lower than what runs, or when
+    /// nothing runs or what runs isn't a version.
+    NotARollback,
     /// The deployment has a deploy queued or running.
     DeploymentBusy,
     /// Its host hasn't reported it, or can't take a deploy as it stands.

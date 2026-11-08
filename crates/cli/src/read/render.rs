@@ -1,13 +1,13 @@
-//! Each read command's view for a person. Every string the controller sent goes through
-//! [`safe`] before it is printed, and every enum through [`wire_name`], so a value from a newer
-//! controller reads `unknown`.
+//! Each read command's view for a person, and the asking commands' view of a request. Every
+//! string the controller sent goes through [`safe`] before it is printed, and every enum
+//! through [`wire_name`], so a value from a newer controller reads `unknown`.
 
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 
 use landfall_api::{
-    ApprovalsView, AuditEntry, CommitsState, CommitsView, DeployView, DeploymentSummary,
+    ApprovalsView, AuditEntry, Cancelled, CommitsState, CommitsView, DeployView, DeploymentSummary,
     DeploymentView, HostView, HostsView, NextAction, Page, PromotionView, RawJson, ReleaseStory,
     ReleaseView, RequestState, RequestView, RunningView, Why,
 };
@@ -206,7 +206,7 @@ pub(crate) fn deploys(page: &Page<DeployView>, out: &mut dyn Write) -> io::Resul
         let host = deploy
             .host
             .as_ref()
-            .map_or_else(|| "a host you can't see".to_owned(), ToString::to_string);
+            .map_or_else(|| "a host you can't view".to_owned(), ToString::to_string);
         writeln!(
             out,
             "deploy {}: {} on {}, {}, queued {}",
@@ -270,7 +270,8 @@ fn link(commits: &CommitsView) -> String {
 }
 
 /// The commits a release brings, or why they're unknown: never "no commits" unless GitHub
-/// listed none.
+/// listed none. A list that is cut, too large or has no base is explained once, by the
+/// story's reasons above it, so this adds only GitHub's compare link when they don't have it.
 fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
     let base = commits.base.as_ref().map_or_else(
         || "the release below".to_owned(),
@@ -279,7 +280,7 @@ fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
     let unknown = match commits.state {
         CommitsState::Listed => None,
         CommitsState::TooLarge => {
-            return writeln!(out, "commits: too large to list here: {}", link(commits));
+            return writeln!(out, "commits: none listed, for the reason above");
         }
         CommitsState::First => {
             return writeln!(
@@ -287,11 +288,13 @@ fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
                 "commits: the first verified release, with none below to compare with"
             );
         }
-        CommitsState::BaseNotFound => Some(format!(
-            "{base} isn't an ancestor of this release: the history was rewritten between them; \
-             compare at {}",
-            link(commits)
-        )),
+        CommitsState::BaseNotFound => {
+            return writeln!(
+                out,
+                "commits: unknown, for the reason above; compare at {}",
+                link(commits)
+            );
+        }
         CommitsState::NotYet => Some("not fetched from GitHub yet".to_owned()),
         CommitsState::Unavailable => {
             Some("GitHub couldn't be asked; it is tried again later".to_owned())
@@ -328,11 +331,7 @@ fn commits(commits: &CommitsView, out: &mut dyn Write) -> io::Result<()> {
     }
     let shown = u64::try_from(commits.commits.len()).unwrap_or(u64::MAX);
     if let Some(total) = commits.total.filter(|total| *total > shown) {
-        writeln!(
-            out,
-            "the newest {shown} of {total}; all of them at {}",
-            link(commits)
-        )?;
+        writeln!(out, "  all {total} at {}", link(commits))?;
     }
     Ok(())
 }
@@ -525,9 +524,8 @@ pub(crate) fn audit(page: &Page<AuditEntry>, out: &mut dyn Write) -> io::Result<
     more_line(page.next_cursor.is_some(), out)
 }
 
-/// Where an approver signs an open request, and that agents can't: `landfall request`
-/// prints it too.
-pub(crate) fn approval_line(approve_url: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
+/// Where an approver signs an open request, and that agents can't.
+fn approval_line(approve_url: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
     match approve_url {
         Some(url) => writeln!(
             out,
@@ -541,12 +539,9 @@ pub(crate) fn approval_line(approve_url: Option<&str>, out: &mut dyn Write) -> i
     }
 }
 
-/// One request waiting for an approver: what it would deploy, and what an approver signs.
-fn request(
-    request: &RequestView,
-    approve_url: Option<&str>,
-    out: &mut dyn Write,
-) -> io::Result<()> {
+/// One request: what it would deploy, what an approver signs, and, while it is open, where.
+/// `landfall request deploy`, `landfall rollback` and `landfall approvals` print it.
+pub(crate) fn request(request: &RequestView, out: &mut dyn Write) -> io::Result<()> {
     let intent = &request.intent;
     writeln!(
         out,
@@ -568,25 +563,31 @@ fn request(
     );
     writeln!(out, "  expects running {expected}")?;
     writeln!(out, "  nonce {}", safe(&intent.nonce))?;
-    // Only an open request can be signed: the controller lists only those, and anything else
-    // a newer one sends is shown for what it is.
+    // Only an open request can be signed, and anything else a newer controller sends is
+    // shown for what it is.
     if request.state == RequestState::AwaitingApproval {
-        approval_line(approve_url, out)?;
+        approval_line(request.approve_url.as_deref(), out)?;
     }
     Ok(())
 }
 
 /// The requests waiting for an approver.
-pub(crate) fn approvals(
-    approvals: &ApprovalsView,
-    approve_url: Option<&str>,
-    out: &mut dyn Write,
-) -> io::Result<()> {
+pub(crate) fn approvals(approvals: &ApprovalsView, out: &mut dyn Write) -> io::Result<()> {
     if approvals.approvals.is_empty() {
         return writeln!(out, "nothing waits for an approver");
     }
     for view in &approvals.approvals {
-        request(view, approve_url, out)?;
+        request(view, out)?;
     }
     Ok(())
+}
+
+/// A request that `landfall cancel` ended, and where it stands now.
+pub(crate) fn cancelled(cancelled: &Cancelled, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "request {}: {}",
+        cancelled.request,
+        safe(&wire_name(&cancelled.state))
+    )
 }

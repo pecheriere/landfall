@@ -14,6 +14,7 @@ use landfall_core::ids::DeploymentId;
 use landfall_core::protocol::PROBLEM_CONTENT_TYPE;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, redirect};
+use serde::Serialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde_json::error::Category;
 use thiserror::Error;
@@ -92,6 +93,29 @@ impl ApiClient {
         self.send(self.http.get(url)).await
     }
 
+    /// `POST path`, with `body` as JSON when there is one, and the body of its answer, as
+    /// [`ApiClient::get`] keeps it. An operation that takes no body is sent none: pass
+    /// [`NO_BODY`].
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Body`] if `body` can't be written as JSON, before anything is sent, and
+    /// otherwise as [`ApiClient::get`].
+    pub async fn post<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<String, ApiError> {
+        let request = self.http.post(self.controller.join(path));
+        let request = match body {
+            Some(body) => request
+                .header(CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(body).map_err(ApiError::Body)?),
+            None => request,
+        };
+        self.send(request).await
+    }
+
     /// `json`, an answer's text, as one of the API's types, read straight from the text.
     /// Fields and values from a newer controller are tolerated, as the types say, and a field
     /// it doesn't know is skipped without being kept.
@@ -153,6 +177,48 @@ impl ApiClient {
             },
             _ => server,
         }
+    }
+}
+
+/// The body of a `POST` to an operation that takes none.
+pub const NO_BODY: Option<&()> = None;
+
+/// The controller's API, as the commands use it: [`ApiClient`], or a fake in tests.
+///
+/// It is used generically, never as `&dyn Api`: a method returning `impl Future` isn't
+/// dyn-compatible.
+pub trait Api {
+    /// `GET path?query`, and the text of its answer, checked to be JSON, as [`ApiClient::get`].
+    fn get(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> impl Future<Output = Result<String, ApiError>> + Send;
+
+    /// `POST path` with `body`, if any, as JSON, and the text of its answer, as
+    /// [`ApiClient::post`].
+    fn post<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: Option<&B>,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send;
+}
+
+impl Api for ApiClient {
+    fn get(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        ApiClient::get(self, path, query)
+    }
+
+    fn post<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: Option<&B>,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        ApiClient::post(self, path, body)
     }
 }
 
@@ -266,6 +332,9 @@ pub enum ApiError {
     /// The answer is over 4 MiB.
     #[error("the controller's answer is over {BODY_CAP} bytes")]
     TooLarge,
+    /// What the CLI would send couldn't be written as JSON. Nothing was sent.
+    #[error("cannot write the request's body")]
+    Body(#[source] serde_json::Error),
     /// The controller could not be reached, or the answer could not be read. The error's URL
     /// has no query and no credentials.
     #[error("cannot reach the controller")]

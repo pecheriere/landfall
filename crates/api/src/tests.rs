@@ -145,3 +145,28 @@ fn a_story_reads_with_fields_it_does_not_know() {
     assert_eq!(read.total, Some(250));
     assert!(!read.verified);
 }
+
+/// `rollback` goes out only when it is meant, so an older controller, which refuses a field it
+/// doesn't know, is never sent it by a plain request.
+#[test]
+fn rollback_is_sent_only_when_meant() {
+    let tag: landfall_core::ids::ReleaseTag = "v1.3.0".parse().unwrap();
+    let plain = NewRequest {
+        tag: tag.clone(),
+        rollback: false,
+    };
+    assert_eq!(
+        serde_json::to_string(&plain).unwrap(),
+        r#"{"tag":"v1.3.0"}"#
+    );
+    let rollback = NewRequest {
+        tag,
+        rollback: true,
+    };
+    assert_eq!(
+        serde_json::to_string(&rollback).unwrap(),
+        r#"{"tag":"v1.3.0","rollback":true}"#
+    );
+    let read: NewRequest = serde_json::from_value(json!({ "tag": "v1.3.0" })).unwrap();
+    assert_eq!(read, plain);
+}

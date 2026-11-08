@@ -91,12 +91,10 @@ pub enum ComparePage {
         rate_reset: Option<i64>,
     },
     /// The page is over [`COMPARE_PAGE_LIMIT`], or GitHub answered 422: the comparison
-    /// is too large to list. [`compare_url`] is where to read it.
-    TooLarge {
-        /// GitHub's `x-ratelimit-remaining`, if it is known: not for a refusal, whose
-        /// headers are not kept.
-        rate_remaining: Option<u32>,
-    },
+    /// is too large to list. [`compare_url`] is where to read it. Neither keeps the
+    /// answer's headers, so it says nothing of GitHub's rate limit: the next listed page
+    /// does.
+    TooLarge,
 }
 
 /// GitHub's page comparing `base` and `head`, for a person to read, built only from
@@ -201,9 +199,7 @@ impl Fetcher {
                     ..
                 },
             ) => {
-                return Ok(ComparePage::TooLarge {
-                    rate_remaining: None,
-                });
+                return Ok(ComparePage::TooLarge);
             }
             Err(error) => return Err(error),
         };

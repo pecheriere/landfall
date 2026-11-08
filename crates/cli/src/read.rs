@@ -10,17 +10,17 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use clap::{Args, Subcommand};
-use landfall_api::{ApprovalsView, DeploymentSummary, MeView, Page, RequestState};
+use landfall_api::{DeploymentSummary, Page};
 use landfall_core::ids::{DeploymentId, HostId, ReleaseTag, RepoName};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::value::RawValue;
 
-use crate::api_client::{ApiClient, ApiError, deployment_path, segment};
+use crate::api_client::{Api, ApiClient, deployment_path, segment};
 use crate::cli::{API_EXIT_STATUS, ApiArgs, CliError};
 use crate::display::write_json;
 
-mod render;
+pub(crate) mod render;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -43,29 +43,6 @@ const STATUS_PAGING: &str = "\
 Without a deployment, status reads the deployments a page of 100 at a time, and stops at
 1,000 deployments or 20 pages, at 8 MiB of answers, or when the controller sends a cursor
 twice, with a line saying which.";
-
-/// The controller's API, as the read commands use it: [`ApiClient`], or a fake in tests.
-///
-/// It is used generically, never as `&dyn Api`: a method returning `impl Future` isn't
-/// dyn-compatible.
-pub trait Api {
-    /// `GET path?query`, and the text of its answer, checked to be JSON, as [`ApiClient::get`].
-    fn get(
-        &self,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> impl Future<Output = Result<String, ApiError>> + Send;
-}
-
-impl Api for ApiClient {
-    fn get(
-        &self,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> impl Future<Output = Result<String, ApiError>> + Send {
-        ApiClient::get(self, path, query)
-    }
-}
 
 /// A command that reads the controller's state.
 #[derive(Debug, Subcommand)]
@@ -275,7 +252,10 @@ pub async fn run_with<A: Api>(
             let text = client.get("/api/v1/audit", &pairs(&query)).await?;
             show(out, json, &text, render::audit)
         }
-        ReadCommand::Approvals(_) => approvals(client, out, json).await,
+        ReadCommand::Approvals(_) => {
+            let text = client.get("/api/v1/approvals", &[]).await?;
+            show(out, json, &text, render::approvals)
+        }
     }
 }
 
@@ -295,7 +275,7 @@ fn pairs<'a>(query: &'a [(&'a str, String)]) -> Vec<(&'a str, &'a str)> {
 }
 
 /// Prints `text` as received with `json`, else through `view` once read as `T`.
-fn show<T: DeserializeOwned>(
+pub(crate) fn show<T: DeserializeOwned>(
     out: &mut dyn Write,
     json: bool,
     text: &str,
@@ -414,25 +394,4 @@ async fn pages<T: DeserializeOwned, A: Api>(
         cursor = Some(next);
     };
     Ok((items, stopped))
-}
-
-/// `listApprovals`, and, when a request is open and a person reads it, `whoAmI` for where an
-/// approver signs.
-async fn approvals<A: Api>(client: &A, out: &mut dyn Write, json: bool) -> Result<(), CliError> {
-    let text = client.get("/api/v1/approvals", &[]).await?;
-    if json {
-        return write_json(out, &text).map_err(CliError::Output);
-    }
-    let approvals: ApprovalsView = ApiClient::typed(&text)?;
-    let open = approvals
-        .approvals
-        .iter()
-        .any(|request| request.state == RequestState::AwaitingApproval);
-    let approve_url = if open {
-        let me: MeView = ApiClient::typed(&client.get("/api/v1/me", &[]).await?)?;
-        me.approve_url
-    } else {
-        None
-    };
-    render::approvals(&approvals, approve_url.as_deref(), out).map_err(CliError::Output)
 }

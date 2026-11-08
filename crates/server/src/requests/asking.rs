@@ -29,20 +29,45 @@ const MAX_REQUEST_BODY_BYTES: usize = 1024;
 
 const NO_GRANT_TO_ASK: &str = "no grant lets this principal ask for this deployment";
 
+/// Refuses a request meant as a rollback that isn't one: `running` is the tag that runs, if
+/// any, and `readable` its version, if it is one.
+fn meant_as_rollback(
+    running: Option<&ReleaseTag>,
+    readable: Option<&Version>,
+    version: &Version,
+) -> Result<(), Stop> {
+    let reason = match (running, readable) {
+        (None, _) => "nothing runs on this deployment, so no release is a rollback",
+        (Some(_), None) => "the running tag is not a version, so no release is lower than it",
+        (Some(_), Some(running)) if version < running => return Ok(()),
+        (Some(_), Some(_)) => "this release is not lower than what runs, so it is not a rollback",
+    };
+    Err(refused(HumanProblem::NotARollback, reason))
+}
+
 /// Everything about a request but its nonce, judged in `tx`: the intent to record, and
-/// whether it is a rollback. A rollback by someone who may do one cancels the open request it
-/// finds, once nothing else stands in its way.
+/// whether it is a rollback. One meant as a rollback that isn't is refused before anything
+/// else is looked at. A rollback by someone who may do one cancels the open request it finds,
+/// once nothing else stands in its way.
 async fn judge_request(
     state: &ApiState,
     tx: &mut Transaction<'_, Sqlite>,
     principal: &Principal,
-    (d, tag, version): (&Deployment, &ReleaseTag, &Version),
+    (d, asked, version): (&Deployment, &NewRequest, &Version),
     nonce: [u8; 32],
 ) -> Result<(DeployIntent, bool), Stop> {
     let store = state.store();
+    let tag = &asked.tag;
     let snapshot = store.request_snapshot(tx, (d.id(), d.host(), tag)).await?;
     let running_tag = snapshot.running.as_ref().and_then(|r| r.tag.as_ref());
     let readable = running_tag.map(|running| d.origin().tags().parse_tag(running).ok());
+    if asked.rollback {
+        meant_as_rollback(
+            running_tag,
+            readable.as_ref().and_then(Option::as_ref),
+            version,
+        )?;
+    }
     let downgrade = readable
         .as_ref()
         .and_then(Option::as_ref)
@@ -139,8 +164,9 @@ async fn judge_request(
     tag = "requests",
     summary = "Ask for a deploy",
     description = "Asks for a verified release to be deployed, once an approver signs it. The \
-                   controller makes the intent from its own records; the client names a tag and \
-                   nothing else.",
+                   controller makes the intent from its own records; the client names a tag, \
+                   and says with `rollback` when it means a rollback, and nothing else. The \
+                   answer says where an approver signs it, in `approve_url`.",
     params(DeploymentPath, NoQuery),
     request_body = NewRequest,
     security(("token" = ["request", "rollback"]), ("session" = ["request", "rollback"])),
@@ -166,7 +192,9 @@ async fn judge_request(
             status = 409,
             description = "Nothing can be asked for now: `request_open`, `deployment_busy`, \
                            `host_not_ready`, `release_not_verified`, `release_refused` or \
-                           `promotion_pending`.",
+                           `promotion_pending`. Or one meant as a rollback isn't: \
+                           `not_a_rollback`, for a tag that isn't lower than what runs, or any \
+                           tag when nothing runs or what runs isn't a version.",
             body = Problem,
             content_type = "application/problem+json",
         ),
@@ -237,7 +265,7 @@ pub(super) async fn ask(
     let now = store.now()?;
     let mut tx = store.begin().await?;
     store.expire_requests(&mut tx, now).await?;
-    match judge_request(&state, &mut tx, &principal, (d, tag, &version), nonce).await {
+    match judge_request(&state, &mut tx, &principal, (d, &asked, &version), nonce).await {
         Ok((intent, is_rollback)) => {
             let request = StoredNewRequest {
                 host: d.host(),
@@ -252,7 +280,7 @@ pub(super) async fn ask(
             // Whoever asked may cancel it.
             Ok((
                 StatusCode::CREATED,
-                ApiJson(view(&stored, can_approve, true)),
+                ApiJson(view(config, &stored, can_approve, true)),
             ))
         }
         Err(Stop::Refused(refusal)) => {

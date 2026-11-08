@@ -14,11 +14,13 @@ passkey approvals. Agents drive it through a typed API. Design:
   identifiers, configuration types and the pure verification and rule logic.
 - `landfall-api` (`crates/api`): the wire types of `/api/v1`, which the controller serialises
   and the CLI reads. No I/O: `requests`, `deployments` (who am I, and the deployments, with
-  `DeploymentRef`, which never names one the reader can't view), `problem` (`Problem` and its
-  stable `ProblemCode`s), `page` and `raw` (`RawJson`, the audit row's and a deploy step's
-  `detail` kept as their JSON text, never as a tree). Each enum that can grow has an `Unknown`
-  for a value from a newer controller, which no controller sends. Its `openapi` feature derives
-  each type's schema, and only the controller enables it.
+  `DeploymentRef`, which never names one the reader can't view), `releases` (a deployment's
+  releases and `ReleaseStory`, with the commits a release brings), `deploys` (a deploy, its
+  steps and `Why`), `hosts`, `audit` (a row of the log as a principal may see it), `problem`
+  (`Problem` and its stable `ProblemCode`s), `page` and `raw` (`RawJson`, the audit row's and a
+  deploy step's `detail` kept as their JSON text, never as a tree). Each enum that can grow has
+  an `Unknown` for a value from a newer controller, which no controller sends. Its `openapi`
+  feature derives each type's schema, and only the controller enables it.
 - `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
   a key from local configuration, and parses an attestation, trusting none of it,
   for its key.
@@ -48,7 +50,10 @@ passkey approvals. Agents drive it through a typed API. Design:
   modules: `store` (the only code that touches SQLite: migrations, transactions, appending to
   and verifying the audit log, enrolment codes, hosts, nonces, deploys, running state, release
   decisions and holds, API tokens, sessions, deploy requests, `commits`, the commit ranges
-  between verified releases, and `views`, what the API reads to show deployments), `audit` (audit events and the hash-chain encoding), `report` (bounding a
+  between verified releases, `views`, what the API reads to show deployments, `history`, what
+  it reads of releases, their requests and deploys, and deploys' steps, and `latest`, each
+  deployment's latest release, kept where releases are recorded, in `highest_releases` and
+  `first_tags`), `audit` (audit events and the hash-chain encoding), `report` (bounding a
   deploy report before it is stored), `agent_api` (the routes agents call: signed-request
   extractor, handlers, problem answers, rate limit, and `client_source`, who a request is from,
   which every per-source limit and the capped log go by), `auth` (the `Principal` extractor,
@@ -59,9 +64,15 @@ passkey approvals. Agents drive it through a typed API. Design:
   annotation, `ApiJson` is every success, `query` the path and query-string parameters, a query
   string refusing any it doesn't take, with a page's `Limit` and its `Cursor`, `visible`, the
   one place that says what a principal may be told of a deployment (404 or 403, and a deployment
-  shown or unseen), `deployments`, who am I and the deployments, and `openapi` the document's
-  fixed part: its schemes and shared refusals; the document is served at `/api/v1/openapi.json`,
-  printed by `openapi` and checked in as `docs/api/openapi.json`, which a test compares),
+  shown or unseen), `deployments`, who am I and the deployments, `releases`, a deployment's
+  releases and one's story, `story`, the one pure function that says where a release stands and
+  why, `deploys`, the deploys and `why` of one, `why`, the pure function that explains a deploy,
+  `hosts`, the hosts seen through their deployments, `audit` (and `audit/detail`, what a row shows
+  of its detail and host to one principal), the log as far as a principal may see it, and
+  `openapi` the document's fixed part: its schemes and shared refusals; the document is served at
+  `/api/v1/openapi.json`, printed by `openapi` and checked in as `docs/api/openapi.json`, which a
+  test compares: regenerate it with `cargo run -p landfall-server -- openapi >
+  docs/api/openapi.json`, never edit it by hand),
   `requests` (the human API's routes: `asking` for a deploy, `approving` one and `cancelling`
   one), `web` (the browser's side: the static pages and their one script, the security headers
   on every answer, `registration`, `sign_in` and sign-out, and `ceremonies`, the challenges and
@@ -109,15 +120,19 @@ passkey approvals. Agents drive it through a typed API. Design:
   install` has its own `--controller`, and `run_with`, the library entry, which prints every
   failure through `display::safe`), `settings` (where the controller is and which token goes
   to it: flags, then the environment, then `cli.toml`; the token never in argv, a token file
-  regular, not a link, owned by the user and theirs alone), `api_client` (`/api/v1` with the token: no
+  regular, not a link, owned by the user and theirs alone, and with no token no `Authorization`
+  header, for warden), `api_client` (`/api/v1` with the token: no
   proxy from the environment, no redirect followed, bodies capped, `ApiError` and its exit
-  status, and `segment`, the one way a value goes into a path), `display` (`safe` and `write_json`,
-  which escape controls, bidi and invisible characters in whatever the controller sent before a
-  terminal sees it), `whoami` (`landfall whoami`), `read` (`status`, `history`, `release`,
-  `releases`, `why`, `hosts`, `audit` and `approvals`, over the `Api` trait, used generically so
-  tests can use a fake; `status` pages within 1,000 deployments, 20 pages or 8 MiB of answers,
-  the others make at most three calls; answers are kept as text, never as a JSON tree;
-  `render`, each view for a person, every server string escaped), `verify`
+  status, `segment`, the one way a value goes into a path, and the `Api` trait the commands
+  call it through, so tests can use a fake), `display` (`safe` and `write_json`, which escape
+  controls, bidi and invisible characters, and `safe` doubles a backslash, in whatever the
+  controller sent before a terminal sees it), `whoami` (`landfall whoami`), `read` (`status`,
+  `history`, `release`, `releases`, `why`, `hosts`, `audit` and `approvals`, over `Api`, used
+  generically; `status` pages within
+  1,000 deployments, 20 pages or 8 MiB of answers, the others make at most three calls;
+  answers are kept as text, never as a JSON tree; `render`, each view for a person, every
+  server string escaped), `ask` (`request deploy`, `rollback`, which says it means one, and
+  `cancel`; each prints where an approver signs, as agents can't), `verify`
   (`landfall verify`), `access` (the trust root's cache and the operator's token), `project`
   (what landfall trusts about its own releases: its repository, ids and workflow as constants,
   and `assets/release-signers`, read by the
@@ -127,8 +142,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   `facts`, what a read-only probe of the target says and whether it's fit; `shell`, the only way a
   value reaches a script; `unit`, the systemd units as the guide has them; `plan`, the script that
   runs as root; `ssh`, the system's `ssh`, its forced options and one connection; and `install` and
-  `upgrade`). Their `run_with` takes a fake source and remote, for the tests, and nothing on a command
-  line leads to them.
+  `upgrade`). Their `run_with` takes a fake source and remote, for the tests, and nothing on a
+  command line leads to them.
 
 Central rule: the controller orchestrates, the host decides. Nothing the
 controller says can make an agent run a release its local configuration does
@@ -279,6 +294,12 @@ processes, over loopback and a real SQLite file. The agent has `landfall-server`
 dev-dependency for it; the server depends on nothing of the agent's. `e2e/approvals/` is a
 person's way through it, with a software passkey over the real routes, and has the controller lie by
 writing to its own database: a host's refusal is the point of those.
+
+`crates/cli/tests/controller/` runs `landfall` through `cli::run_with` against a real controller
+in the test's runtime: the server's router and accept loop on loopback, a SQLite file, real tokens
+and a real passkey sign-in with the software authenticator. What the watcher and a host would say is
+written through the store's own functions, so it needs neither Docker nor the network and runs in
+the normal suite. The CLI has `landfall-server` as a dev-dependency for it.
 
 `crates/server/tests/browser/` drives the web pages in a real browser with Chromium's virtual
 authenticator. It is `#[ignore]`d and named with a `browser_` prefix, and needs Node, `openssl`

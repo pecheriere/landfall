@@ -37,10 +37,14 @@ toml.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+# The software authenticator, for the operator's passkey in `tests/controller`.
+landfall-approval = { workspace = true, features = ["test-support"] }
 # Mock servers over plain http and a snapshot trust root, for the first release's
 # fixture verified offline.
 landfall-origin = { workspace = true, features = ["test-support"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+# A real controller in the test's runtime, for `tests/controller`.
+landfall-server.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread"] }
 wiremock.workspace = true
 
 [lints]

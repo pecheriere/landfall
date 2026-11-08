@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
 use std::thread::{self, JoinHandle};
 
@@ -11,6 +11,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use super::{Chain, Cli, run, run_with};
+use crate::ask::tests::CALLS as ASK_CALLS;
 use crate::read::tests::{CALLS, Call};
 use crate::settings::Env;
 
@@ -206,7 +207,7 @@ fn env(token: Option<&str>) -> FakeEnv {
 }
 
 /// A loopback server that answers one request with `status`, `content_type` and `body`,
-/// and gives back the request's head.
+/// and gives back the request's head and body.
 fn answer_once(status: u16, content_type: &str, body: &str) -> (String, JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -218,14 +219,25 @@ fn answer_once(status: u16, content_type: &str, body: &str) -> (String, JoinHand
         let (stream, _) = listener.accept().unwrap();
         let mut reader = BufReader::new(stream);
         let mut head = String::new();
+        let mut length = 0;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             if line == "\r\n" || line.is_empty() {
                 break;
             }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
             head.push_str(&line);
         }
+        // The body too, so that none is left unread when the connection closes.
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        head.push_str("\r\n");
+        head.push_str(&String::from_utf8(body).unwrap());
         reader.get_mut().write_all(response.as_bytes()).unwrap();
         head
     });
@@ -330,13 +342,16 @@ fn whoami_json_prints_the_body_as_received() {
     assert!(out.contains("\"via\": \"teleport\""), "{out}");
 }
 
+/// The long help of a command, named by its words, such as `request deploy`.
 fn help_of(name: &str) -> String {
     let mut command = Cli::command();
-    command
-        .find_subcommand_mut(name)
-        .unwrap_or_else(|| panic!("no command {name}"))
-        .render_long_help()
-        .to_string()
+    let mut found = &mut command;
+    for word in name.split(' ') {
+        found = found
+            .find_subcommand_mut(word)
+            .unwrap_or_else(|| panic!("no command {name}"));
+    }
+    found.render_long_help().to_string()
 }
 
 /// Every API command's `--help` gives the exit statuses from the Rulings, and `status` says
@@ -353,6 +368,9 @@ fn help_documents_the_exit_statuses() {
         "hosts",
         "audit",
         "approvals",
+        "request deploy",
+        "rollback",
+        "cancel",
     ] {
         let help = help_of(name);
         for line in [
@@ -370,6 +388,12 @@ fn help_documents_the_exit_statuses() {
     }
     let help = help_of("status");
     assert!(help.contains("1,000 deployments or 20 pages"), "{help}");
+    // Asking says that an approver signs on the page, and that rollback means it.
+    for name in ["request deploy", "rollback"] {
+        let help = help_of(name);
+        assert!(help.contains("Agents can't approve"), "{name}: {help}");
+    }
+    assert!(help_of("rollback").contains("not_a_rollback"));
 }
 
 /// Each call a command makes is an operation of the checked-in document, with that method.
@@ -380,6 +404,7 @@ fn every_cli_call_is_in_the_openapi_document() {
     let whoami: &[Call] = &[("GET", "/api/v1/me", "/api/v1/me")];
     let calls = CALLS
         .iter()
+        .chain(ASK_CALLS)
         .map(|(line, calls)| (*line, *calls))
         .chain([("whoami", whoami)]);
     let mut seen = 0;
@@ -393,7 +418,7 @@ fn every_cli_call_is_in_the_openapi_document() {
             seen += 1;
         }
     }
-    assert!(seen >= 12, "{seen}");
+    assert!(seen >= 14, "{seen}");
 }
 
 /// A megabyte of hostile text where the CLI wants something else gives one short line.
@@ -420,4 +445,57 @@ fn a_parse_error_is_one_short_line() {
         "{err}"
     );
     assert_eq!(err.matches('\n').count(), 1, "{err}");
+}
+
+/// `landfall rollback` through `run_with` and the real client: what goes on the wire, and an
+/// older controller's refusal of the flag, escaped, with what it may mean.
+#[test]
+fn rollback_sends_the_flag_and_explains_an_older_controllers_refusal() {
+    let title = "bad\x1b[2J\u{9b}31m\r\nforged";
+    let body = json!({"code": "bad_request", "title": title, "status": 400}).to_string();
+    let (url, server) = answer_once(400, "application/problem+json", &body);
+    let cli = Cli::try_parse_from([
+        "landfall",
+        "rollback",
+        "app/prod",
+        "v1.1.0",
+        "--controller",
+        &url,
+        "--allow-insecure-controller",
+    ])
+    .unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = run_with(cli, &env(Some("tok")), &mut out, &mut err);
+    let request = server.join().unwrap();
+
+    assert!(
+        request.starts_with("POST /api/v1/deployments/app/prod/requests HTTP/1.1"),
+        "{request}"
+    );
+    let lower = request.to_ascii_lowercase();
+    assert!(
+        lower.contains("content-type: application/json"),
+        "{request}"
+    );
+    assert!(lower.contains("authorization: bearer tok"), "{request}");
+    assert!(
+        request.ends_with("\r\n\r\n{\"tag\":\"v1.1.0\",\"rollback\":true}"),
+        "{request}"
+    );
+
+    assert_eq!(status, 1);
+    assert_eq!(String::from_utf8(out).unwrap(), "");
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.contains("may be because it is older than this landfall and doesn't know `rollback`"),
+        "{err}"
+    );
+    assert!(
+        err.contains("bad_request: bad\\u{1b}[2J\\u{9b}31m\\u{d}\\u{a}forged"),
+        "{err}"
+    );
+    for raw in ['\x1b', '\u{9b}', '\r'] {
+        assert!(!err.contains(raw), "{raw:?} in {err:?}");
+    }
+    assert_eq!(err.matches('\n').count(), 1, "one line: {err:?}");
 }
