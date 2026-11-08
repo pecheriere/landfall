@@ -21,7 +21,7 @@ use super::problem::ApiProblem;
 /// with bytes unread can reset the connection and lose the answer on the way, so
 /// this lets a body a little over the limit hear why. A much larger one may still
 /// get the reset, and a client has to bound its retries.
-const DRAIN_BYTES: usize = 64 * 1024;
+pub(crate) const DRAIN_BYTES: usize = 64 * 1024;
 
 /// Seed of the key a signature is checked against when the host is unknown. It is
 /// public, in this file, so a signature by it proves nothing and is never accepted.
