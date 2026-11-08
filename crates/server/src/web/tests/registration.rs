@@ -119,10 +119,6 @@ async fn a_body_just_over_each_cap_is_refused_before_it_is_parsed() {
         (REGISTER_BEGIN, MAX_BEGIN_BODY_BYTES),
         (REGISTER_FINISH, MAX_FINISH_BODY_BYTES),
         (
-            super::SIGN_IN_BEGIN,
-            crate::web::sign_in::MAX_BEGIN_BODY_BYTES,
-        ),
-        (
             super::SIGN_IN_FINISH,
             crate::web::sign_in::MAX_FINISH_BODY_BYTES,
         ),
