@@ -5,14 +5,12 @@
 
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
-use axum::response::Response;
+use landfall_api::{Cancelled, Problem, RequestState as RequestStateView};
 use landfall_core::config::Permission;
-use serde_json::json;
 
-use super::{
-    Refused, Subject, closed, named_request, no_store, refuse_alone, refuse_in, visibility,
-};
-use crate::agent_api::{ApiState, json as json_answer};
+use super::{Refused, Subject, closed, named_request, refuse_alone, refuse_in, visibility};
+use crate::agent_api::ApiState;
+use crate::api::{ApiJson, Forbidden, NotFound, RateLimited, Unauthenticated};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};
 use crate::store::{StoreError, StoredRequest};
@@ -29,11 +27,39 @@ pub(super) fn may_cancel(state: &ApiState, principal: &Principal, request: &Stor
 }
 
 /// The handler.
+#[utoipa::path(
+    post,
+    path = "/api/v1/approvals/{id}/cancel",
+    operation_id = "cancelRequest",
+    tag = "requests",
+    summary = "Cancel a request",
+    description = "For who asked, and for who could approve it or roll back past it. It takes no \
+                   body: all it can do is stop something from running.",
+    params(("id" = i64, Path, description = "The request's number.", example = 42)),
+    security(
+        ("token" = ["requester", "rollback"]),
+        ("session" = ["requester", "approve", "rollback"]),
+    ),
+    responses(
+        (status = 200, description = "The request was cancelled.", body = Cancelled),
+        (status = 401, response = Unauthenticated),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (
+            status = 409,
+            description = "The request is no longer open: `request_closed`, `request_stale`, \
+                           `request_expired` or `request_cancelled`.",
+            body = Problem,
+            content_type = "application/problem+json",
+        ),
+        (status = 429, response = RateLimited),
+    ),
+)]
 pub(super) async fn cancel(
     State(state): State<ApiState>,
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
-) -> Result<Response, HumanProblem> {
+) -> Result<ApiJson<Cancelled>, HumanProblem> {
     let config = state.config();
     let store = state.store();
     let raw = path.map_or_else(|_| String::new(), |Path(raw)| raw);
@@ -86,8 +112,8 @@ pub(super) async fn cancel(
         return Err(StoreError::Corrupt("a request that was open, and could not be ended").into());
     }
     tx.commit().await.map_err(StoreError::from)?;
-    Ok(json_answer(
-        &json!({ "request": request.id, "state": "cancelled" }),
-        &no_store(),
-    ))
+    Ok(ApiJson(Cancelled {
+        request: request.id,
+        state: RequestStateView::Cancelled,
+    }))
 }

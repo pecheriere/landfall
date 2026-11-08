@@ -21,6 +21,7 @@ hex.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
+landfall-api = { workspace = true, features = ["openapi"] }
 landfall-approval.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
@@ -32,6 +33,8 @@ sqlx.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { workspace = true, features = ["util"] }
+utoipa.workspace = true
+utoipa-axum.workspace = true
 
 [dev-dependencies]
 futures-core.workspace = true

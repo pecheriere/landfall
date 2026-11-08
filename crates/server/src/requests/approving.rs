@@ -3,7 +3,7 @@
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
-use axum::response::Response;
+use landfall_api::{Approved, NewApproval, Problem};
 use landfall_approval::{
     Assertion, CoseKey, Expect, MAX_AUTHENTICATOR_DATA_BYTES, MAX_CLIENT_DATA_BYTES,
     MAX_SIGNATURE_BYTES, verify,
@@ -12,15 +12,14 @@ use landfall_core::config::{Config, Deployment, MAX_CREDENTIAL_ID_LEN, Permissio
 use landfall_core::intent::DeployIntent;
 use landfall_core::protocol::{Approval, AssertionText, DeployId};
 use landfall_core::text::quoted;
-use serde::Deserialize;
-use serde_json::json;
 use sqlx::{Sqlite, Transaction};
 
 use super::{
-    Refused, Stop, Subject, closed, named_request, no_store, parsed_body, ready_host, refuse_alone,
+    Refused, Stop, Subject, closed, named_request, parsed_body, ready_host, refuse_alone,
     refuse_in, refused, visibility,
 };
-use crate::agent_api::{ApiState, json as json_answer};
+use crate::agent_api::ApiState;
+use crate::api::{ApiJson, BadRequest, NotFound, RateLimited, Unauthenticated};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};
 use crate::report::REFUSAL_SHOWN_CHARS;
@@ -42,13 +41,6 @@ const _: () = assert!(
 
 const NO_GRANT_TO_APPROVE: &str =
     "no grant lets this principal approve here, and a token never can";
-
-/// The body.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApproveBody {
-    assertion: AssertionText,
-}
 
 /// Refuses an assertion that isn't this approver's over this intent's challenge, by what
 /// the host will check. The key is the configuration's: the one the host goes by.
@@ -213,12 +205,53 @@ async fn approve_in(
 }
 
 /// The handler.
+#[utoipa::path(
+    post,
+    path = "/api/v1/approvals/{id}",
+    operation_id = "approveRequest",
+    tag = "requests",
+    summary = "Approve a request",
+    description = "Signs a request with a passkey's assertion over its challenge, as the \
+                   controller's page does. A token never approves.",
+    params(("id" = i64, Path, description = "The request's number.", example = 42)),
+    request_body = NewApproval,
+    security(("session" = ["approve"])),
+    responses(
+        (
+            status = 200,
+            description = "The request was approved, and its deploy is queued for its host, \
+                           which checks the approval again.",
+            body = Approved,
+        ),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthenticated),
+        (
+            status = 403,
+            description = "No grant lets this principal approve here, a session's state change \
+                           didn't come from the controller's origin, or the assertion isn't one by \
+                           this principal for this request: `forbidden`, `bad_origin`, \
+                           `assertion_refused`.",
+            body = Problem,
+            content_type = "application/problem+json",
+        ),
+        (status = 404, response = NotFound),
+        (
+            status = 409,
+            description = "The request can't be approved now: `request_closed`, \
+                           `request_stale`, `request_expired`, `request_cancelled`, \
+                           `deployment_busy`, `host_not_ready` or `promotion_pending`.",
+            body = Problem,
+            content_type = "application/problem+json",
+        ),
+        (status = 429, response = RateLimited),
+    ),
+)]
 pub(super) async fn approve(
     State(state): State<ApiState>,
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
     body: Body,
-) -> Result<Response, HumanProblem> {
+) -> Result<ApiJson<Approved>, HumanProblem> {
     let config = state.config();
     let store = state.store();
     let raw = path.map_or_else(|_| String::new(), |Path(raw)| raw);
@@ -249,13 +282,14 @@ pub(super) async fn approve(
     if let Some((problem, why)) = closed(request.state) {
         return Err(refuse_alone(&state, &principal, subject, problem, why).await);
     }
-    let sent: ApproveBody = match parsed_body(&state, body, MAX_APPROVAL_BODY_BYTES).await {
+    let sent: NewApproval = match parsed_body(&state, body, MAX_APPROVAL_BODY_BYTES).await {
         Ok(sent) => sent,
         Err((problem, why)) => {
             return Err(refuse_alone(&state, &principal, subject, problem, why).await);
         }
     };
-    if let Err(refusal) = check_assertion(config, &principal, &request.intent, &sent.assertion) {
+    let assertion = AssertionText::from(sent.assertion);
+    if let Err(refusal) = check_assertion(config, &principal, &request.intent, &assertion) {
         return Err(refuse_alone(
             &state,
             &principal,
@@ -267,17 +301,17 @@ pub(super) async fn approve(
     }
     let approval = Approval {
         intent: request.intent.clone(),
-        assertion: sent.assertion,
+        assertion,
     };
     let mut tx = store.begin().await?;
     match approve_in(&state, &mut tx, &principal, d, request, &approval).await {
         Ok(deploy_id) => {
             tx.commit().await.map_err(StoreError::from)?;
             store.wake_agents();
-            Ok(json_answer(
-                &json!({ "request": request.id, "deploy_id": deploy_id }),
-                &no_store(),
-            ))
+            Ok(ApiJson(Approved {
+                request: request.id,
+                deploy_id,
+            }))
         }
         Err(Stop::Refused(refusal)) => {
             refuse_in(&state, tx, &principal, subject, &refusal).await?;

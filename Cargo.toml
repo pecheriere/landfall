@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/approval", "crates/origin", "crates/server", "crates/agent", "crates/cli"]
+members = ["crates/core", "crates/api", "crates/approval", "crates/origin", "crates/server", "crates/agent", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0-rc.1"
@@ -30,6 +30,7 @@ print_stderr = "deny"
 
 [workspace.dependencies]
 landfall-core = { path = "crates/core", version = "0.1.0-rc.1" }
+landfall-api = { path = "crates/api", version = "0.1.0-rc.1" }
 landfall-approval = { path = "crates/approval", version = "0.1.0-rc.1" }
 landfall-origin = { path = "crates/origin", version = "0.1.0-rc.1" }
 landfall-server = { path = "crates/server", version = "0.1.0-rc.1" }
@@ -88,3 +89,11 @@ aws-lc-rs = { version = "1.18.2", default-features = false, features = ["aws-lc-
 # COSE keys and attestation objects. No `alloc`: its `skip` then refuses nested
 # indefinite-length items rather than keeping a stack for them.
 minicbor = { version = "2.3.1", default-features = false }
+# The API's OpenAPI document, from the wire types and the handlers' annotations.
+# Only the derive macros: no YAML, no framework extras guessing at parameters.
+utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
+# Registers each /api/v1 route and its document entry together.
+utoipa-axum = { version = "0.3.0", default-features = false }
+# Validates real answers against the document, in tests. No default features, so
+# it never fetches a `$ref` over the network or from a file.
+jsonschema = { version = "0.60.2", default-features = false }

@@ -1,10 +1,12 @@
-//! Error answers: `application/problem+json` with the codes in
-//! [`landfall_core::protocol::ProblemCode`].
+//! Error answers: `application/problem+json` with the codes in [`ProblemCode`]. Every code
+//! the agent API sends is one the agent reads by [`landfall_core::protocol::ProblemCode`], as
+//! `every_problem_code_is_in_the_schema` holds.
 
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use landfall_core::protocol::{PROBLEM_CONTENT_TYPE, Problem, ProblemCode};
+use landfall_api::{Problem, ProblemCode};
+use landfall_core::protocol::PROBLEM_CONTENT_TYPE;
 
 use crate::logger::log;
 use crate::store::StoreError;
@@ -54,8 +56,8 @@ pub(crate) enum ApiProblem {
 
 impl ApiProblem {
     /// The stable code, for an audit row.
-    pub(crate) fn code(self) -> &'static str {
-        self.parts().1.as_str()
+    pub(crate) fn code(self) -> ProblemCode {
+        self.parts().1
     }
 
     fn parts(self) -> (StatusCode, ProblemCode, &'static str) {
@@ -140,14 +142,14 @@ impl ApiProblem {
 }
 
 /// An `application/problem+json` answer.
-pub(crate) fn problem_response(status: StatusCode, code: &str, title: &str) -> Response {
+pub(crate) fn problem_response(status: StatusCode, code: ProblemCode, title: &str) -> Response {
     let problem = Problem {
-        code: code.to_owned(),
+        code,
         title: title.to_owned(),
         status: status.as_u16(),
     };
-    // Strings and an integer: serialising this cannot fail, and if it ever
-    // did, an empty body with the right status is still a refusal.
+    // A known code, a string and an integer: serialising this cannot fail, and
+    // if it ever did, an empty body with the right status is still a refusal.
     let body = serde_json::to_vec(&problem).unwrap_or_default();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
@@ -161,7 +163,7 @@ pub(crate) fn problem_response(status: StatusCode, code: &str, title: &str) -> R
 impl IntoResponse for ApiProblem {
     fn into_response(self) -> Response {
         let (status, code, title) = self.parts();
-        let mut response = problem_response(status, code.as_str(), title);
+        let mut response = problem_response(status, code, title);
         let headers = response.headers_mut();
         if matches!(self, Self::RateLimited | Self::NoncesExhausted | Self::Busy) {
             headers.insert(

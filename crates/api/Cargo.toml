@@ -1,0 +1,25 @@
+[package]
+name = "landfall-api"
+description = "The wire types of landfall's /api/v1, shared by the controller and the CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# The OpenAPI schema of every type. Only the controller enables it, to generate
+# its document: the CLI reads the types and needs none of it.
+openapi = ["dep:utoipa"]
+
+[dependencies]
+landfall-core.workspace = true
+serde.workspace = true
+utoipa = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
