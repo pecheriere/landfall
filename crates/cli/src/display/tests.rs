@@ -47,7 +47,7 @@ fn json_output_escapes_c1_del_and_bidi() {
         "\u{85}key": true,
     });
     let mut out = Vec::new();
-    write_json(&mut out, &value).unwrap();
+    write_json(&mut out, &value.to_string()).unwrap();
 
     let text = String::from_utf8(out.clone()).unwrap();
     for forbidden in [
@@ -67,4 +67,16 @@ fn json_output_escapes_c1_del_and_bidi() {
     assert!(text.contains("\n  \"list\""), "pretty: {text}");
     let back: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(back, value);
+}
+
+/// The text as the controller sent it, only laid out: key order, numbers and escapes stay.
+#[test]
+fn json_output_keeps_the_text_as_received() {
+    let received = "{ \"b\" : 1.50e3 ,\r\n \"a\":[ ], \"o\":{},\t\"s\":\"q\\\"\\\\\\u001b\u{9b}\",\"n\":[1,[2]]}";
+    let mut out = Vec::new();
+    write_json(&mut out, received).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\n  \"b\": 1.50e3,\n  \"a\": [],\n  \"o\": {},\n  \"s\": \"q\\\"\\\\\\u001b\\u009b\",\n  \"n\": [\n    1,\n    [\n      2\n    ]\n  ]\n}\n"
+    );
 }

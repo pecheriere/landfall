@@ -12,8 +12,9 @@ use std::io::Write;
 use clap::{Args, Subcommand};
 use landfall_api::{ApprovalsView, DeploymentSummary, MeView, Page, RequestState};
 use landfall_core::ids::{DeploymentId, HostId, ReleaseTag, RepoName};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::value::RawValue;
 
 use crate::api_client::{ApiClient, ApiError, deployment_path, segment};
 use crate::cli::{API_EXIT_STATUS, ApiArgs, CliError};
@@ -29,26 +30,31 @@ const MAX_ITEMS: usize = 1000;
 /// The most pages `status` reads.
 const MAX_PAGES: usize = 20;
 
+/// The most bytes of answers `status` reads across its pages: two full answers of 4 MiB. A
+/// thousand deployments come to about 400 KiB, so this is far beyond what a controller sends,
+/// and it keeps what a hostile one can make the CLI hold to a few times this.
+pub(crate) const MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// What `status` asks for in a page: the most the API gives.
 const PAGE_LIMIT: &str = "100";
 
 /// How `status` pages, shown in its `--help`.
 const STATUS_PAGING: &str = "\
 Without a deployment, status reads the deployments a page of 100 at a time, and stops at
-1,000 deployments or 20 pages, or when the controller sends a cursor twice, with a line
-saying which.";
+1,000 deployments or 20 pages, at 8 MiB of answers, or when the controller sends a cursor
+twice, with a line saying which.";
 
 /// The controller's API, as the read commands use it: [`ApiClient`], or a fake in tests.
 ///
 /// It is used generically, never as `&dyn Api`: a method returning `impl Future` isn't
 /// dyn-compatible.
 pub trait Api {
-    /// `GET path?query`, and the body of its answer, as [`ApiClient::get`].
+    /// `GET path?query`, and the text of its answer, checked to be JSON, as [`ApiClient::get`].
     fn get(
         &self,
         path: &str,
         query: &[(&str, &str)],
-    ) -> impl Future<Output = Result<Value, ApiError>> + Send;
+    ) -> impl Future<Output = Result<String, ApiError>> + Send;
 }
 
 impl Api for ApiClient {
@@ -56,7 +62,7 @@ impl Api for ApiClient {
         &self,
         path: &str,
         query: &[(&str, &str)],
-    ) -> impl Future<Output = Result<Value, ApiError>> + Send {
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
         ApiClient::get(self, path, query)
     }
 }
@@ -214,20 +220,20 @@ pub async fn run_with<A: Api>(
     match command {
         ReadCommand::Status(args) => match &args.deployment {
             Some(deployment) => {
-                let value = client.get(&deployment_path(deployment), &[]).await?;
-                show(out, json, &value, render::deployment)
+                let text = client.get(&deployment_path(deployment), &[]).await?;
+                show(out, json, &text, render::deployment)
             }
             None => status_list(args, client, out, json).await,
         },
         ReadCommand::History(args) => {
             let path = format!("{}/deploys", deployment_path(&args.deployment));
-            let value = client.get(&path, &pairs(&limit(args.limit))).await?;
-            show(out, json, &value, render::deploys)
+            let text = client.get(&path, &pairs(&limit(args.limit))).await?;
+            show(out, json, &text, render::deploys)
         }
         ReadCommand::Releases(args) => {
             let path = format!("{}/releases", deployment_path(&args.deployment));
-            let value = client.get(&path, &pairs(&limit(args.limit))).await?;
-            show(out, json, &value, render::releases)
+            let text = client.get(&path, &pairs(&limit(args.limit))).await?;
+            show(out, json, &text, render::releases)
         }
         ReadCommand::Release(args) => {
             let path = format!(
@@ -235,23 +241,23 @@ pub async fn run_with<A: Api>(
                 deployment_path(&args.deployment),
                 segment(args.tag.as_ref())
             );
-            let value = client.get(&path, &[]).await?;
-            show(out, json, &value, render::story)
+            let text = client.get(&path, &[]).await?;
+            show(out, json, &text, render::story)
         }
         ReadCommand::Why(args) => {
-            let value = client
+            let text = client
                 .get(&format!("/api/v1/deploys/{}/why", args.deploy), &[])
                 .await?;
-            show(out, json, &value, render::why)
+            show(out, json, &text, render::why)
         }
         ReadCommand::Hosts(args) => {
             if let Some(host) = &args.host {
                 let path = format!("/api/v1/hosts/{}", segment(host.as_ref()));
-                let value = client.get(&path, &[]).await?;
-                show(out, json, &value, render::host)
+                let text = client.get(&path, &[]).await?;
+                show(out, json, &text, render::host)
             } else {
-                let value = client.get("/api/v1/hosts", &[]).await?;
-                show(out, json, &value, render::hosts)
+                let text = client.get("/api/v1/hosts", &[]).await?;
+                show(out, json, &text, render::hosts)
             }
         }
         ReadCommand::Audit(args) => {
@@ -266,8 +272,8 @@ pub async fn run_with<A: Api>(
                 query.push(("kind", kind.clone()));
             }
             query.extend(limit(args.limit));
-            let value = client.get("/api/v1/audit", &pairs(&query)).await?;
-            show(out, json, &value, render::audit)
+            let text = client.get("/api/v1/audit", &pairs(&query)).await?;
+            show(out, json, &text, render::audit)
         }
         ReadCommand::Approvals(_) => approvals(client, out, json).await,
     }
@@ -288,17 +294,17 @@ fn pairs<'a>(query: &'a [(&'a str, String)]) -> Vec<(&'a str, &'a str)> {
         .collect()
 }
 
-/// Prints `value` as received with `json`, else through `view` once read as `T`.
+/// Prints `text` as received with `json`, else through `view` once read as `T`.
 fn show<T: DeserializeOwned>(
     out: &mut dyn Write,
     json: bool,
-    value: &Value,
+    text: &str,
     view: fn(&T, &mut dyn Write) -> std::io::Result<()>,
 ) -> Result<(), CliError> {
     if json {
-        return write_json(out, value).map_err(CliError::Output);
+        return write_json(out, text).map_err(CliError::Output);
     }
-    let typed: T = ApiClient::typed(value)?;
+    let typed: T = ApiClient::typed(text)?;
     view(&typed, out).map_err(CliError::Output)
 }
 
@@ -307,10 +313,20 @@ fn show<T: DeserializeOwned>(
 pub(crate) enum Stopped {
     /// It holds [`MAX_ITEMS`].
     Items,
+    /// The answers came to [`MAX_BYTES`].
+    Bytes,
     /// It read [`MAX_PAGES`].
     Pages,
     /// The controller sent a cursor it had already sent.
     RepeatedCursor,
+}
+
+/// What `status --json` prints: the items of every page read, each as the text received.
+#[derive(Serialize)]
+struct Listing<'a> {
+    items: &'a [Box<RawValue>],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopped: Option<&'static str>,
 }
 
 /// `listDeployments`, page by page, within the caps.
@@ -332,18 +348,49 @@ async fn status_list<A: Api>(
     }
     filters.push(("limit", PAGE_LIMIT.to_owned()));
 
-    let mut items: Vec<Value> = Vec::new();
+    if json {
+        // Each item is kept as the text received, so what is held is the bytes counted.
+        let (items, stopped) = pages::<Box<RawValue>, A>(&filters, client).await?;
+        let listing = Listing {
+            items: &items,
+            stopped: stopped.map(render::stopped_text),
+        };
+        let text = serde_json::to_string(&listing).map_err(|e| CliError::Output(e.into()))?;
+        return write_json(out, &text).map_err(CliError::Output);
+    }
+    // Each page is read straight into its type: what this CLI doesn't know isn't kept.
+    let (summaries, stopped) = pages::<DeploymentSummary, A>(&filters, client).await?;
+    render::deployments(&summaries, out).map_err(CliError::Output)?;
+    if let Some(stopped) = stopped {
+        writeln!(out, "{}", render::stopped_text(stopped)).map_err(CliError::Output)?;
+    }
+    Ok(())
+}
+
+/// Reads the pages of `listDeployments` as `T`, until the last one or a cap, and says which
+/// cap stopped it. A page whose answer would take the total past [`MAX_BYTES`] is not kept,
+/// so what is held stays within it: an item can't be larger than the text it came from.
+async fn pages<T: DeserializeOwned, A: Api>(
+    filters: &[(&str, String)],
+    client: &A,
+) -> Result<(Vec<T>, Option<Stopped>), CliError> {
+    let mut items: Vec<T> = Vec::new();
+    let mut bytes = 0usize;
     let mut seen = HashSet::new();
     let mut cursor: Option<String> = None;
     let mut pages = 0;
     let stopped = loop {
-        let mut query = pairs(&filters);
+        let mut query = pairs(filters);
         if let Some(cursor) = &cursor {
             query.push(("cursor", cursor));
         }
-        let value = client.get("/api/v1/deployments", &query).await?;
+        let text = client.get("/api/v1/deployments", &query).await?;
         pages += 1;
-        let page: Page<Value> = ApiClient::typed(&value)?;
+        bytes += text.len();
+        if bytes > MAX_BYTES {
+            break Some(Stopped::Bytes);
+        }
+        let page: Page<T> = ApiClient::typed(&text)?;
         let room = MAX_ITEMS - items.len();
         // A page over the API's own limit of 100 can bring more than there is room for:
         // what is dropped is said, cursor or not.
@@ -366,30 +413,17 @@ async fn status_list<A: Api>(
         }
         cursor = Some(next);
     };
-
-    if json {
-        let mut body = json!({ "items": items });
-        if let Some(stopped) = stopped {
-            body["stopped"] = Value::String(render::stopped_text(stopped).to_owned());
-        }
-        return write_json(out, &body).map_err(CliError::Output);
-    }
-    let summaries: Vec<DeploymentSummary> = ApiClient::typed(&Value::Array(items))?;
-    render::deployments(&summaries, out).map_err(CliError::Output)?;
-    if let Some(stopped) = stopped {
-        writeln!(out, "{}", render::stopped_text(stopped)).map_err(CliError::Output)?;
-    }
-    Ok(())
+    Ok((items, stopped))
 }
 
 /// `listApprovals`, and, when a request is open and a person reads it, `whoAmI` for where an
 /// approver signs.
 async fn approvals<A: Api>(client: &A, out: &mut dyn Write, json: bool) -> Result<(), CliError> {
-    let value = client.get("/api/v1/approvals", &[]).await?;
+    let text = client.get("/api/v1/approvals", &[]).await?;
     if json {
-        return write_json(out, &value).map_err(CliError::Output);
+        return write_json(out, &text).map_err(CliError::Output);
     }
-    let approvals: ApprovalsView = ApiClient::typed(&value)?;
+    let approvals: ApprovalsView = ApiClient::typed(&text)?;
     let open = approvals
         .approvals
         .iter()

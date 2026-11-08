@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-use landfall_api::{ProblemCode, ReleaseBrief, ReleaseStatus};
+use landfall_api::{Page, ProblemCode, ReleaseBrief, ReleaseStatus};
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -88,7 +88,10 @@ async fn bearer_is_sent_when_there_is_a_token_and_not_otherwise() {
         .get("/api/v1/me", &[])
         .await
         .unwrap();
-    assert_eq!(answer, json!({"ok": true}));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
+        json!({"ok": true})
+    );
     client(&server, None).get("/api/v1/me", &[]).await.unwrap();
 
     let requests = server.received_requests().await.unwrap();
@@ -326,8 +329,8 @@ async fn unknown_fields_and_values_from_a_newer_controller_are_tolerated() {
     );
 
     // What doesn't fit the type at all is a parse error, exit 2.
-    let error = ApiClient::typed::<ReleaseBrief>(&json!({"tag": 1})).unwrap_err();
-    assert!(matches!(error, ApiError::Parse(_)), "{error:?}");
+    let error = ApiClient::typed::<ReleaseBrief>(&json!({"tag": 1}).to_string()).unwrap_err();
+    assert!(matches!(error, ApiError::Parse { .. }), "{error:?}");
     assert_eq!(error.exit_code(), 2);
 }
 
@@ -495,7 +498,10 @@ async fn proxy_child() {
         .get("/api/v1/me", &[])
         .await
         .unwrap();
-    assert_eq!(answer, json!({"direct": true}));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
+        json!({"direct": true})
+    );
 }
 
 #[test]
@@ -525,4 +531,61 @@ fn segments_are_percent_encoded() {
     );
     assert_eq!(url.query(), None);
     assert_eq!(url.fragment(), None);
+}
+
+/// A parse error says where and what kind of fault, and never repeats what the controller
+/// sent, which serde's own message would, at any length.
+#[tokio::test]
+async fn parse_errors_say_where_and_never_repeat_the_answer() {
+    let big = "A".repeat(1 << 20);
+    let body = json!({"items": big, "next_cursor": null}).to_string();
+    let error = ApiClient::typed::<Page<ReleaseBrief>>(&body).unwrap_err();
+    let text = everything_about(&error);
+    assert!(text.len() < 400, "{} bytes", text.len());
+    assert!(!text.contains("AAAA"), "{text}");
+    assert!(
+        error.to_string().starts_with(
+            "the controller's answer is not one this CLI can read: not the shape this CLI reads at line 1, column "
+        ),
+        "{error}"
+    );
+    assert_eq!(error.exit_code(), 2);
+
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/hosts"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("{\n\"a\": nope", "application/json"))
+        .mount(&server)
+        .await;
+    Mock::given(path("/api/v1/audit"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"{\"a\":\"\xff\"}".to_vec(), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let client = client(&server, None);
+    let error = client.get("/api/v1/hosts", &[]).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ApiError::Parse {
+                problem: "not JSON",
+                line: 2,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let error = client.get("/api/v1/audit", &[]).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ApiError::Parse {
+                problem: "not UTF-8",
+                line: 1,
+                column: 7
+            }
+        ),
+        "{error:?}"
+    );
 }

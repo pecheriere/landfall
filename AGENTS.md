@@ -114,8 +114,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   which escape controls, bidi and invisible characters in whatever the controller sent before a
   terminal sees it), `whoami` (`landfall whoami`), `read` (`status`, `history`, `release`,
   `releases`, `why`, `hosts`, `audit` and `approvals`, over the `Api` trait, used generically so
-  tests can use a fake; `status` pages within 1,000 deployments or 20 pages, the others make at
-  most three calls; `render`, each view for a person, every server string escaped), `verify`
+  tests can use a fake; `status` pages within 1,000 deployments, 20 pages or 8 MiB of answers,
+  the others make at most three calls; answers are kept as text, never as a JSON tree;
+  `render`, each view for a person, every server string escaped), `verify`
   (`landfall verify`), `access` (the trust root's cache and the operator's token), `project`
   (what landfall trusts about its own releases: its repository, ids and workflow as constants,
   and `assets/release-signers`, read by the

@@ -395,3 +395,29 @@ fn every_cli_call_is_in_the_openapi_document() {
     }
     assert!(seen >= 12, "{seen}");
 }
+
+/// A megabyte of hostile text where the CLI wants something else gives one short line.
+#[test]
+fn a_parse_error_is_one_short_line() {
+    let big = "\u{9b}A".repeat(1 << 19);
+    let body = json!({"principal": "operator", "via": "token", "grants": big, "approve_url": null})
+        .to_string();
+    let (url, server) = answer_once(200, "application/json", &body);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = run_with(whoami(&url, &[]), &env(None), &mut out, &mut err);
+    server.join().unwrap();
+
+    assert_eq!(status, 2);
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.len() < 200,
+        "{} bytes: {}",
+        err.len(),
+        &err[..200.min(err.len())]
+    );
+    assert!(
+        err.starts_with("landfall: the controller's answer is not one this CLI can read"),
+        "{err}"
+    );
+    assert_eq!(err.matches('\n').count(), 1, "{err}");
+}

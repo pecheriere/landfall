@@ -96,6 +96,9 @@ pub(crate) fn stopped_text(stopped: Stopped) -> &'static str {
         Stopped::Items => {
             "stopped at 1000 deployments: narrow it with --host, --repo or --needs-you"
         }
+        Stopped::Bytes => {
+            "stopped at 8 MiB of answers: narrow it with --host, --repo or --needs-you"
+        }
         Stopped::Pages => "stopped after 20 pages: narrow it with --host, --repo or --needs-you",
         Stopped::RepeatedCursor => "stopped: the controller sent a cursor it had already sent",
     }

@@ -16,11 +16,11 @@ pub(crate) fn run(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<(), CliError> {
-    let value = runtime.block_on(client.get("/api/v1/me", &[]))?;
+    let text = runtime.block_on(client.get("/api/v1/me", &[]))?;
     if json {
-        return write_json(out, &value).map_err(CliError::Output);
+        return write_json(out, &text).map_err(CliError::Output);
     }
-    let me: MeView = ApiClient::typed(&value)?;
+    let me: MeView = ApiClient::typed(&text)?;
     render(&me, out).map_err(CliError::Output)
 }
 

@@ -27,7 +27,8 @@ reqwest.workspace = true
 rustix.workspace = true
 semver.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: `status --json` keeps each item as the text received, not as a tree.
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

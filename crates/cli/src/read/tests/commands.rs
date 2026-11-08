@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use super::{CALLS, FakeApi, fixture, request, run, summary};
 use crate::api_client::ApiError;
 use crate::cli::CliError;
+use crate::read::MAX_BYTES;
 
 /// A page of `count` deployments, and `next` as its cursor.
 fn page(count: usize, next: Option<&str>) -> Value {
@@ -302,4 +303,44 @@ fn json_passes_new_fields_and_values_through() {
     assert!(!out.contains('\u{9b}'), "{out}");
     let printed: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(printed, body);
+}
+
+/// A hostile controller's wide items, with a fresh cursor on every page: `status` stops at its
+/// byte budget, says so, and holds no more than the bytes it counted.
+#[test]
+fn status_stops_at_the_byte_budget_and_holds_no_more() {
+    let wide = |_: &str, query: &[(String, String)]| {
+        let n = cursor_of(query).map_or(0, |c| c.parse::<u32>().unwrap());
+        let mut item = summary();
+        item["running"]["phase"] = json!("x".repeat(1 << 20));
+        Ok(json!({
+            "items": [item.clone(), item.clone(), item],
+            "next_cursor": (n + 1).to_string(),
+        }))
+    };
+    let stop = "stopped at 8 MiB of answers: narrow it with --host, --repo or --needs-you";
+
+    // Pages of about 3 MiB: two are kept, and the third would pass 8 MiB.
+    let api = FakeApi::new(wide);
+    let (result, out) = run("status", &api, false);
+    result.unwrap();
+    assert_eq!(api.calls().len(), 3);
+    assert_eq!(out.lines().filter(|l| l.starts_with("app/prod")).count(), 6);
+    assert!(
+        out.ends_with(&format!("{stop}\n")),
+        "{}",
+        out.lines().last().unwrap()
+    );
+
+    // Items are kept as the text received: what is printed is what was held, within budget.
+    let api = FakeApi::new(wide);
+    let (result, out) = run("status", &api, true);
+    result.unwrap();
+    assert_eq!(api.calls().len(), 3);
+    let printed: Value = serde_json::from_str(&out).unwrap();
+    let items = printed["items"].as_array().unwrap();
+    assert_eq!(items.len(), 6);
+    let held: usize = items.iter().map(|item| item.to_string().len()).sum();
+    assert!(held > 6 << 20 && held <= MAX_BYTES, "{held}");
+    assert_eq!(printed["stopped"], stop);
 }

@@ -132,14 +132,14 @@ impl Api for FakeApi {
         &self,
         path: &str,
         query: &[(&str, &str)],
-    ) -> impl Future<Output = Result<Value, ApiError>> + Send {
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
         let query: Vec<(String, String)> = query
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect();
         let answer = (self.answer)(path, &query);
         self.calls.lock().unwrap().push((path.to_owned(), query));
-        std::future::ready(answer)
+        std::future::ready(answer.map(|value| value.to_string()))
     }
 }
 

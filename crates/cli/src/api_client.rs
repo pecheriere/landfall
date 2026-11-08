@@ -14,7 +14,8 @@ use landfall_core::ids::DeploymentId;
 use landfall_core::protocol::PROBLEM_CONTENT_TYPE;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, redirect};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
+use serde_json::error::Category;
 use thiserror::Error;
 
 use crate::display::wire_name;
@@ -77,14 +78,13 @@ impl ApiClient {
 
     /// `GET path?query`, and the body of its answer.
     ///
+    /// The body is kept as the text received, checked to be JSON, and never as a tree: a tree
+    /// of hostile JSON takes many times its size in memory.
+    ///
     /// # Errors
     ///
     /// An [`ApiError`] for anything but a success with a JSON body within the cap.
-    pub async fn get(
-        &self,
-        path: &str,
-        query: &[(&str, &str)],
-    ) -> Result<serde_json::Value, ApiError> {
+    pub async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<String, ApiError> {
         let mut url = self.controller.join(path);
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
@@ -92,17 +92,18 @@ impl ApiClient {
         self.send(self.http.get(url)).await
     }
 
-    /// `value` as one of the API's types. Fields and values from a newer controller are
-    /// tolerated, as the types say.
+    /// `json`, an answer's text, as one of the API's types, read straight from the text.
+    /// Fields and values from a newer controller are tolerated, as the types say, and a field
+    /// it doesn't know is skipped without being kept.
     ///
     /// # Errors
     ///
     /// [`ApiError::Parse`] if it isn't one.
-    pub fn typed<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, ApiError> {
-        T::deserialize(value).map_err(ApiError::Parse)
+    pub fn typed<T: DeserializeOwned>(json: &str) -> Result<T, ApiError> {
+        serde_json::from_str(json).map_err(|error| ApiError::parse(&error))
     }
 
-    async fn send(&self, request: RequestBuilder) -> Result<serde_json::Value, ApiError> {
+    async fn send(&self, request: RequestBuilder) -> Result<String, ApiError> {
         let request = match &self.token {
             Some(token) => request.header(AUTHORIZATION, token.clone()),
             None => request,
@@ -110,8 +111,7 @@ impl ApiClient {
         let response = request.send().await.map_err(ApiError::network)?;
         let status = response.status();
         if status.is_success() {
-            let body = read_capped(response).await?;
-            return serde_json::from_slice(&body).map_err(ApiError::Parse);
+            return json_text(read_capped(response).await?);
         }
         Err(self.refusal(status, response).await)
     }
@@ -191,6 +191,25 @@ fn is_problem(response: &Response) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case(PROBLEM_CONTENT_TYPE))
 }
 
+/// `body` as text, once it is known to be UTF-8 and one JSON value: checked as it is read,
+/// keeping nothing of it.
+fn json_text(body: Vec<u8>) -> Result<String, ApiError> {
+    let text = String::from_utf8(body).map_err(|error| {
+        let bytes = error.as_bytes();
+        let at = error.utf8_error().valid_up_to();
+        let before = &bytes[..at];
+        let line = before.split(|&b| b == b'\n').count();
+        let column = before.rsplit(|&b| b == b'\n').next().map_or(0, <[u8]>::len) + 1;
+        ApiError::Parse {
+            problem: "not UTF-8",
+            line,
+            column,
+        }
+    })?;
+    serde_json::from_str::<IgnoredAny>(&text).map_err(|error| ApiError::parse(&error))?;
+    Ok(text)
+}
+
 /// Reads a body up to [`BODY_CAP`]; a larger one is an error, not a truncation.
 async fn read_capped(mut response: Response) -> Result<Vec<u8>, ApiError> {
     let mut body = Vec::new();
@@ -251,9 +270,19 @@ pub enum ApiError {
     /// has no query and no credentials.
     #[error("cannot reach the controller")]
     Network(#[source] reqwest::Error),
-    /// The answer isn't the JSON this CLI reads.
-    #[error("the controller's answer is not one this CLI can read")]
-    Parse(#[source] serde_json::Error),
+    /// The answer isn't the JSON this CLI reads. Only where and what kind of fault are kept:
+    /// the parser's own message can quote the answer at any length.
+    #[error(
+        "the controller's answer is not one this CLI can read: {problem} at line {line}, column {column}"
+    )]
+    Parse {
+        /// What kind of fault: not UTF-8, not JSON, cut short, or not the shape expected.
+        problem: &'static str,
+        /// The line it is on, from 1.
+        line: usize,
+        /// The column, from 1.
+        column: usize,
+    },
 }
 
 impl ApiError {
@@ -264,6 +293,21 @@ impl ApiError {
         match self {
             Self::Refused { .. } => 1,
             _ => 2,
+        }
+    }
+
+    /// `error`, without its message, which can quote the answer.
+    fn parse(error: &serde_json::Error) -> Self {
+        let problem = match error.classify() {
+            Category::Syntax => "not JSON",
+            Category::Eof => "cut short",
+            Category::Data => "not the shape this CLI reads",
+            Category::Io => "unreadable",
+        };
+        Self::Parse {
+            problem,
+            line: error.line(),
+            column: error.column(),
         }
     }
 
