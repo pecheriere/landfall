@@ -58,13 +58,14 @@ FORMULA_TEMPLATE = """\
 class Landfall < Formula
   desc "Continuous delivery for self-hosters"
   homepage "https://github.com/{repo}"
-  version "{version}"
   license any_of: ["MIT", "Apache-2.0"]
 
   on_macos do
     depends_on arch: :arm64
-    url "{base}/{darwin_arm64}"
-    sha256 "{darwin_arm64_sha256}"
+    on_arm do
+      url "{base}/{darwin_arm64}"
+      sha256 "{darwin_arm64_sha256}"
+    end
   end
 
   on_linux do
@@ -182,9 +183,7 @@ def formula(release: Release, out: Path) -> str:
     }
     hashes = {f"{key}_sha256": sha256_of(out / name) for key, name in names.items()}
     base = f"https://github.com/{release.repo}/releases/download/v{release.version}"
-    return FORMULA_TEMPLATE.format(
-        repo=release.repo, version=release.version, base=base, **names, **hashes
-    )
+    return FORMULA_TEMPLATE.format(repo=release.repo, base=base, **names, **hashes)
 
 
 def sums(out: Path) -> str:

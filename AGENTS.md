@@ -201,11 +201,34 @@ cargo deny check
   `cargo update -p <crate> --precise <version>`; allow-list entries are only
   for security fixes and must name a RUSTSEC or GHSA id.
 - Releases come from signed `v*` tags on main (`git tag -s`). `release.yml` reruns
-  CI and crate-age, builds with no cache, and publishes in one job, `publish`, in
-  the `release` environment. A `workflow_dispatch` run skips `preflight`, as it has no
-  tag, and `publish`, so it attests nothing. `CONTRIBUTING.md` has the procedure, and
+  CI and crate-age, builds with no cache, and publishes in one job, `publish`, with no
+  environment and no approval: the tag's signature is the only gate, as a stolen token
+  could approve a deployment through the API but can't forge the signature. The owner
+  signs the tag with `scripts/release-tag <version> --commit <sha>`, which agents never run,
+  and which refuses without a terminal. Its anchor is the owner's own signers file outside
+  the clone (`--trusted-signers`, opened with `O_NOFOLLOW` and checked on the open file: the
+  owner's or root's, writable by its owner alone): the last release is the highest `v*` tag
+  a key there signed, the repository's signers must equal those keys, and other `v*` tags
+  above it are named. It shows the range since then and any change to the signers file,
+  `.github/`, itself, `Cargo.*` and `TRUST_CODE` (all of `crates/origin/`, the tag, release
+  and signer code in core, the agent's verifier and judge, the CLI's verify, host, project
+  and agent-release code, and `crates/cli/assets/`), with control characters escaped, and
+  wants the version typed. It protects against a stolen GitHub token, not against code
+  running as the owner, which can wrap `git` or edit the helper: there only the release
+  key's per-signature prompt and the owner's judgment remain. Its tests are
+  `test_release_tag.py`, with the terminal injected, and `test_release_tag_git.py`, with
+  real git and throwaway keys; a test keeps every file the verifying crates build in
+  covered by what it shows. `CONTRIBUTING.md` has the procedure, and
   `test_release_workflow.py` holds what the workflow must keep doing: edit the two
   together.
+- **The dry run:** a push to main that changes `workspace.package.version`, and a
+  `workflow_dispatch` run, build and check everything a tag does, but skip `preflight`
+  and `publish`, so they attest nothing. The `version` job decides, with
+  `version_bump.py` against `github.event.before`, and `on-main` needs it, so any other
+  push to main stops there. `preflight` and `publish` want
+  `github.event_name == 'push' && github.ref_type == 'tag'`, and `smoke` compares
+  versions only on a tag. `scripts/release-tag` refuses a commit with no full, green dry
+  run.
 - `smoke` and `publish` download by artifact id, which can't be rebound as a name can,
   and `publish` reruns `check_binaries.py`. macOS has no such check: `smoke` running
   those same bytes there is what stands in for it.
@@ -219,19 +242,16 @@ cargo deny check
   in `release.yml`, as the verifier refuses a reusable workflow's identity.
 - **The tag proof:** `release_preflight.py` reads the tag object through the API
   and has `ssh-keygen` check it against `crates/cli/assets/release-signers` at the
-  tagged commit, before anyone is asked to approve. This is what landfall's CLI
+  tagged commit, before `publish` can run. This is what landfall's CLI
   trusts about its own binaries, and has nothing to do with a deployment's optional
   `origin.signed_tags`. A signers file with no key refuses every tag.
 - **One attempt:** `preflight` and `publish` fail at once if `GITHUB_RUN_ATTEMPT` isn't 1, as
   hosts refuse a release attested by two attempts and a tag can't be moved. The way
   out of any failed run is a version bump and a new tag.
-- **The guard:** GitHub silently creates a missing environment with no protection,
-  so `environment-guard` reads `release` and its `deployment-branch-policies` with
-  `check_environment.py`, and `publish` needs it. It wants required reviewers,
-  `prevent_self_review` off, `can_admins_bypass` off, custom policies on and protected
-  branches off, and one policy, a tag policy for `v[0-9]*`. The owner's steps in
-  `CONTRIBUTING.md` must name exactly those settings. Red until the owner creates
-  the environment, which is correct.
+- **Homebrew:** landfall holds no token for the tap and runs nothing for it. The tap's own
+  scheduled workflow reads the latest stable release, verifies it with the tap's script and
+  key, and opens a pull request that merges itself when green. `assemble_release.py` writes
+  the formula, which `brew style` must accept (`on_macos` may not hold `url`).
 - The last step of `publish` sends the tag with `draft=false`, as the API can otherwise
   publish with no tag, and reads the release back: not a draft, this tag, immutable. A
   failure there may mean a public release, so it's checked by hand. The draft is found by

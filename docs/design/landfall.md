@@ -77,7 +77,7 @@ running, and an agent can explain why in one API call.
   the multi-arch index digest).
 - landfall's own releases add to that: static `landfall-agent` and `landfall` binaries are
   release assets, every file a subject of one build-provenance attestation, attached as an
-  asset, and a tag is proved against the project's own key before anyone approves. This is
+  asset, and a tag is proved against the project's own key before `publish` runs. This is
   what `landfall host install` trusts, and it doesn't change what a deployment requires:
   `origin.signed_tags` stays optional.
 
@@ -448,7 +448,7 @@ read-only) by deploy id and time window. Without VictoriaLogs the logs view says
 |---|---|---|
 | Stolen GitHub token / compromised workflow | Host verifies the maintainer's tag signature + cert identity bound to the signed commit | none beyond the maintainer's signing key; with `origin.signed_tags = false`, anyone who can push a tag and run the release workflow can ship a deployable release |
 | Stolen GitHub token vs a host install | `landfall host install` wants the tag signed by a key the CLI holds, and the attestation, and the sums | the maintainer's key; a host's own operator; and whatever the first `landfall` was, so the guide's first trust |
-| Stolen GitHub token vs Homebrew | The tap is filled by hand: the owner checks a release's tag and attestation, and copies one file | that check, and the owner's tap; Homebrew itself checks only the formula's hash |
+| Stolen GitHub token vs Homebrew | landfall holds no token for the tap. The tap pulls each stable release itself and merges its formula only after checking its attestation, and the signed tag against the tap's own copy of the key, refusing a downgrade or a release candidate; a pull request not signed by the owner may only change an existing formula | the maintainer's key, the tap's copy of it and its CI; a token for the tap itself; Homebrew itself checks only the formula's hash |
 | Compromised controller | Host re-verifies origin, signature, rule, approval; upward-only auto; running-digest binding | can trigger allowed auto deploys, delay, lie in UI, mislead an approval to another maintainer-signed release, bypass promotion |
 | Stolen agent API token | Agents can't approve; per-deployment grants; optional warden-only | can request deploys the rules allow |
 | Stolen agent API token reads state | `view` shows only the deployments it grants, and nothing that names another; a read budget per principal's tokens; controller-wide audit rows (tokens, passkeys, sign-ins) never through the API | global sequence, deploy and request numbers show how much happened elsewhere, never what |

@@ -48,8 +48,8 @@ file is documented in [`docs/configuration.md`](docs/configuration.md).
 landfall has no release yet, so none of this has anything to fetch until the first tag. Then:
 
 ```sh
-# Needs the tap, which the owner creates: packaging/homebrew-tap/README.md.
-brew install pecheriere/landfall/landfall
+# From the owner's tap, which every stable release reaches: packaging/homebrew-tap/README.md.
+brew install pecheriere/tap/landfall
 # Or a release's file, for Linux on arm64 or amd64, or macOS on arm64.
 gh release download <tag> --repo pecheriere/landfall --pattern 'landfall-*-darwin-arm64'
 ```
@@ -65,8 +65,9 @@ gh release download <tag> --repo pecheriere/landfall --pattern 'landfall-*-darwi
   [`SECURITY.md`](SECURITY.md), compare `SECURITY.md` with a copy you got some other way, and add
   `--source-digest` with the tag's commit. [The guide's first trust](docs/operations.md#first-trust) has
   the commands, as the key's file and the digest each need a particular form.
-- `brew install` checks only the SHA-256 in the tap's formula, so it trusts the tap, whose formula the
-  owner verified that way and copied by hand. Homebrew itself verifies neither the attestation nor the tag.
+- `brew install` checks only the SHA-256 in the tap's formula, so it trusts the tap, which pulls each
+  stable release itself and checks its formula's attestation, and the release's signed tag against the
+  tap's own copy of the key, before it merges. Homebrew itself verifies neither the attestation nor the tag.
 - `landfall host install` checks the tag's signature, the attestation and the sums every time, against
   what the installed `landfall` holds.
 - A browser download on macOS is quarantined: [the guide](docs/operations.md#first-trust) says what that

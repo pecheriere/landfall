@@ -1,12 +1,16 @@
 name: Release
 
-# A signed tag on main publishes attested binaries and an attested image. A manual run builds and
-# checks the same way, with no cache, but skips `preflight`, which needs a tag, and `publish`: it
-# attests nothing and writes nothing to the transparency log, so it is how to find most problems
-# before a tag spends a version number. CONTRIBUTING.md has the whole procedure, and
+# A signed tag on main publishes attested binaries and an attested image, with no one asked: the
+# tag's signature is the gate, proved by `preflight`, and checked again by every host and the tap.
+# A push to main that changes the workspace's version, and a manual run, are the dry run: they
+# build and check the same way, with no cache, but skip `preflight`, which needs a tag, and
+# `publish`, so they attest nothing and write nothing to the transparency log. That is how the
+# owner tags a commit that already passed, before a tag spends a version number. Any other push to
+# main stops after `version`. CONTRIBUTING.md has the whole procedure, and
 # test_release_workflow.py holds what this file must keep doing.
 on:
   push:
+    branches: [main]
     tags: ['v[0-9]*']
   workflow_dispatch:
 
@@ -14,14 +18,41 @@ permissions:
   contents: read
 
 jobs:
+  # Whether this run builds at all: a tag and a manual run always do, and a push to main only if it
+  # changed the version. Everything else needs `on-main`, so skipping that skips the whole run.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # For the commit main pointed at before the push, which needn't be this one's parent.
+          fetch-depth: 0
+          persist-credentials: false
+      - id: decide
+        name: Build on a tag, a manual run, or a push to main that changes the version
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != push ] || [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            python3 -I .github/scripts/version_bump.py --before "$BEFORE" --output "$GITHUB_OUTPUT"
+          fi
+
   on-main:
+    needs: version
+    if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Require the tagged commit to be on main
+      - name: Require the commit to be on main
         run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
 
   crate-age:
@@ -45,16 +76,16 @@ jobs:
     permissions:
       contents: read
 
-  # So a lightweight tag, or one signed by another key, costs a tag number and nothing else: this
-  # fails before anyone is asked to approve. It reads the signers from the tagged commit, and a
-  # file with no key in it refuses every tag.
+  # The gate: a lightweight tag, or one signed by another key, never reaches `publish`, and costs a
+  # tag number and nothing else. It reads the signers from the tagged commit, and a file with no key
+  # in it refuses every tag. Only a tag push: a push to main and a manual run skip it.
   preflight:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: on-main
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      # Here too, so that a re-run stops in seconds, and not after the builds and an approval.
+      # Here too, so that a re-run stops in seconds, and not after the builds.
       # The design's rule 4 refuses a release attested by two attempts, and a tag can't be moved.
       - name: Refuse a second attempt
         run: |
@@ -71,30 +102,6 @@ jobs:
         run: >-
           python3 -I .github/scripts/release_preflight.py
           --tag "$GITHUB_REF_NAME" --sha "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
-
-  # GitHub silently creates a missing environment with no protection, so `publish` needs this to
-  # have read the real one. A 404 for the environment fails the step. One for the policies, which
-  # is what an environment without any answers, is left for the script to name.
-  environment-guard:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      actions: read # to read the environment
-      contents: read # for the checkout
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Refuse an environment that holds nothing back
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/environments/release" > "$RUNNER_TEMP/environment.json"
-          gh api "repos/$GITHUB_REPOSITORY/environments/release/deployment-branch-policies" \
-            > "$RUNNER_TEMP/policies.json" || true
-          python3 -I .github/scripts/check_environment.py "$RUNNER_TEMP/environment.json" \
-            "$RUNNER_TEMP/policies.json"
 
   build-linux:
     needs: on-main
@@ -130,7 +137,8 @@ jobs:
         with:
           name: binaries-linux
           path: dist
-          retention-days: 7
+          # Only `smoke` and `publish`, later in this same run, read it.
+          retention-days: 1
           if-no-files-found: error
 
   build-macos:
@@ -155,10 +163,11 @@ jobs:
         with:
           name: binaries-macos
           path: target/aarch64-apple-darwin/release/landfall
-          retention-days: 7
+          # Only `smoke` and `publish`, later in this same run, read it.
+          retention-days: 1
           if-no-files-found: error
 
-  # The only run the release's own files get on a real kernel of each kind, before anyone is asked.
+  # The only run the release's own files get on a real kernel of each kind, before `publish`.
   # By id, here and in `publish`: anything else in this run holding a runtime token, such as a
   # test in `ci`, could overwrite an artifact by its name. That gives it a new id and removes the
   # old one, so a download by id fails rather than take the replacement.
@@ -194,25 +203,26 @@ jobs:
             chmod +x "binaries/$binary"
             actual=$("binaries/$binary" --version)
             echo "$binary: $actual"
-            if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ "$GITHUB_REF_TYPE" = tag ]; then
               test "$actual" = "${binary##*/} ${GITHUB_REF_NAME#v}"
             fi
           done
 
+  # No environment and no approval: a stolen token could approve one through the API, and can't
+  # forge the tag's signature, which `preflight` has proved by now.
   publish:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs:
+      - version
       - on-main
       - crate-age
       - ci
       - preflight
-      - environment-guard
       - build-linux
       - build-macos
       - smoke
     runs-on: ubuntu-latest
-    environment: release
-    # Rebuilds the image with no cache. The wait for approval doesn't count.
+    # Rebuilds the image with no cache.
     timeout-minutes: 60
     permissions:
       contents: write # to create the release

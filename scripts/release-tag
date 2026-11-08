@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""Sign the release tag for a version: the one thing the owner does for each release.
+
+Run it on your own machine, from a clone of the repository. Agents never run it: a release tag is
+what every host and the Homebrew tap trust, and only the owner signs one. It asks the owner to type
+the version on a terminal, with no flag to skip that, and refuses when stdin isn't one. It refuses
+unless all of these hold, and changes nothing until they do:
+
+- the checkout has no changes and no untracked files;
+- `origin/main`, freshly fetched, is exactly `--commit`, the merge commit of the version bump the
+  owner reviewed, so nothing that landed after it is signed unseen;
+- that commit has `workspace.package.version` equal to VERSION, and its release signers file
+  holds a key;
+- tag `vVERSION` exists neither here nor on origin;
+- a run of the Release workflow for exactly that commit, on main, succeeded, with every build
+  and check of the dry run green: the automatic one that a version bump starts, or a manual one;
+- the keys in the repository's release signers file at that commit are exactly the keys in the
+  owner's trusted signers file (`--trusted-signers`, by default
+  `$XDG_CONFIG_HOME/landfall/release-signers`): outside the checkout, not a link, owned by the
+  owner or by root, and writable by its owner alone. A root-owned one keeps the key list from
+  being changed without sudo. Nothing here holds against code running as the owner, which can
+  wrap `git` on PATH or edit this script: there, only the release key's prompt before each
+  signature and the owner's judgment remain, so release with no unattended agents running.
+
+What the repository says can be written by anyone who lands a commit, so the trusted file is the
+anchor. The last release is the highest `v*` tag behind the commit that a trusted key signed: a
+key added to the repository's file can't certify a tag here, and every `v*` tag above it that no
+trusted key signed is named in a warning. Before asking, it shows the commit, the dry run, every
+commit since that release with its signature status and files, and in full any change to the
+signers file, `.github/`, this script, `Cargo.toml`, `Cargo.lock`, and the code that reads the
+signers or checks tags, attestations and release files (`TRUST_CODE`). With no such release
+behind it, it shows the signers file whole with its fingerprints, lists `.github/`, `Cargo.lock`
+and that code by name, and shows the rest whole. Control characters in anything git prints are
+shown as escapes, so a commit can't rewrite what the owner reads.
+
+Then it runs `git tag -s vVERSION <commit> -m vVERSION` with git's signing key, or the one given by
+`--signing-key`, checks the tag's signature against the signers file at that commit, and deletes
+the tag again if that check fails, so a wrong key costs nothing. Last, it prints the push command,
+or pushes the tag with `--push`, saying first what it pushes.
+
+No value reaches a shell: `git` and `gh` get argument lists, and every value from outside is
+checked against a pattern first.
+
+Usage:
+  scripts/release-tag VERSION --commit SHA [--trusted-signers FILE] [--signing-key KEY] [--push]
+"""
+
+import argparse
+import base64
+import binascii
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+# The same as `release_preflight.py`'s, which decides in CI what a release's version can be.
+VERSION = re.compile(
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+)
+REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.+$)[A-Za-z0-9._-]+")
+COMMIT = re.compile(r"[0-9a-f]{40}")
+RUN_ID = re.compile(r"[1-9][0-9]*")
+ORIGIN = re.compile(
+    r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"(?P<repo>[^/\s]+/[^/\s]+?)(?:\.git)?/?"
+)
+SIGNING_KEY = re.compile(r"[^\x00-\x1f\x7f]+")
+
+WORKFLOW = ".github/workflows/release.yml"
+SIGNERS_FILE = "crates/cli/assets/release-signers"
+PRINCIPAL = "landfall-release"
+MAIN = "main"
+# main, and the release tags, whose signatures say where the last release was. Not forced: a local
+# tag that differs from origin's fails the fetch.
+FETCH_REFSPECS = (f"+refs/heads/{MAIN}:refs/remotes/origin/{MAIN}", "refs/tags/v*:refs/tags/v*")
+# What decides what a release trusts or how it's built is shown in full before signing (SENSITIVE,
+# below). It includes the code and data that decide whom a release's binaries trust, and whether a
+# host or the CLI lets a verification gate an install or a deploy, as a release can change those
+# without touching the signers file: all of `landfall-origin`, with its embedded Sigstore root.
+TRUST_CODE = (
+    "crates/origin/Cargo.toml",
+    "crates/origin/src/",
+    "crates/origin/assets/",
+    "crates/core/src/tag.rs",
+    "crates/core/src/release.rs",
+    "crates/core/src/config/",
+    "crates/agent/src/daemon.rs",
+    "crates/agent/src/daemon/verifier.rs",
+    "crates/agent/src/daemon/judge.rs",
+    "crates/cli/src/verify.rs",
+    "crates/cli/src/host.rs",
+    "crates/cli/src/host/",
+    "crates/cli/src/project.rs",
+    "crates/cli/src/agent_release.rs",
+    "crates/cli/assets/",
+)
+SENSITIVE = (
+    SIGNERS_FILE,
+    ".github/",
+    "scripts/release-tag",
+    "Cargo.toml",
+    "Cargo.lock",
+    *TRUST_CODE,
+)
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+# Listed by name, not in full, when no release came before: whole, they are thousands of lines.
+LISTED_FIRST = (".github/", "Cargo.lock", *TRUST_CODE)
+TRUSTED_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]{68}")
+MAX_TRUSTED_BYTES = 64 * 1024
+# What git prints can come from anyone who lands a commit. These would let it move the cursor,
+# erase what was shown or reorder it: C0 but newline and tab, DEL, C1, and Unicode's bidi controls.
+UNSAFE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+DRY_RUN_EVENTS = frozenset({"push", "workflow_dispatch"})
+# What a dry run must have run and passed. `preflight` and `publish` want a tag, so they skip.
+REQUIRED_JOBS = ("version", "on-main", "crate-age", "build-linux", "build-macos")
+SMOKE_PREFIX = "smoke ("
+SMOKE_RUNS = 3
+CI_PREFIX = "ci / "
+TAG_ONLY_JOBS = ("preflight", "publish")
+FINE = frozenset({"success", "skipped"})
+COMMAND_TIMEOUT_SECONDS = 120
+MAX_SHOWN = 200
+
+Run = Callable[[Sequence[str]], subprocess.CompletedProcess]
+
+
+class RefusedError(Exception):
+    """The tag must not be made, for the reason given."""
+
+
+def shown(value: object) -> str:
+    """Return a value safe to print on one line, and not too long."""
+    text = ascii(str(value))[1:-1]
+    return text if len(text) <= MAX_SHOWN else f"{text[:MAX_SHOWN]}..."
+
+
+def print_safe(text: str) -> str:
+    """Return git's output with every control a terminal would act on shown as an escape."""
+    return UNSAFE.sub(lambda found: ascii(found.group())[1:-1], text)
+
+
+def run_command(args: Sequence[str]) -> subprocess.CompletedProcess:
+    """Run a command with an argument list, never a shell, and capture what it says."""
+    try:
+        return subprocess.run(
+            list(args),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        msg = f"{args[0]} could not run: {shown(error)}"
+        raise RefusedError(msg) from error
+
+
+def output_of(run: Run, args: Sequence[str]) -> str:
+    """Return what a command printed, refusing if it failed."""
+    result = run(args)
+    if result.returncode != 0:
+        msg = f"`{' '.join(args[:3])} ...` failed: {shown(result.stderr.strip())}"
+        raise RefusedError(msg)
+    return result.stdout
+
+
+def repository_of(url: str) -> str:
+    """Return owner/name for a GitHub remote's URL."""
+    found = ORIGIN.fullmatch(url.strip())
+    if found is None or not REPOSITORY.fullmatch(found.group("repo")):
+        msg = f"origin is not a GitHub repository: {shown(url.strip())}"
+        raise RefusedError(msg)
+    return found.group("repo")
+
+
+def workspace_version(text: str) -> str:
+    """Return `workspace.package.version` from a `Cargo.toml`'s text."""
+    try:
+        version = tomllib.loads(text)["workspace"]["package"]["version"]
+    except (tomllib.TOMLDecodeError, KeyError, TypeError) as error:
+        msg = f"Cargo.toml has no readable workspace.package.version: {shown(error)}"
+        raise RefusedError(msg) from error
+    if not isinstance(version, str):
+        msg = f"Cargo.toml's version isn't a string: {shown(version)}"
+        raise RefusedError(msg)
+    return version
+
+
+def signer_keys(text: str) -> list[str]:
+    """Return the key lines of the signers file, read as preflight reads it."""
+    keys = [line for line in text.split("\n") if line and not line.startswith("#")]
+    if not keys:
+        msg = f"{SIGNERS_FILE} holds no key, so preflight would refuse every tag"
+        raise RefusedError(msg)
+    return keys
+
+
+def dry_runs(answer: object, sha: str) -> list[str]:
+    """Return the ids of successful dry runs of this commit on main, newest first."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("workflow_runs"), list):
+        msg = "GitHub's list of runs isn't one"
+        raise RefusedError(msg)
+    found = []
+    for run in answer["workflow_runs"]:
+        if not isinstance(run, dict):
+            continue
+        if (
+            run.get("head_sha") == sha
+            and run.get("head_branch") == MAIN
+            and run.get("event") in DRY_RUN_EVENTS
+            and run.get("path") == WORKFLOW
+            and run.get("status") == "completed"
+            and run.get("conclusion") == "success"
+            and RUN_ID.fullmatch(str(run.get("id")))
+        ):
+            found.append(str(run["id"]))
+    return found
+
+
+def job_results(answer: object) -> dict[str, list[Any]]:
+    """Return each job's conclusions by name, from GitHub's list of a run's jobs."""
+    if not isinstance(answer, dict) or not isinstance(answer.get("jobs"), list):
+        msg = "GitHub's list of jobs isn't one"
+        raise RefusedError(msg)
+    jobs: dict[str, list[Any]] = {}
+    for job in answer["jobs"]:
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            msg = "a job in GitHub's list has no name"
+            raise RefusedError(msg)
+        jobs.setdefault(job["name"], []).append(job.get("conclusion"))
+    return jobs
+
+
+def conclusions(jobs: dict[str, list[Any]], prefix: str) -> list[Any]:
+    """Return the conclusions of every job whose name starts with this."""
+    return [
+        result for name, results in jobs.items() if name.startswith(prefix) for result in results
+    ]
+
+
+def jobs_faults(jobs: dict[str, list[Any]]) -> list[str]:
+    """Say why a run's jobs aren't a full, green dry run. Nothing said means they are."""
+    faults = []
+    bad = sorted(name for name, results in jobs.items() if not set(results) <= FINE)
+    if bad:
+        faults.append(f"these jobs didn't pass: {', '.join(bad)}")
+    faults += [
+        f"`{name}` didn't run and pass, so this run built nothing"
+        for name in REQUIRED_JOBS
+        if jobs.get(name) != ["success"]
+    ]
+    smoke = conclusions(jobs, SMOKE_PREFIX).count("success")
+    if smoke != SMOKE_RUNS:
+        faults.append(f"`smoke` passed on {smoke} runners, not {SMOKE_RUNS}")
+    if "success" not in conclusions(jobs, CI_PREFIX):
+        faults.append("no job of `ci` ran and passed")
+    faults += [
+        f"`{name}` ran, which a dry run never does"
+        for name in TAG_ONLY_JOBS
+        if jobs.get(name, ["skipped"]) != ["skipped"]
+    ]
+    return faults
+
+
+def gh_json(run: Run, path: str, fields: dict[str, str]) -> object:
+    """Return a GitHub API answer, read with `gh api` and these query fields."""
+    args = ["gh", "api", "--method", "GET", path]
+    for key, value in fields.items():
+        args += ["-f", f"{key}={value}"]
+    text = output_of(run, args)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        msg = f"GitHub's answer for {path} isn't JSON: {shown(error)}"
+        raise RefusedError(msg) from error
+
+
+def require_dry_run(run: Run, repo: str, sha: str) -> str:
+    """Return the id of a full, green dry run of this commit, or refuse."""
+    runs = gh_json(
+        run,
+        f"repos/{repo}/actions/workflows/release.yml/runs",
+        {"head_sha": sha, "per_page": "100"},
+    )
+    ids = dry_runs(runs, sha)
+    if not ids:
+        msg = (
+            f"no Release run for {sha} on main succeeded. A version bump starts one when it lands; "
+            "otherwise run the workflow by hand on main, and wait for it to pass"
+        )
+        raise RefusedError(msg)
+    faults = []
+    for run_id in ids:
+        found = jobs_faults(
+            job_results(
+                gh_json(
+                    run,
+                    f"repos/{repo}/actions/runs/{run_id}/jobs",
+                    {"filter": "latest", "per_page": "100"},
+                )
+            )
+        )
+        if not found:
+            return run_id
+        faults.append(f"run {run_id}: {', '.join(found)}")
+    msg = f"no successful Release run for {sha} was a full dry run: {'; '.join(faults)}"
+    raise RefusedError(msg)
+
+
+def require_clean(run: Run) -> None:
+    """Refuse a checkout with changes, so nothing local stands in for what's on main."""
+    status = output_of(run, ["git", "status", "--porcelain", "--untracked-files=normal"])
+    if status.strip():
+        msg = "the checkout has changes or untracked files: commit or remove them first"
+        raise RefusedError(msg)
+
+
+def require_new_tag(run: Run, tag: str) -> None:
+    """Refuse a tag that exists here or on origin: a tag can't be moved, or used twice."""
+    if run(["git", "rev-parse", "--quiet", "--verify", f"refs/tags/{tag}"]).returncode == 0:
+        msg = f"{tag} already exists here"
+        raise RefusedError(msg)
+    if output_of(run, ["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"]).strip():
+        msg = f"{tag} already exists on origin: bump the version by a pull request instead"
+        raise RefusedError(msg)
+
+
+def signature_check(run: Run, ref: str, keys: list[str]) -> subprocess.CompletedProcess:
+    """Have git check a tag's signature against an allowed-signers file of these keys."""
+    with tempfile.TemporaryDirectory() as directory:
+        allowed = Path(directory) / "allowed_signers"
+        allowed.write_text("".join(f"{PRINCIPAL} {key}\n" for key in keys), encoding="utf-8")
+        return run(
+            [
+                "git",
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                f"gpg.ssh.allowedSignersFile={allowed}",
+                "verify-tag",
+                ref,
+            ]
+        )
+
+
+def tag_commit(run: Run, tag: str) -> str:
+    """Return the commit a local tag names."""
+    return output_of(run, ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"]).strip()
+
+
+def verify_tag(run: Run, tag: str, sha: str, keys: list[str]) -> None:
+    """Check the new tag names this commit and is signed by a release key."""
+    if tag_commit(run, tag) != sha:
+        msg = f"{tag} doesn't name {sha}"
+        raise RefusedError(msg)
+    result = signature_check(run, f"refs/tags/{tag}", keys)
+    if result.returncode != 0:
+        msg = (
+            f"{tag} isn't signed by a key in {SIGNERS_FILE} at {sha}: "
+            f"{shown(result.stderr.strip())}. Pass the release key with --signing-key"
+        )
+        raise RefusedError(msg)
+
+
+def previous_release(run: Run, sha: str, trusted: list[str]) -> tuple[str | None, list[str]]:
+    """Return the highest release tag behind this commit that a trusted key signed, if any.
+
+    Trusted means in the owner's own file, outside the repository: a key someone added to the
+    repository's signers file can't certify a tag here. Also return every `v*` tag above it that
+    doesn't verify against those keys, which the owner is warned about.
+    """
+    listed = output_of(
+        run,
+        [
+            "git",
+            "-c",
+            "versionsort.suffix=-",
+            "tag",
+            "--merged",
+            sha,
+            "--list",
+            "v[0-9]*",
+            "--sort=-v:refname",
+            "--format=%(refname:strip=2) %(objecttype)",
+        ],
+    )
+    unverified = []
+    for line in listed.splitlines():
+        name, _, kind = line.partition(" ")
+        if (
+            kind == "tag"
+            and VERSION.fullmatch(name.removeprefix("v"))
+            and signature_check(run, f"refs/tags/{name}", trusted).returncode == 0
+        ):
+            return name, unverified
+        unverified.append(name)
+    return None, unverified
+
+
+def fingerprint(line: str) -> str:
+    """Return a signers line's key as `ssh-keygen -l` names it, or say why it can't be read."""
+    fields = line.split(" ")
+    try:
+        blob = base64.b64decode(fields[1], validate=True)
+    except (IndexError, binascii.Error):
+        return f"(not a key: {shown(line)})"
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+    return f"SHA256:{digest}"
+
+
+def fingerprints(keys: list[str]) -> str:
+    """Return the fingerprints of these keys, sorted, one per line."""
+    return "\n".join(f"  {print_safe(fingerprint(key))}" for key in sorted(keys)) or "  (none)"
+
+
+def default_trusted_signers(environ: dict[str, str], home: Path) -> Path:
+    """Return where the owner keeps the release keys they trust, outside any clone."""
+    config = environ.get("XDG_CONFIG_HOME") or str(home / ".config")
+    return Path(config) / "landfall" / "release-signers"
+
+
+def open_trusted(path: Path, checkout: Path) -> int:
+    """Open the owner's trusted signers file, outside the checkout, never through a link."""
+    if (path.parent.resolve() / path.name).is_relative_to(checkout.resolve()):
+        msg = f"the trusted signers file at {path} is inside the checkout, which it must not trust"
+        raise RefusedError(msg)
+    try:
+        # Not waiting on a pipe; O_NOFOLLOW makes a link fail, with ELOOP.
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError as error:
+        msg = (
+            f"there is no trusted signers file at {path}. Make it from SECURITY.md, after "
+            "comparing the fingerprints with a copy you got some other way, as CONTRIBUTING says"
+        )
+        raise RefusedError(msg) from error
+    except OSError as error:
+        msg = f"the trusted signers file at {path} is a link or can't be read: {shown(error)}"
+        raise RefusedError(msg) from error
+
+
+def check_trusted(status: os.stat_result, path: Path, uid: int) -> None:
+    """Refuse an open file that isn't regular, the owner's or root's, and theirs alone to write."""
+    if not stat.S_ISREG(status.st_mode):
+        msg = f"the trusted signers file at {path} is not a file"
+        raise RefusedError(msg)
+    if status.st_uid not in {0, uid}:
+        msg = f"the trusted signers file at {path} belongs to someone else (uid {status.st_uid})"
+        raise RefusedError(msg)
+    if status.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        msg = f"the trusted signers file at {path} can be written by others: chmod go-w it"
+        raise RefusedError(msg)
+
+
+def trusted_text(path: Path, checkout: Path, uid: int) -> str:
+    """Return the owner's trusted signers file, checked and read through one open descriptor.
+
+    The checks are made on the open file, so nothing can be swapped in between them and the read.
+    """
+    descriptor = open_trusted(path, checkout)
+    try:
+        check_trusted(os.fstat(descriptor), path, uid)
+        content = b""
+        while len(content) <= MAX_TRUSTED_BYTES:
+            chunk = os.read(descriptor, MAX_TRUSTED_BYTES + 1 - len(content))
+            if not chunk:
+                break
+            content += chunk
+    finally:
+        os.close(descriptor)
+    if len(content) > MAX_TRUSTED_BYTES:
+        msg = f"the trusted signers file at {path} is too large to be a list of keys"
+        raise RefusedError(msg)
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        msg = f"the trusted signers file at {path} isn't text"
+        raise RefusedError(msg) from error
+
+
+def read_trusted(path: Path, checkout: Path, uid: int) -> list[str]:
+    """Return the keys in the owner's own signers file, which the repository can't change."""
+    text = trusted_text(path, checkout, uid)
+    keys = [k for k in text.split("\n") if k and not k.startswith("#")]
+    if not keys:
+        msg = f"the trusted signers file at {path} holds no key"
+        raise RefusedError(msg)
+    if not all(TRUSTED_KEY.fullmatch(k) for k in keys):
+        msg = f"the trusted signers file at {path} has a line that isn't ssh-ed25519 <base64>"
+        raise RefusedError(msg)
+    return keys
+
+
+@dataclass(frozen=True)
+class Request:
+    """What the owner asked for."""
+
+    version: str
+    commit: str
+    trusted_signers: Path
+    signing_key: str | None = None
+    push: bool = False
+
+
+@dataclass(frozen=True)
+class Terminal:
+    """How the command talks to the owner, so tests can stand in for a person."""
+
+    say: Callable[[str], None]
+    ask: Callable[[str], str]
+    is_tty: Callable[[], bool]
+
+
+@dataclass(frozen=True)
+class Ready:
+    """A commit that may be tagged, and what the owner is shown about it."""
+
+    tag: str
+    sha: str
+    run_id: str
+    keys: list[str]
+    trusted: list[str]
+    previous: str | None
+    unverified: list[str]
+
+
+def check_request(request: Request, terminal: Terminal) -> None:
+    """Refuse a request that can't be right, before anything runs."""
+    if not VERSION.fullmatch(request.version):
+        msg = f"{shown(request.version)} is not a version a release can have"
+        raise RefusedError(msg)
+    if not COMMIT.fullmatch(request.commit):
+        msg = f"--commit {shown(request.commit)} is not a full commit id"
+        raise RefusedError(msg)
+    if request.signing_key is not None and not SIGNING_KEY.fullmatch(request.signing_key):
+        msg = "the signing key holds a control character"
+        raise RefusedError(msg)
+    if not terminal.is_tty():
+        msg = "this asks the owner to type the version, and stdin isn't a terminal"
+        raise RefusedError(msg)
+
+
+def ready(request: Request, trusted: list[str], run: Run) -> Ready:
+    """Check everything that decides whether this commit may be tagged."""
+    tag = f"v{request.version}"
+    require_clean(run)
+    repo = repository_of(output_of(run, ["git", "remote", "get-url", "origin"]))
+    output_of(run, ["git", "fetch", "--no-tags", "origin", *FETCH_REFSPECS])
+    sha = output_of(
+        run, ["git", "rev-parse", "--verify", f"refs/remotes/origin/{MAIN}^{{commit}}"]
+    ).strip()
+    if sha != request.commit:
+        msg = (
+            f"origin/main is at {shown(sha)}, not {request.commit}: something landed after the "
+            "commit you named. Look at it, then name the commit you mean to release"
+        )
+        raise RefusedError(msg)
+    found = workspace_version(output_of(run, ["git", "show", f"{sha}:Cargo.toml"]))
+    if found != request.version:
+        msg = f"{sha} is at version {shown(found)}, not {request.version}"
+        raise RefusedError(msg)
+    keys = signer_keys(output_of(run, ["git", "show", f"{sha}:{SIGNERS_FILE}"]))
+    require_new_tag(run, tag)
+    run_id = require_dry_run(run, repo, sha)
+    previous, unverified = previous_release(run, sha, trusted)
+    return Ready(tag, sha, run_id, keys, trusted, previous, unverified)
+
+
+def show_changes(state: Ready, run: Run, say: Callable[[str], None]) -> None:
+    """Show every commit since the last release, and what decides a release, changed or whole."""
+    span = f"{state.previous}..{state.sha}" if state.previous else state.sha
+    say(print_safe(output_of(run, ["git", "log", "--format=%H %G? %an %s", "--stat", span])))
+    diff = ["git", "diff", "--no-ext-diff", "--no-color"]
+    if state.previous is not None:
+        say(f"Changes to what decides a release ({', '.join(SENSITIVE)}):")
+        changed = output_of(run, [*diff, state.previous, state.sha, "--", *SENSITIVE])
+        say(print_safe(changed) or "(none)")
+        return
+    say(f"{SIGNERS_FILE} at {state.sha}, whole:")
+    say(print_safe(output_of(run, ["git", "show", f"{state.sha}:{SIGNERS_FILE}"])))
+    say(fingerprints(state.keys))
+    say(f"Files in {', '.join(LISTED_FIRST)}, by name only, as nothing came before:")
+    listed = output_of(run, [*diff, "--stat", EMPTY_TREE, state.sha, "--", *LISTED_FIRST])
+    say(print_safe(listed) or "(none)")
+    whole = [path for path in SENSITIVE if path not in {SIGNERS_FILE, *LISTED_FIRST}]
+    say(f"{', '.join(whole)}, whole:")
+    say(print_safe(output_of(run, [*diff, EMPTY_TREE, state.sha, "--", *whole])) or "(none)")
+
+
+def show(state: Ready, run: Run, say: Callable[[str], None]) -> None:
+    """Show the owner what the tag would release, and refuse signers they don't already trust."""
+    say(f"Release {state.tag}: commit {state.sha}, dry run {state.run_id} passed.")
+    if state.unverified:
+        names = ", ".join(print_safe(name) for name in state.unverified)
+        say(
+            f"WARNING: these tags behind {state.sha} are above the last release a key you trust "
+            f"signed, and no key you trust signed them: {names}. Find out who made them."
+        )
+    if state.previous is not None:
+        say(f"Since {print_safe(state.previous)}, the last release a key you trust signed:")
+    else:
+        say("Since the first commit: no release behind it is signed by a key you trust.")
+    show_changes(state, run, say)
+    if set(state.keys) != set(state.trusted):
+        say(f"Release keys in {SIGNERS_FILE} at {state.sha}:")
+        say(fingerprints(state.keys))
+        say("Release keys in your trusted signers file:")
+        say(fingerprints(state.trusted))
+        msg = (
+            f"the keys in {SIGNERS_FILE} at {state.sha} aren't the keys you trust. Compare both "
+            "with SECURITY.md and with a copy you got some other way. If this is a rotation you "
+            "meant, update your trusted signers file first"
+        )
+        raise RefusedError(msg)
+
+
+def release_tag(request: Request, run: Run, terminal: Terminal) -> str:
+    """Make, check and maybe push the tag, once the owner has seen it and typed the version."""
+    check_request(request, terminal)
+    checkout = Path(output_of(run, ["git", "rev-parse", "--show-toplevel"]).strip())
+    trusted = read_trusted(request.trusted_signers, checkout, os.getuid())
+    state = ready(request, trusted, run)
+    show(state, run, terminal.say)
+    try:
+        typed = terminal.ask(f"Type {request.version} to sign {state.tag} at {state.sha}: ")
+    except EOFError as error:
+        msg = "no confirmation was typed"
+        raise RefusedError(msg) from error
+    if typed.strip() != request.version:
+        msg = f"you typed {shown(typed.strip())}, not {request.version}: nothing was signed"
+        raise RefusedError(msg)
+
+    signing = ["-c", f"user.signingkey={request.signing_key}"] if request.signing_key else []
+    output_of(run, ["git", *signing, "tag", "--sign", "--message", state.tag, state.tag, state.sha])
+    try:
+        verify_tag(run, state.tag, state.sha, state.keys)
+    except RefusedError:
+        output_of(run, ["git", "tag", "--delete", state.tag])
+        raise
+    push_args = ["git", "push", "origin", f"refs/tags/{state.tag}"]
+    terminal.say(f"Signed {state.tag} at {state.sha}, whose dry run {state.run_id} passed.")
+    if request.push:
+        terminal.say(f"Pushing {state.tag} at {state.sha} (dry run {state.run_id}).")
+        output_of(run, push_args)
+        return "Pushed: the Release workflow publishes from here."
+    return f"Push it to release:\n  {' '.join(push_args)}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Make the tag, or say why not."""
+    parser = argparse.ArgumentParser(description="Sign the release tag for a version.")
+    parser.add_argument("version", help="the version, without the v, such as 0.2.0")
+    parser.add_argument(
+        "--commit",
+        required=True,
+        help="the commit to tag: the merge commit of the version bump you reviewed",
+    )
+    parser.add_argument(
+        "--trusted-signers",
+        type=Path,
+        default=default_trusted_signers(dict(os.environ), Path.home()),
+        help=(
+            "the release keys you trust, kept outside any clone, as crates/cli/assets/"
+            "release-signers is written (default: $XDG_CONFIG_HOME/landfall/release-signers)"
+        ),
+    )
+    parser.add_argument(
+        "--signing-key",
+        help='git\'s user.signingkey for this tag, such as "key::ssh-ed25519 <base64>"',
+    )
+    parser.add_argument("--push", action="store_true", help="push the tag once it's made")
+    args = parser.parse_args(argv)
+    request = Request(args.version, args.commit, args.trusted_signers, args.signing_key, args.push)
+    terminal = Terminal(say=print, ask=input, is_tty=sys.stdin.isatty)
+    try:
+        print(release_tag(request, run_command, terminal))
+    except RefusedError as refusal:
+        print(f"release-tag: refused: {refusal}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
