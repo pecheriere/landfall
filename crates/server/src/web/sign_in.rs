@@ -49,7 +49,7 @@ use serde_json::json;
 use super::ceremonies::{CHALLENGE_LIFETIME_SECS, FailureKind, Full};
 use super::registration::new_challenge;
 use super::{NO_STORE, admit, charge, charged, count_failure, parsed};
-use crate::agent_api::{ApiState, json as json_answer};
+use crate::agent_api::{ApiProblem, ApiState, json as json_answer, read_body};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{
     HumanProblem, Leaving, SESSION_COOKIE, Spender, named_in_config, session_of, spend_budget,
@@ -73,6 +73,14 @@ pub(super) const NOBODYS_KEY: [u8; 77] = [
     0x57, 0x6b, 0x31, 0x5e, 0xce, 0xcb, 0xb6, 0x40, 0x68, 0x37, 0xbf, 0x51, 0xf5,
 ];
 
+/// The page's `{}`, with room for whitespace.
+pub(super) const MAX_BEGIN_BODY_BYTES: usize = 64;
+
+/// The body of `begin`, if it has one: it names nobody.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BeginBody {}
+
 /// The body of `finish`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,13 +92,20 @@ struct FinishBody {
 
 /// `POST /sign-in/begin`: options for `navigator.credentials.get()`, naming nobody. The
 /// relying party is the origin's own hostname, which is the browser's default.
+///
+/// The body, `{}` from the page or none at all, is read whole before the answer goes: an answer
+/// sent with part of a body unread can be lost to the reset that closing the connection causes.
 pub(super) async fn begin(
     State(state): State<ApiState>,
     request: Request<Body>,
 ) -> Result<Response, HumanProblem> {
-    let (parts, _) = request.into_parts();
+    let (parts, body) = request.into_parts();
     admit(&state, &parts)?;
     charge(&state, &parts)?;
+    let sent = read_body(body, MAX_BEGIN_BODY_BYTES, state.limits().body_timeout).await?;
+    if !sent.is_empty() {
+        let BeginBody {} = serde_json::from_slice(&sent).map_err(|_| ApiProblem::BadRequest)?;
+    }
     let challenge = new_challenge()?;
     let opened = state
         .ceremonies()

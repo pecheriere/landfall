@@ -1,6 +1,7 @@
 //! Signing in: whose key opens what, and what a refusal gives away.
 
-use axum::http::{StatusCode, header};
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode, header};
 use landfall_approval::{Ceremony, SoftwareAuthenticator};
 use serde_json::json;
 
@@ -380,6 +381,29 @@ async fn beginning_a_sign_in_names_no_one() {
     let text = String::from_utf8(answer.body.clone()).unwrap();
     assert!(!text.contains("gina"));
     assert!(!text.contains("alice"));
+}
+
+/// It reads what the page sends, `{}`, before it answers: an answer sent with part of a body
+/// unread can be lost to the reset that closing the connection then causes. So no body at all is
+/// fine, and anything but `{}` in one is seen, and refused.
+#[tokio::test]
+async fn beginning_a_sign_in_reads_its_body() {
+    let h = Harness::new().await;
+    assert_eq!(
+        h.post(SIGN_IN_BEGIN, None, &json!({})).await.status,
+        StatusCode::OK
+    );
+    let none = Request::builder()
+        .method(Method::POST)
+        .uri(SIGN_IN_BEGIN)
+        .header(header::ORIGIN, ORIGIN)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(h.send(none).await.status, StatusCode::OK);
+    for body in [json!({ "name": "alice" }), json!(null), json!("{}")] {
+        let answer = h.post(SIGN_IN_BEGIN, None, &body).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{body}");
+    }
 }
 
 #[tokio::test]
