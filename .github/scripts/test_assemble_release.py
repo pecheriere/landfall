@@ -279,7 +279,7 @@ class AssembleTests(TempDirTestCase):
         macos = block(formula, "on_macos do")
         linux = block(formula, "on_linux do")
         platforms = {
-            "landfall-1.2.3-darwin-arm64": macos,
+            "landfall-1.2.3-darwin-arm64": block(macos, "on_arm do"),
             "landfall-1.2.3-linux-arm64": block(linux, "on_arm do"),
             "landfall-1.2.3-linux-amd64": block(linux, "on_intel do"),
         }
@@ -294,9 +294,13 @@ class AssembleTests(TempDirTestCase):
                     ],
                     [f'url "{base}/{name}"', f'sha256 "{digest}"'],
                 )
-        self.assertIn("depends_on arch: :arm64", macos)
+        # Homebrew's layout: `on_macos` may hold `depends_on` and another `on_*`, never a `url`.
+        self.assertTrue(macos.startswith("    depends_on arch: :arm64\n"), macos)
+        self.assertNotIn("\n    url ", macos)
+        self.assertNotIn("\n    sha256 ", macos)
         self.assertIn('homepage "https://github.com/owner/landfall"', formula)
-        self.assertIn('version "1.2.3"', formula)
+        # `brew audit --strict` calls it redundant: Homebrew reads the version from the URL.
+        self.assertNotIn("\n  version ", formula)
 
     def test_formula_installs_the_one_binary_as_landfall(self) -> None:
         """A raw file arrives under its asset name, and the command is `landfall`."""
@@ -338,7 +342,6 @@ class AssembleTests(TempDirTestCase):
         expected = {name.replace("1.2.3", "1.2.3-rc.1") for name in BINARIES}
         self.assertEqual(names, {*expected, *OTHERS})
         formula = (self.out / "landfall.rb").read_text(encoding="utf-8")
-        self.assertIn('version "1.2.3-rc.1"', formula)
         self.assertIn(
             "releases/download/v1.2.3-rc.1/landfall-1.2.3-rc.1-linux-arm64",
             formula,
