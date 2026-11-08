@@ -1124,9 +1124,15 @@ missing; `--cli-config` names another, which then must exist. A file with any ot
 **The token never goes on the command line,** where other users of the machine can read it in the
 process list. It comes from `LANDFALL_TOKEN`, or from a file, and from one place only: two set is an
 error, so that nothing has to choose between them. The file must be a regular file and not a link,
-owned by the user running `landfall`, readable and writable by them alone (`chmod 600`), and at most
-256 bytes, one line of letters, digits, `_` and `-`. Its contents are never printed, in an error or
-otherwise. **With no token set, none is sent:** no `Authorization` header at all.
+owned by the user running `landfall`, with no permission for its group or others (`chmod 600` does
+it; `400` passes too), and at most 256 bytes, one line of letters, digits, `_` and `-`. Its contents
+are never printed, in an error or otherwise. **With no token set, none is sent:** no
+`Authorization` header at all.
+
+**Don't type `export LANDFALL_TOKEN=...` at a prompt:** the token stays in the shell's history.
+Use a token file, or put it in the environment from a secret manager without typing it, such as
+`export LANDFALL_TOKEN="$(secret-tool lookup service landfall)"`, and for a service, its
+supervisor's credential setting, as [`GITHUB_TOKEN`](#github_token) shows for the controller.
 
 **No proxy is used.** `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` are ignored, so nothing in the
 environment can route the token through someone else's machine. No redirect is followed either,
@@ -1147,7 +1153,8 @@ controller is never asked over `http://`.
 
 **For an agent,** `--json` prints the controller's answer as it was received, with the fields
 [the API](api.md) documents, laid out and with control, bidi and invisible characters escaped as
-`\uXXXX`. Without it, everything the controller sent is escaped before it reaches the terminal: C0
+`\uXXXX`. The one exception is `status` with no deployment, which joins the items of the pages it
+read into one document, `{"items": [...]}`, with `"stopped"` when it stopped early. Without it, everything the controller sent is escaped before it reaches the terminal: C0
 and C1 controls, DEL, the bidi and line controls and the invisible characters as `\u{...}`, and a
 backslash doubled, so that a commit message can't move the cursor, rewrite a line or pass for an
 escape. Errors are escaped the same way. The exit status says what to do next:

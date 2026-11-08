@@ -487,7 +487,7 @@ fn rollback_sends_the_flag_and_explains_an_older_controllers_refusal() {
     assert_eq!(String::from_utf8(out).unwrap(), "");
     let err = String::from_utf8(err).unwrap();
     assert!(
-        err.contains("a controller older than this landfall may not know `rollback`"),
+        err.contains("may be because it is older than this landfall and doesn't know `rollback`"),
         "{err}"
     );
     assert!(

@@ -360,7 +360,8 @@ someone with that grant takes the place of a request already open on the deploym
 that isn't lower than what runs is refused with `409 not_a_rollback`, and so is any tag when
 nothing runs or what runs isn't a version, so nobody asks for an upgrade under the `rollback`
 grant's name by mistake. That is decided before an open request is looked at, so the refusal
-changes nothing but its `request_refused` audit row: an open request stays open. Without the
+changes nothing but its `request_refused` audit row, and, as every request does, ends the open
+requests whose 24 hours have passed: an open request still in its time stays open. Without the
 flag, or with it `false`, the tag alone decides, as before. A client leaves the flag out when
 it is `false`, as `landfall` does, so a controller that doesn't know it, which refuses a field
 it doesn't know with `400 bad_request`, is sent it only by a rollback.

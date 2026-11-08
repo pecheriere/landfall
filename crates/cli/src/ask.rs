@@ -96,7 +96,8 @@ impl AskCommand {
 ///
 /// [`CliError::Api`] if the controller refuses or can't be asked,
 /// [`CliError::RequestOpen`] when a request it names already waits on the deployment,
-/// [`CliError::RollbackNotUnderstood`] when it takes `rollback` for a bad request, and
+/// [`CliError::RollbackNotUnderstood`] when it takes a rollback for a bad request, which may
+/// be an older controller not knowing `rollback`, and
 /// [`CliError::Output`] if `out` fails.
 pub async fn run_with<A: Api>(
     command: &AskCommand,

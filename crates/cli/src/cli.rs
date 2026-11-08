@@ -141,10 +141,11 @@ pub enum CliError {
         #[source]
         source: ApiError,
     },
-    /// The controller took a rollback for a bad request: one older than this CLI refuses the
-    /// `rollback` field it doesn't know.
+    /// The controller took a rollback for a bad request. One older than this CLI refuses the
+    /// `rollback` field it doesn't know that way, but its answer is the one it gives any body it
+    /// can't read, so this can only say it may be that.
     #[error(
-        "the controller took this for a bad request: a controller older than this landfall may not know `rollback`, so upgrade it"
+        "the controller took this for a bad request: that may be because it is older than this landfall and doesn't know `rollback`, and if so, upgrading it fixes this"
     )]
     RollbackNotUnderstood(#[source] ApiError),
     /// The result could not be written to stdout.

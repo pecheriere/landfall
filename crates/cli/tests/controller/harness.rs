@@ -9,6 +9,7 @@
 //! software passkey signing for the configured origin.
 
 use std::ffi::OsString;
+use std::sync::Mutex;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -24,11 +25,13 @@ use landfall_server::agent_api::{ApiState, Limits};
 use landfall_server::report::BoundedReport;
 use landfall_server::serve::{self, ServeOptions};
 use landfall_server::store::{ReleaseDecision, Seen, Store};
-use reqwest::header::{COOKIE, ORIGIN, SET_COOKIE};
+use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
+use reqwest::{RequestBuilder, Response};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
 /// Where the approval page is, as `[approval]` names it.
 pub const APPROVAL_ORIGIN: &str = "https://landfall.example.com";
@@ -117,13 +120,15 @@ impl Env for TokenOnly {
 
 /// A controller, serving until this is dropped.
 pub struct Controller {
-    pub store: Store,
+    store: Store,
     url: String,
     config: Config,
     key: SoftwareAuthenticator,
     ci: (i64, String),
     reader: String,
     http: reqwest::Client,
+    /// The accept loop, until it is found to have ended.
+    serving: Mutex<Option<JoinHandle<usize>>>,
     _stop: oneshot::Sender<()>,
     _dir: TempDir,
 }
@@ -146,7 +151,7 @@ impl Controller {
             Limits::default(),
         ));
         let (stop, stopped) = oneshot::channel::<()>();
-        tokio::spawn(serve::run(
+        let serving = tokio::spawn(serve::run(
             listener,
             app,
             ServeOptions::default(),
@@ -165,6 +170,7 @@ impl Controller {
             ci: (ci.0, ci.1.reveal()),
             reader: reader.reveal(),
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            serving: Mutex::new(Some(serving)),
             _stop: stop,
             _dir: dir,
         };
@@ -278,7 +284,7 @@ impl Controller {
             "--allow-insecure-controller".to_owned(),
         ]);
         let env = TokenOnly(token.map(ToOwned::to_owned));
-        tokio::task::spawn_blocking(move || {
+        let ran = tokio::task::spawn_blocking(move || {
             let cli = Cli::try_parse_from(command_line).unwrap();
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let status = cli::run_with(cli, &env, &mut out, &mut err);
@@ -289,25 +295,68 @@ impl Controller {
             }
         })
         .await
-        .unwrap()
+        .unwrap();
+        self.still_serving().await;
+        ran
+    }
+
+    /// Panics with how the accept loop ended, if it has. It serves until this is dropped, so
+    /// one that ended failed, and that is what a test should say rather than the connection
+    /// errors that follow.
+    async fn still_serving(&self) {
+        let ended = {
+            let mut serving = self.serving.lock().unwrap();
+            if serving.as_ref().is_some_and(JoinHandle::is_finished) {
+                serving.take()
+            } else {
+                None
+            }
+        };
+        if let Some(serving) = ended {
+            match serving.await {
+                Ok(left) => panic!("the controller stopped serving, with {left} connections left"),
+                Err(error) => panic!("the controller's accept loop failed: {error}"),
+            }
+        }
+    }
+
+    /// Sends `request` straight over HTTP.
+    async fn send(&self, request: RequestBuilder) -> Response {
+        let answer = request.send().await;
+        self.still_serving().await;
+        answer.unwrap()
+    }
+
+    /// The status and problem of `answer`.
+    async fn problem(answer: Response) -> (u16, Value) {
+        let status = answer.status().as_u16();
+        (status, answer.json().await.unwrap())
     }
 
     /// The status and problem code of a `GET` of `path` with `token`, straight over HTTP.
     pub async fn problem_code(&self, token: &str, path: &str) -> (u16, String) {
-        let answer = self
+        let request = self
             .http
             .get(format!("{}{path}", self.url))
-            .bearer_auth(token)
-            .send()
-            .await
-            .unwrap();
-        let status = answer.status().as_u16();
-        let problem: Value = answer.json().await.unwrap();
+            .bearer_auth(token);
+        let (status, problem) = Self::problem(self.send(request).await).await;
         (status, problem["code"].as_str().unwrap().to_owned())
     }
 
+    /// The status and problem of a `POST` of `body`, as it is, to `path` with `token`,
+    /// straight over HTTP.
+    pub async fn refusal_of_post(&self, token: &str, path: &str, body: &str) -> (u16, Value) {
+        let request = self
+            .http
+            .post(format!("{}{path}", self.url))
+            .bearer_auth(token)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.to_owned());
+        Self::problem(self.send(request).await).await
+    }
+
     /// A POST from the approval page, with the operator's session if any.
-    async fn post(&self, path: &str, session: Option<&str>, body: &Value) -> reqwest::Response {
+    async fn post(&self, path: &str, session: Option<&str>, body: &Value) -> Response {
         let mut request = self
             .http
             .post(format!("{}{path}", self.url))
@@ -316,7 +365,7 @@ impl Controller {
         if let Some(session) = session {
             request = request.header(COOKIE, format!("{SESSION_COOKIE}={session}"));
         }
-        let answer = request.send().await.unwrap();
+        let answer = self.send(request).await;
         assert!(answer.status().is_success(), "{path}: {answer:?}");
         answer
     }

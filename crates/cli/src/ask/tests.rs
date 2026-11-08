@@ -318,7 +318,7 @@ fn a_bad_request_to_rollback_says_an_older_controller_may_not_know_the_flag() {
     assert_eq!(error.exit_code(), 1);
     let text = chain(&error);
     assert!(
-        text.contains("a controller older than this landfall may not know `rollback`"),
+        text.contains("may be because it is older than this landfall and doesn't know `rollback`"),
         "{text}"
     );
     assert!(text.contains("bad_request"), "{text}");

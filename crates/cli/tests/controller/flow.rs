@@ -173,6 +173,29 @@ async fn rollback_of_a_higher_tag_exits_1_with_not_a_rollback() {
     assert_eq!(approvals.out, "nothing waits for an approver\n");
 }
 
+/// Why `landfall rollback` can only say that a `400` may be an older controller: the
+/// controller's answer to a field it doesn't know is the one it gives any body it can't read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_field_is_refused_as_any_unreadable_body() {
+    let controller = Controller::start().await;
+    let path = "/api/v1/deployments/app/prod/requests";
+
+    let unknown = controller
+        .refusal_of_post(
+            controller.ci(),
+            path,
+            r#"{"tag":"v1.1.0","rollback":true,"from_a_newer_cli":true}"#,
+        )
+        .await;
+    let cut_short = controller
+        .refusal_of_post(controller.ci(), path, r#"{"tag":"v1.1.0""#)
+        .await;
+
+    assert_eq!(unknown.0, 400, "{unknown:?}");
+    assert_eq!(unknown.1["code"], "bad_request");
+    assert_eq!(unknown, cut_short);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_token_exits_2() {
     let controller = Controller::start().await;
