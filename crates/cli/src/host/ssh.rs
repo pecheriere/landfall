@@ -43,7 +43,7 @@ const SLOWEST_UPLOAD: u64 = 32 * 1024;
 /// What keeps a configuration from weakening `ssh`, or changing what comes back from it. The
 /// first of each option is the one that counts, and these come before any configuration is read.
 /// `-G` output for each is in `tests/ssh.rs`. `ControlPath` and `ControlMaster` go by the call, in
-/// [`args`].
+/// [`args`], and only [`control_args`] has a `ProxyCommand`.
 const FORCED: [&str; 21] = [
     "BatchMode=yes",
     "StrictHostKeyChecking=yes",
@@ -384,7 +384,9 @@ pub(super) fn master_args(
 }
 
 /// What `ssh` is given to ask the connection at `control` to do `operation`, which reaches
-/// nothing but its socket.
+/// nothing but its socket. A socket that takes the question and drops it, as a master killed that
+/// instant does, has `ssh` connect to the host by itself: a check would log in, run a shell and
+/// pass. A proxy that fails, ahead of any a configuration has, ends that before anything is sent.
 pub(super) fn control_args(
     operation: &str,
     dest: &Destination,
@@ -392,10 +394,10 @@ pub(super) fn control_args(
     config: Option<&Path>,
     known: &Known,
 ) -> Vec<OsString> {
-    with_host(
-        client_options(&["-O", operation], dest, control, config, Tty::Never, known),
-        dest,
-    )
+    let mut args = client_options(&["-O", operation], dest, control, config, Tty::Never, known);
+    args.push("-o".into());
+    args.push("ProxyCommand=false".into());
+    with_host(args, dest)
 }
 
 /// What came of a command on the target.
