@@ -381,20 +381,3 @@ jobs:
           done
           echo "::error title=Release::Publishing the draft failed, or the release at $GITHUB_REF_NAME doesn't read back as public, with this tag, and immutable. It may already be public: check it by hand."
           exit 1
-
-  # Starts homebrew.yml on this tag, which proposes the formula to the tap. A release published with
-  # the run's own token starts no workflow, and a dispatch is the exception GitHub makes. A release
-  # candidate never reaches the tap, so it isn't started for one.
-  homebrew:
-    if: github.event_name == 'push' && github.ref_type == 'tag' && !contains(github.ref_name, '-')
-    needs: publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      actions: write # to start homebrew.yml
-    steps:
-      - name: Start the Homebrew workflow on this tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh workflow run homebrew.yml --ref "$GITHUB_REF_NAME"

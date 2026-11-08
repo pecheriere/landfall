@@ -36,15 +36,7 @@ BUILD_CONDITION = "if: needs.version.outputs.build == 'true'"
 RUN = re.compile(r"\s*(?:- )?run:")
 CONDITION = re.compile(r"\s*(?:- )?if:")
 WRITE = re.compile(r":\s*write\b|write-all")
-JOBS = PUBLISH_NEEDS | {"publish", "homebrew"}
-HOMEBREW_CONDITION = f"{TAG_EVENT} && !contains(github.ref_name, '-')"
-HOMEBREW_STEP = [
-    "      - name: Start the Homebrew workflow on this tag",
-    "        env:",
-    "          GH_TOKEN: ${{ github.token }}",
-    "          GH_REPO: ${{ github.repository }}",
-    '        run: gh workflow run homebrew.yml --ref "$GITHUB_REF_NAME"',
-]
+JOBS = PUBLISH_NEEDS | {"publish"}
 FORBIDDEN_KEY = re.compile(r"\s*(?:- )?(?:ref|repository|run-id|digest-mismatch|defaults):")
 LOGIN_LINE = "          password: ${{ secrets.GITHUB_TOKEN }}"
 CHECKOUT = "actions/checkout"
@@ -90,7 +82,6 @@ JOB_STEPS = {
         ATTEST,
         "Publish the draft, and read it back",
     ],
-    "homebrew": ["Start the Homebrew workflow on this tag"],
 }
 PUBLISH_WRITES = (
     "contents: write",
@@ -135,9 +126,8 @@ class PublishGateTests(WorkflowCase):
         )
 
     def test_a_push_to_main_never_reaches_what_a_tag_does(self) -> None:
-        """Every job that a tag adds wants a tag push, and only `publish` attests."""
+        """`preflight` and `publish` want a tag push, and only `publish` attests."""
         self.assertIn(f"    {TAG_EVENT}", job(self.lines, "preflight"))
-        self.assertIn(f"    {HOMEBREW_CONDITION}", job(self.lines, "homebrew"))
         attesting = [
             name
             for name in JOBS - {"ci"}
@@ -173,13 +163,6 @@ class PublishGateTests(WorkflowCase):
         ):
             with self.subTest(job=name):
                 self.assertNotIn("    permissions:", job(self.lines, name))
-        self.assertEqual(block(job(self.lines, "homebrew"), "permissions"), ["actions: write"])
-
-    def test_homebrew_only_starts_the_workflow_once_published(self) -> None:
-        """After `publish`, one step, with no checkout and nothing of the tap's."""
-        homebrew = job(self.lines, "homebrew")
-        self.assertIn("    needs: publish", homebrew)
-        self.assertEqual(steps(homebrew), [HOMEBREW_STEP])
 
     def test_a_second_attempt_is_refused_first_and_early(self) -> None:
         """First in `publish`, and first in `preflight` so a re-run stops in seconds."""
@@ -443,10 +426,10 @@ class WholeFileTests(WorkflowCase):
         """A new job has none of the gates `publish` has, whatever it's given."""
         self.assertEqual(job_names(self.lines), JOBS)
 
-    def test_only_publish_can_write_but_for_starting_homebrew(self) -> None:
-        """Four lines in `publish`, `actions: write` in `homebrew`, and no broader form anywhere."""
+    def test_only_publish_can_write(self) -> None:
+        """Four lines, all in that job, and no broader form anywhere."""
         writing = [line.strip() for line in self.lines if WRITE.search(line)]
-        self.assertEqual(sorted(writing), sorted([*PUBLISH_WRITES, "actions: write"]))
+        self.assertEqual(sorted(writing), sorted(PUBLISH_WRITES))
         self.assertEqual(
             sorted(line.strip() for line in self.publish if WRITE.search(line)),
             sorted(PUBLISH_WRITES),
@@ -466,7 +449,6 @@ class WholeFileTests(WorkflowCase):
                 f"    {BUILD_CONDITION}",
                 f"    {TAG_EVENT}",
                 f"    {TAG_EVENT}",
-                f"    {HOMEBREW_CONDITION}",
             ],
         )
 
