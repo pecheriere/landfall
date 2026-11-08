@@ -8,7 +8,7 @@ use landfall_core::ids::{CommitSha, RepoName, TagPattern};
 use landfall_origin::fetch::{ComparePage, CompareStatus, FetchError, ListedCommit, Service};
 use serde_json::json;
 
-use super::super::commits::{GitHubBudget, after_tick, base_for, pages_for_newest};
+use super::super::commits::{GitHubBudget, SettledByVersion, after_tick, pages_for_newest};
 use super::promotion::{PROMOTING, STAGING};
 use super::{
     CompareAnswer, HOST, Harness, PATCH_RULE, PROD, RateLimitReset, ReleaseError, commit,
@@ -183,21 +183,24 @@ fn compare_error(status: u16) -> ReleaseError {
 #[test]
 fn base_is_the_highest_lower_settled_version() {
     let pattern: TagPattern = "v*".parse().unwrap();
-    let settled = |tags: &[&str]| -> Vec<_> { tags.iter().map(|t| (tag(t), commit(t))).collect() };
+    let settled = |tags: &[&str]| {
+        SettledByVersion::new(&pattern, tags.iter().map(|t| (tag(t), commit(t), ())))
+    };
     let base = |release: &str, tags: &[&str]| {
-        base_for(&pattern, &tag(release), &settled(tags)).map(|(t, c)| {
-            assert_eq!(c, commit(t.as_ref()));
+        let version = pattern.parse_tag(&tag(release)).unwrap();
+        settled(tags).base_of(&version).map(|(t, c)| {
+            assert_eq!(*c, commit(t.as_ref()));
             t.to_string()
         })
     };
     let all = [
+        "v1.3.0",
+        "junk",
         "v1.1.9",
-        "v1.2.0",
+        "v2.0.0",
         "v1.2.3",
         "v1.3.0-rc.1",
-        "v1.3.0",
-        "v2.0.0",
-        "junk",
+        "v1.2.0",
     ];
     assert_eq!(base("v1.2.3", &all).as_deref(), Some("v1.2.0"));
     assert_eq!(base("v1.2.0", &all).as_deref(), Some("v1.1.9"));
@@ -205,9 +208,27 @@ fn base_is_the_highest_lower_settled_version() {
     assert_eq!(base("v1.3.0-rc.1", &all).as_deref(), Some("v1.2.3"));
     assert_eq!(base("v2.0.0", &all).as_deref(), Some("v1.3.0"));
     assert_eq!(base("v1.1.9", &all), None);
+    // A release not itself settled still finds the one below it.
+    assert_eq!(base("v1.2.5", &all).as_deref(), Some("v1.2.3"));
     assert_eq!(base("v1.2.3", &["v1.2.3", "v1.3.0"]), None);
     assert_eq!(base("v1.2.3", &[]), None);
-    assert_eq!(base("junk", &all), None);
+
+    // In version order, and a tag the pattern doesn't read is never one of them.
+    let order: Vec<String> = settled(&all)
+        .iter()
+        .map(|(_, t, _, ())| t.to_string())
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "v1.1.9",
+            "v1.2.0",
+            "v1.2.3",
+            "v1.3.0-rc.1",
+            "v1.3.0",
+            "v2.0.0"
+        ]
+    );
 }
 
 #[test]

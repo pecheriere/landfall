@@ -106,7 +106,9 @@ pub(crate) fn pages_for_newest(total: u64) -> Vec<u32> {
 
 /// Settled releases of one deployment in version order, lowest first, each tag read
 /// by the pattern once, with whatever else `X` the caller keeps of each. A tag the
-/// pattern doesn't read is left out: it is never a base.
+/// pattern doesn't read is left out: it is never a base. The one place that says where
+/// a range to a release starts: [`Self::base_of`], for every release at once in
+/// [`Store::ranges_wanted`] as for one release's story.
 pub(crate) struct SettledByVersion<X> {
     sorted: Vec<(Version, ReleaseTag, CommitSha, X)>,
 }
@@ -132,8 +134,9 @@ impl<X> SettledByVersion<X> {
         self.sorted.iter()
     }
 
-    /// The highest release below `version`, where a pre-release is below its release, as
-    /// semantic versioning says: a binary search.
+    /// Where a range to the release at `version` starts: the highest settled release
+    /// below it, where a pre-release is below its release, as semantic versioning says.
+    /// `None` when there is none, and the release is the first. A binary search.
     pub(crate) fn base_of(&self, version: &Version) -> Option<(&ReleaseTag, &CommitSha)> {
         let below = self.sorted.partition_point(|(v, ..)| v < version);
         below
@@ -141,34 +144,6 @@ impl<X> SettledByVersion<X> {
             .and_then(|index| self.sorted.get(index))
             .map(|(_, tag, commit, _)| (tag, commit))
     }
-}
-
-/// The release a range to `tag` starts from: the highest version of `settled` below
-/// `tag`'s, by `pattern` and semantic versioning, where a pre-release is below its
-/// release. A tag `pattern` doesn't read is never one. For one release; many at once
-/// go through one [`SettledByVersion`].
-#[must_use]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the release story's lookup of one release's base; until it reads \
-                  ranges, only tests do, and ranges_wanted uses the sorted form"
-    )
-)]
-pub(crate) fn base_for(
-    pattern: &TagPattern,
-    tag: &ReleaseTag,
-    settled: &[(ReleaseTag, CommitSha)],
-) -> Option<(ReleaseTag, CommitSha)> {
-    let version = pattern.parse_tag(tag).ok()?;
-    let by_version = SettledByVersion::new(
-        pattern,
-        settled.iter().map(|(t, c)| (t.clone(), c.clone(), ())),
-    );
-    by_version
-        .base_of(&version)
-        .map(|(tag, commit)| (tag.clone(), commit.clone()))
 }
 
 /// What came of asking for one page.
