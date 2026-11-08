@@ -41,7 +41,7 @@ pub enum RequestState {
 }
 
 impl RequestState {
-    fn parse(text: &str) -> Result<Self, StoreError> {
+    pub(super) fn parse(text: &str) -> Result<Self, StoreError> {
         match text {
             "awaiting_approval" => Ok(Self::AwaitingApproval),
             "approved" => Ok(Self::Approved),

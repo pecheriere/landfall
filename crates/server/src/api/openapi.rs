@@ -28,6 +28,7 @@ use utoipa::{Modify, ToResponse};
             Unauthenticated,
             Forbidden,
             BadOrigin,
+            ReadForbidden,
             NotFound,
             RateLimited,
             BadRequest,
@@ -110,6 +111,11 @@ refusal!(
     BadOrigin,
     "A session's read that its `Sec-Fetch-Site` says another site sent: anything but \
      `same-origin` or `none`, when it is there. `bad_origin`."
+);
+refusal!(
+    ReadForbidden,
+    "The principal may know this exists and has no grant to view it, or a session's read that \
+     its `Sec-Fetch-Site` says another site sent: `forbidden`, `bad_origin`."
 );
 refusal!(
     NotFound,

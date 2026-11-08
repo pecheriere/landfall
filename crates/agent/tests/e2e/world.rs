@@ -17,7 +17,7 @@ use landfall_core::config::Config;
 use landfall_core::ids::{CommitSha, DeploymentId, ImageDigest, ReleaseTag};
 use landfall_core::release::RunCandidate;
 use landfall_origin::attestation::VerifiedAttestation;
-use landfall_origin::fetch::ListedTag;
+use landfall_origin::fetch::{ComparePage, CompareStatus, ListedTag};
 use landfall_origin::release::{ReleaseError, ReleaseOrigin};
 use landfall_server::watcher::ReleaseSource;
 use serde::{Deserialize, Serialize};
@@ -233,6 +233,26 @@ impl ReleaseSource for FileSource {
                 run_url: format!("https://github.com/{}/actions/runs/1/attempts/1", self.repo),
             }]
         }))
+    }
+
+    fn compare_page(
+        &self,
+        _: &DeploymentId,
+        _: &CommitSha,
+        _: &CommitSha,
+        _: u32,
+    ) -> impl Future<Output = Result<ComparePage, ReleaseError>> + Send {
+        ready(Ok(ComparePage::Listed {
+            status: CompareStatus::Ahead,
+            total: 0,
+            commits: Vec::new(),
+            rate_remaining: Some(5000),
+            rate_reset: None,
+        }))
+    }
+
+    fn has_github_token(&self) -> bool {
+        false
     }
 }
 

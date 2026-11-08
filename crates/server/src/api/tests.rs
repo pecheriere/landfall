@@ -1,11 +1,15 @@
 //! `/api/v1` through the controller's real router, on an in-memory store seeded through the
 //! store's own functions.
 
+mod deployments;
 mod document;
 mod grants;
+mod promotions;
 mod query;
 mod reads;
+mod releases;
 mod schemas;
+mod story;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -193,6 +197,15 @@ pub(super) const REQUESTER: &str = "requester";
 /// Who holds `view` on `app/other`, and no grant on `app/prod` or `app/staging`.
 pub(super) const OUTSIDER: &str = "outsider";
 
+/// Who holds `view` on `app/canary`, and not on `app/beta`, which it promotes to.
+pub(super) const CANARY_VIEWER: &str = "canary-viewer";
+
+/// Who holds `view` on `app/canary` and `app/beta`.
+pub(super) const FLEET_VIEWER: &str = "fleet-viewer";
+
+/// Who holds `view` on `app/beta`, and not on `app/canary`, which promotes to it.
+pub(super) const BETA_VIEWER: &str = "beta-viewer";
+
 const WORLD_ORIGIN: &str = "https://landfall.example.com";
 const WORLD_RP_ID: &str = "landfall.example.com";
 
@@ -227,9 +240,10 @@ fn world_digest(fill: char) -> ImageDigest {
         .unwrap()
 }
 
-/// `app/prod`, `app/staging` and `app/other`, all on `home-1`. Every holder of a set of
-/// grants has it on `app/prod` and `app/staging`, and each holder of `approve` is an approver
-/// of both by key.
+/// `app/prod`, `app/staging`, `app/other`, `app/canary` and `app/beta`, all on `home-1`,
+/// with `app/canary` promoting to `app/beta` after an hour. Every holder of a set of grants
+/// has it on `app/prod` and `app/staging`, and each holder of `approve` is an approver of
+/// every deployment by key.
 fn world_config(keys: &HashMap<String, SoftwareAuthenticator>) -> String {
     let mut approvers: Vec<&String> = keys.keys().collect();
     approvers.sort();
@@ -245,8 +259,16 @@ fn world_config(keys: &HashMap<String, SoftwareAuthenticator>) -> String {
         )
     }));
     let listed = quoted_list(&approvers);
+    let promotion = "promote_to = { deployment = \"app/beta\", healthy_for = \"1h\" }\n";
     sections.extend(
-        [(1, "prod"), (2, "staging"), (3, "other")].map(|(repo, stage)| {
+        [
+            (1, "prod", ""),
+            (2, "staging", ""),
+            (3, "other", ""),
+            (4, "canary", promotion),
+            (4, "beta", ""),
+        ]
+        .map(|(repo, stage, extra)| {
             format!(
                 r#"
 [[deployment]]
@@ -257,7 +279,7 @@ compose = {{ dir = "/srv/{stage}", service = "app" }}
 origin = {{ workflow = ".github/workflows/release.yml", tags = "v*", signed_tags = false }}
 rule = {{ auto = "patch", approve = "minor", approvers = [{listed}] }}
 checks = ["container-healthy"]
-"#
+{extra}"#
             )
         }),
     );
@@ -275,6 +297,9 @@ checks = ["container-healthy"]
     );
     sections.push(grant(REQUESTER, &["app/staging"], &["request"]));
     sections.push(grant(OUTSIDER, &["app/other"], &["view"]));
+    sections.push(grant(CANARY_VIEWER, &["app/canary"], &["view"]));
+    sections.push(grant(FLEET_VIEWER, &["app/canary", "app/beta"], &["view"]));
+    sections.push(grant(BETA_VIEWER, &["app/beta"], &["view"]));
     sections.concat()
 }
 
@@ -303,6 +328,10 @@ pub(super) enum Caller<'a> {
 /// - `app/staging` runs `v2.0.0`, `v2.1.0` is verified, and [`REQUESTER`] has asked for it:
 ///   the open request `approveRequest` and `cancelRequest` act on.
 /// - `app/other` has nothing, and [`OUTSIDER`] may view it.
+/// - `app/canary` runs `v3.0.0` and promotes to `app/beta`, which has nothing. Neither is
+///   `app/prod`, where a promotion would answer `requestDeploy` with `promotion_pending`.
+///   [`CANARY_VIEWER`] may view `app/canary` alone, [`FLEET_VIEWER`] both, and [`BETA_VIEWER`]
+///   `app/beta` alone.
 ///
 /// Every principal has a token and a session. Time stands still until a test moves `clock`.
 pub(super) struct World {
@@ -348,17 +377,31 @@ impl World {
             phase: Phase::Idle,
             busy: false,
         };
-        let (prod, staging) = (
+        let (prod, staging, canary) = (
             running("app/prod", "v1.2.0", '2'),
             running("app/staging", "v2.0.0", 'b'),
+            running("app/canary", "v3.0.0", 'd'),
         );
         store
-            .record_host_state(&"home-1".parse().unwrap(), None, &[&prod, &staging])
+            .record_host_state(
+                &"home-1".parse().unwrap(),
+                None,
+                &[&prod, &staging, &canary],
+            )
             .await
             .unwrap();
         let request = open_request(&store).await;
         let mut names: Vec<String> = grant_sets().iter().map(|roles| holder(roles)).collect();
-        names.extend([REQUESTER.to_owned(), OUTSIDER.to_owned()]);
+        names.extend(
+            [
+                REQUESTER,
+                OUTSIDER,
+                CANARY_VIEWER,
+                FLEET_VIEWER,
+                BETA_VIEWER,
+            ]
+            .map(ToOwned::to_owned),
+        );
         let mut tokens = HashMap::new();
         let mut sessions = HashMap::new();
         for name in names {
@@ -438,6 +481,24 @@ impl World {
     }
 }
 
+/// Where a release verified at `fill`'s commit and digest came from, as the watcher records
+/// it in the `origin` column.
+fn origin_of(tag: &str, fill: char) -> Value {
+    json!({
+        "tag": tag,
+        "tag_object": "object",
+        "commit": fill.to_string().repeat(40),
+        "digest": world_digest(fill),
+        "signer": null,
+        "san": format!(
+            "\"https://github.com/example/app/.github/workflows/release.yml@refs/tags/{tag}\""
+        ),
+        "run_url": "\"https://github.com/example/app/actions/runs/7\"",
+        "rekor_log_index": 42,
+        "integrated_time": 1_799_999_000,
+    })
+}
+
 /// Records a release as the watcher does once it verified one.
 async fn verified(store: &Store, config: &Config, deployment: &str, tag: &str, fill: char) {
     let commit = fill.to_string().repeat(40).parse().unwrap();
@@ -449,7 +510,7 @@ async fn verified(store: &Store, config: &Config, deployment: &str, tag: &str, f
         digest: Some(&digest),
         refused: false,
         detail: json!({}),
-        origin: json!({}),
+        origin: origin_of(tag, fill),
     };
     store
         .record_release(

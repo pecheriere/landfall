@@ -1,5 +1,7 @@
 //! The watcher against a fake source, a real store and a clock moved by hand.
 
+mod commit_limits;
+mod commits;
 mod decisions;
 mod failures;
 mod hosts;
@@ -15,6 +17,7 @@ use landfall_core::protocol::{
     DeployReportBody, DeployedRelease, Phase, ReportedOutcome, RunningState,
 };
 use landfall_origin::attestation::VerifiedAttestation;
+use landfall_origin::fetch::{ComparePage, CompareStatus};
 use sha2::{Digest as _, Sha256};
 use sqlx::Row as _;
 
@@ -119,6 +122,10 @@ fn origin(text: &str) -> ReleaseOrigin {
 
 type MakeError = Box<dyn Fn() -> ReleaseError + Send + Sync>;
 
+/// What the fake answers for a page of a comparison: base, head and page number.
+type CompareAnswer =
+    Box<dyn Fn(&CommitSha, &CommitSha, u32) -> Result<ComparePage, ReleaseError> + Send + Sync>;
+
 /// What the fake is set to answer, by deployment and tag.
 #[derive(Default)]
 struct FakeState {
@@ -136,6 +143,12 @@ struct FakeState {
     own_digest_unlisted: HashSet<String>,
     /// Asked in the middle of each call, to see that nothing is holding it up.
     store: Option<Store>,
+    /// What a comparison answers; an empty one by default.
+    compare: Option<CompareAnswer>,
+    /// Whether it says it has a GitHub token.
+    github_token: bool,
+    /// Whether a comparison never answers.
+    compare_hangs: bool,
 }
 
 #[derive(Default)]
@@ -145,6 +158,10 @@ struct Fake {
     tag_lists: AtomicUsize,
     verifies: Mutex<Vec<String>>,
     enumerations: AtomicUsize,
+    /// Each page of a comparison asked for: base, head and page.
+    compares: Mutex<Vec<(CommitSha, CommitSha, u32)>>,
+    /// Verifications and comparisons, in the order they were asked for.
+    calls: Mutex<Vec<&'static str>>,
 }
 
 impl Fake {
@@ -211,6 +228,7 @@ impl ReleaseSource for Fake {
     ) -> Result<ReleaseOrigin, ReleaseError> {
         self.nothing_in_the_way().await;
         self.verifies.lock().unwrap().push(tag.to_string());
+        self.calls.lock().unwrap().push("verify");
         if let Some(fail) = self.locked().verify_fails.get(tag.as_ref()) {
             return Err(fail());
         }
@@ -247,6 +265,39 @@ impl ReleaseSource for Fake {
                 .unwrap_or_default(),
         );
         Ok(candidates)
+    }
+
+    async fn compare_page(
+        &self,
+        _deployment: &DeploymentId,
+        base: &CommitSha,
+        head: &CommitSha,
+        page: u32,
+    ) -> Result<ComparePage, ReleaseError> {
+        self.nothing_in_the_way().await;
+        self.calls.lock().unwrap().push("compare");
+        self.compares
+            .lock()
+            .unwrap()
+            .push((base.clone(), head.clone(), page));
+        let hang = self.locked().compare_hangs;
+        if hang {
+            std::future::pending::<()>().await;
+        }
+        match &self.locked().compare {
+            Some(answer) => answer(base, head, page),
+            None => Ok(ComparePage::Listed {
+                status: CompareStatus::Ahead,
+                total: 0,
+                commits: Vec::new(),
+                rate_remaining: Some(5000),
+                rate_reset: None,
+            }),
+        }
+    }
+
+    fn has_github_token(&self) -> bool {
+        self.locked().github_token
     }
 }
 

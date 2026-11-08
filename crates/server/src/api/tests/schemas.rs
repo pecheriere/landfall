@@ -10,7 +10,7 @@ use super::grants::{documented, grant_checks, operations, served_document};
 /// The schema of `operation`'s answer with this status, as a schema of its own: the
 /// document's components come with it, so that its `$ref`s resolve within the document and
 /// nowhere else.
-fn schema_of(doc: &Value, schema: &Value) -> Value {
+pub(super) fn schema_of(doc: &Value, schema: &Value) -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "components": doc["components"],

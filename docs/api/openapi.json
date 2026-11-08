@@ -260,6 +260,382 @@
         ]
       }
     },
+    "/api/v1/deployments": {
+      "get": {
+        "tags": [
+          "deployments"
+        ],
+        "summary": "The deployments",
+        "description": "The deployments this principal may view, by id, a page at a time. Those they may not view are left out before the page is cut. `needs_you` is whether one has a request this principal could sign, which a token never can.",
+        "operationId": "listDeployments",
+        "parameters": [
+          {
+            "name": "host",
+            "in": "query",
+            "description": "Only the deployments on this host.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "home-1"
+          },
+          {
+            "name": "repo",
+            "in": "query",
+            "description": "Only the deployments of this repository.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "example/app"
+          },
+          {
+            "name": "needs_you",
+            "in": "query",
+            "description": "Only those whose `needs_you` is this.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many deployments a page holds: from 1 to 100, 50 if left out.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The last page's `next_cursor`, to get the page after it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the deployments this principal may view.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_DeploymentSummary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/BadOrigin"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{name}/{stage}": {
+      "get": {
+        "tags": [
+          "deployments"
+        ],
+        "summary": "One deployment",
+        "description": "One deployment: what a list shows of it, its rule, where its releases go on to and come from, and the newest 50 of its holds with a count of all. A deployment this principal can't view is never named in a promotion.",
+        "operationId": "getDeployment",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deployment.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{name}/{stage}/releases": {
+      "get": {
+        "tags": [
+          "releases"
+        ],
+        "summary": "A deployment's releases",
+        "description": "The releases the controller recorded for a deployment, each with where it stands, a page at a time: highest semantic version first by the deployment's tag pattern, then the tags it doesn't read, in string order. At most the 5,000 first recorded most recently are listed.",
+        "operationId": "listReleases",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many releases a page holds: from 1 to 100, 50 if left out.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The last page's `next_cursor`, to get the page after it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the releases.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_ReleaseView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{name}/{stage}/releases/{tag}": {
+      "get": {
+        "tags": [
+          "releases"
+        ],
+        "summary": "One release, and its story",
+        "description": "One release the controller recorded: where it stands and why, what to do next, where it came from, the commits it brings over the verified release below it as GitHub lists them, and its newest 20 requests and deploys. A tag the controller hasn't recorded is `404`.",
+        "operationId": "getRelease",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          },
+          {
+            "name": "tag",
+            "in": "path",
+            "description": "The release's tag.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "v1.3.0"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The release's story.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseStory"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v1/deployments/{name}/{stage}/requests": {
       "post": {
         "tags": [
@@ -367,6 +743,58 @@
           "request": "a tag above what runs, or the first deploy",
           "rollback": "a tag below what runs"
         }
+      }
+    },
+    "/api/v1/me": {
+      "get": {
+        "tags": [
+          "principals"
+        ],
+        "summary": "Who is asking",
+        "description": "The principal, how they proved it, what they may do to each deployment they hold a grant on by this credential, and where an approver signs a request. A token never lists `approve`.",
+        "operationId": "whoAmI",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Who is asking.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/BadOrigin"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": []
+          },
+          {
+            "session": []
+          }
+        ]
       }
     },
     "/api/v1/openapi.json": {
@@ -482,6 +910,374 @@
           }
         }
       },
+      "CommitSource": {
+        "type": "string",
+        "description": "Where a release's commits come from.",
+        "enum": [
+          "github"
+        ]
+      },
+      "CommitView": {
+        "type": "object",
+        "description": "One commit, as GitHub lists it.",
+        "required": [
+          "sha",
+          "summary",
+          "author"
+        ],
+        "properties": {
+          "author": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The login GitHub attributes it to by its email, which nothing verifies, or `null`.",
+            "example": "octocat"
+          },
+          "sha": {
+            "type": "string",
+            "description": "Its id.",
+            "example": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "summary": {
+            "type": "string",
+            "description": "The first line of its message, quoted and cut at 200 characters. Hostile: escape it\nbefore showing it."
+          }
+        }
+      },
+      "CommitsState": {
+        "type": "string",
+        "description": "What is known of a release's commits.",
+        "enum": [
+          "listed",
+          "too_large",
+          "base_not_found",
+          "first",
+          "not_yet",
+          "unavailable",
+          "not_recorded"
+        ]
+      },
+      "CommitsView": {
+        "type": "object",
+        "description": "The commits a release brings over the verified release below it.",
+        "required": [
+          "source",
+          "verified",
+          "state",
+          "base",
+          "total",
+          "compare_url",
+          "commits"
+        ],
+        "properties": {
+          "base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The verified release below this one, where the list starts, `null` for none.",
+            "example": "v1.2.0"
+          },
+          "commits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CommitView"
+            },
+            "description": "The commits, newest first: the newest 100 at most."
+          },
+          "compare_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "GitHub's page comparing the two, whenever there is a base.",
+            "example": "https://github.com/example/app/compare/0123456789abcdef0123456789abcdef01234567...89abcdef0123456789abcdef0123456789abcdef"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CommitSource",
+            "description": "Where the list comes from."
+          },
+          "state": {
+            "$ref": "#/components/schemas/CommitsState",
+            "description": "What is known of them. Only `listed` carries commits; every other state but `first`\nmeans unknown, not none."
+          },
+          "total": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many commits GitHub counts between them, for a listed range: more than `commits`\nholds when only the newest 100 are kept.",
+            "minimum": 0
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Always `false`: GitHub's list is shown as GitHub gave it, and only the release commit itself is verified.",
+            "const": false
+          }
+        }
+      },
+      "Decision": {
+        "type": "string",
+        "description": "What the controller's watcher last recorded of a release.",
+        "enum": [
+          "auto",
+          "needs_approval",
+          "manual",
+          "refused",
+          "deferred"
+        ]
+      },
+      "DeployBrief": {
+        "type": "object",
+        "description": "A deploy of a release, in its story.",
+        "required": [
+          "id",
+          "state",
+          "outcome",
+          "created_at",
+          "finished_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was queued, in seconds since the Unix epoch."
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it finished, in seconds since the Unix epoch, or `null`."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deploy's number."
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Outcome",
+                "description": "How it went, `null` until it finished."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeployState",
+            "description": "Where it stands."
+          }
+        }
+      },
+      "DeployState": {
+        "type": "string",
+        "description": "Where a deploy stands.",
+        "enum": [
+          "queued",
+          "claimed",
+          "finished"
+        ]
+      },
+      "DeploymentRef": {
+        "type": "object",
+        "description": "Another deployment, named in this one's view: its id, or `null` with `unseen` for one this\nprincipal can't view, which is never named.",
+        "required": [
+          "deployment"
+        ],
+        "properties": {
+          "deployment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The deployment, or `null` for one this principal can't view.",
+            "example": "app/beta"
+          },
+          "unseen": {
+            "type": "boolean",
+            "description": "`true` when `deployment` is `null` because this principal can't view it; left out\notherwise."
+          }
+        }
+      },
+      "DeploymentSummary": {
+        "type": "object",
+        "description": "A deployment in a list.",
+        "required": [
+          "id",
+          "repo",
+          "host",
+          "running",
+          "latest",
+          "open_request",
+          "needs_you"
+        ],
+        "properties": {
+          "host": {
+            "type": "string",
+            "description": "The host it runs on.",
+            "example": "home-1"
+          },
+          "id": {
+            "type": "string",
+            "description": "The deployment.",
+            "example": "app/prod"
+          },
+          "latest": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReleaseBrief",
+                "description": "Its newest release, `null` when none is known."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "needs_you": {
+            "type": "boolean",
+            "description": "Whether that request is one this principal could sign. A token never approves, so\nthis is always `false` for one."
+          },
+          "open_request": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The number of its request waiting for an approver, if any."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Its source repository.",
+            "example": "example/app"
+          },
+          "running": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RunningView",
+                "description": "What its host last said, `null` if it hasn't reported it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DeploymentView": {
+        "type": "object",
+        "description": "One deployment, in full.",
+        "required": [
+          "summary",
+          "rule",
+          "promote_to",
+          "promoted_from",
+          "holds",
+          "holds_total"
+        ],
+        "properties": {
+          "holds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HoldView"
+            },
+            "description": "What holds it or its releases undecided, the newest 50."
+          },
+          "holds_total": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many holds there are in all.",
+            "minimum": 0
+          },
+          "promote_to": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PromotionView",
+                "description": "Where its releases go on to, if anywhere."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "promoted_from": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PromotionView"
+            },
+            "description": "Each deployment whose releases come on to this one."
+          },
+          "rule": {
+            "$ref": "#/components/schemas/RuleView",
+            "description": "When its releases deploy."
+          },
+          "summary": {
+            "$ref": "#/components/schemas/DeploymentSummary",
+            "description": "What a list shows of it."
+          }
+        }
+      },
+      "GrantView": {
+        "type": "object",
+        "description": "What a principal may do to one deployment, now, by this credential.",
+        "required": [
+          "deployment",
+          "can"
+        ],
+        "properties": {
+          "can": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Permission"
+            },
+            "description": "What this credential may do to it: a token never lists `approve`."
+          },
+          "deployment": {
+            "type": "string",
+            "description": "The deployment.",
+            "example": "app/prod"
+          }
+        }
+      },
+      "HoldView": {
+        "type": "object",
+        "description": "Why something is still undecided.",
+        "required": [
+          "tag",
+          "reason",
+          "since",
+          "last_try"
+        ],
+        "properties": {
+          "last_try": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was last tried, in seconds since the Unix epoch."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why, as the controller recorded it, quoted. Hostile: escape it before showing it."
+          },
+          "since": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When this reason began to stand, in seconds since the Unix epoch."
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The release held, or `null` for the whole deployment.",
+            "example": "v1.3.0"
+          }
+        }
+      },
       "IntentView": {
         "type": "object",
         "description": "Exactly what an approver signs, with the same JSON as the intent a host checks.",
@@ -528,6 +1324,42 @@
           }
         }
       },
+      "MeView": {
+        "type": "object",
+        "description": "Who is asking.",
+        "required": [
+          "principal",
+          "via",
+          "grants",
+          "approve_url"
+        ],
+        "properties": {
+          "approve_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an approver signs a request with a passkey: the configured `[approval]` origin\nand `/approvals`, or `null` without one.",
+            "example": "https://landfall.example.com/approvals"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrantView"
+            },
+            "description": "Each deployment they hold a grant on, by id."
+          },
+          "principal": {
+            "type": "string",
+            "description": "The principal.",
+            "example": "operator"
+          },
+          "via": {
+            "$ref": "#/components/schemas/Via",
+            "description": "How they proved it."
+          }
+        }
+      },
       "NewApproval": {
         "type": "object",
         "description": "An approval: a passkey's assertion over the request's challenge.",
@@ -556,6 +1388,259 @@
           }
         },
         "additionalProperties": false
+      },
+      "NextAction": {
+        "type": "object",
+        "description": "The one thing to do next about a release.",
+        "required": [
+          "kind",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "The controller's own words for it, such as the command to run.",
+            "example": "ask for a deploy of v1.3.0 with `landfall request`"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NextKind",
+            "description": "What kind of thing it is."
+          }
+        }
+      },
+      "NextKind": {
+        "type": "string",
+        "description": "What a person or agent can do next about a release.",
+        "enum": [
+          "request",
+          "rollback",
+          "approve",
+          "wait",
+          "fix_host",
+          "recover",
+          "none"
+        ]
+      },
+      "OriginView": {
+        "type": "object",
+        "description": "Where a verified release came from, as the controller verified it.",
+        "required": [
+          "commit",
+          "digest",
+          "signer",
+          "san",
+          "run_url",
+          "rekor_log_index",
+          "integrated_time"
+        ],
+        "properties": {
+          "commit": {
+            "type": "string",
+            "description": "The release commit.",
+            "example": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "digest": {
+            "type": "string",
+            "description": "The image digest its build attested.",
+            "example": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "integrated_time": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the transparency log took it, in seconds since the Unix epoch, if it did."
+          },
+          "rekor_log_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Its attestation's index in the transparency log, if it has one.",
+            "minimum": 0
+          },
+          "run_url": {
+            "type": "string",
+            "description": "The run that built it, quoted. Hostile: escape it before showing it."
+          },
+          "san": {
+            "type": "string",
+            "description": "The workflow identity in the attestation's certificate, quoted. Hostile: escape it\nbefore showing it."
+          },
+          "signer": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who signed its tag, `null` when the deployment doesn't require signed tags.",
+            "example": "operator"
+          }
+        }
+      },
+      "Outcome": {
+        "type": "string",
+        "description": "How a finished deploy went, as its host said.",
+        "enum": [
+          "deployed",
+          "rolled_back",
+          "nothing_changed",
+          "failed_no_previous",
+          "rollback_failed",
+          "refused",
+          "deferred"
+        ]
+      },
+      "Page_DeploymentSummary": {
+        "type": "object",
+        "description": "Some of a list, in its order, and where the rest begins.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A deployment in a list.",
+              "required": [
+                "id",
+                "repo",
+                "host",
+                "running",
+                "latest",
+                "open_request",
+                "needs_you"
+              ],
+              "properties": {
+                "host": {
+                  "type": "string",
+                  "description": "The host it runs on.",
+                  "example": "home-1"
+                },
+                "id": {
+                  "type": "string",
+                  "description": "The deployment.",
+                  "example": "app/prod"
+                },
+                "latest": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReleaseBrief",
+                      "description": "Its newest release, `null` when none is known."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "needs_you": {
+                  "type": "boolean",
+                  "description": "Whether that request is one this principal could sign. A token never approves, so\nthis is always `false` for one."
+                },
+                "open_request": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "description": "The number of its request waiting for an approver, if any."
+                },
+                "repo": {
+                  "type": "string",
+                  "description": "Its source repository.",
+                  "example": "example/app"
+                },
+                "running": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/RunningView",
+                      "description": "What its host last said, `null` if it hasn't reported it."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "This page's items."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to send as `cursor` for the next page, opaque; `null` on the last one."
+          }
+        }
+      },
+      "Page_ReleaseView": {
+        "type": "object",
+        "description": "Some of a list, in its order, and where the rest begins.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A release of a deployment, and where it stands.",
+              "required": [
+                "tag",
+                "status",
+                "decision",
+                "first_seen_at",
+                "seen_at"
+              ],
+              "properties": {
+                "decision": {
+                  "$ref": "#/components/schemas/Decision",
+                  "description": "What the watcher last recorded of it."
+                },
+                "first_seen_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "When the controller first recorded it, in seconds since the Unix epoch."
+                },
+                "seen_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "When it was last verified, in seconds since the Unix epoch."
+                },
+                "status": {
+                  "$ref": "#/components/schemas/ReleaseStatus",
+                  "description": "Where it stands now."
+                },
+                "tag": {
+                  "type": "string",
+                  "description": "The tag.",
+                  "example": "v1.3.0"
+                }
+              }
+            },
+            "description": "This page's items."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to send as `cursor` for the next page, opaque; `null` on the last one."
+          }
+        }
+      },
+      "Permission": {
+        "type": "string",
+        "description": "What a grant lets a principal do to a deployment.",
+        "enum": [
+          "view",
+          "request",
+          "approve",
+          "rollback"
+        ]
       },
       "Problem": {
         "type": "object",
@@ -625,11 +1710,224 @@
           "internal"
         ]
       },
+      "PromotionView": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DeploymentRef",
+            "description": "The other deployment."
+          },
+          {
+            "type": "object",
+            "required": [
+              "healthy_for_secs"
+            ],
+            "properties": {
+              "healthy_for_secs": {
+                "type": "integer",
+                "format": "int64",
+                "description": "How long a release must be healthy on the deployment promoted from, in seconds.",
+                "minimum": 0
+              }
+            }
+          }
+        ],
+        "description": "When a deployment's releases go on to another, or came from one."
+      },
+      "ReleaseBrief": {
+        "type": "object",
+        "description": "A release, by its tag and where it stands.",
+        "required": [
+          "tag",
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/ReleaseStatus",
+            "description": "Where it stands."
+          },
+          "tag": {
+            "type": "string",
+            "description": "The tag.",
+            "example": "v1.3.0"
+          }
+        }
+      },
+      "ReleaseStatus": {
+        "type": "string",
+        "description": "Where a release stands on a deployment. The first that applies, in this order.",
+        "enum": [
+          "running",
+          "deploying",
+          "awaiting_approval",
+          "refused",
+          "held",
+          "superseded",
+          "failed",
+          "host_refused",
+          "deferred",
+          "promotion_pending",
+          "needs_request",
+          "waiting"
+        ]
+      },
+      "ReleaseStory": {
+        "type": "object",
+        "description": "One release, and why it stands where it does.",
+        "required": [
+          "release",
+          "reasons",
+          "next",
+          "origin",
+          "commits",
+          "requests",
+          "deploys"
+        ],
+        "properties": {
+          "commits": {
+            "$ref": "#/components/schemas/CommitsView",
+            "description": "The commits it brings."
+          },
+          "deploys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeployBrief"
+            },
+            "description": "The newest 20 deploys of it, newest first."
+          },
+          "next": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NextAction",
+                "description": "What to do next, if anything."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "origin": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OriginView",
+                "description": "Where it came from, `null` unless it verified."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why it stands where it does, in order: the controller's words, with hostile text\nquoted in them. Escape them before showing them."
+          },
+          "release": {
+            "$ref": "#/components/schemas/ReleaseView",
+            "description": "The release."
+          },
+          "requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestBrief"
+            },
+            "description": "The newest 20 requests for it, newest first."
+          }
+        }
+      },
+      "ReleaseView": {
+        "type": "object",
+        "description": "A release of a deployment, and where it stands.",
+        "required": [
+          "tag",
+          "status",
+          "decision",
+          "first_seen_at",
+          "seen_at"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/Decision",
+            "description": "What the watcher last recorded of it."
+          },
+          "first_seen_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the controller first recorded it, in seconds since the Unix epoch."
+          },
+          "seen_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was last verified, in seconds since the Unix epoch."
+          },
+          "status": {
+            "$ref": "#/components/schemas/ReleaseStatus",
+            "description": "Where it stands now."
+          },
+          "tag": {
+            "type": "string",
+            "description": "The tag.",
+            "example": "v1.3.0"
+          }
+        }
+      },
+      "RequestBrief": {
+        "type": "object",
+        "description": "A request for a release, in its story.",
+        "required": [
+          "id",
+          "state",
+          "requested_by",
+          "approved_by",
+          "created_at",
+          "closed_reason"
+        ],
+        "properties": {
+          "approved_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who signed it, `null` unless it was approved.",
+            "example": "operator"
+          },
+          "closed_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it was closed unsigned, in the controller's words, or `null`."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was asked, in seconds since the Unix epoch."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The request's number."
+          },
+          "requested_by": {
+            "type": "string",
+            "description": "Who asked.",
+            "example": "ci"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RequestState",
+            "description": "Where it stands."
+          }
+        }
+      },
       "RequestState": {
         "type": "string",
         "description": "Where a request stands. Values are added as answers come to carry them.",
         "enum": [
           "awaiting_approval",
+          "approved",
+          "stale",
+          "expired",
           "cancelled"
         ]
       },
@@ -695,6 +1993,120 @@
             "description": "Where it stands."
           }
         }
+      },
+      "RuleView": {
+        "type": "object",
+        "description": "When a deployment's releases deploy.",
+        "required": [
+          "auto",
+          "approve",
+          "approvers",
+          "prereleases"
+        ],
+        "properties": {
+          "approve": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "With an approver up to this bump: `patch`, `minor` or `any`, or `null` for never.",
+            "example": "minor"
+          },
+          "approvers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Who may sign a request.",
+            "example": [
+              "operator"
+            ]
+          },
+          "auto": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Without a human up to this bump: `patch`, `minor` or `any`, or `null` for never.",
+            "example": "patch"
+          },
+          "prereleases": {
+            "type": "boolean",
+            "description": "Whether prereleases are eligible."
+          }
+        }
+      },
+      "RunningView": {
+        "type": "object",
+        "description": "What a deployment's host last said about it.",
+        "required": [
+          "tag",
+          "digest",
+          "phase",
+          "busy",
+          "drift",
+          "config_drift",
+          "healthy_secs",
+          "last_report"
+        ],
+        "properties": {
+          "busy": {
+            "type": "boolean",
+            "description": "Whether the agent is running a deploy."
+          },
+          "config_drift": {
+            "type": "boolean",
+            "description": "Whether the host's configuration differs from the controller's."
+          },
+          "digest": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its digest."
+          },
+          "drift": {
+            "type": "boolean",
+            "description": "Whether what runs differs from what the agent deployed."
+          },
+          "healthy_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long this release has been observed healthy, in seconds, as of `last_report`;\n`null` while nothing runs or it has drifted."
+          },
+          "last_report": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the host last said anything about it, in seconds since the Unix epoch."
+          },
+          "phase": {
+            "type": "string",
+            "description": "The agent's phase, such as `idle`.",
+            "example": "idle"
+          },
+          "tag": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The release deployed, `null` if none ever was.",
+            "example": "v1.2.0"
+          }
+        }
+      },
+      "Via": {
+        "type": "string",
+        "description": "How a principal proved who they are.",
+        "enum": [
+          "token",
+          "session"
+        ]
       }
     },
     "responses": {
@@ -794,6 +2206,16 @@
             }
           }
         },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "ReadForbidden": {
+        "description": "The principal may know this exists and has no grant to view it, or a session's read that its `Sec-Fetch-Site` says another site sent: `forbidden`, `bad_origin`.",
         "content": {
           "application/problem+json": {
             "schema": {

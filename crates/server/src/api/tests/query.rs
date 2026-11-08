@@ -4,11 +4,15 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::routing::get;
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use utoipa::IntoParams;
 
 use super::grants::{ANYONE, assert_documented, holder_of, operations, served_document, try_case};
 use super::{Caller, OUTSIDER, REQUESTER, World, answer, holder};
+use crate::agent_api::ApiProblem;
+use crate::api::query::{Cursor, CursorList};
 use crate::api::{ApiQuery, IdPath};
 
 /// A query with one parameter, to find where the limit falls.
@@ -164,5 +168,83 @@ fn an_id_is_read_one_way() {
         "9223372036854775808",
     ] {
         assert_eq!(number(raw), None, "{raw:?}");
+    }
+}
+
+const LISTS: [CursorList; 4] = [
+    CursorList::Releases,
+    CursorList::Deploys,
+    CursorList::Audit,
+    CursorList::Deployments,
+];
+
+#[test]
+fn cursor_round_trips() {
+    let longest = "a".repeat(160);
+    for list in LISTS {
+        for after in [
+            "app/prod",
+            "v1.2.0+build.7",
+            "42",
+            "a.b.c",
+            longest.as_str(),
+        ] {
+            let cursor = Cursor::new(list, after);
+            let raw = cursor.encode();
+            assert!(
+                raw.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{raw}"
+            );
+            let back = Cursor::decode(&raw, list).unwrap();
+            assert_eq!(back, cursor);
+            assert_eq!(back.after(), after);
+        }
+    }
+}
+
+#[test]
+fn cursor_of_another_list_is_refused() {
+    for given in LISTS {
+        let raw = Cursor::new(given, "app/prod").encode();
+        for expected in LISTS.into_iter().filter(|list| *list != given) {
+            assert!(
+                matches!(Cursor::decode(&raw, expected), Err(ApiProblem::BadRequest)),
+                "{given:?} read as {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_cursor_is_refused() {
+    let encoded = |text: &str| URL_SAFE_NO_PAD.encode(text);
+    let over = format!("v1.deployments.{}", "a".repeat(161));
+    let table: Vec<(&str, String)> = vec![
+        ("not base64url", "app/prod".to_owned()),
+        ("not base64url", "djEu+GVw/G95bWVudHMu".to_owned()),
+        ("padded", URL_SAFE.encode("v1.deployments.app/prod")),
+        ("standard alphabet", STANDARD.encode("v1.deployments.a??")),
+        (
+            "not text",
+            URL_SAFE_NO_PAD.encode([b'v', b'1', b'.', 0xff, 0xfe]),
+        ),
+        ("wrong prefix", encoded("v2.deployments.app/prod")),
+        ("wrong prefix", encoded("deployments.app/prod")),
+        ("wrong prefix", encoded("V1.deployments.app/prod")),
+        ("an unknown list", encoded("v1.hosts.home-1")),
+        ("no after", encoded("v1.deployments")),
+        ("empty after", encoded("v1.deployments.")),
+        ("empty", String::new()),
+        ("over 160 bytes", encoded(&over)),
+    ];
+    for (what, raw) in table {
+        assert!(
+            matches!(
+                Cursor::decode(&raw, CursorList::Deployments),
+                Err(ApiProblem::BadRequest)
+            ),
+            "{what}: {raw:?}"
+        );
     }
 }

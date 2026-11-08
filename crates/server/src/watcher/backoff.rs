@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use landfall_origin::fetch::RateLimitReset;
 
+use super::commits::COMMITS_DEADLINE;
 use super::{REPO_DEADLINE, TICK_INTERVAL};
 
 /// The first wait after a failure, seconds; it doubles with each one after.
@@ -20,6 +21,8 @@ pub(super) const RATE_LIMIT_MAX_SECS: i64 = 24 * 60 * 60;
 struct Backoff {
     until: i64,
     failures: u32,
+    /// Whether it waits for a server's rate limit, rather than after failures.
+    rate_limited: bool,
 }
 
 /// What the watcher keeps between ticks: how long each repository waits, by its
@@ -29,7 +32,13 @@ pub struct WatcherState {
     backoffs: Mutex<HashMap<u64, Backoff>>,
     /// Whose turn it is to go first in each repository, as a count of looks.
     turns: Mutex<HashMap<u64, usize>>,
+    /// Until when no commits are asked of GitHub, in Unix seconds: its window's reset,
+    /// once it had fewer requests left than the floor or refused one. Kept across ticks,
+    /// so a new tick's budget doesn't spend a request to learn it again.
+    commits_paused_until: Mutex<i64>,
     pub(super) repo_deadline: Duration,
+    /// How long a tick's commits may take.
+    pub(super) commits_deadline: Duration,
     /// The wait after a host's first "not now", seconds: one look's worth.
     pub(super) cooldown_start: i64,
 }
@@ -50,12 +59,23 @@ impl WatcherState {
         }
     }
 
+    /// The default state but for how long a tick's commits may take, for a test.
+    #[cfg(test)]
+    pub(super) fn with_commits_deadline(commits_deadline: Duration) -> Self {
+        Self {
+            commits_deadline,
+            ..Self::default()
+        }
+    }
+
     /// The state of a watcher that looks every `interval`.
     pub(super) fn looking_every(interval: Duration) -> Self {
         Self {
             backoffs: Mutex::default(),
             turns: Mutex::default(),
+            commits_paused_until: Mutex::new(i64::MIN),
             repo_deadline: REPO_DEADLINE,
+            commits_deadline: COMMITS_DEADLINE,
             cooldown_start: i64::try_from(interval.as_secs()).unwrap_or(i64::MAX),
         }
     }
@@ -79,8 +99,40 @@ impl WatcherState {
         self.locked().get(&repo).is_some_and(|b| now < b.until)
     }
 
+    /// Whether any repository waits for a server's rate limit now. The commits between
+    /// releases are not asked for then: GitHub's requests go to verification first, and
+    /// one limit on the controller's address or token is likely the same for both.
+    pub(super) fn any_rate_limited(&self, now: i64) -> bool {
+        self.locked()
+            .values()
+            .any(|b| b.rate_limited && now < b.until)
+    }
+
     pub(super) fn succeeded(&self, repo: u64) {
         self.locked().remove(&repo);
+    }
+
+    /// Whether commits wait for GitHub's rate-limit window to end.
+    pub(super) fn commits_paused(&self, now: i64) -> bool {
+        now < *self
+            .commits_paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Commits wait until `until`, as far as a server's word is believable: at least a
+    /// second and at most [`RATE_LIMIT_MAX_SECS`] from `now`. A later pause already set
+    /// stands.
+    pub(super) fn pause_commits(&self, until: i64, now: i64) {
+        let until = until.clamp(
+            now.saturating_add(1),
+            now.saturating_add(RATE_LIMIT_MAX_SECS),
+        );
+        let mut paused = self
+            .commits_paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *paused = (*paused).max(until);
     }
 
     /// The repository waits longer the more often it fails in a row.
@@ -96,6 +148,7 @@ impl WatcherState {
             Backoff {
                 until: now.saturating_add(wait),
                 failures,
+                rate_limited: false,
             },
         );
     }
@@ -108,7 +161,13 @@ impl WatcherState {
             RateLimitReset::After(seconds) => {
                 now.saturating_add(i64::try_from(seconds).unwrap_or(RATE_LIMIT_MAX_SECS))
             }
-            RateLimitReset::Unknown => return self.failed(repo, now),
+            RateLimitReset::Unknown => {
+                self.failed(repo, now);
+                if let Some(backoff) = self.locked().get_mut(&repo) {
+                    backoff.rate_limited = true;
+                }
+                return;
+            }
         };
         let until = until.clamp(
             now.saturating_add(1),
@@ -116,6 +175,13 @@ impl WatcherState {
         );
         let mut backoffs = self.locked();
         let failures = backoffs.get(&repo).map_or(0, |b| b.failures);
-        backoffs.insert(repo, Backoff { until, failures });
+        backoffs.insert(
+            repo,
+            Backoff {
+                until,
+                failures,
+                rate_limited: true,
+            },
+        );
     }
 }

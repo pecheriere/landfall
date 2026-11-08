@@ -32,6 +32,26 @@ fn approvals(_: &World) -> String {
     "/api/v1/approvals".to_owned()
 }
 
+fn me(_: &World) -> String {
+    "/api/v1/me".to_owned()
+}
+
+fn deployments(_: &World) -> String {
+    "/api/v1/deployments".to_owned()
+}
+
+fn prod(_: &World) -> String {
+    "/api/v1/deployments/app/prod".to_owned()
+}
+
+fn prod_releases(_: &World) -> String {
+    "/api/v1/deployments/app/prod/releases".to_owned()
+}
+
+fn prod_release(_: &World) -> String {
+    "/api/v1/deployments/app/prod/releases/v1.3.0".to_owned()
+}
+
 fn prod_requests(_: &World) -> String {
     "/api/v1/deployments/app/prod/requests".to_owned()
 }
@@ -73,6 +93,41 @@ pub(super) const CASES: &[Case] = &[
         role: ANYONE,
         method: Method::GET,
         path: approvals,
+        body: None,
+    },
+    Case {
+        operation: "whoAmI",
+        role: ANYONE,
+        method: Method::GET,
+        path: me,
+        body: None,
+    },
+    Case {
+        operation: "listDeployments",
+        role: ANYONE,
+        method: Method::GET,
+        path: deployments,
+        body: None,
+    },
+    Case {
+        operation: "getDeployment",
+        role: "view",
+        method: Method::GET,
+        path: prod,
+        body: None,
+    },
+    Case {
+        operation: "listReleases",
+        role: "view",
+        method: Method::GET,
+        path: prod_releases,
+        body: None,
+    },
+    Case {
+        operation: "getRelease",
+        role: "view",
+        method: Method::GET,
+        path: prod_release,
         body: None,
     },
     Case {

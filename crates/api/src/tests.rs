@@ -3,7 +3,11 @@
 use landfall_core::intent::DeployIntent;
 use serde_json::json;
 
-use crate::{IntentView, NewApproval, NewRequest, Problem, ProblemCode, RequestState};
+use crate::{
+    CommitSource, CommitsState, CommitsView, Decision, DeployState, DeploymentRef, IntentView,
+    NewApproval, NewRequest, NextKind, Outcome, Permission, Problem, ProblemCode, PromotionView,
+    ReleaseStatus, RequestState, Via,
+};
 
 fn intent(expected_running: Option<&str>) -> DeployIntent {
     DeployIntent {
@@ -39,12 +43,47 @@ fn codes_and_states_from_a_newer_controller_read_as_unknown() {
     assert_eq!(problem.code, ProblemCode::Unknown);
     let state: RequestState = serde_json::from_value(json!("teleporting")).unwrap();
     assert_eq!(state, RequestState::Unknown);
+    let via: Via = serde_json::from_value(json!("telepathy")).unwrap();
+    assert_eq!(via, Via::Unknown);
+    let permission: Permission = serde_json::from_value(json!("teleport")).unwrap();
+    assert_eq!(permission, Permission::Unknown);
+    let status: ReleaseStatus = serde_json::from_value(json!("teleported")).unwrap();
+    assert_eq!(status, ReleaseStatus::Unknown);
 }
 
 #[test]
 fn unknown_is_never_sent() {
     assert!(serde_json::to_value(ProblemCode::Unknown).is_err());
     assert!(serde_json::to_value(RequestState::Unknown).is_err());
+    assert!(serde_json::to_value(Via::Unknown).is_err());
+    assert!(serde_json::to_value(Permission::Unknown).is_err());
+    assert!(serde_json::to_value(ReleaseStatus::Unknown).is_err());
+}
+
+#[test]
+fn a_deployment_one_cannot_view_is_never_named() {
+    let seen = PromotionView {
+        deployment: DeploymentRef::Seen("app/beta".parse().unwrap()),
+        healthy_for_secs: 3600,
+    };
+    let unseen = PromotionView {
+        deployment: DeploymentRef::Unseen,
+        healthy_for_secs: 3600,
+    };
+    let seen_json = json!({ "deployment": "app/beta", "healthy_for_secs": 3600 });
+    let unseen_json = json!({ "deployment": null, "unseen": true, "healthy_for_secs": 3600 });
+    assert_eq!(serde_json::to_value(&seen).unwrap(), seen_json);
+    assert_eq!(serde_json::to_value(&unseen).unwrap(), unseen_json);
+    assert_eq!(
+        serde_json::from_value::<PromotionView>(seen_json).unwrap(),
+        seen
+    );
+    assert_eq!(
+        serde_json::from_value::<PromotionView>(unseen_json).unwrap(),
+        unseen
+    );
+    assert_eq!(seen.deployment.to_string(), "app/beta");
+    assert_eq!(unseen.deployment.to_string(), "a deployment you can't view");
 }
 
 #[test]
@@ -63,4 +102,40 @@ fn what_a_client_sends_refuses_fields_the_controller_does_not_know() {
     assert!(serde_json::from_value::<NewApproval>(json!({ "assertion": extra })).is_err());
     let outer = json!({ "assertion": assertion, "intent": {} });
     assert!(serde_json::from_value::<NewApproval>(outer).is_err());
+}
+
+#[test]
+fn release_values_from_a_newer_controller_read_as_unknown_and_are_never_sent() {
+    fn unknown<T>(value: &str, want: &T)
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize + PartialEq + std::fmt::Debug,
+    {
+        let read: T = serde_json::from_value(json!(value)).unwrap();
+        assert_eq!(&read, want);
+        assert!(serde_json::to_value(&read).is_err(), "{read:?} was sent");
+    }
+    unknown("teleported", &Decision::Unknown);
+    unknown("teleport", &NextKind::Unknown);
+    unknown("gitlab", &CommitSource::Unknown);
+    unknown("guessed", &CommitsState::Unknown);
+    unknown("vanished", &DeployState::Unknown);
+    unknown("exploded", &Outcome::Unknown);
+}
+
+#[test]
+fn a_story_reads_with_fields_it_does_not_know() {
+    let commits = json!({
+        "source": "github",
+        "verified": false,
+        "state": "listed",
+        "base": "v1.2.0",
+        "total": 250,
+        "compare_url": "https://github.com/example/app/compare/a...b",
+        "commits": [],
+        "signed": "a field from a newer controller",
+    });
+    let read: CommitsView = serde_json::from_value(commits).unwrap();
+    assert_eq!(read.state, CommitsState::Listed);
+    assert_eq!(read.total, Some(250));
+    assert!(!read.verified);
 }

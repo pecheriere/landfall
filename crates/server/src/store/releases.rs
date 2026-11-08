@@ -16,6 +16,7 @@ use sqlx::Row as _;
 use sqlx::sqlite::SqliteRow;
 
 use super::deploys::{NewDeploy, observed_secs, parsed};
+use super::latest::note_release;
 use super::{Store, StoreError};
 use crate::audit::{AuditEvent, EventKind};
 use crate::logger::log;
@@ -116,6 +117,12 @@ impl StoredRelease {
     pub fn verified_under(&self, config_hash: &str) -> bool {
         self.config_hash.as_deref() == Some(config_hash)
     }
+
+    /// Why it was decided so, as recorded: quoted, and bounded.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
 }
 
 /// What a release was found to be, the first time, or when its inputs changed.
@@ -157,6 +164,22 @@ impl Hold {
     pub fn says(&self, reason: &str) -> bool {
         self.reason == stored_reason(reason)
     }
+
+    /// Why, as recorded: quoted, and bounded.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// A hold, from a `release_holds` row with its `reason`, `since`, `last_try` and `slow`.
+pub(super) fn hold_from(row: &SqliteRow) -> Result<Hold, sqlx::Error> {
+    Ok(Hold {
+        reason: row.try_get("reason")?,
+        since: row.try_get("since")?,
+        last_try: row.try_get("last_try")?,
+        slow: row.try_get("slow")?,
+    })
 }
 
 /// What a host last said about a deployment.
@@ -262,12 +285,13 @@ impl Store {
             None => (None, None, None, None, None),
         };
         // Without a `seen`, whatever is known of its origin stays as it is. A commit
-        // or digest already recorded is never overwritten by none.
+        // or digest already recorded is never overwritten by none. `first_seen_at` is
+        // set here and never on conflict: what is compared goes by it.
         sqlx::query(
             "INSERT INTO releases
                  (deployment, tag, commit_sha, digest, decision, reason, seen_at,
-                  tag_object, config_hash, origin, origin_refused)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12)
+                  tag_object, config_hash, origin, origin_refused, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?7)
              ON CONFLICT (deployment, tag) DO UPDATE SET
                  decision = excluded.decision,
                  reason = excluded.reason,
@@ -294,6 +318,7 @@ impl Store {
         .bind(seen.is_some_and(|seen| seen.refused))
         .execute(&mut *tx)
         .await?;
+        note_release(&mut tx, deployment, tag).await?;
         sqlx::query("DELETE FROM release_holds WHERE deployment = ? AND tag = ?")
             .bind(deployment.as_ref())
             .bind(tag.as_ref())
@@ -354,12 +379,7 @@ impl Store {
         let mut whole = None;
         for row in &rows {
             let tag: String = row.try_get("tag")?;
-            let hold = Hold {
-                reason: row.try_get("reason")?,
-                since: row.try_get("since")?,
-                last_try: row.try_get("last_try")?,
-                slow: row.try_get("slow")?,
-            };
+            let hold = hold_from(row)?;
             if tag == WHOLE_DEPLOYMENT {
                 whole = Some(hold);
             } else {
@@ -643,7 +663,9 @@ impl Store {
     }
 }
 
-fn stored_release(row: &SqliteRow) -> Result<StoredRelease, StoreError> {
+/// A release, from a row with `commit_sha`, `digest`, `decision`, `reason`, `tag_object`,
+/// `config_hash` and `origin_refused`.
+pub(super) fn stored_release(row: &SqliteRow) -> Result<StoredRelease, StoreError> {
     let optional = |column: &'static str| row.try_get::<Option<String>, _>(column);
     Ok(StoredRelease {
         commit: optional("commit_sha")?

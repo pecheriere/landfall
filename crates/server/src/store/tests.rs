@@ -1,4 +1,6 @@
 mod approvals_migration;
+mod commit_ranges_migration;
+mod latest_releases;
 mod read_only;
 
 use std::fs::{self, Permissions};
@@ -471,14 +473,20 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
         [
             "api_tokens",
             "audit_events",
+            "commit_ranges",
+            "commits_since",
             "deploy_requests",
             "deploy_steps",
             "deploys",
             "enrol_codes",
+            "first_tags",
+            "highest_releases",
             "hosts",
+            "latest_unfilled",
             "nonces",
             "passkey_invites",
             "passkeys",
+            "range_commits",
             "release_holds",
             "releases",
             "replaced_releases",
@@ -490,7 +498,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(applied, 4);
+    assert_eq!(applied, 7);
     assert_eq!(chain(&store).await, (2, None));
 }
 

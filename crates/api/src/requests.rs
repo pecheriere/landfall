@@ -65,6 +65,12 @@ impl From<&DeployIntent> for IntentView {
 pub enum RequestState {
     /// Waiting for an approver to sign it.
     AwaitingApproval,
+    /// Signed, and its deploy queued.
+    Approved,
+    /// Closed unsigned: what runs, or the release's record, moved away from what it asked.
+    Stale,
+    /// Closed unsigned, past its time.
+    Expired,
     /// Cancelled before anyone signed it.
     Cancelled,
     /// A state from a newer controller than this client knows. No controller sends it, and

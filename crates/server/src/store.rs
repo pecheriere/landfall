@@ -7,9 +7,13 @@
 mod agent;
 mod auth;
 mod ceremonies;
+mod commits;
 mod deploys;
+pub(crate) mod history;
+pub(crate) mod latest;
 mod releases;
 mod requests;
+pub(crate) mod views;
 
 use std::fmt;
 use std::fs::{OpenOptions, Permissions};
@@ -32,6 +36,7 @@ use tokio::sync::watch;
 pub use self::agent::NONCE_LIFETIME_SECS;
 pub use self::ceremonies::SESSION_LIFETIME_SECS;
 pub(crate) use self::ceremonies::{NewPasskey, Redeemed};
+pub use self::commits::{CommitRange, NewRange, RangeState, WantedRange};
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
     FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,
@@ -256,6 +261,21 @@ fn migrator() -> Migrator {
             "passkeys",
             include_str!("../migrations/0004_passkeys.sql"),
         ),
+        migration(
+            5,
+            "read_indexes",
+            include_str!("../migrations/0005_read_indexes.sql"),
+        ),
+        migration(
+            6,
+            "commit_ranges",
+            include_str!("../migrations/0006_commit_ranges.sql"),
+        ),
+        migration(
+            7,
+            "latest_releases",
+            include_str!("../migrations/0007_latest_releases.sql"),
+        ),
     ])
 }
 
@@ -346,6 +366,7 @@ impl Store {
         prepare_private_file(path)?;
         let store = Self::connect(path).await?;
         migrator().run(&store.pool).await?;
+        store.fill_latest().await?;
         Ok(store)
     }
 
@@ -440,7 +461,9 @@ impl Store {
             .connect_with(options)
             .await?;
         migrator().run(&pool).await?;
-        Ok(Self::from_pool(pool))
+        let store = Self::from_pool(pool);
+        store.fill_latest().await?;
+        Ok(store)
     }
 
     /// Starts a write transaction. It takes the write lock at once, so reading

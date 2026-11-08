@@ -10,7 +10,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use super::{
-    REPOS_AT_ONCE, ReleaseSource, Stop, TickSummary, WatcherState, settle_whole_hold,
+    REPOS_AT_ONCE, ReleaseSource, Stop, TickSummary, WatcherState, commits, settle_whole_hold,
     watch_deployment,
 };
 use crate::logger::log;
@@ -157,6 +157,22 @@ pub async fn tick<S: ReleaseSource>(
                 summary.failed += 1;
             }
         }
+    }
+    // Only now that every verification of the tick is done, so that GitHub's budget
+    // goes to them first; within a deadline, so that the next tick's don't wait long;
+    // and not while GitHub has a repository waiting for its limit.
+    match store.now() {
+        Ok(now) if state.any_rate_limited(now) => {}
+        Ok(now) => {
+            let walk = commits::after_tick(store, source.as_ref(), config, state, now);
+            if tokio::time::timeout(state.commits_deadline, walk)
+                .await
+                .is_err()
+            {
+                log("watcher: commits: the tick's commits ran past their deadline");
+            }
+        }
+        Err(error) => log(&format!("watcher: commits: {error}")),
     }
     summary
 }

@@ -97,6 +97,11 @@ pub enum ReleaseError {
     /// have said, so this is never a refusal of the release: it is tried again.
     #[error("release listing")]
     Listing(#[source] FetchError),
+    /// The commits between two verified releases could not be read from GitHub.
+    /// This says nothing of either release: it is never a refusal, and it is tried
+    /// again.
+    #[error("commit comparison")]
+    Compare(#[source] FetchError),
     /// There is no Sigstore trust root to verify against.
     #[error("no trust root")]
     NoTrustRoot,
@@ -118,6 +123,7 @@ impl ReleaseError {
         match self {
             Self::UnknownDeployment(_)
             | Self::Listing(_)
+            | Self::Compare(_)
             | Self::NoTrustRoot
             | Self::Interrupted
             | Self::TagObject(_)
@@ -153,7 +159,8 @@ impl ReleaseError {
             | Self::TagCommit(e)
             | Self::Index(e)
             | Self::Bundle(e)
-            | Self::Listing(e) => Some(e),
+            | Self::Listing(e)
+            | Self::Compare(e) => Some(e),
             Self::UnknownDeployment(_)
             | Self::TagPattern(_)
             | Self::TagSignature(_)
