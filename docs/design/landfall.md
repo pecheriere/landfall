@@ -386,8 +386,14 @@ needs approval). Grants live in the same reviewed config file.
 ### 8.3 Audit
 Every event (release seen, verification result, rule decision, request, approval, deploy step, check,
 rollback, config change) is appended to a hash-chained log in SQLite, as in warden, and exposed via the
-API. The agent also writes each decision and failure to its host's journal, so the host's own alerting
-sees refusals even if the controller is down or lying.
+API as far as a principal's grants reach: a row about a deployment to whoever may view it, and a host's
+enrolment and configuration drift to whoever may view a deployment on that host. **Controller-wide rows**
+(API tokens, passkeys, sign-ins, throttling) **are not exposed through the API, and never to a token:**
+no per-deployment grant covers them, and a stolen agent token is the threat they would serve. They stay
+with `landfall-server audit show` on the controller. If the web UI's audit page needs them, the way is a
+controller-level grant enforced like `approve`: a passkey session only, whatever the file says. The agent
+also writes each decision and failure to its host's journal, so the host's own alerting sees refusals
+even if the controller is down or lying.
 
 The chain finds a row edited, deleted or reordered by anyone who did not also rewrite every later one. It
 holds no secret, so alone it can't show rows cut from the end with the sequence record lowered, a dropped
