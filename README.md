@@ -65,9 +65,9 @@ gh release download <tag> --repo pecheriere/landfall --pattern 'landfall-*-darwi
   [`SECURITY.md`](SECURITY.md), compare `SECURITY.md` with a copy you got some other way, and add
   `--source-digest` with the tag's commit. [The guide's first trust](docs/operations.md#first-trust) has
   the commands, as the key's file and the digest each need a particular form.
-- `brew install` checks only the SHA-256 in the tap's formula, so it trusts the tap, whose CI checks each
-  formula's attestation, and the release's signed tag against the tap's own copy of the key, before it
-  merges. Homebrew itself verifies neither the attestation nor the tag.
+- `brew install` checks only the SHA-256 in the tap's formula, so it trusts the tap, which pulls each
+  stable release itself and checks its formula's attestation, and the release's signed tag against the
+  tap's own copy of the key, before it merges. Homebrew itself verifies neither the attestation nor the tag.
 - `landfall host install` checks the tag's signature, the attestation and the sums every time, against
   what the installed `landfall` holds.
 - A browser download on macOS is quarantined: [the guide](docs/operations.md#first-trust) says what that

@@ -62,20 +62,25 @@ its own key.
 4. **Add `host-install` to the `main` ruleset's required checks,** once the job has run on `main`. A
    required check that doesn't exist yet leaves every pull request pending for ever. Never filter
    that job by path while it's required, as one that doesn't run blocks a merge too.
-5. **Let releases reach the Homebrew tap,** `<owner>/homebrew-tap`, which the owner's command-line
-   tools share:
-   - Create a fine-grained personal access token limited to that one repository, with
-     **Contents: read and write** and **Pull requests: read and write**, and nothing else: no
-     Workflows permission, so it can't change the tap's CI. Keep it apart from the token any other
-     project uses for the same tap, so that each can be revoked alone.
-   - Create a `homebrew-tap` environment in this repository, with "Selected branches and tags" and
-     exactly one rule, the **tag** rule `v[0-9]*`, so only a run on a release tag can read it. Add
-     the token there as the secret `HOMEBREW_TAP_TOKEN`. It needs no reviewers: the tap's checks
-     decide what merges.
-   - In the tap, allow auto-merge, and require its checks on `main`, as `homebrew.yml` asks GitHub
-     to merge once they pass.
+5. **The Homebrew tap,** `<owner>/homebrew-tap`, which the owner's command-line tools share,
+   pulls releases itself: this repository holds no token for it, and needs no environment or
+   secret for it. A scheduled workflow in the tap reads landfall's latest stable release, verifies
+   it with the tap's own script and its own copy of the release key, and opens a pull request that
+   merges itself once the tap's checks pass, with a token the tap keeps in an environment limited
+   to its `main`. Its setup is the tap's.
 
-   Until the secret exists, `homebrew.yml` fails after each release, and nothing else does.
+   The tap's `scope` check lets a pull request that isn't signed by you only change a formula that
+   already exists. So **the first stable release's formula is added by you,** once that release is
+   out, by a commit signed with your key, in a clone of the tap:
+
+   ```sh
+   python3 -I scripts/landfall.py fetch <version> Formula/landfall.rb
+   git add Formula/landfall.rb && git commit -m "landfall <version>"
+   ```
+
+   The commit must carry your signature, as the tap's `scope` check wants, and the script verifies
+   what it fetches as the tap's workflow does. Every later stable release
+   reaches the tap on its own.
 6. **If a `release` environment is left from before,** delete it: nothing names it any more.
 
 To rotate the key, let two overlap: release N carries both and is signed by the old one, and
@@ -94,28 +99,40 @@ release N+1 is signed by the new one.
    If a later commit landed on `main` since, run the workflow by `workflow_dispatch` on `main`, as
    the tag goes on `main`'s head and only a version change starts the dry run.
 3. Once it's green, check immutable releases once more, with the `gh api` call above: this is the
-   one setting that goes red only after publishing. Then, from a clean clone:
+   one setting that goes red only after publishing. Then, from a clean clone, at a terminal:
 
    ```sh
-   scripts/release-tag <version> --push
+   scripts/release-tag <version> --commit <sha> --push
    ```
 
-   It refuses unless `origin/main` is at that version, its dry run passed in full, and the tag is
-   new, here and on origin. Then it signs `v<version>` on that commit with git's signing key,
-   checks the signature against the signers file, deletes the tag if it doesn't match, and pushes
-   it. Name the release key with `--signing-key "key::ssh-ed25519 <base64>"` if it isn't git's
-   default. Leave out `--push` to see the push command instead. Agents never run it.
-4. Nothing else. The tag runs `preflight`, then `publish`, then starts `homebrew.yml`, which,
-   for a release that isn't a candidate, opens a pull request in the tap with the new formula and
-   turns on auto-merge. The tap's checks verify the formula's attestation, and the signed tag
-   against the tap's own copy of the key, refuse a downgrade or a candidate, and merge only when
-   green. [`packaging/homebrew-tap/README.md`](packaging/homebrew-tap/README.md) says how to check
-   a formula by hand.
+   `<sha>` is the merge commit of the version bump's pull request, the one you saw. It refuses
+   unless `origin/main` is exactly that commit, at that version, its dry run passed in full, and
+   the tag is new, here and on origin. It also refuses a change to
+   `crates/cli/assets/release-signers` since the last release unless you pass `--signers-change`,
+   and then shows the old and new fingerprints: compare them with `SECURITY.md` and with a copy you
+   got some other way. Before anything is signed it shows the commit and the dry run, every commit
+   since the last release with its signature status and files, and in full any change to the
+   signers file, `.github/`, `scripts/release-tag`, `Cargo.toml` and `Cargo.lock`. **Read them.**
+   Then it asks you to type the version, with no flag to skip that, signs `v<version>` on that
+   commit with git's signing key, checks the signature against the signers file, deletes the tag
+   if it doesn't match, says what it pushes and pushes it. Name the release key with
+   `--signing-key "key::ssh-ed25519 <base64>"` if it isn't git's default. Leave out `--push` to see
+   the push command instead. **The first time, run it without `--push`,** as its checks of a dry
+   run's jobs haven't met a real one yet: a refusal there costs nothing. Agents never run it, and
+   it refuses when stdin isn't a terminal.
+4. Nothing else for landfall. The tag runs `preflight`, then `publish`. For a release that isn't
+   a candidate, the tap's scheduled workflow then proposes the new formula and merges it once its
+   checks pass: they verify the formula's attestation, and the signed tag against the tap's own
+   copy of the key, and refuse a downgrade or a candidate. The first stable release's formula is
+   yours to add, by "Once" step 5.
+   [`packaging/homebrew-tap/README.md`](packaging/homebrew-tap/README.md) says how to check a
+   formula by hand.
 5. After a first release candidate, before the real tag, go through "The first-tag list" in
    [the plan that added this workflow](docs/superpowers/plans/2026-11-02-landfall-06-release-binaries-and-host-install.md):
    what only a real tag can show, such as a real bundle, and a real download. Its items about the
-   approval are gone with the approval. Two wait for later: Homebrew for the real release, and a
-   real `landfall host upgrade` for a second release.
+   approval are gone with the approval, and its Homebrew item, copying the formula by hand, is now
+   the signed first formula of "Once" step 5. A real `landfall host upgrade` waits for a second
+   release.
 
 ### What a failed run costs
 
@@ -137,9 +154,6 @@ pull request, and tag again. A flake anywhere costs this too. A dry run can be r
   public,** as a failed try may have been applied. Check it by hand before doing anything else: it should not be a draft, should have this tag, and
   should read as immutable. It could be public with the wrong tag or not locked, and it may not
   be possible to repair it, in which case the way on is still a new version.
-- **The `homebrew` job or `homebrew.yml` failing** costs nothing: the release is out. Run
-  `homebrew.yml` by `workflow_dispatch` on the tag (`gh workflow run homebrew.yml --ref v<version>`)
-  once the cause is fixed. It stops cleanly if the tap's branch or pull request already exists.
 - **crates.io failing** past the few tries each lookup gets fails `crate-age`, which looks up
   every locked crate on a release, and so costs a version number. A pull request's check can
   simply be re-run.

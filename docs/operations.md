@@ -861,9 +861,9 @@ each way of getting it does and doesn't check:
   `--source-digest` on another project's release. `git verify-tag` with that file hasn't run at all, on
   any tag, and there are no tags of landfall's yet.
 
-- **`brew install`** checks only the SHA-256 in the tap's formula, so you're trusting the tap, whose
-  CI checks each formula's attestation, and the release's signed tag against the tap's own copy of
-  the key, before it merges. Homebrew itself verifies neither the attestation nor the tag.
+- **`brew install`** checks only the SHA-256 in the tap's formula, so you're trusting the tap, which
+  pulls each stable release itself and checks its formula's attestation, and the release's signed
+  tag against the tap's own copy of the key, before it merges. Homebrew itself verifies neither the attestation nor the tag.
 
 - **A browser download on macOS** is quarantined, and these binaries aren't notarised, so Gatekeeper
   should stop it, which hasn't been tried on a real release yet. Verify it as above first. Then `xattr -d com.apple.quarantine <file>` lets it run. `gh

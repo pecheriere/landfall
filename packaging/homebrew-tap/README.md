@@ -7,17 +7,21 @@ about landfall works without it. A fork does the same with its own names.
 ## How a release gets there
 
 Every release has `landfall.rb` as an attested asset, pinning each platform's file by URL and
-SHA-256. After a stable release is published, `.github/workflows/homebrew.yml` checks that its tag
-is `v` plus the workspace version, verifies the formula against the release's attestation, and opens
-a pull request in the tap that writes it to `Formula/landfall.rb`, with auto-merge on. It does that
-through the GitHub API with a token limited to the tap, and never checks out or runs anything of the
-tap's. Release candidates never reach the tap: the workflow skips any tag with a suffix, and any
-release marked as a prerelease.
+SHA-256. The tap pulls it: landfall holds no token for the tap and runs nothing for it.
 
-The tap decides what merges. Its CI, from the tap's own `main`, verifies the formula's attestation
-and the release's signed tag against the tap's own copy of the key, refuses a downgrade and a release
-candidate, and the pull request merges only when that is green. A stolen landfall token can run the
-release workflow, but can't sign a tag, so it can't get a formula past those checks.
+- A scheduled workflow in the tap reads landfall's latest stable release, verifies it with the
+  tap's own script and its own copy of the release key, the formula's attestation and the signed
+  tag both, and opens a pull request that merges itself once the tap's checks pass. Its token is
+  the tap's, in an environment limited to the tap's `main`.
+- The tap's checks refuse a downgrade and a release candidate, so release candidates never reach
+  `brew upgrade`.
+- The tap's `scope` check lets a pull request that isn't signed by the owner only change a formula
+  that already exists. So the first stable release's formula is added by the owner, by a commit
+  signed with their key, after `python3 -I scripts/landfall.py fetch <version>
+  Formula/landfall.rb` in the tap. Every later release is automatic.
+
+A stolen landfall token can run landfall's release workflow, but can't sign a tag, so it can't get
+a formula past the tap's checks, and it holds nothing that reaches the tap.
 
 ## Checking a formula by hand
 

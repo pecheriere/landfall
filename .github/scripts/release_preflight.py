@@ -1,4 +1,4 @@
-"""Prove a tag before anyone is asked to approve its release.
+"""Prove a tag before `publish` runs: the signature is the only gate a release has.
 
 Refuses unless all of these hold, and fails closed on anything it didn't expect:
 

@@ -204,15 +204,18 @@ cargo deny check
   CI and crate-age, builds with no cache, and publishes in one job, `publish`, with no
   environment and no approval: the tag's signature is the only gate, as a stolen token
   could approve a deployment through the API but can't forge the signature. The owner
-  signs the tag with `scripts/release-tag`, which agents never run; its tests are
-  `test_release_tag.py`. `CONTRIBUTING.md` has the procedure, and
+  signs the tag with `scripts/release-tag <version> --commit <sha>`, which agents never run,
+  and which refuses without a terminal: it shows the range since the last signed release
+  and any change to the signers file, `.github/`, itself and `Cargo.*`, refuses a signers
+  change without `--signers-change`, and wants the version typed. Its tests are
+  `test_release_tag.py`, with the terminal injected. `CONTRIBUTING.md` has the procedure, and
   `test_release_workflow.py` holds what the workflow must keep doing: edit the two
   together.
 - **The dry run:** a push to main that changes `workspace.package.version`, and a
   `workflow_dispatch` run, build and check everything a tag does, but skip `preflight`
   and `publish`, so they attest nothing. The `version` job decides, with
   `version_bump.py` against `github.event.before`, and `on-main` needs it, so any other
-  push to main stops there. `preflight`, `publish` and `homebrew` want
+  push to main stops there. `preflight` and `publish` want
   `github.event_name == 'push' && github.ref_type == 'tag'`, and `smoke` compares
   versions only on a tag. `scripts/release-tag` refuses a commit with no full, green dry
   run.
@@ -235,16 +238,10 @@ cargo deny check
 - **One attempt:** `preflight` and `publish` fail at once if `GITHUB_RUN_ATTEMPT` isn't 1, as
   hosts refuse a release attested by two attempts and a tag can't be moved. The way
   out of any failed run is a version bump and a new tag.
-- **Homebrew:** the `homebrew` job, after `publish`, starts `homebrew.yml` on the tag
-  with `gh workflow run`, as a release published with the run's own token starts no
-  workflow. Its `formula` job, with no secret, checks the tag against the workspace
-  version and the release (published, not a prerelease), downloads `landfall.rb` and
-  verifies it against the release's bundle. Its `tap` job, in the `homebrew-tap`
-  environment, gives `HOMEBREW_TAP_TOKEN` to one step, `homebrew_tap.py propose`, which
-  opens a pull request in the owner's tap through the API alone (no checkout of the tap,
-  nothing of it run) and turns on auto-merge. Release candidates never reach it. The tap's
-  own CI is the gate there. `test_homebrew_workflow.py` holds what that workflow must keep
-  doing.
+- **Homebrew:** landfall holds no token for the tap and runs nothing for it. The tap's own
+  scheduled workflow reads the latest stable release, verifies it with the tap's script and
+  key, and opens a pull request that merges itself when green. `assemble_release.py` writes
+  the formula, which `brew style` must accept (`on_macos` may not hold `url`).
 - The last step of `publish` sends the tag with `draft=false`, as the API can otherwise
   publish with no tag, and reads the release back: not a draft, this tag, immutable. A
   failure there may mean a public release, so it's checked by hand. The draft is found by
