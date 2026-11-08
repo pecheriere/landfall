@@ -27,7 +27,7 @@ use super::openapi::{
     Unauthenticated,
 };
 use super::query::{ApiQuery, Cursor, CursorList, DeploymentPath, Limit, NoQuery};
-use super::releases::{self, open_tag};
+use super::releases;
 use super::visible::{shown_deployment, viewable};
 use crate::agent_api::ApiState;
 use crate::auth::{HumanProblem, Principal, can, sees};
@@ -157,14 +157,7 @@ impl Facts {
     ) -> Result<Self, HumanProblem> {
         let ids: Vec<&DeploymentId> = deployments.iter().map(|d| d.id()).collect();
         let running = state.store().running_states(&ids).await?;
-        let mut latest = HashMap::new();
-        for d in deployments {
-            let running = host_said(&running, d).cloned();
-            let newest = releases::latest(state, principal, d, running, open_tag(&open, d)).await?;
-            if let Some(newest) = newest {
-                latest.insert(d.id().clone(), newest);
-            }
-        }
+        let latest = releases::latest_of(state, principal, deployments, &running, &open).await?;
         Ok(Self {
             running,
             open,

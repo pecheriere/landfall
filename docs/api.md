@@ -103,7 +103,8 @@ that match. Each shows what its host last said (`running`), its request waiting 
 (`open_request`) and `needs_you`, whether that request is one this principal could sign. A token
 never approves, so `needs_you` is always `false` for a token, and `needs_you=true` lists nothing
 for one. `latest` is its newest release, the first `listReleases` shows, with where it stands,
-or `null` when the controller has recorded none.
+or `null` when the controller has recorded none. The controller keeps each deployment's newest
+release as it records releases, so a page costs the same however long the histories are.
 
 `getDeployment` (`GET /api/v1/deployments/{name}/{stage}`) adds the rule, where its releases go
 on to (`promote_to`) and come from (`promoted_from`), and its holds: the newest 50, with
@@ -122,7 +123,8 @@ recorded, when it was first recorded (`first_seen_at`) and when it was last veri
 pattern, where a pre-release is below its release; tags the pattern doesn't read come last, in
 string order. No index holds that order, so each page sorts the deployment's releases in memory:
 at most 5,000 of them, the bound the watcher keeps on a deployment's tags, and those first
-recorded most recently when there are more.
+recorded most recently when there are more, which an index gives without sorting its whole
+history.
 
 `getRelease` (`GET /api/v1/deployments/{name}/{stage}/releases/{tag}`) is a release's story. A
 tag holding `/` is sent with it as `%2F`, and a tag the controller hasn't recorded is

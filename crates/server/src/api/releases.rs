@@ -19,7 +19,7 @@ use landfall_api::{
     RequestState as RequestStateView,
 };
 use landfall_core::config::{Config, Deployment};
-use landfall_core::ids::{ReleaseTag, TagPattern};
+use landfall_core::ids::{DeploymentId, ReleaseTag, TagPattern};
 use landfall_core::rule::decide;
 use landfall_origin::fetch::compare_url;
 use semver::Version;
@@ -88,19 +88,17 @@ struct Standing<'a> {
 }
 
 impl<'a> Standing<'a> {
-    /// What `deployment`'s host said, `running`, its open request, `open`, and its holds and
-    /// its deploy in progress, read now.
-    async fn with(
+    /// What `deployment`'s host said, `running`, its open request's tag, `open`, its holds,
+    /// by tag and on the whole deployment, and its deploy in progress, `active`.
+    fn new(
         state: &'a ApiState,
         principal: &'a Principal,
         deployment: &'a Deployment,
-        running: Option<RunningRow>,
-        open: Option<ReleaseTag>,
-    ) -> Result<Self, StoreError> {
-        let store = state.store();
+        (running, open): (Option<RunningRow>, Option<ReleaseTag>),
+        (holds, whole): (HashMap<String, Hold>, Option<Hold>),
+        active: Option<ReleaseTag>,
+    ) -> Self {
         let config = state.config();
-        let (holds, whole) = store.holds_of(deployment.id()).await?;
-        let active = store.active_deploy_tag(deployment.id()).await?;
         let running_version = match running.as_ref().and_then(|row| row.running.tag.as_ref()) {
             None => RunningVersion::Nothing,
             Some(tag) => deployment
@@ -114,7 +112,7 @@ impl<'a> Standing<'a> {
                 .promote_to()
                 .is_some_and(|p| p.deployment() == deployment.id())
         });
-        Ok(Self {
+        Self {
             config,
             principal,
             deployment,
@@ -125,7 +123,7 @@ impl<'a> Standing<'a> {
             holds,
             whole,
             promoted_to,
-        })
+        }
     }
 
     /// The same, reading what its host said and its open request too.
@@ -134,10 +132,20 @@ impl<'a> Standing<'a> {
         principal: &'a Principal,
         deployment: &'a Deployment,
     ) -> Result<Self, HumanProblem> {
-        let running = state.store().running_states(&[deployment.id()]).await?;
+        let store = state.store();
+        let running = store.running_states(&[deployment.id()]).await?;
         let running = host_said(&running, deployment).cloned();
         let open = open_tag(&open_requests(state).await?, deployment);
-        Ok(Self::with(state, principal, deployment, running, open).await?)
+        let holds = store.holds_of(deployment.id()).await?;
+        let active = store.active_deploy_tag(deployment.id()).await?;
+        Ok(Self::new(
+            state,
+            principal,
+            deployment,
+            (running, open),
+            holds,
+            active,
+        ))
     }
 
     /// Where `row` stands, why, and what to do next, given `last`, the last finished deploy
@@ -254,27 +262,48 @@ fn outcome(name: &str) -> Result<Outcome, StoreError> {
     })
 }
 
-/// `deployment`'s newest release, the first a list shows, and where it stands: for its
-/// summary. `running` and `open` are what its host said and its open request's tag.
-pub(super) async fn latest(
+/// Each of `deployments`' newest release, the first a list of its releases shows, and where
+/// it stands: for their summaries. `running` and `open` are what their hosts said and the
+/// open requests. A fixed number of statements on indexes, whatever their histories hold,
+/// but for promotion, looked up for a deployment something promotes to.
+pub(super) async fn latest_of(
     state: &ApiState,
     principal: &Principal,
-    deployment: &Deployment,
-    running: Option<RunningRow>,
-    open: Option<ReleaseTag>,
-) -> Result<Option<ReleaseBrief>, StoreError> {
+    deployments: &[&Deployment],
+    running: &HashMap<DeploymentId, RunningRow>,
+    open: &[StoredRequest],
+) -> Result<HashMap<DeploymentId, ReleaseBrief>, StoreError> {
     let store = state.store();
-    let rows = store.release_rows(deployment.id()).await?;
-    let pattern = deployment.origin().tags();
-    let Some(newest) = rows.iter().min_by_key(|row| Order::of(pattern, &row.tag)) else {
-        return Ok(None);
-    };
-    let standing = Standing::with(state, principal, deployment, running, open).await?;
-    let view = standing.views(store, &[newest]).await?;
-    Ok(view.into_iter().next().map(|view| ReleaseBrief {
-        tag: view.tag,
-        status: view.status,
-    }))
+    let wanted: Vec<(&DeploymentId, &str)> = deployments
+        .iter()
+        .map(|d| (d.id(), d.origin().tags().prefix()))
+        .collect();
+    let mut facts = store.latest_facts(&wanted).await?;
+    let mut latest = HashMap::new();
+    let none = HashMap::new();
+    for d in deployments {
+        let Some(row) = facts.rows.get(d.id()) else {
+            continue;
+        };
+        let standing = Standing::new(
+            state,
+            principal,
+            d,
+            (host_said(running, d).cloned(), open_tag(open, d)),
+            facts.holds.remove(d.id()).unwrap_or_default(),
+            facts.active.remove(d.id()),
+        );
+        let last = facts.last.get(d.id()).unwrap_or(&none);
+        let explained = standing.explain(store, row, last).await?;
+        latest.insert(
+            d.id().clone(),
+            ReleaseBrief {
+                tag: row.tag.clone(),
+                status: explained.status,
+            },
+        );
+    }
+    Ok(latest)
 }
 
 /// What `listReleases` reads from its query string.

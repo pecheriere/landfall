@@ -16,6 +16,7 @@ use sqlx::Row as _;
 use sqlx::sqlite::SqliteRow;
 
 use super::deploys::{NewDeploy, observed_secs, parsed};
+use super::latest::note_release;
 use super::{Store, StoreError};
 use crate::audit::{AuditEvent, EventKind};
 use crate::logger::log;
@@ -317,6 +318,7 @@ impl Store {
         .bind(seen.is_some_and(|seen| seen.refused))
         .execute(&mut *tx)
         .await?;
+        note_release(&mut tx, deployment, tag).await?;
         sqlx::query("DELETE FROM release_holds WHERE deployment = ? AND tag = ?")
             .bind(deployment.as_ref())
             .bind(tag.as_ref())

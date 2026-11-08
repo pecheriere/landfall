@@ -17,6 +17,13 @@ use super::{RequestState, Store, StoreError, StoredRelease};
 const RELEASE_COLUMNS: &str = "tag, commit_sha, digest, decision, reason, tag_object,
                                config_hash, origin_refused, first_seen_at, seen_at";
 
+/// A deployment's releases first recorded most recently, at most a number: on the index
+/// `releases_by_first_seen`, so that the cut is made without sorting its whole history.
+pub(super) const RELEASE_ROWS: &str = "SELECT tag, commit_sha, digest, decision, reason,
+         tag_object, config_hash, origin_refused, first_seen_at, seen_at
+     FROM releases WHERE deployment = ?
+     ORDER BY first_seen_at DESC, tag LIMIT ?";
+
 /// A release the watcher recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReleaseRow {
@@ -71,7 +78,8 @@ pub(crate) struct LastFinished {
     pub(crate) reason: Option<String>,
 }
 
-fn release_row(row: &SqliteRow) -> Result<ReleaseRow, StoreError> {
+/// A release, from a row with [`RELEASE_COLUMNS`].
+pub(super) fn release_from(row: &SqliteRow) -> Result<ReleaseRow, StoreError> {
     Ok(ReleaseRow {
         tag: parsed(row, "tag")?,
         release: stored_release(row)?,
@@ -83,7 +91,7 @@ fn release_row(row: &SqliteRow) -> Result<ReleaseRow, StoreError> {
 impl Store {
     /// `deployment`'s recorded releases, at most [`MAX_LISTED_TAGS`], the watcher's own
     /// bound on a deployment's tags: those first recorded most recently, when there are
-    /// more. In no particular order, since the order a list shows is the semantic
+    /// more, as their index gives them. Not in the order a list shows, the semantic
     /// versions', which no index holds.
     ///
     /// # Errors
@@ -93,17 +101,14 @@ impl Store {
         deployment: &DeploymentId,
     ) -> Result<Vec<ReleaseRow>, StoreError> {
         let limit = i64::try_from(MAX_LISTED_TAGS).unwrap_or(i64::MAX);
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {RELEASE_COLUMNS} FROM releases WHERE deployment = ?
-             ORDER BY first_seen_at DESC, tag LIMIT ?"
-        )))
-        .bind(deployment.as_ref())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?
-        .iter()
-        .map(release_row)
-        .collect()
+        sqlx::query(RELEASE_ROWS)
+            .bind(deployment.as_ref())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(release_from)
+            .collect()
     }
 
     /// One recorded release, with where it came from as the watcher recorded it: the
@@ -130,7 +135,7 @@ impl Store {
             .try_get::<Option<String>, _>("origin")?
             .map(|text| serde_json::from_str(&text))
             .transpose()?;
-        Ok(Some((release_row(&row)?, origin)))
+        Ok(Some((release_from(&row)?, origin)))
     }
 
     /// The newest `limit` requests for `tag` of `deployment`, newest first.

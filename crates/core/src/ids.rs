@@ -243,6 +243,12 @@ pub struct TagPattern {
 }
 
 impl TagPattern {
+    /// The literal prefix a tag starts with, before its version: the pattern without its `*`.
+    #[must_use]
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Extracts the version from `tag`, already validated as a
     /// [`ReleaseTag`]: strips the literal prefix, parses
     /// strict semver and refuses build metadata.

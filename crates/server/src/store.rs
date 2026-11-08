@@ -10,6 +10,7 @@ mod ceremonies;
 mod commits;
 mod deploys;
 pub(crate) mod history;
+pub(crate) mod latest;
 mod releases;
 mod requests;
 pub(crate) mod views;
@@ -270,6 +271,11 @@ fn migrator() -> Migrator {
             "commit_ranges",
             include_str!("../migrations/0006_commit_ranges.sql"),
         ),
+        migration(
+            7,
+            "latest_releases",
+            include_str!("../migrations/0007_latest_releases.sql"),
+        ),
     ])
 }
 
@@ -360,6 +366,7 @@ impl Store {
         prepare_private_file(path)?;
         let store = Self::connect(path).await?;
         migrator().run(&store.pool).await?;
+        store.fill_latest().await?;
         Ok(store)
     }
 
@@ -454,7 +461,9 @@ impl Store {
             .connect_with(options)
             .await?;
         migrator().run(&pool).await?;
-        Ok(Self::from_pool(pool))
+        let store = Self::from_pool(pool);
+        store.fill_latest().await?;
+        Ok(store)
     }
 
     /// Starts a write transaction. It takes the write lock at once, so reading
