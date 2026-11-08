@@ -1,10 +1,12 @@
 //! `/api/v1` through the controller's real router, on an in-memory store seeded through the
 //! store's own functions.
 
+mod audit;
 mod deployments;
 mod deploys;
 mod document;
 mod grants;
+mod hosts;
 mod promotions;
 mod query;
 mod reads;
@@ -246,8 +248,8 @@ fn world_digest(fill: char) -> ImageDigest {
         .unwrap()
 }
 
-/// `app/prod`, `app/staging`, `app/other`, `app/canary` and `app/beta`, all on `home-1`,
-/// with `app/canary` promoting to `app/beta` after an hour. Every holder of a set of grants
+/// `app/prod`, `app/staging`, `app/canary` and `app/beta` on `home-1`, and `app/other` on
+/// `home-2`, with `app/canary` promoting to `app/beta` after an hour. Every holder of a set of grants
 /// has it on `app/prod` and `app/staging`, and each holder of `approve` is an approver of
 /// every deployment by key.
 fn world_config(keys: &HashMap<String, SoftwareAuthenticator>) -> String {
@@ -268,19 +270,19 @@ fn world_config(keys: &HashMap<String, SoftwareAuthenticator>) -> String {
     let promotion = "promote_to = { deployment = \"app/beta\", healthy_for = \"1h\" }\n";
     sections.extend(
         [
-            (1, "prod", ""),
-            (2, "staging", ""),
-            (3, "other", ""),
-            (4, "canary", promotion),
-            (4, "beta", ""),
+            (1, "prod", "home-1", ""),
+            (2, "staging", "home-1", ""),
+            (3, "other", "home-2", ""),
+            (4, "canary", "home-1", promotion),
+            (4, "beta", "home-1", ""),
         ]
-        .map(|(repo, stage, extra)| {
+        .map(|(repo, stage, host, extra)| {
             format!(
                 r#"
 [[deployment]]
 id = "app/{stage}"
 repo = {{ name = "example/app", id = {repo}, owner_id = 9 }}
-host = "home-1"
+host = "{host}"
 compose = {{ dir = "/srv/{stage}", service = "app" }}
 origin = {{ workflow = ".github/workflows/release.yml", tags = "v*", signed_tags = false }}
 rule = {{ auto = "patch", approve = "minor", approvers = [{listed}] }}
@@ -328,13 +330,68 @@ pub(super) enum Caller<'a> {
     Session(&'a str),
 }
 
+/// A token and a session for each principal, by name.
+pub(super) struct Credentials {
+    pub(super) tokens: HashMap<String, ApiToken>,
+    pub(super) sessions: HashMap<String, SessionToken>,
+}
+
+impl Credentials {
+    /// A new token and an hour's session for each of `names`.
+    pub(super) async fn issue(store: &Store, names: &[impl AsRef<str>]) -> Self {
+        let mut tokens = HashMap::new();
+        let mut sessions = HashMap::new();
+        for name in names {
+            let name = name.as_ref();
+            let (_, token) = store.create_token(&name.parse().unwrap()).await.unwrap();
+            tokens.insert(name.to_owned(), token);
+            sessions.insert(
+                name.to_owned(),
+                store.begin_session_for_test(name, 3600).await,
+            );
+        }
+        Self { tokens, sessions }
+    }
+
+    /// What `router` answers to `method` on `path` from `caller`, with `body` as JSON if any.
+    pub(super) async fn send(
+        &self,
+        router: &Router,
+        method: Method,
+        path: &str,
+        caller: Caller<'_>,
+        body: Option<String>,
+    ) -> Answer {
+        let mut request = Request::builder().method(method).uri(path);
+        match caller {
+            Caller::Nobody => {}
+            Caller::Token(name) => {
+                let token = self.tokens[name].reveal();
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            Caller::Session(name) => {
+                let session = self.sessions[name].reveal();
+                request = request
+                    .header(header::COOKIE, format!("__Host-landfall-session={session}"))
+                    .header(header::ORIGIN, WORLD_ORIGIN);
+            }
+        }
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        let body = body.map_or_else(Body::empty, Body::from);
+        answer(router, request.body(body).unwrap()).await
+    }
+}
+
 /// A controller in a known state, which only grants decide `requestDeploy` on `app/prod`:
 ///
 /// - `app/prod` runs `v1.2.0`, and `v1.3.0` above it and `v1.1.0` below it are verified. It
 ///   has no open request and no promotion.
 /// - `app/staging` runs `v2.0.0`, `v2.1.0` is verified, and [`REQUESTER`] has asked for it:
 ///   the open request `approveRequest` and `cancelRequest` act on.
-/// - `app/other` has nothing, and [`OUTSIDER`] may view it.
+/// - `app/other`, on `home-2`, has nothing, and [`OUTSIDER`] may view it: no deployment on
+///   `home-1`.
 /// - `app/canary` runs `v3.0.0` and promotes to `app/beta`, which has nothing. Neither is
 ///   `app/prod`, where a promotion would answer `requestDeploy` with `promotion_pending`.
 ///   [`CANARY_VIEWER`] may view `app/canary` alone, [`FLEET_VIEWER`] both, and [`BETA_VIEWER`]
@@ -348,8 +405,7 @@ pub(super) struct World {
     pub(super) state: ApiState,
     pub(super) store: Store,
     pub(super) clock: Arc<ManualClock>,
-    pub(super) tokens: HashMap<String, ApiToken>,
-    pub(super) sessions: HashMap<String, SessionToken>,
+    pub(super) credentials: Credentials,
     keys: HashMap<String, SoftwareAuthenticator>,
     /// The open request on `app/staging`.
     pub(super) request: (i64, DeployIntent),
@@ -421,23 +477,13 @@ impl World {
             ]
             .map(ToOwned::to_owned),
         );
-        let mut tokens = HashMap::new();
-        let mut sessions = HashMap::new();
-        for name in names {
-            let (_, token) = store.create_token(&name.parse().unwrap()).await.unwrap();
-            tokens.insert(name.clone(), token);
-            sessions.insert(
-                name.clone(),
-                store.begin_session_for_test(&name, 3600).await,
-            );
-        }
+        let credentials = Credentials::issue(&store, &names).await;
         Self {
             app: crate::router(state.clone()),
             state,
             store,
             clock,
-            tokens,
-            sessions,
+            credentials,
             keys,
             request,
             deploy,
@@ -452,25 +498,9 @@ impl World {
         caller: Caller<'_>,
         body: Option<String>,
     ) -> Answer {
-        let mut request = Request::builder().method(method).uri(path);
-        match caller {
-            Caller::Nobody => {}
-            Caller::Token(name) => {
-                let token = self.tokens[name].reveal();
-                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-            }
-            Caller::Session(name) => {
-                let session = self.sessions[name].reveal();
-                request = request
-                    .header(header::COOKIE, format!("__Host-landfall-session={session}"))
-                    .header(header::ORIGIN, WORLD_ORIGIN);
-            }
-        }
-        if body.is_some() {
-            request = request.header(header::CONTENT_TYPE, "application/json");
-        }
-        let body = body.map_or_else(Body::empty, Body::from);
-        answer(&self.app, request.body(body).unwrap()).await
+        self.credentials
+            .send(&self.app, method, path, caller, body)
+            .await
     }
 
     /// The body of an approval of the open request, signed by `name`'s passkey as the

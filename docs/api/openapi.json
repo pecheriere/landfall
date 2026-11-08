@@ -260,6 +260,111 @@
         ]
       }
     },
+    "/api/v1/audit": {
+      "get": {
+        "tags": [
+          "audit"
+        ],
+        "summary": "The audit log",
+        "description": "The rows of the audit log this principal may see, newest first, a page at a time: those about a deployment they may view, and a host's `host_enrolled` and `config_drift` rows where they may view a deployment on it. Rows about tokens, passkeys, sign-ins and throttling are never listed. A `deployment` or `host` filter on what they can't see gives an empty page. Sequence numbers are the whole log's, so gaps are rows this principal can't see. A page over more than 400 deployments and hosts' kinds at once is refused with `bad_request`, asking for a filter.",
+        "operationId": "listAudit",
+        "parameters": [
+          {
+            "name": "deployment",
+            "in": "query",
+            "description": "Only the rows about this deployment.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app/prod"
+          },
+          {
+            "name": "host",
+            "in": "query",
+            "description": "Only the rows about this host alone, and those about the deployments the configuration\nputs on it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "home-1"
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Only the rows of this kind: a name the log uses, such as `deploy_queued`. Any other is\nrefused.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "example": "deploy_queued"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many rows a page holds: from 1 to 100, 50 if left out.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The last page's `next_cursor`, to get the page after it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the rows this principal may see.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AuditEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/BadOrigin"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
     "/api/v1/deployments": {
       "get": {
         "tags": [
@@ -991,6 +1096,128 @@
         ]
       }
     },
+    "/api/v1/hosts": {
+      "get": {
+        "tags": [
+          "hosts"
+        ],
+        "summary": "The hosts",
+        "description": "The hosts the configuration puts a deployment on that this principal may view, by id, each with those deployments and no others. Not paged: the configuration bounds it.",
+        "operationId": "listHosts",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The hosts this principal may see.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/BadOrigin"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
+    "/api/v1/hosts/{host}": {
+      "get": {
+        "tags": [
+          "hosts"
+        ],
+        "summary": "One host",
+        "description": "One host, with the deployments on it this principal may view and no others. A host with no deployment they hold a grant on is `404`, as one no deployment names; with some other grant there and no `view`, `403`.",
+        "operationId": "getHost",
+        "parameters": [
+          {
+            "name": "host",
+            "in": "path",
+            "description": "The host's id.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "home-1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The host.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v1/me": {
       "get": {
         "tags": [
@@ -1136,6 +1363,55 @@
           }
         },
         "additionalProperties": false
+      },
+      "AuditEntry": {
+        "type": "object",
+        "description": "One row of the audit log. There is no hash: checking the chain is\n`landfall-server audit verify`'s job, on the controller.",
+        "required": [
+          "seq",
+          "ts",
+          "kind",
+          "deployment",
+          "host",
+          "detail"
+        ],
+        "properties": {
+          "deployment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The deployment it is about, or `null` for a row about a host alone.",
+            "example": "app/prod"
+          },
+          "detail": {
+            "type": "object",
+            "description": "The particulars, as the controller recorded them. A row whose detail isn't JSON, which\nonly someone editing the database makes, reads `{\"unreadable\": \"...\"}`, with its first\n256 characters quoted. Text from hosts and GitHub is in here: escape it before showing\nit."
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The host it is about, or `null`.",
+            "example": "home-1"
+          },
+          "kind": {
+            "type": "string",
+            "description": "What it records, such as `deploy_queued`. A newer controller may add kinds.",
+            "example": "deploy_queued"
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its place in the log. Numbers are shared by the whole log, so a gap between two rows\nis rows this principal can't see."
+          },
+          "ts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was written, in seconds since the Unix epoch."
+          }
+        }
       },
       "Cancelled": {
         "type": "object",
@@ -1651,6 +1927,67 @@
           }
         }
       },
+      "HostView": {
+        "type": "object",
+        "description": "A host, with the deployments on it that this principal may view, and only those.",
+        "required": [
+          "id",
+          "enrolled_at",
+          "config_drift",
+          "last_report",
+          "deployments"
+        ],
+        "properties": {
+          "config_drift": {
+            "type": "boolean",
+            "description": "Whether its configuration differs from the controller's."
+          },
+          "deployments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentSummary"
+            },
+            "description": "The deployments on it that this principal may view, by id. The configuration says\nwhich deployment runs on which host."
+          },
+          "enrolled_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it enrolled its key, in seconds since the Unix epoch, or `null` if it never has."
+          },
+          "id": {
+            "type": "string",
+            "description": "The host.",
+            "example": "home-1"
+          },
+          "last_report": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it last said anything about one of the deployments listed here, in seconds since\nthe Unix epoch, or `null` if it hasn't."
+          }
+        }
+      },
+      "HostsView": {
+        "type": "object",
+        "description": "The hosts this principal may see: those the configuration puts a deployment on that they\nmay view.",
+        "required": [
+          "hosts"
+        ],
+        "properties": {
+          "hosts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HostView"
+            },
+            "description": "The hosts, by id."
+          }
+        }
+      },
       "IntentView": {
         "type": "object",
         "description": "Exactly what an approver signs, with the same JSON as the intent a host checks.",
@@ -1864,6 +2201,75 @@
           "refused",
           "deferred"
         ]
+      },
+      "Page_AuditEntry": {
+        "type": "object",
+        "description": "Some of a list, in its order, and where the rest begins.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "One row of the audit log. There is no hash: checking the chain is\n`landfall-server audit verify`'s job, on the controller.",
+              "required": [
+                "seq",
+                "ts",
+                "kind",
+                "deployment",
+                "host",
+                "detail"
+              ],
+              "properties": {
+                "deployment": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The deployment it is about, or `null` for a row about a host alone.",
+                  "example": "app/prod"
+                },
+                "detail": {
+                  "type": "object",
+                  "description": "The particulars, as the controller recorded them. A row whose detail isn't JSON, which\nonly someone editing the database makes, reads `{\"unreadable\": \"...\"}`, with its first\n256 characters quoted. Text from hosts and GitHub is in here: escape it before showing\nit."
+                },
+                "host": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The host it is about, or `null`.",
+                  "example": "home-1"
+                },
+                "kind": {
+                  "type": "string",
+                  "description": "What it records, such as `deploy_queued`. A newer controller may add kinds.",
+                  "example": "deploy_queued"
+                },
+                "seq": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "Its place in the log. Numbers are shared by the whole log, so a gap between two rows\nis rows this principal can't see."
+                },
+                "ts": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "When it was written, in seconds since the Unix epoch."
+                }
+              }
+            },
+            "description": "This page's items."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to send as `cursor` for the next page, opaque; `null` on the last one."
+          }
+        }
       },
       "Page_DeployView": {
         "type": "object",

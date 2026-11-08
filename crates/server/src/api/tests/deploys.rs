@@ -292,7 +292,7 @@ can = [\"view\"]
     ];
     // While it was configured, the reader saw all of it.
     let configured = crate::router(ApiState::new(world.store.clone(), then, Limits::default()));
-    let token = world.tokens[&reader].reveal();
+    let token = world.credentials.tokens[&reader].reveal();
     for path in &paths {
         let request = axum::http::Request::builder()
             .uri(path)

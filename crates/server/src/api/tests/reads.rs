@@ -32,11 +32,11 @@ async fn read(world: &World, path: &str, reader: Reader<'_>, fetch_site: &[&str]
     let mut request = Request::builder().method(Method::GET).uri(path);
     request = match reader {
         Reader::Token(name) => {
-            let token = world.tokens[name].reveal();
+            let token = world.credentials.tokens[name].reveal();
             request.header(header::AUTHORIZATION, format!("Bearer {token}"))
         }
         Reader::Session(name) => {
-            let session = world.sessions[name].reveal();
+            let session = world.credentials.sessions[name].reveal();
             request.header(header::COOKIE, format!("__Host-landfall-session={session}"))
         }
         Reader::OtherSession(session) => {

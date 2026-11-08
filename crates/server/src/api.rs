@@ -9,8 +9,10 @@
 //! Every success is JSON through `ApiJson`, and every refusal `application/problem+json`
 //! with a stable code from the document's `Problem` schema. No answer carries a CORS header.
 
+mod audit;
 mod deployments;
 mod deploys;
+mod hosts;
 mod openapi;
 mod query;
 mod releases;
@@ -60,6 +62,8 @@ fn operations() -> OpenApiRouter<ApiState> {
         .merge(deployments::routes())
         .merge(releases::routes())
         .merge(deploys::routes())
+        .merge(hosts::routes())
+        .merge(audit::routes())
         .merge(requests::routes())
         .routes(routes!(document))
 }
