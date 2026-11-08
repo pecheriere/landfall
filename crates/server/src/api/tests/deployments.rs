@@ -29,7 +29,12 @@ use crate::store::{ManualClock, NewRequest, REQUEST_LIFETIME_SECS, Store};
 const NOW: i64 = 1_800_000_000;
 
 /// A deployment of `repo` on `host`, which only `approvers` may approve.
-fn deployment(id: &str, (repo, repo_id): (&str, u64), host: &str, approvers: &str) -> String {
+pub(super) fn deployment(
+    id: &str,
+    (repo, repo_id): (&str, u64),
+    host: &str,
+    approvers: &str,
+) -> String {
     let dir = id.replace('/', "-");
     format!(
         r#"
@@ -45,7 +50,7 @@ checks = ["container-healthy"]
     )
 }
 
-fn grant(principal: &str, deployments: &[&str], can: &[&str]) -> String {
+pub(super) fn grant(principal: &str, deployments: &[&str], can: &[&str]) -> String {
     let list = |items: &[&str]| {
         items
             .iter()
@@ -609,7 +614,7 @@ async fn deployment_shows_rule_promotion_holds_and_running() {
                 "auto": "patch",
                 "approve": "minor",
                 "approvers": approvers,
-                "prerelease": false,
+                "prereleases": false,
             },
             "promote_to": { "deployment": "app/beta", "healthy_for_secs": 3600 },
             "promoted_from": [],

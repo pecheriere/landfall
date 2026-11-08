@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use landfall_api::{
-    DeploymentSummary, DeploymentView, GrantView, HoldView, MeView, Page, Permission as Granted,
-    PromotionView, RuleView, RunningView, Via,
+    DeploymentRef, DeploymentSummary, DeploymentView, GrantView, HoldView, MeView, Page,
+    Permission as Granted, PromotionView, RuleView, RunningView, Via,
 };
 use landfall_core::config::{Config, Deployment, Permission};
 use landfall_core::ids::{DeploymentId, HostId, RepoName};
@@ -288,8 +288,43 @@ fn rule_view(deployment: &Deployment) -> RuleView {
         auto: rule.auto().map(|level| level.to_string()),
         approve: rule.approve().map(|level| level.to_string()),
         approvers: rule.approvers().to_vec(),
-        prerelease: rule.prereleases(),
+        prereleases: rule.prereleases(),
     }
+}
+
+/// The deployments whose releases come on to `target`: each one this principal may view, by
+/// id, then at most one marker for all those they may not, so that neither their names nor
+/// how many there are is told. The marker carries the longest wait among those it stands for.
+fn promoted_from(
+    config: &Config,
+    principal: &Principal,
+    target: &DeploymentId,
+) -> Vec<PromotionView> {
+    let mut seen: Vec<(DeploymentId, u64)> = Vec::new();
+    let mut unseen: Option<u64> = None;
+    for source in config.deployments() {
+        let Some(promotion) = source.promote_to().filter(|p| p.deployment() == target) else {
+            continue;
+        };
+        let wait = promotion.healthy_for_secs();
+        match shown_deployment(config, principal, source.id()) {
+            DeploymentRef::Seen(id) => seen.push((id, wait)),
+            DeploymentRef::Unseen => {
+                unseen = Some(unseen.map_or(wait, |longest| longest.max(wait)));
+            }
+        }
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    seen.into_iter()
+        .map(|(id, healthy_for_secs)| PromotionView {
+            deployment: DeploymentRef::Seen(id),
+            healthy_for_secs,
+        })
+        .chain(unseen.map(|healthy_for_secs| PromotionView {
+            deployment: DeploymentRef::Unseen,
+            healthy_for_secs,
+        }))
+        .collect()
 }
 
 /// `GET /api/v1/deployments/{name}/{stage}`: one deployment, with its rule, its promotions,
@@ -346,28 +381,13 @@ async fn get(
         deployment: shown_deployment(config, &principal, target),
         healthy_for_secs,
     };
-    let mut sources: Vec<&Deployment> = config
-        .deployments()
-        .iter()
-        .filter(|d| {
-            d.promote_to()
-                .is_some_and(|p| p.deployment() == deployment.id())
-        })
-        .collect();
-    sources.sort_by(|a, b| a.id().cmp(b.id()));
     Ok(ApiJson(DeploymentView {
         summary: summary(config, &principal, deployment, &facts),
         rule: rule_view(deployment),
         promote_to: deployment
             .promote_to()
             .map(|p| promotion(p.deployment(), p.healthy_for_secs())),
-        promoted_from: sources
-            .iter()
-            .filter_map(|source| {
-                let healthy_for_secs = source.promote_to()?.healthy_for_secs();
-                Some(promotion(source.id(), healthy_for_secs))
-            })
-            .collect(),
+        promoted_from: promoted_from(config, &principal, deployment.id()),
         holds: holds
             .into_iter()
             .map(|(tag, hold)| HoldView {

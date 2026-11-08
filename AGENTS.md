@@ -12,12 +12,12 @@ passkey approvals. Agents drive it through a typed API. Design:
 
 - `landfall-core` (`crates/core`): shared library with no I/O: validated
   identifiers, configuration types and the pure verification and rule logic.
-- `landfall-api` (`crates/api`): the wire types of `/api/v1`, which the controller
-  serialises and the CLI reads. No I/O: `requests`, `deployments` (who am I, and the
-  deployments, with `DeploymentRef`, which never names one the reader can't view), `problem`
-  (`Problem` and its stable `ProblemCode`s) and `page`. Each enum that can grow has an `Unknown` for a value from a
-  newer controller, which no controller sends. Its `openapi` feature derives each type's
-  schema, and only the controller enables it.
+- `landfall-api` (`crates/api`): the wire types of `/api/v1`, which the controller serialises
+  and the CLI reads. No I/O: `requests`, `deployments` (who am I, and the deployments, with
+  `DeploymentRef`, which never names one the reader can't view), `problem` (`Problem` and its
+  stable `ProblemCode`s) and `page`. Each enum that can grow has an `Unknown` for a value from a
+  newer controller, which no controller sends. Its `openapi` feature derives each type's schema,
+  and only the controller enables it.
 - `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
   a key from local configuration, and parses an attestation, trusting none of it,
   for its key.
@@ -43,27 +43,27 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-server` (`crates/server`): the controller. Watches releases,
   verifies origin, evaluates rules, runs approval ceremonies, keeps state and
   the audit log, serves the API and the web UI. A library plus a thin binary;
-  modules: `store` (the only code that touches SQLite: migrations, transactions,
-  appending to and verifying the audit log, enrolment codes, hosts, nonces,
-  deploys, running state, release decisions and holds, API tokens, sessions, deploy
-  requests, and `views`, what the API reads to show deployments), `audit` (audit events and the hash-chain encoding), `report` (bounding
-  a deploy report before it is stored), `agent_api` (the routes agents call:
-  signed-request extractor, handlers, problem answers, rate limit, and `client_source`, who a
-  request is from, which every per-source limit and the capped log go by), `auth` (the
-  `Principal` extractor, which makes the exact-`Origin` check on a session's state change
-  and the `Sec-Fetch-Site` check on its read, `can`, the one place that says what a principal
-  may do, each credential's budgets for state changes and for reads, secrets that are only
-  stored hashed, and the human API's problem answers),
-  `api` (`/api/v1`: one `OpenApiRouter` registers each route with its annotation, `ApiJson` is
-  every success, `query` the path and query-string parameters, a query string refusing any it
-  doesn't take, with a page's `Limit` and its `Cursor`, `visible`, the one place that says what a
-  principal may be told of a deployment (404 or 403, and a deployment shown or unseen),
-  `deployments`, who am I and the deployments, and `openapi` the document's fixed part: its schemes and shared refusals; the
-  document is served at `/api/v1/openapi.json`, printed by `openapi` and checked in as
-  `docs/api/openapi.json`, which a test compares), `requests` (the human API's routes: `asking`
-  for a deploy, `approving` one and `cancelling` one), `web` (the browser's side: the static
-  pages and their one script, the security headers on every answer, `registration`, `sign_in`
-  and sign-out, and `ceremonies`, the challenges and failure counts in memory), `watcher`
+  modules: `store` (the only code that touches SQLite: migrations, transactions, appending to
+  and verifying the audit log, enrolment codes, hosts, nonces, deploys, running state, release
+  decisions and holds, API tokens, sessions, deploy requests, and `views`, what the API reads to
+  show deployments), `audit` (audit events and the hash-chain encoding), `report` (bounding a
+  deploy report before it is stored), `agent_api` (the routes agents call: signed-request
+  extractor, handlers, problem answers, rate limit, and `client_source`, who a request is from,
+  which every per-source limit and the capped log go by), `auth` (the `Principal` extractor,
+  which makes the exact-`Origin` check on a session's state change and the `Sec-Fetch-Site`
+  check on its read, `can`, the one place that says what a principal may do, each credential's
+  budgets for state changes and for reads, secrets that are only stored hashed, and the human
+  API's problem answers), `api` (`/api/v1`: one `OpenApiRouter` registers each route with its
+  annotation, `ApiJson` is every success, `query` the path and query-string parameters, a query
+  string refusing any it doesn't take, with a page's `Limit` and its `Cursor`, `visible`, the
+  one place that says what a principal may be told of a deployment (404 or 403, and a deployment
+  shown or unseen), `deployments`, who am I and the deployments, and `openapi` the document's
+  fixed part: its schemes and shared refusals; the document is served at `/api/v1/openapi.json`,
+  printed by `openapi` and checked in as `docs/api/openapi.json`, which a test compares),
+  `requests` (the human API's routes: `asking` for a deploy, `approving` one and `cancelling`
+  one), `web` (the browser's side: the static pages and their one script, the security headers
+  on every answer, `registration`, `sign_in` and sign-out, and `ceremonies`, the challenges and
+  failure counts in memory), `watcher`
   (release discovery, origin verification, rule decisions and queueing, behind a
   `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `logger` (the only code

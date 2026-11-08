@@ -280,7 +280,7 @@ pub struct RuleView {
     #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, example = json!(["operator"])))]
     pub approvers: Vec<PrincipalId>,
     /// Whether prereleases are eligible.
-    pub prerelease: bool,
+    pub prereleases: bool,
 }
 
 /// Why something is still undecided.

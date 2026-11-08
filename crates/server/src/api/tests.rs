@@ -4,6 +4,7 @@
 mod deployments;
 mod document;
 mod grants;
+mod promotions;
 mod query;
 mod reads;
 mod schemas;

@@ -1323,7 +1323,7 @@
           "auto",
           "approve",
           "approvers",
-          "prerelease"
+          "prereleases"
         ],
         "properties": {
           "approve": {
@@ -1352,7 +1352,7 @@
             "description": "Without a human up to this bump: `patch`, `minor` or `any`, or `null` for never.",
             "example": "patch"
           },
-          "prerelease": {
+          "prereleases": {
             "type": "boolean",
             "description": "Whether prereleases are eligible."
           }

@@ -86,7 +86,9 @@ A principal with no grant at all on a deployment is told `404 not_found`, the sa
 deployment that doesn't exist. One with some other grant there is told `403 forbidden`.
 A deployment a principal can't view is never named to them, not even where another
 deployment's view would: a promotion to or from one reads `"deployment": null, "unseen": true`,
-and a reason about one says "a deployment you can't view".
+and a reason about one says "a deployment you can't view". Nor is it told how many there are:
+`promoted_from` lists those the principal may view, by id, then at most one such marker for all
+the others, with the longest `healthy_for_secs` among them.
 
 ## Who am I, and deployments
 
