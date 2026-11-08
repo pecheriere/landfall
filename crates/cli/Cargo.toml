@@ -15,22 +15,28 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 getrandom.workspace = true
+landfall-api.workspace = true
 landfall-approval.workspace = true
 landfall-core.workspace = true
 landfall-origin.workspace = true
+# The controller's API. rustls only, as the workspace sets it.
+reqwest.workspace = true
+# The token file, opened with no-follow and checked by its descriptor, without unsafe code.
+rustix.workspace = true
 semver.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt"] }
+toml.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
 # Mock servers over plain http and a snapshot trust root, for the first release's
 # fixture verified offline.
 landfall-origin = { workspace = true, features = ["test-support"] }
-reqwest.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock.workspace = true
 

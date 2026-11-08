@@ -3,9 +3,13 @@
 
 mod access;
 pub mod agent_release;
+pub mod api_client;
 pub mod cli;
+pub mod display;
 pub mod host;
 pub mod project;
+pub mod settings;
 pub mod verify;
+mod whoami;
 
 pub use access::AccessError;

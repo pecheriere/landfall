@@ -104,7 +104,15 @@ passkey approvals. Agents drive it through a typed API. Design:
   end-to-end tests; nothing on a command line leads to them.
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents. A library plus a thin binary; modules: `cli` (the command line, exit
-  statuses), `verify` (`landfall verify`), `access` (the trust root's cache and the
+  statuses, `ApiArgs`, the API flags each API command flattens, never global, since `host
+  install` has its own `--controller`, and `run_with`, the library entry, which prints every
+  failure through `display::safe`), `settings` (where the controller is and which token goes
+  to it: flags, then the environment, then `cli.toml`; the token never in argv, a token file
+  regular, not a link and its owner's alone), `api_client` (`/api/v1` with the token: no
+  proxy from the environment, no redirect followed, bodies capped, `ApiError` and its exit
+  status), `display` (`safe`, `safe_lines` and `write_json`, which escape controls and bidi
+  characters in whatever the controller sent before a terminal sees it), `whoami` (`landfall
+  whoami`), `verify` (`landfall verify`), `access` (the trust root's cache and the
   operator's token), `project` (what landfall trusts about its own releases: its
   repository, ids and workflow as constants, and `assets/release-signers`, read by the
   same rule as `release_preflight.py`, whose test keeps the keys in the two test tables
