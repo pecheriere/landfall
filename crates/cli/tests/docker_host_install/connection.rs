@@ -3,8 +3,13 @@
 
 use std::cell::RefCell;
 use std::io::Write as _;
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use landfall_cli::host::install::InstallArgs;
@@ -195,13 +200,95 @@ fn docker_a_master_killed_leaves_nothing_behind() {
     }
     assert_eq!(ssh.run_privileged("exit 7", false).unwrap(), 7);
 
-    // Two as a rule. Far from the nine of a master started over the old one's socket, which logs
-    // in twice for each thing asked. It's one master more than a rule if one failed a check.
-    assert_logins(&target, 2, 5, &said.borrow());
-    assert!(said.borrow().len() >= 2, "{:?}", said.borrow());
+    // Far from the nine of a master started over the old one's socket, which logs in twice for
+    // each thing asked. A check in the instant the old one is dying is the next test.
+    assert_logins(&target, 2, 2, &said.borrow());
+    assert_eq!(said.borrow().len(), 2, "{:?}", said.borrow());
     assert!(said.borrow()[1].contains("approve it if your key or agent asks"));
     wait_until("one connection", || masters_of(&target).len() == 1);
     drop(ssh);
+    wait_until("the connection to end", || masters_of(&target).is_empty());
+}
+
+/// The `-o ControlPath=` of the `ssh` with pid `pid`.
+fn control_path_of(pid: &str) -> PathBuf {
+    let ran = Command::new("ps")
+        .args(["-o", "command=", "-p", pid])
+        .output()
+        .unwrap();
+    let line = String::from_utf8(ran.stdout).unwrap();
+    let path = line
+        .split(' ')
+        .find_map(|word| word.strip_prefix("ControlPath="))
+        .unwrap_or_else(|| panic!("no ControlPath in {line:?}"));
+    PathBuf::from(path)
+}
+
+/// Takes connections on `socket` and drops each unanswered, until dropped.
+struct Unanswered {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Unanswered {
+    fn at(socket: &Path) -> Self {
+        let listener = UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A master killed outright takes connections for an instant after the kill, and drops them
+/// unanswered, which is when a check may come. Here a socket that does that stands in for it, for
+/// the rest of the run: `ssh` would log in by itself for each check, which passed, and for each
+/// command. One login more, said beforehand, and nothing else.
+#[test]
+#[ignore = "needs Docker, LANDFALL_TEST_DIST and the image: see README.md"]
+fn docker_a_master_dying_as_it_is_checked_costs_one_connection() {
+    let target = Target::start();
+    let (ssh, said) = saying_kept(&target);
+    assert_eq!(ssh.run("exit 3", b"").unwrap().status, 3);
+    let masters = masters_of(&target);
+    assert_eq!(masters.len(), 1, "{masters:?}");
+    let socket = control_path_of(&masters[0]);
+    signal("KILL", &masters[0]);
+    wait_until("the master to end", || masters_of(&target).is_empty());
+    std::fs::remove_file(&socket).unwrap();
+    let unanswered = Unanswered::at(&socket);
+
+    for status in [4, 5, 6] {
+        let command = format!("exit {status}");
+        assert_eq!(ssh.run(&command, b"").unwrap().status, status);
+    }
+    assert_eq!(ssh.run_privileged("exit 7", false).unwrap(), 7);
+
+    assert_logins(&target, 2, 2, &said.borrow());
+    assert_eq!(said.borrow().len(), 2, "{:?}", said.borrow());
+    wait_until("one connection", || masters_of(&target).len() == 1);
+    drop(ssh);
+    drop(unanswered);
     wait_until("the connection to end", || masters_of(&target).is_empty());
 }
 

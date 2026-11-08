@@ -299,21 +299,31 @@ fn the_master_is_itself_against_a_hostile_config() {
     }
 }
 
-/// With a configuration's `ControlMaster yes`, these would skip the socket and log in again.
+/// With a configuration's `ControlMaster yes`, these would skip the socket and log in again. With
+/// its proxy or jump, a socket that answers nothing would have them log in through it.
 #[test]
 fn asking_the_connection_is_only_ever_a_client() {
     let known = real_known();
     let dest = Destination::parse("user@host.example").unwrap();
-    for operation in ["check", "exit"] {
-        let args = control_args(
-            operation,
-            &dest,
-            Path::new("/tmp/ours"),
-            Some(Path::new(HOSTILE_CONFIG)),
-            &known,
-        );
-        let said = resolved(&args).unwrap();
-        assert_eq!(value(&said, "controlmaster"), Some("false"), "{said}");
+    let dir = TempDir::new().unwrap();
+    let jump = dir.path().join("jump");
+    fs::write(&jump, "Host *\n  ProxyJump jumper@jump.example\n").unwrap();
+    let proxy = dir.path().join("proxy");
+    fs::write(&proxy, "Host *\n  ProxyCommand nc %h %p\n").unwrap();
+    for config in [Path::new(HOSTILE_CONFIG), &jump, &proxy] {
+        for operation in ["check", "exit"] {
+            let args = control_args(
+                operation,
+                &dest,
+                Path::new("/tmp/ours"),
+                Some(config),
+                &known,
+            );
+            let said = resolved(&args).unwrap();
+            assert_eq!(value(&said, "controlmaster"), Some("false"), "{said}");
+            assert_eq!(value(&said, "proxycommand"), Some("false"), "{said}");
+            assert_eq!(value(&said, "proxyjump"), None, "{said}");
+        }
     }
 }
 
