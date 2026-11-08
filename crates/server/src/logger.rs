@@ -24,8 +24,9 @@ const CAPACITY: usize = 256;
 /// The most of a line written, in bytes, before it is cut short.
 const MAX_LINE_BYTES: usize = 4096;
 
-/// What ends a line that was cut short.
-const CUT_SHORT: &str = " [cut short]";
+/// What ends a line that was cut short. It starts with a single backslash, which escaping always
+/// doubles, so no line can end with it but one that was cut.
+const CUT_SHORT: &str = " \\[cut short]";
 
 /// How often a flush tries again to queue its mark while the queue is full.
 const FLUSH_RETRY: Duration = Duration::from_millis(5);
@@ -252,4 +253,9 @@ pub(crate) fn log(line: &str) {
 }
 
 #[cfg(test)]
+pub(crate) mod gate;
+mod panics;
+#[cfg(test)]
 mod tests;
+
+pub(crate) use self::panics::log_panics;

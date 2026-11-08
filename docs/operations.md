@@ -53,7 +53,8 @@ landfall-server: hold: app/prod everything: "its host's configuration differs fr
 A control character in a line, or one that reorders text, breaks a line or isn't seen (every Unicode
 format character, such as a zero-width space, and the variation selectors), is written as an escape
 such as `\u000a`, as JSON writes it, with a surrogate pair past the first plane. A backslash is
-written `\\`, so that nothing in a line can pass for an escape. A line past 4 KiB is cut short. Its lines are
+written `\\`, so that nothing in a line can pass for an escape. A line past 4 KiB is cut short and
+ends with ` \[cut short]`, whose single backslash no line can end with otherwise. Its lines are
 written by a thread of their own, so that whatever reads stderr can't hold up the controller by not
 reading: up to 256 wait for it, and those that don't fit are dropped and counted, as
 `landfall-server: 12 more log lines were not written, as stderr was not taking them`, said before the
@@ -63,8 +64,9 @@ to are in the audit log too: only refusals that could come from anyone, already 
 are here alone.
 
 A panic while serving goes to the same log, as `thread '<name>' panicked at <file:line:column>:
-<message>`, and with `RUST_BACKTRACE=1` set, a second line, `backtrace: ...`, escaped and cut short
-like any other. If `serve` fails, it says why as the last line of this log. Any other command
+<message>`. `RUST_BACKTRACE` is read as Rust's own panic message reads it: with `1`, the frames of
+the code that panicked follow, one `backtrace: <n>: <function> at <file:line:column>` line each, and
+with `full`, every frame. If `serve` fails, it says why as the last line of this log. Any other command
 says why straight on stderr, waiting for it as long as it takes.
 
 So when nothing deploys, look there first. The whole story is in the audit log, which

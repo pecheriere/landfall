@@ -54,7 +54,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   verification, rule decisions and queueing, behind a `ReleaseSource` trait),
   `serve` (the accept loop, with header timeouts and a connection cap), `logger` (the only code
   that writes to stderr while serving: a bounded queue to a thread of its own, which drops and
-  counts what doesn't fit, so that logging never blocks a runtime thread), `cli`
+  counts what doesn't fit, so that logging never blocks a runtime thread; `panics`, the hook
+  `serve` sends panics to it by; and `gate`, a stderr for tests that takes nothing until opened),
+  `cli`
   (`serve`, `enrol-code`, `token`, `passkey-invite`, `backup`, `audit verify`, `audit
   show`, behind the thin `main.rs`).
 - `landfall-agent` (`crates/agent`): runs on every target host. Pulls work

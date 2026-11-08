@@ -1,71 +1,8 @@
 use std::io::{self, Write};
-use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use super::gate::{Gate, PATIENCE};
 use super::{CUT_SHORT, Logger, MAX_LINE_BYTES, hides_text};
-
-/// A wait that only a hung test waits out.
-const PATIENCE: Duration = Duration::from_secs(60);
-
-/// A stderr that takes nothing until it is opened, and keeps what it took.
-#[derive(Clone, Default)]
-struct Gate(Arc<(Mutex<GateState>, Condvar)>);
-
-#[derive(Default)]
-struct GateState {
-    open: bool,
-    /// Whether a write has come and is waiting, or went through.
-    reached: bool,
-    taken: Vec<u8>,
-}
-
-impl Gate {
-    fn opened() -> Self {
-        let gate = Self::default();
-        gate.open();
-        gate
-    }
-
-    fn open(&self) {
-        let (state, changed) = &*self.0;
-        state.lock().unwrap().open = true;
-        changed.notify_all();
-    }
-
-    /// Waits until the writing thread is at the gate, holding a line it took from the queue.
-    fn wait_for_a_write(&self) {
-        let (state, changed) = &*self.0;
-        let (_state, waited) = changed
-            .wait_timeout_while(state.lock().unwrap(), PATIENCE, |state| !state.reached)
-            .unwrap();
-        assert!(!waited.timed_out(), "nothing came to be written");
-    }
-
-    fn lines(&self) -> Vec<String> {
-        let (state, _) = &*self.0;
-        String::from_utf8(state.lock().unwrap().taken.clone())
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
-}
-
-impl Write for Gate {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let (state, changed) = &*self.0;
-        let mut state = state.lock().unwrap();
-        state.reached = true;
-        changed.notify_all();
-        let mut state = changed.wait_while(state, |state| !state.open).unwrap();
-        state.taken.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 /// A stderr that fails its first `failing` writes, then takes everything into `gate`.
 struct FailsFirst {
@@ -279,6 +216,20 @@ fn a_long_line_is_cut_short() {
     let line = lines[0].strip_prefix("landfall-server: ").unwrap();
     assert!(line.ends_with(CUT_SHORT), "{line}");
     assert_eq!(line.len(), MAX_LINE_BYTES + CUT_SHORT.len());
+}
+
+/// Only a line that was cut ends with the mark: one that says it itself has its backslash doubled.
+#[test]
+fn a_line_cant_pass_for_one_cut_short() {
+    let gate = Gate::opened();
+    let logger = Logger::start(gate.clone(), 8).unwrap();
+    logger.log(&format!("only says so{CUT_SHORT}"));
+    assert!(logger.flush_within(PATIENCE));
+    assert_eq!(
+        gate.lines(),
+        [r"landfall-server: only says so \\[cut short]"]
+    );
+    assert!(!gate.lines()[0].ends_with(CUT_SHORT));
 }
 
 /// A command's own failure keeps the lines it spans, as a parse error's pointer needs them.

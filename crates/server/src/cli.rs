@@ -3,7 +3,6 @@
 //! audit log, or a backup's, failed verification, 2 could not run (usage included,
 //! which is clap's own status).
 
-use std::backtrace::{Backtrace, BacktraceStatus};
 use std::ffi::OsString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::future::Future;
@@ -390,7 +389,7 @@ async fn serve_watching<S: ReleaseSource>(
     let mut interrupt = signal(SignalKind::interrupt()).map_err(CliError::Signals)?;
     // Says the real port, if it was asked for port 0, and that signals are heard from here on.
     let listening = listener.local_addr().map_err(serve_error)?;
-    log_panics();
+    logger::log_panics();
     logger::log(&format!("listening on {listening}"));
 
     let (stop_watcher, stop_watching) = watch::channel(false);
@@ -426,31 +425,9 @@ async fn serve_watching<S: ReleaseSource>(
     Ok(EXIT_OK)
 }
 
-/// Sends what a panic says to the log, rather than having the runtime's thread write it to stderr
-/// itself, where it could block: the thread, the place and the message, and the backtrace when
-/// `RUST_BACKTRACE` asks for one, each escaped and cut short as any line is. The rest of what a
-/// panic does is unchanged.
-fn log_panics() {
-    std::panic::set_hook(Box::new(|info| {
-        let thread = std::thread::current();
-        let thread = thread.name().unwrap_or("<unnamed>");
-        let location = info
-            .location()
-            .map_or_else(|| "an unknown place".to_owned(), ToString::to_string);
-        let message = info.payload_as_str().unwrap_or("with no message");
-        logger::log(&format!(
-            "thread '{thread}' panicked at {location}: {message}"
-        ));
-        let backtrace = Backtrace::capture();
-        if backtrace.status() == BacktraceStatus::Captured {
-            logger::log(&format!("backtrace: {backtrace}"));
-        }
-    }));
-}
-
 /// Waits for the watcher and the flushing, told to stop as the serving began to. They let go at
 /// once, and the limit is so that what comes after runs whatever holds them up. If the watcher had
-/// already stopped, that was a panic and it was logged by the runtime.
+/// already stopped, that was a panic, and the log has what it said.
 async fn wait_for_tasks<A, B>(watching: JoinHandle<A>, flushing: JoinHandle<B>, limit: Duration) {
     drop(tokio::time::timeout(limit, async { tokio::join!(watching, flushing) }).await);
 }
@@ -697,33 +674,59 @@ impl FailureTo {
     }
 }
 
-/// Gives the log its [`FLUSH_TIMEOUT`] to write what's queued when dropped, so that a panic
-/// unwinding out of the work, whose message is queued, is written too.
-struct FlushOnDrop<'a>(Option<&'a Logger>);
+/// How a command's runtime ends: the log, how long it has to write what's queued once the runtime
+/// is gone, and where the command's failure is said.
+struct Ending<'a, E: Write> {
+    log: Option<&'a Logger>,
+    flush_timeout: Duration,
+    failure: FailureTo,
+    /// Where a failure said straight on stderr goes.
+    stderr: E,
+}
+
+/// Gives the log its time to write what's queued when dropped, so that a panic unwinding out of the
+/// work, whose message is queued, is written too.
+struct FlushOnDrop<'a> {
+    log: Option<&'a Logger>,
+    limit: Duration,
+}
 
 impl Drop for FlushOnDrop<'_> {
     fn drop(&mut self) {
-        if let Some(log) = self.0 {
+        if let Some(log) = self.log {
             // If it couldn't in time, stderr isn't taking lines, so there is nowhere to say so.
-            let _ = log.flush_within(FLUSH_TIMEOUT);
+            let _ = log.flush_within(self.limit);
         }
     }
 }
 
 fn on_a_runtime(work: impl Future<Output = Result<u8, CliError>>, failure: FailureTo) -> u8 {
-    on_a_runtime_logging(work, logger::global(), failure)
+    let ending = Ending {
+        log: logger::global(),
+        flush_timeout: FLUSH_TIMEOUT,
+        failure,
+        stderr: io::stderr(),
+    };
+    on_a_runtime_ending(work, ending)
 }
 
-/// [`on_a_runtime`], with what is logged going to `log`, which then has [`FLUSH_TIMEOUT`] to write
-/// it, as the runtime's threads can no longer be blocked by it, and the failure said as `failure`
-/// says.
-fn on_a_runtime_logging(
+/// [`on_a_runtime`], ending as `ending` says: what is logged has its time to be written, as the
+/// runtime's threads can no longer be blocked by it, and the failure is said where it says.
+fn on_a_runtime_ending(
     work: impl Future<Output = Result<u8, CliError>>,
-    log: Option<&Logger>,
-    failure: FailureTo,
+    ending: Ending<'_, impl Write>,
 ) -> u8 {
+    let Ending {
+        log,
+        flush_timeout,
+        failure,
+        mut stderr,
+    } = ending;
     // Made first, so that it is dropped last, the runtime gone, whether this returns or unwinds.
-    let flushing = FlushOnDrop(log);
+    let flushing = FlushOnDrop {
+        log,
+        limit: flush_timeout,
+    };
     let result = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -744,7 +747,7 @@ fn on_a_runtime_logging(
             // What was logged comes first.
             drop(flushing);
             // Nothing is left to tell if stderr itself is gone.
-            drop(writeln!(io::stderr(), "landfall-server: {error}"));
+            drop(writeln!(stderr, "landfall-server: {error}"));
         }
     }
     EXIT_COULD_NOT_RUN
