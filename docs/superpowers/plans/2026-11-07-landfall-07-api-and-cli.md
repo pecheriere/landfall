@@ -2,280 +2,621 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** An agent with a token can see every deployment it may view, read a release's whole story (where it came from, which commits it holds, why it did or didn't deploy, its checks and outcome), ask why a deploy ended as it did, and request a deploy or a rollback, all through a versioned OpenAPI 3.1 API generated from the code and a `landfall` command over it. The operator still approves on the web, with a passkey.
+**Goal:** An agent with a token can see every deployment it may view, read a release's whole story (where it came from, which commits it holds, why it did or didn't deploy, its checks and outcome), ask why a deploy ended as it did, and request a deploy or a rollback. It does all of this through a versioned OpenAPI 3.1 API generated from the code, and through a `landfall` command over it. The operator still approves on the web, with a passkey.
 
-**Architecture:** A new crate, `landfall-api`, holds the `/api/v1` wire types, shared by the controller (which serialises them) and the CLI (which reads them). The controller's `/api/v1` routes are built through `utoipa-axum`'s `OpenApiRouter`, so a route can't exist without its entry in the document; the document is served at `/api/v1/openapi.json` and checked in as `docs/api/openapi.json`, and a test fails when they differ. Each operation names its grant in its OpenAPI `security` requirement, and one test drives every operation in the document against that requirement. Reads come from the store's existing tables plus a commit list the watcher fetches once per release. The CLI is a thin, typed HTTP client with no redirects, bounded bodies and escaped output.
+**Architecture:** A new crate, `landfall-api`, holds the `/api/v1` wire types. The controller serialises them and the CLI reads them. The controller builds its `/api/v1` routes through `utoipa-axum`'s `OpenApiRouter`, so a route can't exist without its entry in the document. Query types derive `IntoParams` and handlers return a typed `ApiJson<T>`, so parameters and bodies are documented from the same types. The document is served at `/api/v1/openapi.json` and checked in as `docs/api/openapi.json`, and a test fails when the two differ. Each operation names its grant in its OpenAPI `security` requirement. One test drives every operation in the served document against that grant, and checks every success body against the operation's schema. Reads come from the store's existing tables, plus commit lists the watcher fetches from GitHub, within a GitHub budget that leaves origin verification its share. The CLI is a thin, typed HTTP client: no proxy, no redirects, bounded bodies and escaped output.
 
-**Tech Stack:** Rust 1.99 (edition 2024). New: `utoipa` 6 and `utoipa-axum` 0.3 (Task 1 confirms both against `crate-age`, axum 0.8 and the licence list, and records the finding). `reqwest` becomes a direct dependency of `landfall-cli` (already in the tree through `landfall-origin`, rustls only). Nothing else new.
+**Tech Stack:** Rust 1.99 (edition 2024). New: `utoipa` 6 and `utoipa-axum` 0.3, and `jsonschema` 0.60 as a dev-dependency of the server, with default features off (no remote `$ref` resolution). Task 1 confirms all three against `crate-age`, axum 0.8 and the licence list, and records the finding. `reqwest` moves from a dev-dependency to a dependency of `landfall-cli`; it is already in the tree through `landfall-origin`, with rustls only. Nothing else is new.
 
 **Spec:** `docs/design/landfall.md` sections 1, 2, 8.1 to 8.4, 9, 10 and 12; `docs/operations.md` ("API tokens, requests and approvals", "Passkeys and signing in", "From nothing to a first deploy"); plan 05's rulings on principals, grants, budgets and problem answers, which stand.
 
 ## Rulings made while writing this plan
 
-Each says what it costs if it is wrong.
+Each says what it costs if it is wrong. These are the rulings as amended by the review; the next section says what changed.
 
-- **Five PRs, ten tasks, in order.** PR A: the API crate, the generated document and the grant test (Task 1). PR B: deployments, release stories and the commits behind them (Tasks 2 to 4). PR C: deploys, `why`, hosts and the audit log (Tasks 5 and 6). PR D: the CLI's client and its read commands (Tasks 7 and 8). PR E: asking from the CLI, an end-to-end run and the guide (Tasks 9 and 10). Each PR is reviewable alone and leaves `main` working. *If wrong:* a later PR reshapes a type an earlier one shipped, which the checked-in document makes visible in review.
-- **Logs are the next plan, not this one.** Section 10 needs a label this code doesn't write: the agent labels containers `dev.landfall.deployment`, `dev.landfall.version` and `dev.landfall.commit` (`crates/agent/src/compose.rs`), and nothing carries the deploy id the spec queries by. It also needs the controller's first outbound client to a service the operator runs, a LogsQL query built safely from hostile values, and field names that depend on the operator's Docker, journald and Vector setup, which only a test against a real Vector and VictoriaLogs can pin. That is a plan of its own, with a security review of its own. This plan leaves room: `DeployView` has no `logs` field yet, and plan 08 adds `GET /api/v1/deploys/{id}/logs` and `landfall logs`. *If wrong:* agents wait one plan longer for logs, and read the host's journal meanwhile.
-- **Issues #30 and #31 belong to a later plan.** Both change what hosts and the watcher do with approvals (re-enumerating runs for non-automatic releases, settling or cancelling a queued approved deploy, a host-side minimum version), not what an agent can see or ask. They go together in an approvals-hardening plan after logs, with `landfall approve`'s locally computed intent hash (spec 6.3). #60 is `host install`'s, and not here. *If wrong:* a queued approved row stays uncancellable for one more plan, as today; hosts still refuse it.
-- **The OpenAPI document is generated, served, checked in and tested.** `utoipa`'s derive on every wire type and `#[utoipa::path]` on every handler; `OpenApiRouter::routes(routes!(handler))` registers route and document entry together, so neither can exist alone. `landfall-server openapi` prints the document. `docs/api/openapi.json` holds that output, and `openapi_document_is_checked_in` fails, with the command to regenerate it, when the two differ, so CI catches drift. `info.version` is `"1"`, the API's version and not the workspace's, so a release bump doesn't touch the file. *If wrong:* `utoipa-axum` fails Task 1's check; then the fallback is a `const API_ROUTES` table that builds the router and is compared with the document's paths in a test, which Task 1 records.
-- **The grant is in the document, and the test reads it from there.** Each operation has `security` with two schemes, `token` (HTTP bearer) and `session` (the `__Host-landfall-session` cookie), each listing the roles that may call it, as OpenAPI 3.1 allows for non-OAuth schemes. Roles are the config's `view`, `request`, `approve`, `rollback`, plus `requester` for cancelling one's own request; a list means any one of them, and an empty list any authenticated principal, for a list filtered by what they may see. `approve` is listed under `session` only, as a token never approves. The public document itself has `security: [{}]`. `every_operation_enforces_its_documented_grant` enumerates the served document, not a hand list, so a route can't be added without being tested against its grant. *If wrong:* a tool reading `security` as OAuth scopes shows odd scope names; nothing breaks.
-- **Reading anything about a deployment takes `view`.** `GET /api/v1/approvals` keeps plan 05's rule (`approve` or `view`), so an approver sees what waits for them. As plan 05 has it, a principal with no grant at all on a deployment gets the same `404 not_found` as for one that doesn't exist, and one with another grant gets `403 forbidden`. A deploy, release or request of a deployment the configuration no longer has is `404` to everyone. *If wrong:* an approver without `view` can't read the story of what they sign; the operator adds `view` to their grant.
-- **Hosts and the audit log are seen through deployments.** Section 8.2 grants per deployment, and adds no host or audit grant, so: a host is listed to a principal who may view a deployment on it, showing only those deployments. An audit row with a deployment is seen with `view` on it; a row with a host and no deployment (`host_enrolled`, `config_drift`) with `view` on any deployment of that host; **a row with neither (tokens, passkeys, sign-ins, throttling) never through the API.** Those stay with `landfall-server audit show` on the controller. Grants are applied in SQL, so a page is never short of what the principal may see, and its cursor can't reach past it. *If wrong:* see the owner's question at the end.
-- **The story's status is one pure function with a fixed precedence.** `story::status(&StoryInputs) -> StatusExplained` in its own file, table-tested, in this order, first match wins: `running` (the host runs this digest) → `deploying` (a queued or claimed deploy of it) → `awaiting_approval` (an open request for it) → `refused` (decision `refused`, verification or rule) → `held` (a hold on this tag or the whole deployment) → `superseded` (a higher version than this one is running) → `failed` (its last finished deploy was `rolled_back`, `failed_no_previous` or `rollback_failed`; not retried automatically, spec 7.2) → `host_refused` → `deferred` (decision or last outcome) → `promotion_pending` → `needs_request` (decision `needs_approval` or `manual`; with which grant asks: `rollback` if lower than what runs, else `request`) → `waiting` (`auto`, nothing known in the way). Each status comes with reasons in order and at most one `next` action. *If wrong:* one status reads oddly for a corner; the table shows which, and the order is one list to change.
-- **Commits come from GitHub and say so.** Only the release commit is verified (signed tag, attestation). Which commits a release holds is GitHub's compare of the previous recorded release's commit and this one: `GET /repos/{repo}/compare/{base}...{head}?per_page=100`, the body capped at 8 MiB, keeping `status`, `total_commits` and the first 100 commits' sha, first message line (200 characters, quoted) and author login. The base is the highest lower version this deployment has recorded with a commit; with none, the story says it's the first. Fetched once per release, by the watcher, after its origin is settled, at most 8 per tick, newest first; a failure is retried after an hour and never holds or refuses anything. The API marks the list `"verified": false`. *If wrong:* a diff too large for 8 MiB shows as `too_large`, and a force-pushed history as `diverged`, both stated rather than guessed.
-- **Reads have a budget of their own.** Plan 05 charged only state changes. A read API this size lets a stolen token keep SQLite busy, so each credential (each session, a principal's tokens as one, as for writes) gets a read bucket of 300 at once, refilling at 10 a second: a CLI command makes at most three calls, a page polls every few seconds. Over it is `429 rate_limited` with `Retry-After`, writing nothing; the count goes in `access_throttled` with `"reads": true`, by the existing flush. Every list is paginated (`limit` 1 to 100, default 50, `cursor` opaque) and every query has an index. *If wrong:* an agent sweeping a large fleet meets a 429 and waits a few seconds.
-- **The CLI never puts the token in argv, never follows a redirect, and talks `https://`.** The token comes from `LANDFALL_TOKEN`, or a file (`--token-file`, `LANDFALL_TOKEN_FILE` or `token_file` in the CLI's config): a regular file, not a link, not readable by group or others on Unix, at most 256 bytes. With none, no `Authorization` is sent, which is how a warden proxy injects it (spec 8.4). The controller URL goes by `landfall_core::controller_url::ControllerUrl::parse`, as the agent's does: `https://`, or, with `--allow-insecure-controller`, `http://` to a loopback address, `localhost` or a tailnet (`*.ts.net`) name. Redirects are refused (`redirect::Policy::none()`), as one could carry the token elsewhere. *If wrong:* someone behind a redirecting proxy points the CLI at the final address.
-- **What the CLI prints is escaped.** Human output passes every server string through `display::safe`, which escapes C0 and C1 controls and bidi overrides (U+202A to U+202E, U+2066 to U+2069) as `\u{…}`. `--json` prints the API's JSON with C1 controls and bidi overrides escaped as `\uXXXX` too, which `serde_json` alone doesn't do. Commit messages, check names and host reasons are hostile text. *If wrong:* a terminal shows an escape sequence as text.
-- **The CLI tolerates a newer controller.** Within `/api/v1` the controller only adds fields and enum values. The CLI's types ignore unknown fields, and each enum that can grow has `#[serde(other)] Unknown`, shown as `unknown`. The controller still refuses unknown fields in what it is sent. *If wrong:* an older CLI shows `unknown` for a new status, never fails to parse.
-- **Approving stays on the web, and the CLI says where.** A request's answer gains `approve_url`, the configuration's `[approval] origin` with `/approvals`, or `null` without `[approval]`. `landfall request` and `landfall approvals` print it with one line: an approver signs it there with a passkey; agents can't approve. *If wrong:* nothing; the page is unchanged.
-- **`landfall rollback` says what it means.** The request body gains an optional `"rollback": true`; with it, a tag that isn't lower than what runs is refused `409 not_a_rollback`, so an agent can't ask for an upgrade by mistake under the `rollback` grant's name. Without it, plan 05's behaviour stands. *If wrong:* one more problem code.
-- **Exit statuses stay 0, 1, 2.** 0: done. 1: the controller refused (a problem answer other than `401` and `429`). 2: couldn't ask: configuration, credentials (`401`), network, rate limit or a server error. `--help` says so, as `verify`'s does. *If wrong:* a script retries a refusal; the code in the problem body tells it not to.
+- **Five PRs, twelve tasks, in order.** PR A: the API crate and its document (Task 1), query parameters, cursors and the grant test (Task 2), and the read budget (Task 3). PR B: deployments (Task 4), commit ranges (Task 5), and releases with their story (Task 6). PR C: deploys and `why` (Task 7), then hosts and the audit log (Task 8). PR D: the CLI's client (Task 9) and its read commands (Task 10). PR E: asking from the CLI (Task 11), and an end-to-end run with the guide (Task 12). Each PR is reviewable alone and leaves `main` working. *If wrong:* a later PR reshapes a type an earlier one shipped. The checked-in document makes that visible in review.
+- **Logs are the next plan, not this one.** Section 10 needs a label this code doesn't write. The agent labels containers `dev.landfall.deployment`, `dev.landfall.version` and `dev.landfall.commit` (`crates/agent/src/compose.rs`), and no label carries the deploy id the spec queries by. Logs also need the controller's first outbound client to a service the operator runs, a LogsQL query built safely from hostile values, and field names that depend on the operator's Docker, journald and Vector setup. Only a test against a real Vector and VictoriaLogs can pin those names. That is a plan of its own, with its own security review. It also decides between the spec's `landfall.*` label names and the code's `dev.landfall.*`. This plan leaves room: `DeployView` has no `logs` field yet. *If wrong:* agents wait one plan longer for logs, and read the host's journal meanwhile.
+- **Issues #30 and #31 belong to plan 09.** Both change what hosts and the watcher do with approvals, not what an agent can see or ask. #30 re-enumerates runs for non-automatic releases and settles or cancels a queued approved deploy. #31 adds a host-side minimum version. They go together in an approvals-hardening plan after logs, with `landfall approve`'s locally computed intent hash (spec 6.3). That plan can rely on `IntentView`, which mirrors `DeployIntent` exactly. #60 belongs to `host install`, not this plan. *If wrong:* a queued approved row stays uncancellable for one more plan, as today, and hosts still refuse it.
+- **The OpenAPI document is generated, served, checked in and tested.** Every wire type derives `utoipa`'s schema, and every handler has `#[utoipa::path]`. `OpenApiRouter::routes(routes!(handler))` registers the route and its document entry together, so neither can exist alone. Every query and path parameter type derives `IntoParams` and is named in `params(…)`. Every handler returns `ApiJson<T>` (`T: ToSchema + Serialize`), and the annotation's body is `T`. `landfall-server openapi` prints the document. `docs/api/openapi.json` holds that output. `openapi_document_is_checked_in` fails when the two differ, and its failure message gives the command to regenerate. `every_success_answer_matches_its_documented_schema` validates real bodies against the document. `info.version` is `"1"`, the API's version rather than the workspace's, so a release bump doesn't touch the file. Task 1 confirms the crates. If `utoipa-axum` doesn't fit, Task 1 stops and reports back: it doesn't build the fallback on its own. *If wrong:* the plan is amended once, before Task 2.
+- **The grant is in the document, and the test reads it from there.** Each operation's `security` has two schemes: `token` (HTTP bearer) and `session` (the `__Host-landfall-session` cookie). Each scheme lists the roles that may call the operation, as OpenAPI 3.1 allows for schemes that aren't OAuth. Roles are the configuration's `view`, `request`, `approve` and `rollback`, plus `requester` for cancelling one's own request. A list means any one of them applies. An empty list means any authenticated principal, for a list filtered by what they may see. `approve` appears under `session` only, because a token never approves. Where the release decides which role applies, the operation also carries `x-landfall-grant`, mapping each role to the case it governs: `requestDeploy` has `{"request": "a tag above what runs, or the first deploy", "rollback": "a tag below what runs"}`. The test reads that mapping too. The public document has `security: [{}]`. *If wrong:* a tool that reads `security` as OAuth scopes shows odd scope names, and nothing breaks.
+- **The grant test gives each case fresh state.** `every_operation_enforces_its_documented_grant` enumerates the served document, not a hand-written list. It builds a new `World` for each (operation, role) pair, so a state change made by one role can't turn the next into a `409` that passes "not 401, 403 or 404". `World::seed` runs `app/prod` at `v1.2.0` and records `v1.3.0` (higher) and `v1.1.0` (lower) as verified. A table `CASES` gives each (operationId, role) its request: `requestDeploy` sends `v1.3.0` for `request` and `v1.1.0` with `"rollback": true` for `rollback`. Each role is also tried against the other's case, which must answer `403`. An operation, role or `x-landfall-grant` key missing from `CASES` fails the test, naming it. *If wrong:* a new operation needs a row before its PR passes, which is the point.
+- **Reading anything about a deployment takes `view`.** `GET /api/v1/approvals` keeps plan 05's rule (`approve` or `view`), so an approver sees what waits for them. As in plan 05, a principal with no grant at all on a deployment gets the same `404 not_found` as for one that doesn't exist, and one with some other grant gets `403 forbidden`. A deploy, release or request of a deployment the configuration no longer has is `404` to everyone. **A deployment the principal can't see is never named:** a promotion source or target, or a story reason about one, reads "a deployment you can't view". *If wrong:* an approver without `view` can't read the story of what they sign, and the operator adds `view` to their grant.
+- **Hosts and the audit log are seen through deployments.** Section 8.2 grants per deployment and adds no host or audit grant. So a host is listed to a principal who may view a deployment on it, and the listing shows only those deployments. With another grant on a deployment there and no `view`, `getHost` is `403`, by plan 05's rule. An audit row with a deployment is seen with `view` on that deployment. **A row with a host and no deployment is seen only if its kind is on the allow-list, `host_enrolled` and `config_drift`, and only with `view` on a deployment of that host.** `enrol_code_issued`, `enrol_refused` (which names another host) and a `report_refused` with no deployment stay on the controller. **A row with neither (tokens, passkeys, sign-ins, throttling) never comes through the API, in plan 07 or with a token ever** (spec 8.3, amended in this commit). Grants are applied in SQL, so a page is never short of what the principal may see, and its cursor can't reach past it. Sequence numbers and ids are global, so gaps count activity the principal can't see. That is accepted and documented. *If wrong:* an operator who wants those rows reads them with `landfall-server audit show`.
+- **The story's status is one pure function with a fixed precedence.** `story::status(&StoryInputs) -> StatusExplained` lives in its own file and is table-tested. The first match wins, in this order:
+  1. `running`: the host runs this digest.
+  2. `deploying`: a queued or claimed deploy of it.
+  3. `awaiting_approval`: an open request for it.
+  4. `refused`: decision `refused`, by verification or the rule.
+  5. `held`: a hold on this tag or on the whole deployment.
+  6. `superseded`: a higher version than this one is running.
+  7. `failed`: its last finished deploy was `rolled_back`, `failed_no_previous` or `rollback_failed`. It isn't retried automatically (spec 7.2).
+  8. `host_refused`.
+  9. `deferred`: by decision or by last outcome.
+  10. `promotion_pending`.
+  11. `needs_request`: decision `needs_approval` or `manual`. The `next` action names the grant that asks: `rollback` if lower than what runs, else `request`.
+  12. `waiting`: `auto`, and nothing known in the way.
+
+  Each status comes with its reasons in order and at most one `next` action. *If wrong:* one status reads oddly in a corner case. The table shows which, and the order is one list to change.
+- **Commit ranges are between verified releases only, and keyed by commit.** A range has a head and a base. Both must be releases whose record is `settled()` (a commit and a digest, not `origin_refused`) under the current configuration's hash. The base is the highest lower version of the same deployment that is settled. With none, the story says this is the first. A refused or unsigned tag gets no range and is never a base. A range is stored by `(repo, base_commit, head_commit)`, not by tag, and the story looks it up from the releases' current commits. So a moved tag leaves its old list behind, two deployments of one repository share one fetch, and nothing goes stale. *If wrong:* a release whose base hasn't verified yet shows `not_yet` until it does.
+- **Commits come from GitHub, within its limits, and say so.** The fetch is `GET /repos/{repo}/commits?sha={head}&per_page=100`, newest first, which carries no file patches, so a large diff costs nothing more. It walks at most 3 pages and stops at the base commit. It keeps the newest 100 commits before the base, each with its sha, its first message line (200 characters, quoted) and the author login GitHub attributes by email. The range records whether the base was met (`base_found`) and how many commits were seen before it. If the base isn't met within 300 commits, the range is `base_not_found`, which is a long range or a history that doesn't lead back to the base. GitHub's listing orders commits by date, so a merged branch's commits dated before the previous release can be missing. `docs/api.md` says so.
+
+  It runs only after the tick's verifications, and only within a GitHub budget. With the controller's `GITHUB_TOKEN`: at most 12 requests a tick, and only while `x-ratelimit-remaining` stays at 1,000 or above. Without a token: at most 2 requests a tick, and only while it stays at 30 or above. It stops at the first 403 or 429. It runs only for releases first recorded after migration `0006` ran: no backfill of old ones. A failure leaves the range absent, to be tried again after an hour, and never holds or refuses anything. The API reports `"source": "github"` and `"verified": false`, a constant in the schema; only the release commit is verified. A range that couldn't be fetched shows as unknown (`not_yet`, `unavailable`, `not_recorded`), never as an empty list. *If wrong:* a busy fleet without a token fills commit lists slowly, and each one says it's still waiting.
+- **Reads have a budget of their own.** Plan 05 charged only state changes. A read API this size would let a stolen token keep SQLite busy. So each credential gets a read bucket of 300 at once, refilling at 10 a second; as for writes, each session has its own and a principal's tokens share one. A CLI command makes at most three calls, and a page polls every few seconds. Over the budget, a read gets `429 rate_limited` with `Retry-After` and writes nothing. The count goes in `access_throttled` with `"reads": true`, by the existing flush. **A read with a session is refused before it is charged** if `Sec-Fetch-Site` is present and is neither `same-origin` nor `none`. `SameSite=Strict` still sends the cookie on a same-site `GET`, so without this a page on a sibling subdomain could drain an operator's bucket. Every list that can grow is paginated (`limit` 1 to 100, default 50, `cursor` opaque), and every query has an index. `listHosts` and `listApprovals` aren't paginated: the configuration bounds them, with one open request per deployment. *If wrong:* an agent sweeping a large fleet meets a 429 and waits a few seconds.
+- **The CLI keeps the token to itself.** The token never goes in argv. It comes from `LANDFALL_TOKEN`, or from a file named by `--token-file`, `LANDFALL_TOKEN_FILE` or `token_file` in the CLI's config. The file must be a regular file, not a link, not readable by group or others on Unix, and at most 256 bytes. With no token configured, the CLI sends no `Authorization` header, which is how a warden proxy injects one (spec 8.4). The controller URL goes through `landfall_core::controller_url::ControllerUrl::parse`, as the agent's does: `https://`, or, with `--allow-insecure-controller`, `http://` to a loopback address, `localhost` or a tailnet (`*.ts.net`) name. A refusal gets the CLI's own message, about a bearer token in clear. The client calls `.no_proxy()`, as the agent's does, so no environment variable routes the token through a proxy. It sets `.https_only(true)` for an `https://` controller, and refuses redirects (`redirect::Policy::none()`), since a redirect could carry the token elsewhere. *If wrong:* someone who reaches the controller through a proxy uses a tunnel or the warden route; a `--proxy` setting can come later.
+- **What the CLI prints is escaped.** Human output passes every server string through `display::safe`, and so does every error `main` prints, problem titles included. `safe` escapes C0 and C1 controls, DEL, and the bidi and line controls (U+061C, U+200E, U+200F, U+2028, U+2029, U+202A to U+202E and U+2066 to U+2069) as `\u{…}`. `--json` prints the body as it was received, as a `serde_json::Value`, not re-serialised from the typed values. DEL, C1 and the same controls are escaped as `\uXXXX`, which `serde_json` alone doesn't do. *If wrong:* a terminal shows an escape sequence as text.
+- **Compatibility runs one way: an older CLI against a newer controller.** Within `/api/v1` the controller only adds fields and enum values. The CLI's types ignore unknown fields, and each enum that can grow has `#[serde(other)] Unknown`, shown as `unknown` and left out of the schema. The controller still refuses unknown fields in what it's sent. So the CLI never sends a field the older controller lacks unless it's meant: `rollback` is skipped when false. *If wrong:* a newer CLI's `landfall rollback` gets `bad_request` from an older controller. The message says to upgrade the controller.
+- **Approving stays on the page, and the CLI says where.** A request's answer gains `approve_url`: the configuration's `[approval] origin` followed by `/approvals`, or `null` without `[approval]`. `landfall request` and `landfall approvals` print it, with one line saying an approver signs it there with a passkey and agents can't approve. `landfall approve` is plan 09, and its assertion is still made on the page. *If wrong:* nothing; the page is unchanged.
+- **`landfall rollback` says what it means.** The request body gains an optional `"rollback": true`. With it, a tag that isn't lower than what runs is refused with `409 not_a_rollback`, and so is any tag when nothing runs or the running tag doesn't parse. So an agent can't ask for an upgrade by mistake under the `rollback` grant's name. The check runs before `RequestOpen` and before `cancel_open_request`, so the refusal changes nothing else. Without the flag, plan 05's behaviour stands. *If wrong:* one more problem code.
+- **Exit statuses stay 0, 1, 2.** 0: done. 1: the controller refused (a problem answer other than `401` and `429`). 2: the CLI couldn't ask, for a configuration, credentials (`401`), network, rate-limit or server error. `--help` says so, as `verify`'s does. *If wrong:* a script retries a refusal; the code in the problem body tells it not to.
+
+## Rulings on the plan review
+
+The review (8 Important, 17 Minor) approved the plan with changes:
+
+| Finding | Change | Where it is held |
+|---|---|---|
+| I1 Grant test couldn't honour `requestDeploy`; `cancelRequest` listed `approve` for tokens; a `409` passed for a role | Roles by tag direction in `x-landfall-grant`; two seeded tags; a fresh `World` per case; `approve` session-only | Task 2 `every_operation_enforces_its_documented_grant`, `each_role_is_refused_the_case_it_does_not_govern` |
+| I2 Ranges from refused releases; stale after a moved tag | Settled releases only; keyed by `(repo, base_commit, head_commit)` | Task 5 `a_refused_release_is_neither_compared_nor_a_base`, `a_moved_tag_is_compared_again` |
+| I3 Rate limit, backfill, `too_large`, oldest 100 | Commits listing with no patches, newest 100, budget after verification, no backfill, unknown shown as unknown | Task 5 `compares_stop_when_the_rate_limit_is_low`, `verification_runs_before_commits`, `releases_seen_before_the_migration_are_never_fetched` |
+| I4 Unfiltered audit page a scan | One branch per scope on its index, `UNION ALL`, outer limit | Task 8 `audit_page_uses_an_index` (unfiltered, `kind`, deployment) |
+| I5 Token through an environment proxy | `.no_proxy()`, `.https_only` | Task 9 `http_proxy_in_the_environment_is_not_used` |
+| I6 Bodies and parameters could drift | `IntoParams`, `ApiJson<T>`, schema validation of real answers, deterministic output, `Unknown` out of the schema | Task 1 `document_is_generated_the_same_twice`; Task 2 `every_success_answer_matches_its_documented_schema` |
+| I7 Task 1 too large; budget in a read task | Tasks 1, 2 and 3 in PR A | Pre-flight table |
+| I8 Host-only rows too wide | Allow-list `host_enrolled`, `config_drift` | Task 8 `host_rows_of_enrolment_are_not_listed` |
+
+**Minors applied:** 1 (unseen deployments not named: Task 4 `promotion_to_an_unseen_deployment_is_not_named`), 2 (documented in `docs/api.md` and the section 12 row), 3 (`MeView.grants` through `can`: Task 4 `a_tokens_grants_never_list_approve`), 4 (`not_a_rollback` placement and edges: Task 11), 5 (`skip_serializing_if`; one-way compatibility), 6 (paging capped at 20 pages and stopped on a repeated cursor: Task 10), 7 (error path, `\r`, extra controls, DEL: Task 9), 8 (`--json` passes the body through: Task 10), 9 (the CLI's own URL messages: Task 9), 10 (author unverified; a `base_not_found` reason line: Tasks 6 and 10), 11 (`Sec-Fetch-Site`: Task 3), 12 (spec wording: section 8.3 amended in this commit, Task 12's edits worded for plan 09, labels left to plan 08), 13 (holds bounded at the newest 50 with a count; `listHosts` and `listApprovals` bounded by the configuration), 14 (`getHost` 403: Task 8), 15 (file lists; `reqwest` moves from dev-dependency; the tick's call lives in `watcher/commits.rs`), 16 (`source` and a constant `verified`), 17 (the public route in Global Constraints, `Cache-Control` tested). **Left:** none.
 
 ## Global Constraints
 
-- `rust-toolchain.toml` 1.99; workspace lints apply. No `#[allow]`/`#[expect]` without `reason = "..."`. `unsafe_code` forbidden. No `unwrap`/`expect` outside tests. Public error enums are `#[non_exhaustive]`.
-- Source files stay under about 800 lines of code; tests in their own files, as `foo/tests.rs` and `foo/tests/<scenario>.rs`, naming what they import. `crates/server/src/requests.rs` and `store.rs` take no new code beyond what a task names; new reads go in new files.
-- Every `/api/v1` route takes a `Principal` before anything else, except `GET /api/v1/openapi.json`. Query strings are capped at 2 KiB and parsed with unknown parameters refused. Every answer is JSON with `Cache-Control: no-store` and no CORS header; every refusal is `application/problem+json` with a stable `code` listed in the document's `Problem` schema.
+- `rust-toolchain.toml` 1.99; workspace lints apply. No `#[allow]` or `#[expect]` without `reason = "..."`. `unsafe_code` is forbidden. No `unwrap` or `expect` outside tests. Public error enums are `#[non_exhaustive]`.
+- Source files stay under about 800 lines of code. Tests go in their own files, as `foo/tests.rs` and `foo/tests/<scenario>.rs`, naming what they import. `crates/server/src/requests.rs`, `store.rs` and `watcher.rs` (681 lines of code) take nothing beyond what a task names: module lines, a trait method, one call. New reads go in new files.
+- Every `/api/v1` route takes a `Principal` before anything else. The one exception is `GET /api/v1/openapi.json`: it is public, has no budget and serves static bytes that say nothing about this controller. Query strings are capped at 2 KiB and parsed with unknown parameters refused. Every answer, the document included, is JSON with `Cache-Control: no-store` and no CORS header. Every refusal is `application/problem+json` with a stable `code` listed in the document's `Problem` schema.
 - No secret in any answer, log line or audit row: tokens and session tokens appear nowhere, not even hashed. A request's nonce and challenge are already shown to whoever may see the request, and that stands.
-- Hostile text (commit messages, check names, reasons from hosts, anything from GitHub) is stored through `landfall_core::text` (`quoted`, `shown`) as today, and escaped again by the CLI before a terminal sees it.
+- Hostile text (commit messages, author logins, check names, reasons from hosts, anything from GitHub) is stored through `landfall_core::text` (`quoted`, `shown`), as today, and escaped again by the CLI before it reaches a terminal.
+- Outbound requests to GitHub stay within the budget in the Rulings, and verification always goes first.
 - Nothing personal: example names only (`app/prod`, `app/staging`, `home-1`, `operator`, `ci`, `https://landfall.example.com`, `example/app`).
-- Security review (`security-review` skill or equivalent) before merging every PR of this plan: each touches authentication, grants or outbound HTTP. Each PR says what was and wasn't verified, separating CI from local.
-- Gate before each commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --all-features --locked`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`, `cargo deny --all-features --locked check`. Iterate with `cargo nextest run -p <crate>`. Never set `CARGO_TARGET_DIR` or another `CARGO_*` variable. Conventional commits, no attribution trailers.
+- Security review (the `security-review` skill or an equivalent) before merging every PR of this plan, since each one touches authentication, grants or outbound HTTP. Each PR says what was and wasn't verified, separating CI from local.
+- Gate before each commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`, `cargo test --workspace --all-features --locked`, `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`, `cargo deny --all-features --locked check`. Iterate with `cargo nextest run -p <crate>`. Never set `CARGO_TARGET_DIR` or any other `CARGO_*` variable. Conventional commits, no attribution trailers.
 
-**Every `/api/v1` operation and its grant,** as the document's `security` lists it (`T` token, `S` session):
+**Every `/api/v1` operation and its grant,** as the document's `security` lists it (`T` token, `S` session). `[]` means any authenticated principal, with the answer filtered to what they may view; each list's own task tests the filtering.
 
 | Operation | Path | Roles | Task |
 |---|---|---|---|
 | `getOpenApi` | `GET /api/v1/openapi.json` | public | 1 |
 | `listApprovals` | `GET /api/v1/approvals` | T, S: `[]`, filtered by `approve` or `view` | 1 (existing) |
-| `requestDeploy` | `POST /api/v1/deployments/{name}/{stage}/requests` | T, S: `request`, `rollback` | 1 (existing) |
+| `requestDeploy` | `POST /api/v1/deployments/{name}/{stage}/requests` | T, S: `request` (tag above, or first deploy), `rollback` (tag below) | 1 (existing) |
 | `approveRequest` | `POST /api/v1/approvals/{id}` | S: `approve` | 1 (existing) |
-| `cancelRequest` | `POST /api/v1/approvals/{id}/cancel` | T, S: `requester`, `approve`, `rollback` | 1 (existing) |
-| `whoAmI` | `GET /api/v1/me` | T, S: `[]` | 2 |
-| `listDeployments` | `GET /api/v1/deployments` | T, S: `[]`, filtered by `view` | 2 |
-| `getDeployment` | `GET /api/v1/deployments/{name}/{stage}` | T, S: `view` | 2 |
-| `listReleases` | `GET /api/v1/deployments/{name}/{stage}/releases` | T, S: `view` | 4 |
-| `getRelease` | `GET /api/v1/deployments/{name}/{stage}/releases/{tag}` | T, S: `view` | 4 |
-| `listDeploys` | `GET /api/v1/deployments/{name}/{stage}/deploys` | T, S: `view` | 5 |
-| `getDeploy` | `GET /api/v1/deploys/{id}` | T, S: `view` | 5 |
-| `whyDeploy` | `GET /api/v1/deploys/{id}/why` | T, S: `view` | 5 |
-| `listHosts` | `GET /api/v1/hosts` | T, S: `[]`, filtered by `view` | 6 |
-| `getHost` | `GET /api/v1/hosts/{host}` | T, S: `view` | 6 |
-| `listAudit` | `GET /api/v1/audit` | T, S: `[]`, filtered by `view` | 6 |
-
-An empty role list, `[]`, means any authenticated principal: the answer is `200`, holding only what they may view, which each list's own task tests.
+| `cancelRequest` | `POST /api/v1/approvals/{id}/cancel` | T: `requester`, `rollback`; S: `requester`, `approve`, `rollback` | 1 (existing) |
+| `whoAmI` | `GET /api/v1/me` | T, S: `[]` | 4 |
+| `listDeployments` | `GET /api/v1/deployments` | T, S: `[]`, filtered by `view` | 4 |
+| `getDeployment` | `GET /api/v1/deployments/{name}/{stage}` | T, S: `view` | 4 |
+| `listReleases` | `GET /api/v1/deployments/{name}/{stage}/releases` | T, S: `view` | 6 |
+| `getRelease` | `GET /api/v1/deployments/{name}/{stage}/releases/{tag}` | T, S: `view` | 6 |
+| `listDeploys` | `GET /api/v1/deployments/{name}/{stage}/deploys` | T, S: `view` | 7 |
+| `getDeploy` | `GET /api/v1/deploys/{id}` | T, S: `view` | 7 |
+| `whyDeploy` | `GET /api/v1/deploys/{id}/why` | T, S: `view` | 7 |
+| `listHosts` | `GET /api/v1/hosts` | T, S: `[]`, filtered by `view` | 8 |
+| `getHost` | `GET /api/v1/hosts/{host}` | T, S: `view` | 8 |
+| `listAudit` | `GET /api/v1/audit` | T, S: `[]`, filtered by `view` | 8 |
 
 ## Review Focus
 
-1. **Hostile text reaching an operator's terminal:** a commit message, check name or host reason holding an ANSI escape, a C1 CSI or a bidi override, printed by `landfall` in either output mode, must appear escaped → Task 8 `hostile_text_is_escaped_in_human_output`, `json_output_escapes_c1_and_bidi`.
-2. **A side route telling a principal about a deployment they may not view:** a host's list, an audit row, a deploy's `why` by id, a cursor crafted to start elsewhere, or a count, must show nothing of it, and a page must never come back short because rows were filtered after the limit → Task 6 `hosts_show_only_viewable_deployments`, `audit_rows_follow_view_in_sql`, `a_crafted_cursor_reaches_nothing_unseen`; Task 5 `why_of_an_unseen_deploy_is_not_found`.
-3. **A deployment taken out of the configuration** while its deploys, releases, requests and audit rows stay in the database must be `404` by every route, and absent from every list → Task 5 `deploy_of_a_deployment_no_longer_configured_is_not_found`; Task 6 `audit_of_a_removed_deployment_is_not_listed`.
-4. **The CLI leaking its token:** in argv, through a redirect to another host, over `http://` to a non-loopback address, in an error or `Debug` output, or from a token file others can read → Task 7 `redirect_is_not_followed_and_the_token_stays`, `token_is_never_in_output_or_errors`, `insecure_url_is_refused`, `readable_token_file_is_refused`.
-5. **A large fleet and a long history:** millions of audit rows, 5,000 tags on a deployment, `limit=100000`, a cursor from another list: queries stay on an index and bounded → Task 2 `limit_outside_1_to_100_is_refused`; Task 1 `cursor_of_another_list_is_refused`; Task 6 `audit_page_uses_an_index` (`EXPLAIN QUERY PLAN` names it); Task 4 `five_thousand_releases_page_in_version_order`.
+1. **Hostile text reaching an operator's terminal.** A commit message, author, check name, host reason or problem title holding an ANSI escape, a C1 CSI, a carriage return or a bidi override must appear escaped when `landfall` prints it, in either output mode and on the error path → Task 10 `hostile_text_is_escaped_in_human_output`; Task 9 `json_output_escapes_c1_del_and_bidi`, `errors_are_escaped`.
+2. **A side route telling a principal about a deployment they may not view.** A host's list, an audit row, a deploy's `why` by id, a promotion, a crafted cursor or a count must show nothing of it. A page must never come back short because rows were filtered after the limit → Task 8 `hosts_show_only_viewable_deployments`, `audit_rows_follow_view_in_sql`, `a_crafted_cursor_reaches_nothing_unseen`, `host_rows_of_enrolment_are_not_listed`; Task 7 `why_of_an_unseen_deploy_is_not_found`; Task 4 `promotion_to_an_unseen_deployment_is_not_named`.
+3. **A deployment taken out of the configuration** while its deploys, releases, requests and audit rows stay in the database must be `404` on every route and absent from every list → Task 7 `deploy_of_a_deployment_no_longer_configured_is_not_found`; Task 8 `audit_of_a_removed_deployment_is_not_listed`.
+4. **The CLI leaking its token** in argv, through a redirect to another host, through an environment proxy, over `http://` to a host outside the rule, in an error or `Debug` output, or from a token file others can read → Task 9 `redirect_is_not_followed_and_the_token_stays`, `http_proxy_in_the_environment_is_not_used`, `token_is_never_in_output_or_errors`, `insecure_url_is_refused`, `readable_token_file_is_refused`.
+5. **A large fleet and a long history:** millions of audit rows, 5,000 tags on a deployment, `limit=100000`, a cursor from another list, an untokened controller with many new releases. Queries stay on an index and bounded, and GitHub calls never crowd out verification → Task 4 `limit_outside_1_to_100_is_refused`; Task 2 `cursor_of_another_list_is_refused`; Task 8 `audit_page_uses_an_index`; Task 6 `five_thousand_releases_page_in_version_order`; Task 5 `compares_stop_when_the_rate_limit_is_low`.
 
 ## Pre-flight: tasks sharing files or interfaces
 
-Run tasks in order. These are where two tasks meet, so a parallel run would conflict or a later task depends on a name an earlier one fixed:
+Run the tasks in order. These are the places where two tasks meet, so a parallel run would conflict, or a later task depends on a name an earlier one fixed:
 
 | Shared | Tasks | How |
 |---|---|---|
-| `crates/api/src/lib.rs` and its modules | 1, 2, 4, 5, 6, 9 | Each adds its module's types; Task 1 fixes `Page<T>`, `Problem`, `ProblemCode` |
-| `crates/server/src/api.rs` (`router`, `ApiDoc`) | 1, 2, 4, 5, 6 | Each adds `routes!(…)` lines; only Task 1 changes the assembly |
-| `crates/server/src/api/tests/grants.rs` and `api/tests.rs` (`World`, `World::seed`) | 1, 2, 4, 5, 6, 9 | The matrix test reads the document; each task adds what its paths need to `World::seed` |
-| `docs/api/openapi.json` | 1, 2, 4, 5, 6, 9 | Regenerated by each, never edited by hand |
-| `docs/api.md` | 1, 2, 4, 5, 6 | Each documents its routes |
-| `crates/server/src/auth/budget.rs`, `auth/principal.rs` | 2 | Read budget; nothing later touches them |
-| `crates/server/migrations/` | 2 (`0005`), 3 (`0006`) | Two files, in that order |
-| `ReleaseSource` trait and its five impls | 3 | `watcher.rs`, `watcher/source.rs`, `watcher/tests.rs`, `server/tests/serve_upkeep.rs`, `server/tests/browser/main.rs`, `agent/tests/e2e/world.rs` |
-| `crates/server/src/requests.rs`, `requests/asking.rs` | 1 (annotations, router type), 9 (`rollback`, `approve_url`) | |
-| `crates/cli/src/cli.rs` (`Command`, `CliError`) | 7, 8, 9 | Task 7 adds the global flags and `ApiError`; 8 and 9 add commands |
-| `docs/operations.md`, `docs/design/landfall.md`, `AGENTS.md`, `README.md` | 10 (and 1 for `AGENTS.md`'s crate map) | |
+| `crates/api/src/lib.rs` and its modules | 1, 4, 6, 7, 8, 11 | Task 1 fixes `Page<T>`, `Problem`, `ProblemCode`, `IntentView`, `RequestView`; the others each add their module |
+| `crates/server/src/api.rs` (`router`, `ApiDoc`, `ApiJson`) | 1, 2, 4, 6, 7, 8 | Task 1 owns the assembly and `ApiJson`, Task 2 adds `ApiQuery`, the rest add `routes!(…)` lines |
+| `crates/server/src/api/tests.rs` (`World`, `World::seed`) and `api/tests/grants.rs` (`CASES`) | 2, 4, 6, 7, 8, 11 | Task 2 writes both; each later task adds its seed and its `CASES` rows |
+| `docs/api/openapi.json` | 1, 2, 4, 6, 7, 8, 11 | Regenerated by each task, never edited by hand |
+| `docs/api.md` | 1, 2, 3, 4, 5, 6, 7, 8, 11 | Each task documents its part |
+| `crates/server/src/auth/budget.rs`, `auth/principal.rs`, `agent_api.rs` (`Limits`) | 3 | Nothing later touches them |
+| `crates/server/migrations/` | 4 (`0005`), 5 (`0006`), 8 (`0007`) | Three files, in that order |
+| `ReleaseSource` trait and its five impls | 5 | `watcher.rs`, `watcher/source.rs`, `watcher/tests.rs`, `server/tests/serve_upkeep.rs`, `server/tests/browser/main.rs`, `agent/tests/e2e/world.rs` |
+| `store/views.rs` | 4, 8 | Task 4 creates it, Task 8 adds hosts and the audit page |
+| `store/history.rs` | 6, 7 | Task 6 creates it, Task 7 adds deploys and steps |
+| `crates/server/src/requests.rs`, `requests/*.rs` | 1 (annotations, router type), 11 (`rollback`, `approve_url`) | |
+| `crates/server/src/auth/problem.rs`, `crates/api/src/problem.rs` | 1, 11 | Task 11 adds `NotARollback` to both |
+| `crates/cli/src/cli.rs` (`Command`, `CliError`) | 9, 10, 11 | Task 9 adds the global flags, `ApiError` and escaping on the error path; Tasks 10 and 11 add commands |
+| `docs/operations.md`, `docs/design/landfall.md`, `README.md` | 12 | Section 8.3 was already amended with this plan |
+| `AGENTS.md` | 1 (crate map), 9 (CLI modules), 12 | |
 
 ## What the next plans hold
 
-- **Plan 08, logs (section 10):** the agent labels each container `landfall.deployment`, `landfall.deploy` and `landfall.version`; `[logs]` in the configuration (VictoriaLogs URL, the field names, a query timeout); `GET /api/v1/deploys/{id}/logs` by deploy id and window, bounded and paginated, with "logs aren't configured" when absent; `landfall logs`; a Docker test with a real Vector and VictoriaLogs.
+- **Plan 08, logs (section 10).** It picks the label names (the spec's `landfall.*` or the code's `dev.landfall.*`) and adds the deploy id. It adds `[logs]` to the configuration (the VictoriaLogs URL, the field names and a query timeout), `GET /api/v1/deploys/{id}/logs` by deploy id and window, bounded and paginated and saying when logs aren't configured, and `landfall logs`. It tests against a real Vector and VictoriaLogs in Docker.
 - **Plan 09, approvals hardening:** #30, #31, and `landfall approve` computing the intent's hash locally (spec 6.3).
-- **Then the web UI (section 11):** the pages over this API, the pipeline view per repo and per host, the version story, "needs you", the design language and Bobbin. Triggering a release check, staging on its own address in the UI, and more hosts come with or after it.
+- **Then the web UI (section 11).** The pages over this API, the pipeline view per repo and per host, the version story, "needs you", the design language and Bobbin. **If its audit page needs controller-wide rows,** they come through a controller-level grant enforced like `approve`: a passkey session only, never a token, whatever the file says, with the session-only rule in the document's `security` so the grant test covers it (spec 8.3). Triggering a release check, staging on its own address in the UI, and more hosts come with it or after it.
 
 ---
 
-## PR A: the API crate, the document and the grant test
+## PR A: the API crate, the document, the grant test and the read budget
 
-### Task 1: `landfall-api`, the generated document, and every operation tested against its grant
+### Task 1: `landfall-api` and the generated document, behaviour unchanged
 
-**Files:** Create `crates/api/` (`Cargo.toml`, `src/lib.rs`, `src/page.rs`, `src/problem.rs`, `src/requests.rs`), `crates/server/src/api.rs`, `crates/server/src/api/openapi.rs`, `crates/server/src/api/query.rs`, `crates/server/src/api/tests.rs`, `crates/server/src/api/tests/{grants,document,query}.rs`, `docs/api/openapi.json`, `docs/api.md`. Modify `Cargo.toml` (members, `landfall-api`, `utoipa`, `utoipa-axum`), `crates/server/Cargo.toml`, `crates/server/src/lib.rs`, `crates/server/src/requests.rs` (the router becomes an `OpenApiRouter<ApiState>`; `RequestView` moves to `landfall-api`), `crates/server/src/requests/{asking,approving,cancelling}.rs` (annotations only), `crates/server/src/auth/problem.rs` and `crates/server/src/agent_api/problem.rs` (`code()` returns a `ProblemCode`), `crates/server/src/cli.rs` (`openapi`), `Dockerfile` (`api` in the stub loop), `deny.toml` (licences only, if needed), `AGENTS.md` (crate map).
+**Files:** Create `crates/api/` (`Cargo.toml`, `src/lib.rs`, `src/page.rs`, `src/problem.rs`, `src/requests.rs`), `crates/server/src/api.rs`, `crates/server/src/api/openapi.rs`, `crates/server/src/api/tests/document.rs`, `docs/api/openapi.json`, `docs/api.md`. Modify `Cargo.toml` (members, `landfall-api`, `utoipa`, `utoipa-axum`, `jsonschema`), `crates/server/Cargo.toml`, `crates/server/src/lib.rs`, `crates/server/src/requests.rs` (the router becomes an `OpenApiRouter<ApiState>`, and `RequestView` moves to `landfall-api`), `crates/server/src/requests/{asking,approving,cancelling}.rs` (annotations and `ApiJson` only), `crates/server/src/auth/problem.rs` and `crates/server/src/agent_api/problem.rs` (`code()` returns a `ProblemCode`), `crates/server/src/cli.rs` (`openapi`), `Dockerfile` (`api` joins the stub loop), `deny.toml` (licences only, if needed), `AGENTS.md` (crate map).
 
 **Interfaces:**
-- `landfall-api`: no I/O; depends on `landfall-core`, `serde`, `serde_json`; feature `openapi` adds `utoipa` and `#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]` on every type. Core ids appear as themselves, with `#[cfg_attr(feature = "openapi", schema(value_type = String, example = "app/prod"))]`. Only `landfall-server` enables `openapi`.
+- `landfall-api` has no I/O and depends on `landfall-core`, `serde` and `serde_json`. Its `openapi` feature adds `utoipa`, with `#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]` on every type. Core ids appear as themselves, with `#[cfg_attr(feature = "openapi", schema(value_type = String, example = "app/prod"))]`. Only `landfall-server` enables `openapi`.
 - `pub struct Page<T> { pub items: Vec<T>, pub next_cursor: Option<String> }`.
-- `pub struct Problem { pub code: ProblemCode, pub title: String, pub status: u16 }`; `pub enum ProblemCode` with every stable code of `ApiProblem` and `HumanProblem` as `snake_case` variants, and `#[serde(other)] Unknown`. `HumanProblem::code()` and `ApiProblem`'s return `ProblemCode`; the bytes on the wire don't change.
-- `pub struct IntentView` mirroring `DeployIntent`'s JSON exactly (`deployment`, `tag`, `commit`, `digest`, `expected_running`, `nonce` as 64 hex), with `impl From<&DeployIntent>`; `pub struct RequestView { id, host, intent: IntentView, challenge, state, requested_by, created_at, expires_at, can_approve, can_cancel }`; `pub struct ApprovalsView { approvals: Vec<RequestView> }`; `pub struct NewRequest { tag: ReleaseTag }` with `deny_unknown_fields` (Task 9 adds `rollback`).
-- `crates/server/src/api.rs`: `pub(crate) fn router(state: ApiState) -> Router` builds one `OpenApiRouter<ApiState>` from `requests::routes()` and this module's routes, splits it into the axum router and `utoipa::openapi::OpenApi`, adds `GET /api/v1/openapi.json` serving that document's bytes, keeps plan 05's `/api/v1` fallbacks, `deadline` and `note_client_source` layers. `pub fn openapi_document() -> String` (pretty JSON and a final newline), used by the route, the CLI subcommand and the test.
-- `api/openapi.rs`: `#[derive(OpenApi)] struct ApiDoc` with `info(title = "landfall", version = "1")`, `openapi = 3.1.0`, the `token` (HTTP bearer) and `session` (`apiKey`, cookie `__Host-landfall-session`) schemes, the `Problem` schema, and reusable responses `Unauthenticated` (401), `Forbidden` (403), `NotFound` (404), `RateLimited` (429, `Retry-After`), `BadRequest` (400).
-- `api/query.rs`: `pub(crate) struct ApiQuery<T>(pub T)`, an extractor: query string at most 2 KiB, `serde_urlencoded` into `T` with `deny_unknown_fields`, any rejection `ApiProblem::BadRequest`. `pub(crate) struct Limit(u8)`, 1 to 100, default 50. `pub(crate) struct Cursor { list: CursorList, after: String }` encoded as base64url of `v1.<list>.<after>`, `CursorList` one of `releases`, `deploys`, `audit`, `deployments`; `Cursor::decode(raw, expected: CursorList) -> Result<Cursor, ApiProblem>` refuses another list's cursor, a bad encoding and an `after` over 160 bytes.
-- `landfall-server openapi`: prints `openapi_document()`.
+- `pub struct Problem { pub code: ProblemCode, pub title: String, pub status: u16 }`. `pub enum ProblemCode` has every stable code of `ApiProblem` and `HumanProblem` as a `snake_case` variant, plus `#[serde(other)] Unknown`, which is left out of the schema. `HumanProblem::code()` and `ApiProblem`'s return a `ProblemCode`; the bytes on the wire don't change.
+- `pub struct IntentView` mirrors `DeployIntent`'s JSON exactly (`deployment`, `tag`, `commit`, `digest`, `expected_running`, `nonce` as 64 hex digits), with `impl From<&DeployIntent>`. `pub struct RequestView { id, host, intent: IntentView, challenge, state, requested_by, created_at, expires_at, can_approve, can_cancel }`. `pub struct ApprovalsView { approvals: Vec<RequestView> }`. `pub struct NewRequest { tag: ReleaseTag }`, with `deny_unknown_fields`; Task 11 adds `rollback`.
+- `crates/server/src/api.rs`: `pub(crate) struct ApiJson<T>(pub T)`, an `IntoResponse` with `application/json` and `Cache-Control: no-store`. `pub(crate) fn router(state: ApiState) -> Router` builds one `OpenApiRouter<ApiState>` from `requests::routes()` and this module's routes, and splits it into the axum router and the `utoipa::openapi::OpenApi`. It adds `GET /api/v1/openapi.json`, serving the document's bytes, and keeps plan 05's `/api/v1` fallbacks and its `deadline` and `note_client_source` layers. `pub fn openapi_document() -> String` gives pretty JSON with a final newline; the route, the CLI subcommand and the tests all use it.
+- `api/openapi.rs`: `#[derive(OpenApi)] struct ApiDoc`, with `info(title = "landfall", version = "1")`, `openapi = 3.1.0`, the `token` (HTTP bearer) and `session` (`apiKey`, cookie `__Host-landfall-session`) schemes, the `Problem` schema, and reusable responses: `Unauthenticated` (401), `Forbidden` (403), `NotFound` (404), `RateLimited` (429, with `Retry-After`) and `BadRequest` (400). `requestDeploy` carries `x-landfall-grant`.
+- `landfall-server openapi` prints `openapi_document()`.
 
-- [ ] **Step 1: Check the crates.** `utoipa` and `utoipa-axum`, newest versions `crate-age` accepts: axum 0.8 support, OpenAPI 3.1 output, `security` with role lists for a non-OAuth scheme, their dependency tree in `cargo tree` (no OpenSSL, no new proc-macro stack beyond `syn` 2), licences against `deny.toml`. Record it in the PR. If `utoipa-axum` doesn't fit, take the fallback in the Rulings and record that.
-- [ ] **Step 2: Failing tests.** In `api/tests/document.rs`: `openapi_document_is_checked_in` (`openapi_document()` equals `include_str!("../../../../../docs/api/openapi.json")`; on failure the message is `run: cargo run -p landfall-server -- openapi > docs/api/openapi.json`), `served_document_is_the_same_bytes` (`GET /api/v1/openapi.json` with no credentials: 200, `application/json`, the same bytes), `document_is_openapi_3_1` (`openapi` is `3.1.0`; `info.version` is `1`), `every_operation_has_an_id_security_and_problem_answers` (each operation has an `operationId` from the table under Global Constraints, a `security` list, 401 and 429 responses referencing `Problem`, and 404 where the path has a parameter, except `getOpenApi`), `every_problem_code_is_in_the_schema` (each variant of `HumanProblem` and `ApiProblem`, by an exhaustive `match` in the test, has its code in the schema's enum), `approvals_json_is_unchanged` (the body of `GET /api/v1/approvals` for a seeded request equals the shape plan 05 shipped, key for key), `api_answers_have_no_cors_headers` (a `GET` with `Origin: https://other.example` gets no `Access-Control-*`), `json_answers_are_not_cached` (`Cache-Control: no-store` on every operation's success). In `api/tests/query.rs`: `unknown_query_parameter_is_refused`, `query_string_over_2_kib_is_refused`, `cursor_round_trips`, `cursor_of_another_list_is_refused`, `malformed_cursor_is_refused` (a table: not base64url, wrong prefix, empty, over 160 bytes). In `api/tests/grants.rs`, `every_operation_enforces_its_documented_grant`: for each operation in the served document, with its path filled from `World::seed` (`{name}/{stage}` `app/prod`, `{tag}` `v1.2.3`, `{id}` the seeded request or deploy, `{host}` `home-1`): no credentials gives 401 unless public; a token for a principal with no grant on `app/prod` gives 404; a principal holding every grant on `app/prod` except the listed roles gives 403 (a session, with the right `Origin`, for a `session`-only role); a principal holding exactly one listed role gets neither 401, 403 nor 404, for each role in turn (`requester` is the principal that made the seeded request). An operation with `[]` gets only the first check, and `200` for a principal with no grant at all. And `every_documented_operation_is_seeded` fails naming any operation `World::seed` can't fill. Run: `cargo nextest run -p landfall-server api::`. Expected: FAIL.
-- [ ] **Step 3: Implement.** Annotate plan 05's four handlers without changing behaviour; `requests/tests` pass unchanged. Generate `docs/api/openapi.json` with the command. Write `docs/api.md`: authentication, the grant column, pagination and cursors, problem answers and their codes, budgets, the version promise ("within `/api/v1`, fields and values are only added"). Run: `cargo nextest run -p landfall-server -p landfall-api`. Expected: PASS.
-- [ ] **Step 4: Gate; `docker build .`; security review. Commit:** `feat(api): generate the OpenAPI document and test every operation against its grant`. Open PR A.
+- [ ] **Step 1: Check the crates.** Check `utoipa`, `utoipa-axum` and `jsonschema` at the newest versions `crate-age` accepts: axum 0.8 support, OpenAPI 3.1 output, `security` with role lists for a scheme that isn't OAuth, `x-` extensions on an operation, and JSON Schema 2020-12 validation without network `$ref`s. Check their dependency trees in `cargo tree` (no OpenSSL, no proc-macro stack beyond `syn` 2) and their licences against `deny.toml`. Record the findings in the PR. If one doesn't fit, stop and report back with what would replace it.
+- [ ] **Step 2: Failing tests** in `api/tests/document.rs`:
+  - `openapi_document_is_checked_in`: `openapi_document()` equals `include_str!` of `docs/api/openapi.json`. On failure the message is `run: cargo run -p landfall-server -- openapi > docs/api/openapi.json`.
+  - `document_is_generated_the_same_twice`: two calls give the same bytes.
+  - `served_document_is_the_same_bytes`: `GET /api/v1/openapi.json` with no credentials gets 200, `application/json`, `Cache-Control: no-store` and the same bytes.
+  - `document_is_openapi_3_1`: `openapi` is `3.1.0` and `info.version` is `1`.
+  - `every_operation_has_an_id_security_and_problem_answers`: each operation has an `operationId` from the table under Global Constraints, a `security` list, 401 and 429 responses referencing `Problem`, and 404 where the path has a parameter. `getOpenApi` is exempt.
+  - `every_problem_code_is_in_the_schema`: each variant of `HumanProblem` and `ApiProblem`, by an exhaustive `match` in the test, has its code in the schema's enum, and `unknown` isn't there.
+  - `approvals_json_is_unchanged`: for a seeded request, the body of `GET /api/v1/approvals` has the same keys as what plan 05 shipped.
+  - `api_answers_have_no_cors_headers`: a `GET` with `Origin: https://other.example` gets no `Access-Control-*` header.
 
-## PR B: deployments, release stories and their commits
+  Run: `cargo nextest run -p landfall-server api::`. Expected: FAIL.
+- [ ] **Step 3: Implement.** Annotate plan 05's four handlers without changing their behaviour; `requests/tests` must pass unchanged. Generate `docs/api/openapi.json` with the command. Start `docs/api.md`: authentication, the grant column with `x-landfall-grant`, problem answers and their codes, and the version promise ("within `/api/v1`, fields and values are only added; an older CLI works with a newer controller"). Run: `cargo nextest run -p landfall-server -p landfall-api`. Expected: PASS.
+- [ ] **Step 4: Gate. Commit:** `feat(api): a wire crate and the generated OpenAPI document`.
 
-### Task 2: Who am I, deployments, and a budget for reads
+### Task 2: Query parameters, cursors, and every operation tested against its grant and schema
 
-**Files:** Create `crates/api/src/deployments.rs`, `crates/server/src/api/deployments.rs`, `crates/server/src/store/views.rs`, `crates/server/migrations/0005_read_indexes.sql`, `crates/server/src/api/tests/deployments.rs`, `crates/server/src/auth/tests/reads.rs` (or the budget's test module, whichever keeps `budget.rs` under the limit). Modify `crates/server/src/store.rs` (`mod views;` only), `crates/server/src/auth/budget.rs`, `crates/server/src/auth/principal.rs`, `crates/server/src/agent_api.rs` (`Limits`), `crates/server/src/api.rs`, `docs/api.md`, `docs/api/openapi.json`.
-
-**Interfaces:**
-- `Limits` gains `read_rate_per_second: u32` (10) and `read_burst: u32` (300). `Budget` gains a second `RateLimiter<Spender>` for reads, keyed by the same `Spender::Session` and `Spender::Tokens`, and `pub(crate) fn spend_read(&mut self, spender: &Spender, now: i64) -> Spent`, with its own dropped counts. `throttled_event` gains `reads: bool`, written as `"reads": true` only when set. The `Principal` extractor charges a safe method to the read bucket and the rest as now; a read over it is `429 rate_limited` with `Retry-After` and writes nothing.
-- `0005_read_indexes.sql`: `audit_events (deployment, seq)`, `audit_events (host, seq)`, `deploys (deployment, id)`, `deploy_requests (deployment, tag)`. Indexes only; the audit triggers are unaffected.
-- `landfall-api`: `MeView { principal: PrincipalId, via: Via, grants: Vec<GrantView>, approve_url: Option<String> }`, `Via { Token, Session, #[serde(other)] Unknown }`, `GrantView { deployment: DeploymentId, can: Vec<Permission> }` (permission names as the config's). `DeploymentSummary { id, repo: RepoName, host: HostId, running: Option<RunningView>, latest: Option<ReleaseBrief>, open_request: Option<i64>, needs_you: bool }`, `RunningView { tag: Option<ReleaseTag>, digest: Option<ImageDigest>, phase: String, busy: bool, drift: bool, config_drift: bool, healthy_secs: Option<i64>, last_report: Option<i64> }`, `ReleaseBrief { tag: ReleaseTag, status: ReleaseStatus }`, `DeploymentView { summary: DeploymentSummary, rule: RuleView, promote_to: Option<PromotionView>, holds: Vec<HoldView> }`, `RuleView { auto: Option<String>, approve: Option<String>, approvers: Vec<PrincipalId>, prerelease: bool }`, `PromotionView { deployment: DeploymentId, healthy_for_secs: u64 }`, `HoldView { tag: Option<ReleaseTag>, reason: String, since: i64, last_try: i64 }`. `ReleaseStatus` is declared here with the twelve values of the Rulings and `Unknown`; Task 4 computes it, and until then `latest` is `None`.
-- `store/views.rs`: `Store::running_states(&self, ids: &[&DeploymentId]) -> Result<HashMap<DeploymentId, RunningRow>, StoreError>`, `Store::open_request_ids(&self, now: i64) -> Result<HashMap<DeploymentId, i64>, StoreError>`, `Store::holds_of_deployment(&self, id: &DeploymentId) -> Result<Vec<HoldRow>, StoreError>`. `RunningRow` and `HoldRow` are plain rows, crate-private.
-- Routes: `whoAmI`, `listDeployments` with `ApiQuery<DeploymentsQuery { host: Option<HostId>, repo: Option<RepoName>, needs_you: Option<bool>, limit: Option<Limit>, cursor: Option<String> }>`, ordered by deployment id; `getDeployment`. Deployments come from the configuration; a host's report for a host the configuration no longer pairs with that deployment is ignored, as the watcher does.
-
-- [ ] **Step 1: Failing tests** in `api/tests/deployments.rs`: `me_names_the_principal_its_grants_and_where_to_approve`, `me_says_token_or_session`, `list_holds_only_viewable_deployments` (a principal with `view` on `app/prod` and `request` on `app/staging` sees one), `list_filters_by_host_repo_and_needs_you`, `needs_you_is_an_open_request_this_principal_can_approve`, `list_pages_in_id_order` (three deployments, `limit=2`, then the cursor), `limit_outside_1_to_100_is_refused` (`0`, `101`, `100000`, `-1`, `x`), `deployment_shows_rule_promotion_holds_and_running`, `a_report_from_a_host_no_longer_paired_is_ignored`, `unseen_deployment_is_not_found_and_another_grant_is_forbidden`. In the read budget's tests: `reads_spend_their_own_bucket` (301 reads at one instant: the last is 429 with `Retry-After`; a `POST` still passes), `a_session_and_tokens_read_apart`, `read_throttles_are_counted_with_reads_true`, `a_read_over_budget_writes_nothing` (audit row count unchanged until the flush). Expected: FAIL.
-- [ ] **Step 2: Implement.** Seed what `every_operation_enforces_its_documented_grant` needs for the new paths. Regenerate the document. Run: `cargo nextest run -p landfall-server`. Expected: PASS, with the grant test now covering `whoAmI`, `listDeployments` and `getDeployment`.
-- [ ] **Step 3: Gate. Commit:** `feat(api): who am I, deployments, and a budget for reads`.
-
-### Task 3: The commits a release holds, fetched once by the watcher
-
-**Files:** Create `crates/origin/src/fetch/compare.rs`, `crates/origin/src/fetch/tests/compare.rs`, `crates/server/src/watcher/commits.rs`, `crates/server/src/watcher/tests/commits.rs`, `crates/server/src/store/commits.rs`, `crates/server/migrations/0006_release_commits.sql`. Modify `crates/origin/src/fetch.rs` (`mod compare;`), `crates/server/src/watcher.rs` (trait method, one call in the tick), `crates/server/src/watcher/source.rs`, `crates/server/src/watcher/tests.rs`, `crates/server/tests/serve_upkeep.rs`, `crates/server/tests/browser/main.rs`, `crates/agent/tests/e2e/world.rs`, `crates/server/src/store.rs` (`mod commits;` only).
+**Files:** Create `crates/server/src/api/query.rs`, `crates/server/src/api/tests.rs`, `crates/server/src/api/tests/{grants,query,schemas}.rs`. Modify `crates/server/src/api.rs`, `docs/api.md`, `docs/api/openapi.json`.
 
 **Interfaces:**
-- `pub const COMPARE_LIMIT: usize = 8 * 1024 * 1024`, `pub const MAX_COMPARED_COMMITS: usize = 100`, `pub const COMMIT_SUMMARY_CHARS: usize = 200`.
-- `Fetcher::compare_commits(&self, repo: &RepoName, base: &CommitSha, head: &CommitSha) -> Result<Comparison, FetchError>`: `GET /repos/{repo}/compare/{base}...{head}?per_page=100`, capped at `COMPARE_LIMIT` while streaming; a body over it is `Ok(Comparison::TooLarge)`, not an error. `pub enum Comparison { Listed { status: CompareStatus, total: u64, commits: Vec<ComparedCommit> }, TooLarge }`, `pub enum CompareStatus { Ahead, Behind, Identical, Diverged }` (anything else is a parse error), `pub struct ComparedCommit { pub sha: CommitSha, pub summary: String, pub author: Option<String> }`: `summary` is the message's first line through `quoted(_, COMMIT_SUMMARY_CHARS)`, `author` the login if it matches GitHub's login grammar (`[A-Za-z0-9-]{1,39}`), else `None`. At most `MAX_COMPARED_COMMITS` kept, in the order GitHub gives.
-- `ReleaseSource` gains `fn commits(&self, deployment: &DeploymentId, base: &CommitSha, head: &CommitSha) -> impl Future<Output = Result<Comparison, ReleaseError>> + Send;`. `LiveSource` calls the fetcher with the deployment's repo. Each test fake returns `Ok(Comparison::Listed { status: Ahead, total: 0, commits: vec![] })` unless its test says otherwise.
-- `0006_release_commits.sql`: `release_commit_ranges (deployment, tag, base_tag NULL, base_commit NULL, state CHECK IN ('listed','first','too_large','unavailable'), status NULL, total NULL, last_try, PRIMARY KEY (deployment, tag))` and `release_commits (deployment, tag, position, sha, summary, author NULL, PRIMARY KEY (deployment, tag, position))`, both `STRICT`, with `FOREIGN KEY (deployment, tag) REFERENCES releases`.
-- `store/commits.rs`: `Store::commit_range(&self, deployment, tag) -> Result<Option<CommitRange>, StoreError>`, `Store::record_commit_range(&self, deployment, tag, range: &NewRange<'_>) -> Result<(), StoreError>` (replaces the range and its commits in one transaction), `Store::releases_needing_commits(&self, deployment, now: i64, retry_after: i64) -> Result<Vec<(ReleaseTag, CommitSha)>, StoreError>` (a commit, and no range, or `unavailable` tried before `now - retry_after`).
-- `watcher/commits.rs`: `pub(crate) const MAX_COMPARES_PER_TICK: usize = 8`, `pub(crate) const COMPARE_RETRY_SECS: i64 = 3600`; `pub(crate) fn base_for(tag: &ReleaseTag, recorded: &[(ReleaseTag, CommitSha)]) -> Option<(ReleaseTag, CommitSha)>`, the highest semantic version below `tag` with a commit (a pre-release orders below its release, as `semver` says); `pub(crate) async fn fill_commits<S: ReleaseSource>(store, source, config, now) -> usize`, run at the end of each tick, newest versions first across deployments, at most `MAX_COMPARES_PER_TICK` calls. No audit row: it decides nothing. A failure is `unavailable`, logged once per release.
+- `api/query.rs`: `pub(crate) struct ApiQuery<T>(pub T)`, an extractor for `T: DeserializeOwned + IntoParams`. The query string is at most 2 KiB and goes through `serde_urlencoded` into `T` with `deny_unknown_fields`; any rejection is `ApiProblem::BadRequest`. `pub(crate) struct Limit(u8)` is 1 to 100, default 50, documented with its bounds. `pub(crate) struct Cursor { list: CursorList, after: String }` is encoded as the base64url of `v1.<list>.<after>`, where `CursorList` is one of `releases`, `deploys`, `audit` or `deployments`. `Cursor::decode(raw, expected: CursorList) -> Result<Cursor, ApiProblem>` refuses another list's cursor, a bad encoding and an `after` over 160 bytes. Path parameters (`DeploymentPath { name, stage }`, `IdPath { id }`, `TagPath`, `HostPath`) derive `IntoParams`. An id is plain digits with no leading zero, as `request_number` has it.
+- `api/tests.rs`: `pub(super) struct World { app: Router, store: Store, tokens: HashMap<&'static str, ApiToken>, sessions: HashMap<&'static str, SessionToken> }`. `World::seed() -> World` sets up a fresh in-memory store and `app/prod` and `app/staging` on `home-1`, with `app/prod` running `v1.2.0` and `v1.3.0` and `v1.1.0` verified. It creates principals for each role alone, one with every grant, one with none, and the requester of one seeded open request, each with a token, and a session for the approver. Later tasks add to `seed`.
+- `api/tests/grants.rs`: `const CASES: &[Case]`, where `Case { operation: &str, role: &str, method, path: &str, body: Option<&str> }` holds the concrete request each role makes. It also holds the cross cases for `x-landfall-grant`.
 
-- [ ] **Step 1: Failing tests.** In `fetch/tests/compare.rs` with `wiremock`: `comparison_is_parsed` (status, total, sha, first line only, login), `summary_is_quoted_and_cut` (a message with a newline, ANSI escapes and 500 characters), `odd_login_is_dropped`, `more_than_100_commits_keeps_100`, `body_over_the_limit_is_too_large`, `unknown_status_is_an_error`, `token_goes_with_the_compare_request` (as `tag_object` sends it). In `watcher/tests/commits.rs`: `base_is_the_highest_lower_version_with_a_commit` (a table: `v1.2.3` over `v1.2.0`, `v1.1.9`; pre-release `v1.3.0-rc.1` below `v1.3.0`; none below gives `None`), `first_release_is_recorded_as_first`, `each_release_is_compared_once`, `at_most_eight_a_tick_newest_first`, `a_failure_is_retried_after_an_hour_and_holds_nothing` (the release's decision and holds are as they were), `a_release_without_a_commit_is_not_compared`, `too_large_is_recorded_and_not_retried`. Run: `cargo nextest run -p landfall-origin compare` and `-p landfall-server commits`. Expected: FAIL.
-- [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-origin -p landfall-server -p landfall-agent`. Expected: PASS, every existing watcher and end-to-end test unchanged.
-- [ ] **Step 3: Gate; Linux (the agent's e2e changed). Commit:** `feat(watcher): record the commits each release holds, as GitHub says`.
+- [ ] **Step 1: Failing tests.**
+  - In `api/tests/query.rs`: `unknown_query_parameter_is_refused`, `query_string_over_2_kib_is_refused`, `cursor_round_trips`, `cursor_of_another_list_is_refused`, `malformed_cursor_is_refused` (a table: not base64url, wrong prefix, empty, over 160 bytes), `non_canonical_ids_are_refused_as_not_found` (`01`, `+1`, `1.0`, a 30-digit number).
+  - In `api/tests/grants.rs`, `every_operation_enforces_its_documented_grant`, for each operation in the served document and each case, on a fresh `World::seed()`:
+    - with no credentials, 401, unless the operation is public;
+    - a token of a principal with no grant on `app/prod` gets 404;
+    - a principal holding every grant on `app/prod` except the listed roles gets 403 (a session with the right `Origin` for a role listed only under `session`, and a token for the token's list);
+    - a principal holding exactly one listed role gets neither 401, 403 nor 404, nor a `409`.
+    - An operation with `[]` gets only the first check, plus `200` for a principal with no grant at all.
 
-### Task 4: Releases and their story
+    `each_role_is_refused_the_case_it_does_not_govern`: `request` asking for `v1.1.0` and `rollback` asking for `v1.3.0` both get 403. `every_documented_operation_and_role_has_a_case` fails naming any operation, role or `x-landfall-grant` key without a row in `CASES`. `a_token_never_approves_even_with_the_grant`.
+  - In `api/tests/schemas.rs`, `every_success_answer_matches_its_documented_schema`: every 2xx body from the grant cases is validated with `jsonschema` against the schema the document gives for that operation and status, with `$ref`s resolved within the document.
 
-**Files:** Create `crates/api/src/releases.rs`, `crates/server/src/api/releases.rs`, `crates/server/src/api/story.rs`, `crates/server/src/api/tests/{releases,story}.rs`, `crates/server/src/store/history.rs`. Modify `crates/server/src/store.rs` (`mod history;` only), `crates/server/src/api.rs`, `crates/server/src/api/deployments.rs` (`latest` filled), `docs/api.md`, `docs/api/openapi.json`.
+  Expected: FAIL.
+- [ ] **Step 2: Implement.** Regenerate the document, as the path parameters gain their documentation. Add pagination, cursors and the ids rule to `docs/api.md`. Run: `cargo nextest run -p landfall-server`. Expected: PASS.
+- [ ] **Step 3: Gate. Commit:** `test(api): every operation against its documented grant and schema`.
+
+### Task 3: A budget for reads, and session reads only from the controller's own pages
+
+**Files:** Create `crates/server/src/auth/tests/reads.rs` (or the budget's test module, whichever keeps `budget.rs` under the limit). Modify `crates/server/src/auth/budget.rs`, `crates/server/src/auth/principal.rs`, `crates/server/src/agent_api.rs` (`Limits`), `docs/api.md`.
 
 **Interfaces:**
-- `landfall-api`: `ReleaseView { tag, status: ReleaseStatus, decision: Decision, seen_at: i64 }`; `Decision { Auto, NeedsApproval, Manual, Refused, Deferred, #[serde(other)] Unknown }`; `ReleaseStory { release: ReleaseView, reasons: Vec<String>, next: Option<NextAction>, origin: Option<OriginView>, commits: CommitsView, requests: Vec<RequestBrief>, deploys: Vec<DeployBrief> }`; `OriginView { commit, digest, signer: Option<PrincipalId>, san: String, run_url: String, rekor_log_index: Option<u64>, integrated_time: Option<i64> }` from the `origin` column; `CommitsView { verified: bool /* always false */, state: CommitsState, base: Option<ReleaseTag>, status: Option<String>, total: Option<u64>, commits: Vec<CommitView> }`, `CommitsState { Listed, First, TooLarge, Unavailable, NotYet, Unknown }`; `CommitView { sha, summary, author: Option<String> }`; `RequestBrief { id, state, requested_by, approved_by: Option<PrincipalId>, created_at, closed_reason: Option<String> }`; `DeployBrief { id, state, outcome: Option<Outcome>, created_at, finished_at: Option<i64> }`; `Outcome { Deployed, RolledBack, NothingChanged, FailedNoPrevious, RollbackFailed, Refused, Deferred, Unknown }` (the stored names); `NextAction { kind: NextKind, detail: String }`, `NextKind { Request, Rollback, Approve, Wait, FixHost, Recover, None, Unknown }`; `detail` is the controller's own text, such as the CLI command or the approval page.
-- `store/history.rs`: `Store::release_rows(&self, deployment) -> Result<Vec<ReleaseRow>, StoreError>` (at most `MAX_LISTED_TAGS`, the watcher's own bound), `Store::release_row(&self, deployment, tag) -> Result<Option<ReleaseRow>, StoreError>` (with `origin` and `seen_at`), `Store::requests_of_release(&self, deployment, tag, limit: u32) -> Result<Vec<RequestRow>, StoreError>`, `Store::deploys_of_release(&self, deployment, tag, limit: u32) -> Result<Vec<DeployRow>, StoreError>`, newest first. A story keeps the newest 20 requests and 20 deploys.
-- `api/story.rs`: `pub(crate) struct StoryInputs<'a> { tag: &'a ReleaseTag, digest: Option<&'a ImageDigest>, decision: Decision, decision_reason: &'a str, running: Option<&'a RunningRow>, active_deploy: bool, open_request: bool, hold: Option<&'a HoldRow>, last_outcome: Option<(Outcome, &'a str)>, promotion_waits_for: Option<&'a DeploymentId>, lower_than_running: bool }`, `pub(crate) struct StatusExplained { status: ReleaseStatus, reasons: Vec<String>, next: Option<NextAction> }`, `#[must_use] pub(crate) fn status(inputs: &StoryInputs<'_>) -> StatusExplained`, by the precedence in the Rulings. Promotion uses `Store::promotion_waits_for`, as asking does.
-- Routes: `listReleases` (`ApiQuery<{ limit, cursor }>`), highest version first by `semver`, tags that don't parse last in string order, the cursor holding the last tag; `getRelease`, which is `404` for a tag the controller hasn't recorded.
+- `Limits` gains `read_rate_per_second: u32` (10) and `read_burst: u32` (300), each documented as plan 05's are.
+- `Budget` gains a second `RateLimiter<Spender>` for reads, keyed by the same `Spender::Session` and `Spender::Tokens`, and `pub(crate) fn spend_read(&mut self, spender: &Spender, now: i64) -> Spent`, with its own dropped counts. `throttled_event` gains `reads: bool`, written as `"reads": true` only when it is set.
+- In the `Principal` extractor, a safe method with a session is first checked for `Sec-Fetch-Site`. When the header is present and is neither `same-origin` nor `none`, the read is refused as `HumanProblem::BadOrigin`, with nothing charged, and counted as plan 05 counts a bad `Origin`. Otherwise the read goes to the read bucket. A token's read goes to its principal's tokens' read bucket. Over the budget, a read is `429 rate_limited` with `Retry-After` and writes nothing. State changes are unchanged.
 
-- [ ] **Step 1: Failing tests.** In `api/tests/story.rs`, `status_table`: one row per status of the precedence, each with the inputs that produce it, its first reason and `next` (for `needs_request`, `next.kind` is `request`, or `rollback` when lower); `precedence_holds_when_several_apply` (running and held at once is `running`; a held release that a higher one superseded is `held`; failed and superseded is `superseded`). In `api/tests/releases.rs`: `story_has_origin_commits_requests_and_deploys`, `commits_are_marked_unverified`, `first_release_says_first`, `story_before_commits_are_fetched_says_not_yet`, `a_rolled_back_release_says_failed_and_not_retried`, `a_release_that_never_verified_has_no_origin`, `five_thousand_releases_page_in_version_order` (5,000 tags seeded, pages of 100, each page's first tag lower than the last page's last), `unparseable_tags_come_last`, `unrecorded_tag_is_not_found`, `deployment_summary_shows_the_latest_release_and_its_status`. Expected: FAIL.
-- [ ] **Step 2: Implement.** Seed the grant test for `listReleases` and `getRelease`. Regenerate. Run: `cargo nextest run -p landfall-server`. Expected: PASS.
+- [ ] **Step 1: Failing tests:**
+  - `reads_spend_their_own_bucket`: 301 reads of `listApprovals` at one instant; the last gets 429 with `Retry-After`, and a `POST` still passes.
+  - `a_session_and_tokens_read_apart`.
+  - `read_throttles_are_counted_with_reads_true`.
+  - `a_read_over_budget_writes_nothing`: the audit row count is unchanged until the flush.
+  - `a_cross_site_session_read_is_refused_and_charges_nothing`: `Sec-Fetch-Site: same-site`, then `cross-site`; each is 403 `bad_origin`, and the bucket is untouched.
+  - `same_origin_and_absent_fetch_site_are_read`.
+  - `a_token_read_ignores_fetch_site`.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement.** Document the read budget and the `Sec-Fetch-Site` rule in `docs/api.md`. Run: `cargo nextest run -p landfall-server`. Expected: PASS, with `requests/tests/budget.rs` unchanged.
+- [ ] **Step 3: Gate; `docker build .`; security review of PR A. Commit:** `feat(auth): a budget for reads, and session reads from the controller's own pages`. Open PR A.
+
+## PR B: deployments, commit ranges and release stories
+
+### Task 4: Who am I, and deployments
+
+**Files:** Create `crates/api/src/deployments.rs`, `crates/server/src/api/deployments.rs`, `crates/server/src/api/visible.rs`, `crates/server/src/store/views.rs`, `crates/server/migrations/0005_read_indexes.sql`, `crates/server/src/api/tests/deployments.rs`. Modify `crates/server/src/store.rs` (`mod views;` only), `crates/server/src/api.rs`, `crates/server/src/api/tests.rs`, `crates/server/src/api/tests/grants.rs`, `docs/api.md`, `docs/api/openapi.json`.
+
+**Interfaces:**
+- `0005_read_indexes.sql` creates indexes on `deploys (deployment, id)` and `deploy_requests (deployment, tag)`. Indexes only.
+- `api/visible.rs`: `pub(crate) fn shown_deployment(config, principal, id: &DeploymentId) -> DeploymentRef`, where `DeploymentRef` is `Seen(DeploymentId)` or `Unseen`, serialised as the id or as `null` with `"unseen": true`. The text form for reasons is `"a deployment you can't view"`. Every view that names another deployment goes through it.
+- `landfall-api`:
+  - `MeView { principal: PrincipalId, via: Via, grants: Vec<GrantView>, approve_url: Option<String> }`, with `Via { Token, Session, #[serde(other)] Unknown }` and `GrantView { deployment: DeploymentId, can: Vec<Permission> }`. `can` lists only what `can()` allows for this principal now, so a token never lists `approve`.
+  - `DeploymentSummary { id, repo: RepoName, host: HostId, running: Option<RunningView>, latest: Option<ReleaseBrief>, open_request: Option<i64>, needs_you: bool }`.
+  - `RunningView { tag: Option<ReleaseTag>, digest: Option<ImageDigest>, phase: String, busy: bool, drift: bool, config_drift: bool, healthy_secs: Option<i64>, last_report: Option<i64> }`.
+  - `ReleaseBrief { tag: ReleaseTag, status: ReleaseStatus }`.
+  - `DeploymentView { summary: DeploymentSummary, rule: RuleView, promote_to: Option<PromotionView>, promoted_from: Vec<PromotionView>, holds: Vec<HoldView>, holds_total: u32 }`, holding the newest 50 holds.
+  - `RuleView { auto: Option<String>, approve: Option<String>, approvers: Vec<PrincipalId>, prerelease: bool }`.
+  - `PromotionView { deployment: DeploymentRef, healthy_for_secs: u64 }`.
+  - `HoldView { tag: Option<ReleaseTag>, reason: String, since: i64, last_try: i64 }`.
+  - `ReleaseStatus`, declared here with the twelve values of the Rulings plus `Unknown`. Task 6 computes it; until then `latest` is `None`.
+- `store/views.rs`: `Store::running_states(&self, ids: &[&DeploymentId]) -> Result<HashMap<DeploymentId, RunningRow>, StoreError>`, `Store::open_request_ids(&self, now: i64) -> Result<HashMap<DeploymentId, i64>, StoreError>`, and `Store::holds_of_deployment(&self, id: &DeploymentId, limit: u32) -> Result<(Vec<HoldRow>, u32), StoreError>`. `RunningRow` and `HoldRow` are plain, crate-private rows.
+- Routes: `whoAmI`; `listDeployments` with `ApiQuery<DeploymentsQuery { host: Option<HostId>, repo: Option<RepoName>, needs_you: Option<bool>, limit: Option<Limit>, cursor: Option<String> }>`, ordered by deployment id; and `getDeployment`. Deployments come from the configuration. A report from a host the configuration no longer pairs with that deployment is ignored, as the watcher does.
+
+- [ ] **Step 1: Failing tests** in `api/tests/deployments.rs`:
+  - `me_names_the_principal_its_grants_and_where_to_approve`.
+  - `a_tokens_grants_never_list_approve`: the approver's token shows `view`, `request` and `rollback`; their session adds `approve`.
+  - `list_holds_only_viewable_deployments`: with `view` on `app/prod` and `request` on `app/staging`, a principal sees one.
+  - `list_filters_by_host_repo_and_needs_you`.
+  - `needs_you_is_an_open_request_this_principal_can_approve`.
+  - `list_pages_in_id_order`: three deployments, `limit=2`, then the cursor.
+  - `limit_outside_1_to_100_is_refused`: `0`, `101`, `100000`, `-1` and `x`.
+  - `deployment_shows_rule_promotion_holds_and_running`.
+  - `holds_keep_the_newest_50_and_count_all`.
+  - `promotion_to_an_unseen_deployment_is_not_named`: with `view` on `app/staging` only, its `promote_to` reads `unseen`, and nothing in the body contains `app/prod`.
+  - `a_report_from_a_host_no_longer_paired_is_ignored`.
+  - `unseen_deployment_is_not_found_and_another_grant_is_forbidden`.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement.** Add the seed and the `CASES` rows. Regenerate the document. Run: `cargo nextest run -p landfall-server`. Expected: PASS, with the grant and schema tests now covering the three new operations.
+- [ ] **Step 3: Gate. Commit:** `feat(api): who am I, and deployments`.
+
+### Task 5: Commit ranges between verified releases, within GitHub's budget
+
+**Files:** Create `crates/origin/src/fetch/commits.rs`, `crates/origin/src/fetch/tests/commits.rs`, `crates/server/src/watcher/commits.rs`, `crates/server/src/watcher/tests/commits.rs`, `crates/server/src/store/commits.rs`, `crates/server/migrations/0006_commit_ranges.sql`. Modify `crates/origin/src/fetch.rs` (`mod commits;`), `crates/server/src/watcher.rs` (the trait method, and one call to `commits::after_tick` at the end of the tick), `crates/server/src/watcher/source.rs`, `crates/server/src/watcher/tests.rs`, `crates/server/tests/serve_upkeep.rs`, `crates/server/tests/browser/main.rs`, `crates/agent/tests/e2e/world.rs`, `crates/server/src/store.rs` (`mod commits;` only), `docs/api.md`.
+
+**Interfaces:**
+- `fetch/commits.rs`: `pub const COMMITS_PAGE_LIMIT: usize = 2 * 1024 * 1024`, `pub const COMMITS_PER_PAGE: u8 = 100`, `pub const MAX_COMMIT_PAGES: u8 = 3`, `pub const KEPT_COMMITS: usize = 100` and `pub const COMMIT_SUMMARY_CHARS: usize = 200`.
+- `Fetcher::commits_page(&self, repo: &RepoName, head: &CommitSha, page: u8) -> Result<CommitsPage, FetchError>`: `GET /repos/{repo}/commits?sha={head}&per_page=100&page={page}`, capped at `COMMITS_PAGE_LIMIT` while streaming, with the GitHub token as other calls send it. `pub struct CommitsPage { pub commits: Vec<ListedCommit>, pub rate_remaining: Option<u32> }`, where `rate_remaining` is read from `x-ratelimit-remaining`. `pub struct ListedCommit { pub sha: CommitSha, pub summary: String, pub author: Option<String> }`. `summary` is the message's first line through `quoted(_, COMMIT_SUMMARY_CHARS)`. `author` is the login if it matches GitHub's login grammar (`[A-Za-z0-9-]{1,39}`), else `None`.
+- `ReleaseSource` gains `fn commits_page(&self, deployment: &DeploymentId, head: &CommitSha, page: u8) -> impl Future<Output = Result<CommitsPage, ReleaseError>> + Send;`. `LiveSource` calls the fetcher with the deployment's repo. Each test fake returns an empty page with `rate_remaining: Some(5000)` unless its test says otherwise.
+- `0006_commit_ranges.sql`:
+  - `commit_ranges (repo, base_commit, head_commit, state CHECK IN ('listed','base_not_found','unavailable'), seen INTEGER, last_try INTEGER, PRIMARY KEY (repo, base_commit, head_commit))`;
+  - `range_commits (repo, base_commit, head_commit, position, sha, summary, author NULL, PRIMARY KEY (repo, base_commit, head_commit, position))`;
+  - `commits_since (at INTEGER NOT NULL)`, holding one row inserted by the migration with the time it ran.
+
+  All three are `STRICT`.
+- `store/commits.rs`: `Store::commit_range(&self, repo, base, head) -> Result<Option<CommitRange>, StoreError>` and `Store::record_commit_range(&self, repo, base, head, range: &NewRange<'_>) -> Result<(), StoreError>`, which replaces the range and its commits in one transaction. `Store::ranges_wanted(&self, config: &Config, config_hash: &str, now: i64) -> Result<Vec<WantedRange>, StoreError>` yields, newest version first across deployments, each settled release first recorded at or after `commits_since.at` whose base exists, with no range stored or an `unavailable` one tried more than `COMMIT_RETRY_SECS` ago. Each `(repo, base, head)` appears once.
+- `watcher/commits.rs`:
+  - `pub(crate) const COMMIT_RETRY_SECS: i64 = 3600`.
+  - `pub(crate) struct GitHubBudget { requests_left: u8, floor: u32 }`, with `GitHubBudget::for_tick(has_token: bool) -> Self`: 12 requests and a floor of 1,000 with a token, 2 and 30 without.
+  - `pub(crate) fn base_for(tag: &ReleaseTag, settled: &[(ReleaseTag, CommitSha)]) -> Option<(ReleaseTag, CommitSha)>`: the highest semantic version below `tag`, where a pre-release orders below its release, as `semver` says.
+  - `pub(crate) async fn after_tick<S: ReleaseSource>(store, source, config, config_hash, has_token, now) -> usize` is called once the tick's verifications are done. It walks `ranges_wanted`, fetching pages until the base appears or `MAX_COMMIT_PAGES` is reached. It keeps the newest `KEPT_COMMITS` before the base. It stops for the tick when the budget is spent, a page's `rate_remaining` falls below the floor, or GitHub answers 403 or 429 (as `FetchError::RateLimited`).
+  - It writes no audit row, since it decides nothing. A failure records `unavailable`, logged once per range.
+
+- [ ] **Step 1: Failing tests.**
+  - In `fetch/tests/commits.rs` with `wiremock`: `commits_page_is_parsed` (sha, first line only, login, rate remaining), `summary_is_quoted_and_cut` (a message with a newline, ANSI escapes and 500 characters), `odd_login_is_dropped`, `page_over_the_limit_is_an_error`, `token_goes_with_the_request`.
+  - In `watcher/tests/commits.rs`:
+    - `base_is_the_highest_lower_settled_version`: a table with `v1.2.3` over `v1.2.0` and `v1.1.9`; pre-release `v1.3.0-rc.1` below `v1.3.0`; none below gives `None`.
+    - `a_refused_release_is_neither_compared_nor_a_base`: `v1.2.5` with `origin_refused` sits between `v1.2.0` and `v1.3.0`. It gets no range, and `v1.3.0`'s base is `v1.2.0`.
+    - `a_release_not_settled_under_this_configuration_is_skipped`.
+    - `a_moved_tag_is_compared_again`: `v1.3.0` re-recorded with a new commit gets a new range for the new head, and the story no longer shows the old one.
+    - `the_newest_100_before_the_base_are_kept`: 250 commits, base at position 180; positions 0 to 99 are kept, and `seen` is 180.
+    - `base_not_met_in_three_pages_is_base_not_found`.
+    - `two_deployments_of_one_repo_share_one_range`.
+    - `verification_runs_before_commits`: a fake source records call order within a tick.
+    - `compares_stop_when_the_rate_limit_is_low`: a page with `rate_remaining` below the floor stops the tick, and the next tick goes on.
+    - `untokened_ticks_make_at_most_two_requests`.
+    - `a_rate_limited_answer_stops_the_tick_and_holds_nothing`: the release's decision and holds stay as they were.
+    - `releases_seen_before_the_migration_are_never_fetched`.
+    - `unavailable_is_retried_after_an_hour`.
+
+  Run: `cargo nextest run -p landfall-origin commits` and `-p landfall-server commits`. Expected: FAIL.
+- [ ] **Step 2: Implement.** Document the source, the unverified author, which 100 are kept, the date-order caveat and the budget in `docs/api.md`. Run: `cargo nextest run -p landfall-origin -p landfall-server -p landfall-agent`. Expected: PASS, with every existing watcher and end-to-end test unchanged.
+- [ ] **Step 3: Gate; Linux, as the agent's e2e changed. Commit:** `feat(watcher): record the commits between verified releases, as GitHub lists them`.
+
+### Task 6: Releases and their story
+
+**Files:** Create `crates/api/src/releases.rs`, `crates/server/src/api/releases.rs`, `crates/server/src/api/story.rs`, `crates/server/src/api/tests/{releases,story}.rs`, `crates/server/src/store/history.rs`. Modify `crates/server/src/store.rs` (`mod history;` only), `crates/server/src/api.rs`, `crates/server/src/api/deployments.rs` (fills `latest`), `crates/server/src/api/tests.rs`, `crates/server/src/api/tests/grants.rs`, `docs/api.md`, `docs/api/openapi.json`.
+
+**Interfaces:**
+- `landfall-api`:
+  - `ReleaseView { tag, status: ReleaseStatus, decision: Decision, seen_at: i64 }`.
+  - `Decision { Auto, NeedsApproval, Manual, Refused, Deferred, #[serde(other)] Unknown }`.
+  - `ReleaseStory { release: ReleaseView, reasons: Vec<String>, next: Option<NextAction>, origin: Option<OriginView>, commits: CommitsView, requests: Vec<RequestBrief>, deploys: Vec<DeployBrief> }`.
+  - `OriginView { commit, digest, signer: Option<PrincipalId>, san: String, run_url: String, rekor_log_index: Option<u64>, integrated_time: Option<i64> }`, read from the `origin` column.
+  - `CommitsView { source: CommitSource, verified: bool, state: CommitsState, base: Option<ReleaseTag>, seen: Option<u32>, commits: Vec<CommitView> }`. `CommitSource { Github, #[serde(other)] Unknown }`. `verified` is documented as `const: false`. `CommitsState { Listed, BaseNotFound, First, NotYet, Unavailable, NotRecorded, Unknown }`; `NotYet`, `Unavailable` and `NotRecorded` carry no commits and mean unknown, not empty.
+  - `CommitView { sha, summary, author: Option<String> }`.
+  - `RequestBrief { id, state, requested_by, approved_by: Option<PrincipalId>, created_at, closed_reason: Option<String> }`.
+  - `DeployBrief { id, state, outcome: Option<Outcome>, created_at, finished_at: Option<i64> }`.
+  - `Outcome { Deployed, RolledBack, NothingChanged, FailedNoPrevious, RollbackFailed, Refused, Deferred, Unknown }`, the stored names.
+  - `NextAction { kind: NextKind, detail: String }`, with `NextKind { Request, Rollback, Approve, Wait, FixHost, Recover, None, Unknown }`. `detail` is the controller's own text, such as the CLI command to run or the approval page.
+- `store/history.rs`: `Store::release_rows(&self, deployment) -> Result<Vec<ReleaseRow>, StoreError>`, at most `MAX_LISTED_TAGS`, the watcher's own bound. `Store::release_row(&self, deployment, tag) -> Result<Option<ReleaseRow>, StoreError>`, with `origin` and `seen_at`. `Store::requests_of_release(&self, deployment, tag, limit: u32) -> Result<Vec<RequestRow>, StoreError>` and `Store::deploys_of_release(&self, deployment, tag, limit: u32) -> Result<Vec<DeployRow>, StoreError>`, newest first. A story keeps the newest 20 requests and the newest 20 deploys.
+- `api/story.rs`: `pub(crate) struct StoryInputs<'a> { tag: &'a ReleaseTag, digest: Option<&'a ImageDigest>, decision: Decision, decision_reason: &'a str, running: Option<&'a RunningRow>, active_deploy: bool, open_request: bool, hold: Option<&'a HoldRow>, last_outcome: Option<(Outcome, &'a str)>, promotion_waits_for: Option<DeploymentRef>, lower_than_running: bool }`, `pub(crate) struct StatusExplained { status: ReleaseStatus, reasons: Vec<String>, next: Option<NextAction> }`, and `#[must_use] pub(crate) fn status(inputs: &StoryInputs<'_>) -> StatusExplained`, by the precedence in the Rulings. Promotion uses `Store::promotion_waits_for`, as asking does, through `shown_deployment`. The commit range is looked up from the release's current commit and its base's, by `base_for`. A `base_not_found` range adds a reason line saying the history from the previous release couldn't be followed.
+- Routes: `listReleases`, with `ApiQuery<ReleasesQuery { limit, cursor }>`. The highest version comes first by `semver`, tags that don't parse come last in string order, and the cursor holds the last tag. `getRelease` is `404` for a tag the controller hasn't recorded.
+
+- [ ] **Step 1: Failing tests.**
+  - In `api/tests/story.rs`: `status_table`, with one row per status of the precedence, each with the inputs that produce it, its first reason and its `next` (for `needs_request`, `next.kind` is `request`, or `rollback` when lower); `precedence_holds_when_several_apply` (running and held at once is `running`; a held release that a higher one superseded is `held`; failed and superseded is `superseded`); and `promotion_reason_does_not_name_an_unseen_deployment`.
+  - In `api/tests/releases.rs`:
+    - `story_has_origin_commits_requests_and_deploys`.
+    - `commits_say_github_and_unverified`.
+    - `first_release_says_first`.
+    - `a_range_not_fetched_is_unknown_not_empty`: `not_yet`, `unavailable` and `not_recorded` each have no `commits` key content and are distinct from `listed` with zero commits.
+    - `base_not_found_adds_a_reason`.
+    - `a_rolled_back_release_says_failed_and_not_retried`.
+    - `a_release_that_never_verified_has_no_origin_and_no_commits`.
+    - `five_thousand_releases_page_in_version_order`: 5,000 tags seeded, in pages of 100; each page's first tag is lower than the previous page's last.
+    - `unparseable_tags_come_last`.
+    - `unrecorded_tag_is_not_found`.
+    - `deployment_summary_shows_the_latest_release_and_its_status`.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement.** Add the seed and the `CASES` rows. Regenerate the document. Run: `cargo nextest run -p landfall-server`. Expected: PASS.
 - [ ] **Step 3: Gate; security review of PR B. Commit:** `feat(api): releases and their story`. Open PR B.
 
 ## PR C: deploys, why, hosts and the audit log
 
-### Task 5: Deploys and `why`
+### Task 7: Deploys and `why`
 
-**Files:** Create `crates/api/src/deploys.rs`, `crates/server/src/api/deploys.rs`, `crates/server/src/api/why.rs`, `crates/server/src/api/tests/{deploys,why}.rs`. Modify `crates/server/src/store/history.rs`, `crates/server/src/api.rs`, `docs/api.md`, `docs/api/openapi.json`.
+**Files:** Create `crates/api/src/deploys.rs`, `crates/server/src/api/deploys.rs`, `crates/server/src/api/why.rs`, `crates/server/src/api/tests/{deploys,why}.rs`. Modify `crates/server/src/store/history.rs`, `crates/server/src/api.rs`, `crates/server/src/api/tests.rs`, `crates/server/src/api/tests/grants.rs`, `docs/api.md`, `docs/api/openapi.json`.
 
 **Interfaces:**
-- `landfall-api`: `DeployView { id, deployment, host, tag, digest, commit, state: DeployState, outcome: Option<Outcome>, reason: Option<String>, rollback_reason: Option<String>, request: Option<i64>, approved_by: Option<PrincipalId>, created_at, claimed_at: Option<i64>, finished_at: Option<i64>, steps: Vec<StepView> }`, `DeployState { Queued, Claimed, Finished, Unknown }`, `StepView { position: u32, name: String, millis: i64, failure: Option<String>, detail: Option<serde_json::Value> }` (the stored, already-bounded detail: checks with attempts and millis, backup counts). `Why { deploy: i64, outcome: Option<Outcome>, summary: String, events: Vec<WhyEvent>, next: Option<NextAction> }`, `WhyEvent { at: Option<i64>, what: WhyKind, text: String }`, `WhyKind { Requested, Approved, Queued, Claimed, Step, CheckPassed, StepFailed, RolledBack, RollbackFailed, HostRefused, Deferred, Finished, Unknown }`.
-- `store/history.rs` gains `Store::deploy(&self, id: i64) -> Result<Option<DeployRow>, StoreError>` (with `request_id`, and the request's `requested_by` and `approved_by`), `Store::deploy_steps(&self, id: i64) -> Result<Vec<StepRow>, StoreError>`, `Store::deploys_of_deployment(&self, deployment, before: Option<i64>, limit: u32) -> Result<Vec<DeployRow>, StoreError>` on the `(deployment, id)` index.
-- `api/why.rs`: `#[must_use] pub(crate) fn explain(deploy: &DeployRow, steps: &[StepRow]) -> Why`, pure. Events in time order: requested (who), approved (who), queued, claimed, each step (a failure as `StepFailed` with its text), the outcome. `summary` is one sentence an agent can act on, such as "v1.2.3 failed its checks on home-1 and rolled back to the previous version; it won't be retried automatically". `next`: `rolled_back` and `failed_no_previous` give `request` naming a newer release or a retry with an approval; `rollback_failed` gives `recover`, naming `landfall-agent recover` on that host; `refused` gives `fix_host`, quoting the host's reason and saying it is an alert; `deferred` and `nothing_changed` give `wait`; `deployed` gives `none`; queued or claimed gives `wait`.
-- Routes: `listDeploys` (`ApiQuery<{ limit, cursor }>`, newest first), `getDeploy`, `whyDeploy`. A deploy whose deployment the configuration doesn't have is `404`, and so is one the principal can't view, by the visibility rule.
+- `landfall-api`:
+  - `DeployView { id, deployment, host, tag, digest, commit, state: DeployState, outcome: Option<Outcome>, reason: Option<String>, rollback_reason: Option<String>, request: Option<i64>, approved_by: Option<PrincipalId>, created_at, claimed_at: Option<i64>, finished_at: Option<i64>, steps: Vec<StepView> }`.
+  - `DeployState { Queued, Claimed, Finished, Unknown }`.
+  - `StepView { position: u32, name: String, millis: i64, failure: Option<String>, detail: Option<serde_json::Value> }`: the stored detail, already bounded (checks with their attempts and millis, backup counts).
+  - `Why { deploy: i64, outcome: Option<Outcome>, summary: String, events: Vec<WhyEvent>, next: Option<NextAction> }`.
+  - `WhyEvent { at: Option<i64>, what: WhyKind, text: String }`.
+  - `WhyKind { Requested, Approved, Queued, Claimed, Step, StepFailed, RolledBack, RollbackFailed, HostRefused, Deferred, Finished, Unknown }`.
+- `store/history.rs` gains `Store::deploy(&self, id: i64) -> Result<Option<DeployRow>, StoreError>`, with `request_id` and the request's `requested_by` and `approved_by`; `Store::deploy_steps(&self, id: i64) -> Result<Vec<StepRow>, StoreError>`; and `Store::deploys_of_deployment(&self, deployment, before: Option<i64>, limit: u32) -> Result<Vec<DeployRow>, StoreError>`, on the `(deployment, id)` index.
+- `api/why.rs`: `#[must_use] pub(crate) fn explain(deploy: &DeployRow, steps: &[StepRow]) -> Why`, pure.
+  - Events come in time order: requested (by whom), approved (by whom), queued, claimed, each step (a failure as `StepFailed`, with its text), then the outcome.
+  - `summary` is one sentence an agent can act on, such as "v1.2.3 failed its checks on home-1 and rolled back to the previous version; it won't be retried automatically".
+  - `next` by outcome:
+    - `rolled_back` and `failed_no_previous`: `request`, naming a newer release or a retry with an approval.
+    - `rollback_failed`: `recover`, naming `landfall-agent recover` on that host.
+    - `refused`: `fix_host`, quoting the host's reason and saying it is an alert.
+    - `deferred` and `nothing_changed`: `wait`.
+    - `deployed`: `none`.
+    - Queued or claimed: `wait`.
+- Routes: `listDeploys` (`ApiQuery<DeploysQuery { limit, cursor }>`, newest first), `getDeploy` and `whyDeploy`. A deploy whose deployment the configuration doesn't have is `404`, and so is one the principal can't view, by the visibility rule.
 
-- [ ] **Step 1: Failing tests.** In `api/tests/why.rs`, `explain_table`: one row per outcome (each of the seven, plus queued and claimed), asserting `summary` names the tag and host, the event kinds in order and `next.kind`; `a_step_failure_is_quoted_not_raw` (a failure with a newline and an escape stays as stored); `approver_and_requester_are_named`. In `api/tests/deploys.rs`: `deploy_has_steps_with_checks`, `history_pages_newest_first`, `why_of_an_unseen_deploy_is_not_found` (a principal with `view` on `app/staging` only, asking for an `app/prod` deploy, gets the same 404 as for id 999999), `deploy_of_a_deployment_no_longer_configured_is_not_found` (rows for `app/old` in the database, `app/old` absent from the configuration: `getDeploy`, `whyDeploy` and `listDeploys` all 404, for a principal whose grants once named it), `non_canonical_ids_are_not_found` (`01`, `+1`, `1.0`, a 30-digit number). Expected: FAIL.
-- [ ] **Step 2: Implement; seed; regenerate.** Run: `cargo nextest run -p landfall-server`. Expected: PASS.
+- [ ] **Step 1: Failing tests.**
+  - In `api/tests/why.rs`: `explain_table`, with one row per outcome (each of the seven, plus queued and claimed), asserting that `summary` names the tag and host, the event kinds come in order, and `next.kind` is right; `a_step_failure_is_quoted_not_raw` (a failure with a newline and an escape stays as stored); `approver_and_requester_are_named`.
+  - In `api/tests/deploys.rs`:
+    - `deploy_has_steps_with_checks`.
+    - `history_pages_newest_first`.
+    - `why_of_an_unseen_deploy_is_not_found`: a principal with `view` on `app/staging` only, asking for an `app/prod` deploy, gets the same 404 as for id 999999.
+    - `deploy_of_a_deployment_no_longer_configured_is_not_found`: with rows for `app/old` in the database and `app/old` absent from the configuration, `getDeploy`, `whyDeploy` and `listDeploys` all give 404, even for a principal whose grants once named it.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement; seed; add the `CASES` rows; regenerate.** Run: `cargo nextest run -p landfall-server`. Expected: PASS.
 - [ ] **Step 3: Gate. Commit:** `feat(api): deploys, and why each ended as it did`.
 
-### Task 6: Hosts and the audit log
+### Task 8: Hosts and the audit log
 
-**Files:** Create `crates/api/src/hosts.rs`, `crates/api/src/audit.rs`, `crates/server/src/api/hosts.rs`, `crates/server/src/api/audit.rs`, `crates/server/src/api/tests/{hosts,audit}.rs`. Modify `crates/server/src/store/views.rs`, `crates/server/src/api.rs`, `docs/api.md`, `docs/api/openapi.json`.
+**Files:** Create `crates/api/src/hosts.rs`, `crates/api/src/audit.rs`, `crates/server/src/api/hosts.rs`, `crates/server/src/api/audit.rs`, `crates/server/migrations/0007_audit_indexes.sql`, `crates/server/src/api/tests/{hosts,audit}.rs`. Modify `crates/server/src/store/views.rs`, `crates/server/src/api.rs`, `crates/server/src/api/tests.rs`, `crates/server/src/api/tests/grants.rs`, `docs/api.md`, `docs/api/openapi.json`.
 
 **Interfaces:**
-- `landfall-api`: `HostView { id: HostId, enrolled_at: Option<i64>, config_drift: bool, last_report: Option<i64>, deployments: Vec<DeploymentSummary> }`. `AuditEntry { seq: i64, ts: i64, kind: String, deployment: Option<DeploymentId>, host: Option<HostId>, detail: serde_json::Value }`: `detail` parsed, or for a row that doesn't parse (a tampered one), `{"unreadable": "<first 256 characters, quoted>"}`. No hash: verifying is `landfall-server audit verify`'s.
-- `store/views.rs` gains `Store::hosts(&self, ids: &[&HostId]) -> Result<HashMap<HostId, HostRow>, StoreError>` and `Store::audit_page(&self, seen: &AuditScope<'_>, filter: &AuditFilter<'_>, before: Option<i64>, limit: u32) -> Result<Vec<AuditRow>, StoreError>`, where `AuditScope { deployments: &[&DeploymentId], hosts: &[&HostId] }` is what the principal may see (hosts: those with a viewable deployment) and `AuditFilter { deployment: Option<&DeploymentId>, host: Option<&HostId>, kind: Option<&str> }`. One query, newest first: `seq < ?before AND (deployment IN (SELECT value FROM json_each(?scope_deployments)) OR (deployment IS NULL AND host IN (SELECT value FROM json_each(?scope_hosts))))` plus the filter, `LIMIT ?`. Rows with neither deployment nor host are never selected.
-- Routes: `listHosts` (hosts named by configured deployments the principal may view, by id), `getHost`, `listAudit` (`ApiQuery<{ deployment, host, kind, limit, cursor }>`; `kind` must be one of `EventKind`'s names, else 400; a `deployment` or `host` filter the principal can't see gives an empty page, never 403 or 404, so the filter says nothing).
+- `0007_audit_indexes.sql` creates indexes on `audit_events (deployment, seq)`, `audit_events (deployment, kind, seq)` and `audit_events (host, kind, seq) WHERE deployment IS NULL`. Indexes only; the audit triggers are unaffected.
+- `landfall-api`: `HostView { id: HostId, enrolled_at: Option<i64>, config_drift: bool, last_report: Option<i64>, deployments: Vec<DeploymentSummary> }`. `AuditEntry { seq: i64, ts: i64, kind: String, deployment: Option<DeploymentId>, host: Option<HostId>, detail: serde_json::Value }`. `detail` is parsed, or, for a row that doesn't parse (a tampered one), is `{"unreadable": "<first 256 characters, quoted>"}`. There is no hash: verifying is `landfall-server audit verify`'s job.
+- `store/views.rs` gains `Store::hosts(&self, ids: &[&HostId]) -> Result<HashMap<HostId, HostRow>, StoreError>` and `Store::audit_page(&self, scope: &AuditScope<'_>, filter: &AuditFilter<'_>, before: Option<i64>, limit: u32) -> Result<Vec<AuditRow>, StoreError>`. `AuditScope { deployments: &[&DeploymentId], hosts: &[&HostId] }` is what the principal may see; its hosts are those with a viewable deployment. `AuditFilter { deployment: Option<&DeploymentId>, host: Option<&HostId>, kind: Option<&str> }`. `pub(crate) const HOST_ROW_KINDS: [&str; 2] = ["host_enrolled", "config_drift"]`.
+- The audit query, built for the scope and filter: one branch per scoped deployment, `SELECT … FROM audit_events WHERE deployment = ? [AND kind = ?] AND seq < ? ORDER BY seq DESC LIMIT ?`, and one branch per scoped host and allowed kind, `… WHERE deployment IS NULL AND host = ? AND kind = ? AND seq < ? ORDER BY seq DESC LIMIT ?`. They are combined with `UNION ALL` under an outer `ORDER BY seq DESC LIMIT ?`. Each branch reads at most `limit` rows from its index. Rows with neither a deployment nor a host are never selected. A scope over 1,000 branches is refused with `bad_request`, asking for a `deployment` or `host` filter; the configuration bounds the scope.
+- Routes: `listHosts`, the hosts named by configured deployments the principal may view, by id; `getHost`, which is 404 for a host with no deployment the principal sees and 403 for one where they hold another grant but no `view`; and `listAudit`, with `ApiQuery<AuditQuery { deployment, host, kind, limit, cursor }>`. `kind` must be one of `EventKind`'s names, else 400. A `deployment` or `host` filter the principal can't see gives an empty page, never 403 or 404, so the filter says nothing.
 
-- [ ] **Step 1: Failing tests.** In `api/tests/hosts.rs`: `hosts_show_only_viewable_deployments` (`home-1` runs `app/prod` and `app/other`; with `view` on `app/prod` only, `home-1` lists one deployment and `home-2`, which runs only `app/other`, is absent and `getHost` gives 404), `host_never_enrolled_is_listed_without_enrolled_at`, `host_shows_config_drift_and_last_report`. In `api/tests/audit.rs`: `audit_rows_follow_view_in_sql` (60 rows across `app/prod`, `app/other`, `home-1` and controller-wide kinds; with `view` on `app/prod`, `limit=50` gives exactly 50 visible rows, none of `app/other`, none controller-wide), `host_rows_are_seen_through_a_deployment_on_that_host`, `controller_wide_rows_are_never_listed` (`token_created`, `signed_in`, `access_throttled`, `passkey_registered` all absent, whatever the grants), `audit_of_a_removed_deployment_is_not_listed`, `a_crafted_cursor_reaches_nothing_unseen` (a cursor with `before` at a seq of an unseen row yields only visible rows), `filter_on_an_unseen_deployment_is_an_empty_page`, `unknown_kind_is_refused`, `tampered_detail_is_unreadable_not_an_error`, `audit_page_uses_an_index` (`EXPLAIN QUERY PLAN` of the query with a deployment filter names `audit_events` with one of `0005`'s indexes, not a full scan). Expected: FAIL.
-- [ ] **Step 2: Implement; seed; regenerate.** Run: `cargo nextest run -p landfall-server`. Expected: PASS.
+- [ ] **Step 1: Failing tests.**
+  - In `api/tests/hosts.rs`:
+    - `hosts_show_only_viewable_deployments`: `home-1` runs `app/prod` and `app/other`. With `view` on `app/prod` only, `home-1` lists one deployment, `home-2` (which runs only `app/other`) is absent, and `getHost` for `home-2` gives 404.
+    - `host_with_only_another_grant_is_forbidden`.
+    - `host_never_enrolled_is_listed_without_enrolled_at`.
+    - `host_shows_config_drift_and_last_report`.
+  - In `api/tests/audit.rs`:
+    - `audit_rows_follow_view_in_sql`: 60 rows across `app/prod`, `app/other`, `home-1` and controller-wide kinds. With `view` on `app/prod`, `limit=50` gives exactly 50 visible rows, none of `app/other` and none controller-wide.
+    - `host_rows_are_seen_through_a_deployment_on_that_host`: `host_enrolled` and `config_drift` only.
+    - `host_rows_of_enrolment_are_not_listed`: `enrol_code_issued`, `enrol_refused` and a `report_refused` with no deployment are absent, whatever the grants.
+    - `controller_wide_rows_are_never_listed`: `token_created`, `signed_in`, `access_throttled` and `passkey_registered` are absent, whatever the grants, for a token and for a session.
+    - `audit_of_a_removed_deployment_is_not_listed`.
+    - `a_crafted_cursor_reaches_nothing_unseen`: a cursor whose `before` is the seq of an unseen row yields only visible rows.
+    - `filter_on_an_unseen_deployment_is_an_empty_page`.
+    - `unknown_kind_is_refused`.
+    - `tampered_detail_is_unreadable_not_an_error`.
+    - `audit_page_uses_an_index`: `EXPLAIN QUERY PLAN` of the unfiltered scoped query, of the `kind` filter and of a deployment filter, for a scope of three deployments and one host. Each names one of `0007`'s indexes in every branch, and none contains `SCAN audit_events`.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement; seed; add the `CASES` rows; regenerate.** Document the audit rule, the allow-list and that global sequence numbers and ids show gaps, in `docs/api.md`. Run: `cargo nextest run -p landfall-server`. Expected: PASS.
 - [ ] **Step 3: Gate; security review of PR C. Commit:** `feat(api): hosts and the audit log, as far as a principal may see`. Open PR C.
 
 ## PR D: the CLI's client and its read commands
 
-### Task 7: The client: where the controller is, the token, and answers
+### Task 9: The client: where the controller is, the token, answers and escaping
 
-**Files:** Create `crates/cli/src/api_client.rs`, `crates/cli/src/api_client/tests.rs`, `crates/cli/src/settings.rs`, `crates/cli/src/settings/tests.rs`, `crates/cli/src/display.rs`, `crates/cli/src/display/tests.rs`. Modify `crates/cli/Cargo.toml` (`landfall-api`, `reqwest` with `json` off and `rustls`, `serde`, `toml`), `crates/cli/src/lib.rs`, `crates/cli/src/cli.rs` (global flags, `CliError::Api`), `AGENTS.md` (crate map).
+**Files:** Create `crates/cli/src/api_client.rs`, `crates/cli/src/api_client/tests.rs`, `crates/cli/src/settings.rs`, `crates/cli/src/settings/tests.rs`, `crates/cli/src/display.rs`, `crates/cli/src/display/tests.rs`. Modify `crates/cli/Cargo.toml` (`landfall-api`, `reqwest` moved from dev-dependencies to dependencies with `rustls` and `stream`, `serde`, `toml`), `crates/cli/src/lib.rs`, `crates/cli/src/cli.rs` (the global flags, `CliError::Api`, and `run` printing every error through `display::safe`), `AGENTS.md` (crate map).
 
 **Interfaces:**
-- `settings.rs`: `pub struct Settings { pub controller: ControllerUrl, pub token: Option<Token> }`. `pub struct Token(String)` with redacted `Debug`, no `Display`, `pub(crate) fn header(&self) -> HeaderValue` (marked sensitive). `pub fn resolve(flags: &GlobalFlags, env: &dyn Env, files: &dyn Files) -> Result<Settings, SettingsError>`: controller from `--controller`, then `LANDFALL_CONTROLLER`, then `controller` in the config file (`--cli-config`, else `$XDG_CONFIG_HOME/landfall/cli.toml`, else `~/.config/landfall/cli.toml`; a missing default file is fine, a missing named one isn't); the allow-insecure flag from `--allow-insecure-controller` or `allow_insecure_controller = true`. Token from `LANDFALL_TOKEN` (non-empty), then `--token-file`, `LANDFALL_TOKEN_FILE`, then `token_file`; two sources set at once is an error naming both. A token file must be a regular file opened with no-follow, mode `& 0o077 == 0` on Unix, at most 256 bytes, one line of `[A-Za-z0-9_-]` after trimming one final newline. The config file is TOML with `deny_unknown_fields`: `controller`, `token_file`, `allow_insecure_controller`. `pub trait Env` and `pub trait Files`, for tests.
+- `settings.rs`:
+  - `pub struct Settings { pub controller: ControllerUrl, pub token: Option<Token> }`.
+  - `pub struct Token(String)`: redacted `Debug`, no `Display`, and `pub(crate) fn header(&self) -> HeaderValue`, marked sensitive.
+  - `pub fn resolve(flags: &GlobalFlags, env: &dyn Env, files: &dyn Files) -> Result<Settings, SettingsError>`.
+    - The controller comes from `--controller`, then `LANDFALL_CONTROLLER`, then `controller` in the config file. The config file is `--cli-config`, else `$XDG_CONFIG_HOME/landfall/cli.toml`, else `~/.config/landfall/cli.toml`; a missing default file is fine, and a missing named one isn't.
+    - Insecure transport is allowed by `--allow-insecure-controller` or `allow_insecure_controller = true`.
+    - The token comes from `LANDFALL_TOKEN` (non-empty), then `--token-file`, then `LANDFALL_TOKEN_FILE`, then `token_file`. Two sources set at once is an error naming both.
+    - A token file must be a regular file opened with no-follow, with `mode & 0o077 == 0` on Unix, at most 256 bytes, holding one line of `[A-Za-z0-9_-]` after trimming one final newline.
+    - The config file is TOML with `deny_unknown_fields`: `controller`, `token_file` and `allow_insecure_controller`.
+  - `SettingsError::Controller(UrlError)` has the CLI's own message for each case: an `http://` controller would get the bearer token in clear, so the flag is needed and only for loopback, `localhost` or `*.ts.net`.
+  - `pub trait Env` and `pub trait Files`, for tests.
 - `GlobalFlags` (clap, `global = true`): `--controller <URL>`, `--allow-insecure-controller`, `--token-file <FILE>`, `--cli-config <FILE>`, `--json`.
-- `api_client.rs`: `pub struct ApiClient`. `pub fn new(settings: &Settings) -> Result<ApiClient, ApiError>`: `reqwest` with `redirect::Policy::none()`, connect timeout 10 s, request timeout 30 s, `User-Agent: landfall/<version>`, no proxy from the environment unless `HTTPS_PROXY` is set for an `https://` controller (reqwest's default; stated in the guide). `pub async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, ApiError>`, `pub async fn post<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T, ApiError>`. Bodies capped at 4 MiB while streaming. Path segments go through one function, `pub(crate) fn segment(&str) -> String`, percent-encoding everything outside unreserved characters, and a deployment id is split into `{name}/{stage}` by `DeploymentId`'s own grammar.
-- `pub enum ApiError` (`#[non_exhaustive]`): `Refused { status: u16, code: ProblemCode, title: String }` (exit 1), `Unauthenticated` (exit 2, saying where the token was looked for), `RateLimited { retry_after_secs: Option<u32> }` (exit 2), `Server { status: u16 }` (exit 2), `Redirected { status: u16 }` (exit 2, naming no location), `TooLarge`, `Network(#[source] reqwest::Error)` with the URL's query and any credentials stripped, `Parse` (exit 2). No variant holds the token.
-- `display.rs`: `#[must_use] pub fn safe(text: &str) -> Cow<'_, str>` escaping C0 (but not `\n` in multi-line blocks, which a caller asks for with `safe_lines`), DEL, C1, U+202A to U+202E and U+2066 to U+2069 as `\u{XX}`. `pub fn write_json<T: Serialize>(out: &mut dyn Write, value: &T) -> io::Result<()>`: pretty JSON, with U+0080 to U+009F and the bidi controls escaped as `\uXXXX`, through a `serde_json::ser::Formatter` that overrides `write_string_fragment`.
+- `api_client.rs`: `pub struct ApiClient`.
+  - `pub fn new(settings: &Settings) -> Result<ApiClient, ApiError>`: `reqwest` with `.no_proxy()`, `.https_only(controller is https)`, `redirect::Policy::none()`, a connect timeout of 10 s, a request timeout of 30 s and `User-Agent: landfall/<version>`.
+  - `pub async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value, ApiError>`, `pub async fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<serde_json::Value, ApiError>`, and `pub fn typed<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, ApiError>`. Bodies are capped at 4 MiB while streaming. Path segments go through one function, `pub(crate) fn segment(&str) -> String`, which percent-encodes everything outside the unreserved characters. A deployment id is split into `{name}/{stage}` by `DeploymentId`'s own grammar.
+- `pub enum ApiError` (`#[non_exhaustive]`):
+  - `Refused { status: u16, code: ProblemCode, title: String }`: exit 1.
+  - `Unauthenticated`: exit 2, saying where the token was looked for.
+  - `RateLimited { retry_after_secs: Option<u32> }`: exit 2.
+  - `Server { status: u16 }`: exit 2.
+  - `Redirected { status: u16 }`: exit 2, naming no location.
+  - `TooLarge`.
+  - `Network(#[source] reqwest::Error)`, with the URL's query and any credentials stripped.
+  - `Parse`: exit 2.
 
-- [ ] **Step 1: Failing tests.** In `settings/tests.rs`: `flag_beats_env_beats_file`, `two_token_sources_are_refused_naming_both`, `no_token_is_allowed_for_a_proxy_that_adds_one`, `insecure_url_is_refused` (`http://controller.example` is refused with or without the flag; `http://127.0.0.1:8080` and `http://landfall.example.ts.net` are refused without it and pass with it, by `ControllerUrl`'s rule), `readable_token_file_is_refused` (0644; 0600 passes), `linked_token_file_is_refused`, `token_file_over_256_bytes_is_refused`, `token_with_odd_characters_is_refused`, `unknown_config_key_is_refused`, `named_config_file_must_exist`, `token_debug_is_redacted`. In `api_client/tests.rs`, with `wiremock`: `bearer_is_sent_when_there_is_a_token_and_not_otherwise`, `redirect_is_not_followed_and_the_token_stays` (a 302 to a second server: that server receives nothing, and the error names no location), `problem_answers_become_refused_with_their_code`, `401_is_unauthenticated_and_says_where_the_token_came_from`, `429_carries_retry_after`, `body_over_4_mib_is_cut_off`, `unknown_fields_and_values_from_a_newer_controller_are_tolerated` (an extra field, a `status` of `"teleporting"` read as `Unknown`, a new problem code read as `ProblemCode::Unknown`), `token_is_never_in_output_or_errors` (every `ApiError`'s `Display` and `Debug`, and a failed connection's, searched for the token), `segments_are_percent_encoded` (a tag with `/`, `?`, `#`, `%`, `..`). In `display/tests.rs`: `safe_escapes_controls_and_bidi` (a table: `\x1b[31m`, `\u{9b}31m`, `\u{202e}`, `\u{2066}`, `\x07`, `\x7f`, and plain text with accents unchanged and borrowed), `json_output_escapes_c1_and_bidi` (the output parses back to the same value, and holds no byte of U+009B or U+202E). Expected: FAIL.
-- [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-cli`. Expected: PASS, and the existing `verify` and `host` tests unchanged.
+  No variant holds the token.
+- `display.rs`: `#[must_use] pub fn safe(text: &str) -> Cow<'_, str>` escapes C0 (including `\r` and `\n`), DEL, C1, U+061C, U+200E, U+200F, U+2028, U+2029, U+202A to U+202E and U+2066 to U+2069 as `\u{XX}`. `#[must_use] pub fn safe_lines(text: &str) -> Cow<'_, str>` is the same except that it keeps `\n`. `pub fn write_json(out: &mut dyn Write, value: &serde_json::Value) -> io::Result<()>` prints pretty JSON with DEL, C1 and the same controls escaped as `\uXXXX`, through a `serde_json::ser::Formatter` that overrides `write_string_fragment`.
+
+- [ ] **Step 1: Failing tests.**
+  - In `settings/tests.rs`:
+    - `flag_beats_env_beats_file`.
+    - `two_token_sources_are_refused_naming_both`.
+    - `no_token_is_allowed_for_a_proxy_that_adds_one`.
+    - `insecure_url_is_refused`: `http://controller.example` is refused with or without the flag; `http://127.0.0.1:8080` and `http://landfall.example.ts.net` are refused without it and pass with it. Each message speaks of the token.
+    - `readable_token_file_is_refused`: 0644 is refused and 0600 passes.
+    - `linked_token_file_is_refused`.
+    - `token_file_over_256_bytes_is_refused`.
+    - `token_with_odd_characters_is_refused`.
+    - `unknown_config_key_is_refused`.
+    - `named_config_file_must_exist`.
+    - `token_debug_is_redacted`.
+  - In `api_client/tests.rs`, with `wiremock`:
+    - `bearer_is_sent_when_there_is_a_token_and_not_otherwise`.
+    - `http_proxy_in_the_environment_is_not_used`: `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` pointed at a second server, set through the client builder's test seam or a child process. That server receives nothing.
+    - `redirect_is_not_followed_and_the_token_stays`: a 302 to a second server. That server receives nothing, and the error names no location.
+    - `problem_answers_become_refused_with_their_code`.
+    - `401_is_unauthenticated_and_says_where_the_token_came_from`.
+    - `429_carries_retry_after`.
+    - `body_over_4_mib_is_cut_off`.
+    - `unknown_fields_and_values_from_a_newer_controller_are_tolerated`: an extra field, a `status` of `"teleporting"` read as `Unknown`, and a new problem code read as `ProblemCode::Unknown`.
+    - `token_is_never_in_output_or_errors`: every `ApiError`'s `Display` and `Debug`, and a failed connection's, searched for the token.
+    - `segments_are_percent_encoded`: a tag with `/`, `?`, `#`, `%` and `..`.
+  - In `display/tests.rs`:
+    - `safe_escapes_controls_and_bidi`: a table of `\x1b[31m`, `\u{9b}31m`, `\r`, `\u{202e}`, `\u{2066}`, `\u{200f}`, `\u{2028}`, `\x07` and `\x7f`, with plain accented text unchanged and borrowed.
+    - `safe_lines_keeps_newlines_and_escapes_carriage_returns`.
+    - `json_output_escapes_c1_del_and_bidi`: the output parses back to the same value and holds no byte of U+009B, U+007F or U+202E.
+    - `errors_are_escaped`: a `Refused` whose title holds `\x1b]0;x\x07`, printed by `run`'s error path, comes out escaped.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-cli`. Expected: PASS, with the existing `verify` and `host` tests unchanged.
 - [ ] **Step 3: Gate. Commit:** `feat(cli): a client for the controller's API`.
 
-### Task 8: Reading: status, history, release, why, hosts, audit, approvals, whoami
+### Task 10: Reading: status, history, release, why, hosts, audit, approvals, whoami
 
 **Files:** Create `crates/cli/src/read.rs`, `crates/cli/src/read/render.rs`, `crates/cli/src/read/tests.rs`, `crates/cli/src/read/tests/{render,commands}.rs`. Modify `crates/cli/src/cli.rs`, `crates/cli/src/cli/tests.rs`.
 
 **Interfaces:**
-- Commands (each with `--json`, printing the API's body through `display::write_json`):
+- Commands. With `--json`, each prints the body as received, through `display::write_json`, and a paged command prints `{"items": [...]}` from every page it read.
   - `landfall whoami` → `GET /api/v1/me`.
-  - `landfall status [<DEPLOYMENT>] [--host <ID>] [--repo <NAME>] [--needs-you]` → without a deployment, every page of `listDeployments` (stopping at 1,000 items with a line saying so), one line each: id, host, running tag and phase, latest release and its status, `needs you` where it applies. With one, `getDeployment`: rule, promotion, holds, running, latest.
+  - `landfall status [<DEPLOYMENT>] [--host <ID>] [--repo <NAME>] [--needs-you]`. Without a deployment, it reads `listDeployments` page by page, stopping at 1,000 items or 20 pages, or when a cursor comes back that it has already seen, with a line saying which. It prints one line per deployment: id, host, running tag and phase, latest release and its status, and `needs you` where that applies. With a deployment, it reads `getDeployment`: rule, promotion, holds (and how many more), running, latest.
   - `landfall history <DEPLOYMENT> [--limit <N>]` → `listDeploys`.
-  - `landfall release <DEPLOYMENT> <TAG>` → `getRelease`: status, reasons, `next`, origin, commits (headed "commits, as GitHub lists them (not verified)"), requests, deploys.
+  - `landfall release <DEPLOYMENT> <TAG>` → `getRelease`: status, reasons, `next`, origin, commits, requests and deploys. Commits are headed "commits, as GitHub lists them (not verified; authors are GitHub's attribution)", with "the newest 100 of N" when cut. An unknown state is printed as its reason, never as "no commits".
   - `landfall releases <DEPLOYMENT> [--limit <N>]` → `listReleases`.
-  - `landfall why <DEPLOY_ID>` → `whyDeploy`: the summary, the events, `next`.
+  - `landfall why <DEPLOY_ID>` → `whyDeploy`: the summary, the events, and `next`.
   - `landfall hosts [<HOST>]` → `listHosts` or `getHost`.
   - `landfall audit [--deployment <ID>] [--host <ID>] [--kind <KIND>] [--limit <N>]` → `listAudit`.
-  - `landfall approvals` → `listApprovals`, each with its intent and `approve_url`, and the line from the Rulings.
-- `read::run_with(command: &ReadCommand, client: &dyn Api, out: &mut dyn Write) -> Result<(), CliError>`, over `pub trait Api` (the two methods of `ApiClient`), so tests use a fake. `render.rs`: one `pub(crate) fn` per view, taking the `landfall-api` type and `&mut dyn Write`, every server string through `display::safe`.
-- `cli.rs`: exit statuses in `--help` for these commands: the table in the Rulings.
+  - `landfall approvals` → `listApprovals`: each request with its intent and `approve_url`, and the line from the Rulings.
+- `read::run_with(command: &ReadCommand, client: &dyn Api, out: &mut dyn Write, json: bool) -> Result<(), CliError>` runs over `pub trait Api` (the two methods of `ApiClient`), so tests can use a fake. `render.rs` has one `pub(crate) fn` per view, taking the `landfall-api` type and `&mut dyn Write`, with every server string through `display::safe` or `safe_lines`.
+- `cli.rs`: these commands' `--help` gives the exit statuses from the Rulings.
 
-- [ ] **Step 1: Failing tests.** In `read/tests/render.rs`: `hostile_text_is_escaped_in_human_output` (a release story whose commit summary holds `\x1b]0;owned\x07`, a check name with `\u{9b}2J`, a host reason with `\u{202e}`; none of those bytes in the output, each escaped), `status_line_shows_needs_you`, `story_heads_commits_as_unverified`, `why_prints_summary_events_and_next`, `unknown_status_prints_unknown`. In `read/tests/commands.rs`, with a fake `Api` recording calls: `status_pages_until_done` (two pages, one call each), `status_stops_at_1000_and_says_so`, `each_command_calls_its_operation` (a table: command line → method and path), `refused_exits_1_and_unreachable_exits_2`, `json_flag_prints_the_body`. In `cli/tests.rs`: `every_cli_call_is_in_the_openapi_document` (each method and path in the table above, with parameters as `{…}`, is an operation of `include_str!` of `docs/api/openapi.json`), `help_documents_the_exit_statuses`. Expected: FAIL.
+- [ ] **Step 1: Failing tests.**
+  - In `read/tests/render.rs`:
+    - `hostile_text_is_escaped_in_human_output`: a release story whose commit summary holds `\x1b]0;owned\x07`, an author with `\r`, a check name with `\u{9b}2J` and a host reason with `\u{202e}`. None of those bytes appears in the output; each is escaped.
+    - `status_line_shows_needs_you`.
+    - `story_heads_commits_as_unverified_and_says_how_many`.
+    - `unknown_commit_state_is_not_printed_as_none`.
+    - `why_prints_summary_events_and_next`.
+    - `unknown_status_prints_unknown`.
+  - In `read/tests/commands.rs`, with a fake `Api` recording calls:
+    - `status_pages_until_done`: two pages, one call each.
+    - `status_stops_at_1000_items_or_20_pages_and_says_so`.
+    - `a_repeated_cursor_stops_paging`.
+    - `each_command_calls_its_operation`: a table from command line to method and path.
+    - `refused_exits_1_and_unreachable_exits_2`.
+    - `json_passes_new_fields_and_values_through`: a body with an extra field and a status of `"teleporting"` comes out with both, unchanged.
+  - In `cli/tests.rs`: `every_cli_call_is_in_the_openapi_document` (each method and path in the table above, with parameters as `{…}`, is an operation of `include_str!` of `docs/api/openapi.json`) and `help_documents_the_exit_statuses`.
+
+  Expected: FAIL.
 - [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-cli`. Expected: PASS.
-- [ ] **Step 3: Gate; `docker build .` (binaries stage); security review of PR D. Commit:** `feat(cli): status, history, release stories, why, hosts and audit`. Open PR D.
+- [ ] **Step 3: Gate; `docker build .` (the binaries stage); security review of PR D. Commit:** `feat(cli): status, history, release stories, why, hosts and audit`. Open PR D.
 
 ## PR E: asking from the CLI, end to end, and the guide
 
-### Task 9: Requesting a deploy or a rollback, and cancelling
+### Task 11: Requesting a deploy or a rollback, and cancelling
 
-**Files:** Create `crates/cli/src/ask.rs`, `crates/cli/src/ask/tests.rs`, `crates/server/src/requests/tests/rollback_flag.rs`. Modify `crates/api/src/requests.rs` (`NewRequest.rollback`, `RequestView.approve_url`), `crates/server/src/requests.rs` (`view` fills `approve_url`), `crates/server/src/requests/asking.rs`, `crates/server/src/auth/problem.rs` (`NotARollback`), `crates/server/src/api/tests.rs` (seed), `crates/cli/src/cli.rs`, `docs/api.md`, `docs/api/openapi.json`.
+**Files:** Create `crates/cli/src/ask.rs`, `crates/cli/src/ask/tests.rs`, `crates/server/src/requests/tests/rollback_flag.rs`. Modify `crates/api/src/requests.rs` (`NewRequest.rollback`, `RequestView.approve_url`), `crates/api/src/problem.rs` (`ProblemCode::NotARollback`), `crates/server/src/requests.rs` (`view` fills `approve_url`), `crates/server/src/requests/asking.rs`, `crates/server/src/auth/problem.rs` (`NotARollback`), `crates/server/src/api/tests/grants.rs` (the `rollback` case sends the flag), `crates/cli/src/cli.rs`, `docs/api.md`, `docs/api/openapi.json`.
 
 **Interfaces:**
-- `NewRequest { tag: ReleaseTag, #[serde(default)] rollback: bool }`, still `deny_unknown_fields`. In `asking`, after the running release is known: `rollback` and a tag not lower than what runs is `HumanProblem::NotARollback` (`409 not_a_rollback`, "this release is not lower than what runs, so it is not a rollback"), audited as `request_refused` like the others. Nothing else in `asking` changes.
+- `NewRequest { tag: ReleaseTag, #[serde(default, skip_serializing_if = "is_false")] rollback: bool }`, still with `deny_unknown_fields`. In `asking`, once the running release is known and before `RequestOpen` and `cancel_open_request` are considered: with `rollback`, a tag that isn't lower than what runs is `HumanProblem::NotARollback` (`409 not_a_rollback`, "this release is not lower than what runs, so it is not a rollback"). So is any tag when nothing runs or the running tag doesn't parse as a version. It is audited as `request_refused`, like the others, and nothing else changes in that transaction.
 - `RequestView.approve_url: Option<String>`: `format!("{}/approvals", origin)` from `[approval]`, else `None`, on every answer that carries a `RequestView`.
-- Commands: `landfall request deploy <DEPLOYMENT> <TAG>` → `requestDeploy` with `rollback: false`; `landfall rollback <DEPLOYMENT> <TAG>` → with `rollback: true`; `landfall cancel <REQUEST_ID>` → `cancelRequest`. Each prints the request's id, state, intent fields, `expires_at`, and then, for an open request, `An approver signs this at <approve_url> with their passkey. Agents can't approve.`; with no `approve_url`, `This controller has no [approval] settings, so nobody can approve yet.` `ask::run_with(command: &AskCommand, client: &dyn Api, out: &mut dyn Write) -> Result<(), CliError>`.
+- Commands:
+  - `landfall request deploy <DEPLOYMENT> <TAG>` → `requestDeploy` with no flag.
+  - `landfall rollback <DEPLOYMENT> <TAG>` → `requestDeploy` with `rollback: true`.
+  - `landfall cancel <REQUEST_ID>` → `cancelRequest`.
 
-- [ ] **Step 1: Failing tests.** In `requests/tests/rollback_flag.rs`: `rollback_flag_with_a_higher_tag_is_refused_and_audited`, `rollback_flag_with_a_lower_tag_needs_the_rollback_grant` (as plan 05's rollback), `no_flag_keeps_plan_05s_behaviour`, `unknown_body_field_is_still_refused`, `approve_url_follows_the_configured_origin_and_is_null_without_one`. In `ask/tests.rs`, with a fake `Api`: `request_prints_where_to_approve`, `rollback_sends_the_flag`, `not_a_rollback_exits_1_with_its_code`, `request_open_exits_1_naming_the_open_request`, `cancel_calls_cancel`, `no_approval_settings_says_nobody_can_approve`. Expected: FAIL.
-- [ ] **Step 2: Implement; seed the grant test; regenerate.** Run: `cargo nextest run -p landfall-server -p landfall-cli`. Expected: PASS, `requests/tests` unchanged but for the new field.
+  Each prints the request's id, state, intent fields and `expires_at`. For an open request it then prints `An approver signs this at <approve_url> with their passkey. Agents can't approve.`, or, with no `approve_url`, `This controller has no [approval] settings, so nobody can approve yet.`. A `bad_request` answer to `rollback` adds that an older controller may not know the flag. `ask::run_with(command: &AskCommand, client: &dyn Api, out: &mut dyn Write, json: bool) -> Result<(), CliError>`.
+
+- [ ] **Step 1: Failing tests.**
+  - In `requests/tests/rollback_flag.rs`:
+    - `rollback_flag_with_a_higher_tag_is_refused_and_audited`.
+    - `rollback_flag_on_a_first_deploy_is_refused`.
+    - `rollback_flag_with_an_unparseable_running_tag_is_refused`.
+    - `not_a_rollback_leaves_an_open_request_open`: an open request is neither cancelled nor replaced.
+    - `rollback_flag_with_a_lower_tag_needs_the_rollback_grant`.
+    - `no_flag_keeps_plan_05s_behaviour`.
+    - `unknown_body_field_is_still_refused`.
+    - `approve_url_follows_the_configured_origin_and_is_null_without_one`.
+  - In `ask/tests.rs`, with a fake `Api`:
+    - `request_prints_where_to_approve`.
+    - `request_deploy_sends_no_rollback_field`.
+    - `rollback_sends_the_flag`.
+    - `not_a_rollback_exits_1_with_its_code`.
+    - `request_open_exits_1_naming_the_open_request`.
+    - `cancel_calls_cancel`.
+    - `no_approval_settings_says_nobody_can_approve`.
+
+  Expected: FAIL.
+- [ ] **Step 2: Implement; update the `CASES` rows; regenerate.** Run: `cargo nextest run -p landfall-server -p landfall-cli`. Expected: PASS, with `requests/tests` unchanged except for the new field.
 - [ ] **Step 3: Gate. Commit:** `feat(cli): request a deploy or a rollback, and cancel a request`.
 
-### Task 10: The CLI against a real controller, and the guide
+### Task 12: The CLI against a real controller, and the guide
 
 **Files:** Create `crates/cli/tests/controller/main.rs`, `crates/cli/tests/controller/harness.rs`, `crates/cli/tests/controller/flow.rs`. Modify `crates/cli/Cargo.toml` (dev-dependencies: `landfall-server`, `landfall-approval` with `test-support`, `tempfile`), `docs/operations.md`, `docs/design/landfall.md`, `docs/api.md`, `README.md`, `AGENTS.md`.
 
 **Interfaces:**
-- `harness.rs`: a real controller in the test's runtime: `landfall_server::serve::run` on `127.0.0.1:0`, over `landfall_server::router` with a store in a temp directory and a configuration with `app/prod` on `home-1`, `[approval]` at `https://landfall.example.com`, an approver `operator` with a `SoftwareAuthenticator` key, grants for `ci` (`view`, `request`, `rollback` on `app/prod`) and `reader` (`view` on `app/prod`), and a token for each from `Store::create_token`. Releases and running state are written through the store's own functions (`record_release`, `record_host_state`), as the server's tests do; no agent and no network. The CLI runs through its library entry with real `ApiClient` and `http://127.0.0.1:<port>` and `--allow-insecure-controller`.
+- `harness.rs` runs a real controller in the test's runtime: `landfall_server::serve::run` on `127.0.0.1:0`, over `landfall_server::router`, with a store in a temp directory. The configuration has `app/prod` on `home-1`, `[approval]` at `https://landfall.example.com`, an approver `operator` with a `SoftwareAuthenticator` key, and grants for `ci` (`view`, `request` and `rollback` on `app/prod`) and `reader` (`view` on `app/prod`), each with a token from `Store::create_token`. Releases and running state are written through the store's own functions (`record_release`, `record_host_state`), as the server's tests do: no agent and no network. The CLI runs through its library entry, with the real `ApiClient`, `http://127.0.0.1:<port>` and `--allow-insecure-controller`.
 
-- [ ] **Step 1: Write the tests** in `flow.rs`: `an_agent_finds_a_waiting_release_and_asks` (`ci`: `status` shows `app/prod` with `v1.3.0` `needs_request`; `release app/prod v1.3.0` shows it, unverified commits included; `request deploy app/prod v1.3.0` exits 0 and prints the approval URL; `approvals` lists it, `can_approve` false), `the_operator_approves_and_why_explains` (the approval made with the software authenticator through `POST /api/v1/approvals/{id}` with a session, as plan 05's tests do; a report of a rolled-back deploy recorded through the store; `history` lists it; `why <id>` says rolled back and names `request` as next; `release` says `failed`), `a_reader_can_read_and_not_ask` (`reader`: `status` works; `request deploy` exits 1 with `forbidden`), `a_revoked_token_exits_2` (`unauthenticated`), `json_output_parses_as_the_api_types` (each read command's `--json` output parses into its `landfall-api` type). Run: `cargo nextest run -p landfall-cli --test controller`. Expected: PASS.
+- [ ] **Step 1: Write the tests** in `flow.rs`:
+  - `an_agent_finds_a_waiting_release_and_asks`, as `ci`: `status` shows `app/prod` with `v1.3.0` as `needs_request`; `release app/prod v1.3.0` shows it, with its commit state; `request deploy app/prod v1.3.0` exits 0 and prints the approval URL; `approvals` lists it with `can_approve` false.
+  - `the_operator_approves_and_why_explains`: the approval is made with the software authenticator through `POST /api/v1/approvals/{id}` with a session, as plan 05's tests do, and a report of a rolled-back deploy is recorded through the store. `history` lists the deploy; `why <id>` says it rolled back and names `request` as next; `release` says `failed`.
+  - `a_reader_can_read_and_not_ask`: as `reader`, `status` works and `request deploy` exits 1 with `forbidden`.
+  - `rollback_of_a_higher_tag_exits_1_with_not_a_rollback`.
+  - `a_revoked_token_exits_2`, with `unauthenticated`.
+  - `json_output_parses_as_the_api_types`: each read command's `--json` output parses into its `landfall-api` type.
+
+  Run: `cargo nextest run -p landfall-cli --test controller`. Expected: PASS.
 - [ ] **Step 2: Docs.**
-  - `docs/operations.md`: a new section, "The `landfall` command", after "API tokens, requests and approvals": settings and where each is read from, the token's rules and why it never goes in argv, warden (no token, a proxy URL, `agents_via_warden`), the transport rule, `--json` for agents and the exit statuses, the read budget, and what an agent can and can't do (it can't approve). "From nothing to a first deploy" step 6 becomes `landfall request deploy app/prod v1.2.3` with the token in `LANDFALL_TOKEN`, and step 7 says `landfall approvals` prints where to sign. The opening line about no `landfall` command for approvals changes to say approving is the page's.
-  - `docs/api.md`: complete; the grant table; the audit rule (controller-wide rows stay on the controller); the commits caveat.
-  - `docs/design/landfall.md`: section 9, what's built (`status`, `why`, `request deploy`, `rollback`, `hosts`, and the rest), that `logs` is plan 08 and `approve` stays on the page; section 10, the labels the agent writes today and the one plan 08 adds; section 12, a row: a stolen agent token reading state (`view` only shows what it grants; read budget; controller-wide audit rows stay off the API).
-  - `README.md`: the CLI in the overview, and a two-line example.
-  - `AGENTS.md`: the crate map (`landfall-api`; the server's `api` module and its files; the CLI's `settings`, `api_client`, `display`, `read`, `ask`), and that `docs/api/openapi.json` is regenerated, never edited.
-- [ ] **Step 3: Full gate; Linux (`landfall-agent` tests, as Task 3 touched its e2e); `docker build .`; security review of PR E. Commit:** `test(cli): the CLI against a real controller; docs`. Open PR E.
+  - `docs/operations.md`: a new section, "The `landfall` command", after "API tokens, requests and approvals". It covers the settings and where each is read from; the token's rules and why it never goes in argv; that no proxy is used; warden (no token, a proxy URL, `agents_via_warden`); the transport rule; `--json` for agents and the exit statuses; the read budget and the `Sec-Fetch-Site` rule; and what an agent can and can't do (it can't approve). "From nothing to a first deploy" step 6 becomes `landfall request deploy app/prod v1.2.3`, with the token in `LANDFALL_TOKEN`, and step 7 says `landfall approvals` prints where to sign. The opening line about no `landfall` command for approvals changes to say the assertion is made on the page.
+  - `docs/api.md`: complete; the grant table and `x-landfall-grant`; the audit rule and its allow-list; global ids; the commits caveats.
+  - `docs/design/landfall.md`:
+    - Section 9: what's built (`status`, `why`, `request deploy`, `rollback`, `hosts` and the rest); that `logs` is plan 08; and that `landfall approve` is plan 09, with the assertion still made on the page.
+    - Section 10: only what exists today, the agent's `dev.landfall.*` labels, with plan 08 deciding the final names and adding the deploy id.
+    - Section 12: a row for a stolen agent token reading state. Mitigations: `view` shows only what it grants, the read budget, and controller-wide audit rows staying off the API. Residual: global ids show how much happened elsewhere.
+
+    Section 8.3 was already amended with this plan.
+  - `README.md`: the CLI in the overview, with a two-line example.
+  - `AGENTS.md`: the crate map (`landfall-api`; the server's `api` module and its files; the CLI's `settings`, `api_client`, `display`, `read` and `ask`), and that `docs/api/openapi.json` is regenerated, never edited.
+- [ ] **Step 3: Full gate; Linux (`landfall-agent` tests, as Task 5 touched its e2e); `docker build .`; security review of PR E. Commit:** `test(cli): the CLI against a real controller; docs`. Open PR E.
 
 ---
 
 ## Self-review
 
-- **Spec coverage.** Section 1 (agents see state, investigate, request, never approve): Tasks 2, 4, 5, 8, 9; approving stays on the page, with its URL printed (Task 9). Section 8.2 (grants per principal and deployment, `approve` human only): the document's `security` and `every_operation_enforces_its_documented_grant` (Task 1), the visibility rule in every read task. Section 8.3 (audit exposed via the API): Task 6, with controller-wide rows left to the controller and the question below. Section 8.4 (warden): no token sent when none is set (Task 7), documented in Task 10. Section 9: REST, JSON, `/api/v1`, OpenAPI 3.1 generated from code at `/api/v1/openapi.json` (Task 1), problem+json with stable codes (Task 1), cursor pagination (Tasks 1, 2), deployments, releases with origin story, deploys with steps and checks, approvals, hosts, audit events (Tasks 2, 4, 5, 6), `GET /api/v1/deploys/{id}/why` (Task 5), CLI `status`, `why`, `request deploy`, `rollback`, `hosts` (Tasks 8, 9). `logs` and section 10 are plan 08, with reasons in the Rulings; `landfall approve` is plan 09.
-- **The owner's wants:** a pipeline per repo and per host (`listDeployments` filters, `HostView`), clicking a version to see why and which commits (Task 4), agent-first typed OpenAPI (Task 1, `landfall-api`), grants per repo and host (through deployments; Rulings), locked down (Global Constraints, budgets, Review Focus), a CLI (Tasks 7 to 9). Triggering a push, canaries and staging on another address, many hosts and cloud are later and named.
-- **Types:** `ReleaseStatus` is declared in Task 2 and computed in Task 4; `Outcome`, `NextAction` and `NextKind` are declared in Task 4 and used in Task 5; `RunningRow` and `HoldRow` come from Task 2's `store/views.rs` and feed Task 4's `StoryInputs`; `Page<T>`, `Cursor` and `CursorList` from Task 1 are used by Tasks 2, 4, 5, 6; `Api` (Task 8) is reused by Task 9; `ProblemCode::NotARollback` is added in Task 9 with `HumanProblem::NotARollback`, and `every_problem_code_is_in_the_schema` holds them together.
-- **File sizes:** reads go in new files (`store/views.rs`, `store/history.rs`, `store/commits.rs`, `api/*.rs`); `requests.rs`, `store.rs` and `watcher.rs` gain only module lines, a trait method and one call. Each test file is per scenario.
-- **Proportion:** ten tasks, five PRs; interfaces and test names only, with no bodies but the SQL scope the audit rule depends on.
+- **Spec coverage.**
+  - Section 1 (agents see state, investigate, request, never approve): Tasks 4, 6, 7, 10 and 11. Approving stays on the page, and its URL is printed (Task 11).
+  - Section 8.2 (grants per principal and deployment, `approve` human only): the document's `security`, `x-landfall-grant` and Task 2's grant test, plus the visibility rule in every read task.
+  - Section 8.3 (audit through the API): Task 8, with controller-wide rows kept off the API, never readable with a token, and the spec amended to say so.
+  - Section 8.4 (warden): no token is sent when none is set, and no proxy is used (Task 9); documented in Task 12.
+  - Section 9: REST, JSON, `/api/v1`, and OpenAPI 3.1 generated from code at `/api/v1/openapi.json` (Task 1); problem+json with stable codes (Task 1); cursor pagination (Task 2); deployments, releases with their origin story, deploys with steps and checks, approvals, hosts and audit events (Tasks 4, 6, 7 and 8); `GET /api/v1/deploys/{id}/why` (Task 7); CLI `status`, `why`, `request deploy`, `rollback` and `hosts` (Tasks 10 and 11).
+  - Not here: `logs` and section 10 are plan 08, with the reasons in the Rulings; `landfall approve` is plan 09.
+- **The owner's wants:**
+  - A pipeline per repo and per host: `listDeployments` filters and `HostView`.
+  - Clicking a version to see why it did or didn't deploy, and which commits it holds: Tasks 5 and 6.
+  - An agent-first, typed OpenAPI: Tasks 1 and 2, and `landfall-api`.
+  - Grants per repo and host: through deployments (Rulings).
+  - Locked down: Global Constraints, Task 3, Review Focus.
+  - A CLI: Tasks 9 to 11.
+  - Later, and named in the next plans: triggering a push, canaries, staging on another address, many hosts and cloud.
+- **The review:** each Important finding has a named test in the table above, and every Minor is applied.
+- **Types:**
+  - `ReleaseStatus` is declared in Task 4 and computed in Task 6.
+  - `Outcome`, `NextAction` and `NextKind` are declared in Task 6 and used in Task 7.
+  - `RunningRow` and `HoldRow` come from Task 4's `store/views.rs` and feed Task 6's `StoryInputs`.
+  - `DeploymentRef` and `shown_deployment` (Task 4) are used by Tasks 6 and 8.
+  - `Page<T>` (Task 1), and `Cursor`, `CursorList`, `ApiQuery` and `Limit` (Task 2), are used by Tasks 4, 6, 7 and 8.
+  - `World` and `CASES` (Task 2) are extended by Tasks 4, 6, 7, 8 and 11.
+  - `CommitsPage` (Task 5) and `base_for` (Task 5) are used by Task 6.
+  - `Api` (Task 10) is reused by Task 11.
+  - `ProblemCode::NotARollback` is added in Task 11 with `HumanProblem::NotARollback`, and `every_problem_code_is_in_the_schema` holds them together.
+- **File sizes:** reads go in new files (`store/views.rs`, `store/history.rs`, `store/commits.rs`, `api/*.rs`, `watcher/commits.rs`). `requests.rs`, `store.rs` and `watcher.rs` gain only module lines, a trait method and one call. Each test file covers one scenario.
+- **Proportion:** twelve tasks in five PRs, with interfaces and test names only. The one exception is the audit query's shape, on which both the index rule and the visibility rule depend.
 
-## A question only the owner can answer
+## Open questions
 
-Should controller-wide audit rows (tokens made and revoked, passkeys, sign-ins, throttling) be readable through the API at all? Section 8.2 has no grant that covers them, so this plan keeps them on `landfall-server audit show` on the controller. Exposing them needs a new, non-deployment grant (an `audit` grant, say) in the configuration, which is a change to the spec's grant model.
+None left for the owner. The controller-wide audit rows question was settled: they aren't readable through the API in plan 07, and never with a token (spec 8.3).
