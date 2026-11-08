@@ -68,6 +68,11 @@ only what they may see.
 | `whoAmI` | any | the same |
 | `listDeployments` | any, filtered by `view` | the same |
 | `getDeployment` | `view` | `view` |
+| `listReleases` | `view` | `view` |
+| `getRelease` | `view` | `view` |
+| `listDeploys` | `view` | `view` |
+| `getDeploy` | `view` | `view` |
+| `whyDeploy` | `view` | `view` |
 | `requestDeploy` | `request`, `rollback` | `request`, `rollback` |
 | `approveRequest` | never | `approve` |
 | `cancelRequest` | `requester`, `rollback` | `requester`, `approve`, `rollback` |
@@ -217,6 +222,42 @@ again from its new commit, and two deployments of one repository share one list.
   Only releases first recorded after the controller was upgraded to this version are compared:
   nothing is fetched for the history it already had.
 
+## Deploys, and why each ended as it did
+
+`listDeploys` (`GET /api/v1/deployments/{name}/{stage}/deploys`) lists a deployment's deploys,
+newest first, a page at a time. `getDeploy` (`GET /api/v1/deploys/{id}`) is one deploy: the
+release sent (`tag`, `digest`, `commit`) and to which `host`, its `state` (`queued`, `claimed` or
+`finished`) and `outcome`, its host's `reason` and `rollback_reason`, the `request` it came from
+and who signed it (`approved_by`), both `null` for one the controller queued by itself, when it
+was queued, taken and finished, and its `steps`. Each step has its position, its name, how long
+it took, its `failure`, and its `detail` as the controller stored it, bounded: for checks, each
+check with its attempts and milliseconds; for a backup, what it copied. A list gives every
+deploy's steps too.
+
+`whyDeploy` (`GET /api/v1/deploys/{id}/why`) says why a deploy ended as it did, or where it
+stands if it hasn't:
+
+- `events`, in time order: who asked (`requested`) and who signed (`approved`), for a deploy
+  that came from a request, then `queued`, `claimed`, each step (`step`, or `step_failed` with
+  its failure), and how it ended: `rolled_back`, `rollback_failed`, `host_refused`, `deferred`,
+  or `finished` for a deploy that runs, changed nothing, or failed with nothing to go back to.
+  A step has no time of its own, so its `at` is `null`;
+- `summary`, one sentence to act on, naming the tag and the host;
+- `next`, the one thing to do: `request` a newer release, or a retry, which an approver signs,
+  after a rollback or a failure with nothing to go back to; `recover`, with
+  `landfall-agent recover` on the host, after a failed rollback; `fix_host` after a refusal,
+  quoting the host's reason, since a host refusing what the controller sent it is an alert;
+  `wait` while it is queued or claimed, after the host said not now, or after it changed
+  nothing; `none` once it runs.
+
+A step's name and failure, and a host's reasons, are the host's words, quoted when they were
+stored, and `events` and `summary` quote them: escape them before showing them.
+
+Seeing a deploy takes `view` on its deployment. With no grant there, a deploy is the same
+`404 not_found` as a number no deploy has, and with some other grant it is `403 forbidden`. A
+deploy of a deployment the configuration no longer has is `404` to everyone, as is that
+deployment's list, whatever the database still holds of it.
+
 ## Refusals
 
 Every answer that isn't a success is `application/problem+json` (RFC 9457):
@@ -252,7 +293,8 @@ A cursor is opaque: it belongs to the list that gave it, and one from another li
 was changed, is refused with `400 bad_request`. A page is never short of what the principal
 may see: what they may not see is left out before the page is cut, not after.
 
-`listDeployments` is paged in order of deployment id, and `listReleases` in order of version. `listApprovals` isn't paged, as the
+`listDeployments` is paged in order of deployment id, `listReleases` in order of version, and
+`listDeploys` newest first. `listApprovals` isn't paged, as the
 configuration bounds it: a deployment has at most one open request.
 
 ## Versions

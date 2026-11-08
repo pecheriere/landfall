@@ -2,6 +2,7 @@
 //! store's own functions.
 
 mod deployments;
+mod deploys;
 mod document;
 mod grants;
 mod promotions;
@@ -10,6 +11,7 @@ mod reads;
 mod releases;
 mod schemas;
 mod story;
+mod why;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,13 +25,14 @@ use landfall_approval::{Ceremony, SoftwareAuthenticator};
 use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, PrincipalId, ReleaseTag};
 use landfall_core::intent::DeployIntent;
-use landfall_core::protocol::{DeployedRelease, Phase, RunningState};
+use landfall_core::protocol::{DeployReportBody, DeployedRelease, Phase, RunningState};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 use crate::agent_api::{ApiState, Limits};
 use crate::auth::{ApiToken, SessionToken};
-use crate::store::{ManualClock, NewRequest, ReleaseDecision, Seen, Store};
+use crate::report::BoundedReport;
+use crate::store::{ManualClock, NewDeploy, NewRequest, ReleaseDecision, Seen, Store};
 
 /// `operator` may view `app/prod` and ask for its releases, and is its approver by key, with
 /// no grant to approve.
@@ -206,6 +209,9 @@ pub(super) const FLEET_VIEWER: &str = "fleet-viewer";
 /// Who holds `view` on `app/beta`, and not on `app/canary`, which promotes to it.
 pub(super) const BETA_VIEWER: &str = "beta-viewer";
 
+/// Who holds `view` on `app/staging`, and no grant on `app/prod`.
+pub(super) const STAGING_VIEWER: &str = "staging-viewer";
+
 const WORLD_ORIGIN: &str = "https://landfall.example.com";
 const WORLD_RP_ID: &str = "landfall.example.com";
 
@@ -300,6 +306,7 @@ checks = ["container-healthy"]
     sections.push(grant(CANARY_VIEWER, &["app/canary"], &["view"]));
     sections.push(grant(FLEET_VIEWER, &["app/canary", "app/beta"], &["view"]));
     sections.push(grant(BETA_VIEWER, &["app/beta"], &["view"]));
+    sections.push(grant(STAGING_VIEWER, &["app/staging"], &["view"]));
     sections.concat()
 }
 
@@ -332,6 +339,8 @@ pub(super) enum Caller<'a> {
 ///   `app/prod`, where a promotion would answer `requestDeploy` with `promotion_pending`.
 ///   [`CANARY_VIEWER`] may view `app/canary` alone, [`FLEET_VIEWER`] both, and [`BETA_VIEWER`]
 ///   `app/beta` alone.
+/// - `app/prod` deployed `v1.1.0` before, by itself: the finished deploy `deploy`, with its
+///   steps and checks. [`STAGING_VIEWER`] may view `app/staging` alone.
 ///
 /// Every principal has a token and a session. Time stands still until a test moves `clock`.
 pub(super) struct World {
@@ -344,6 +353,8 @@ pub(super) struct World {
     keys: HashMap<String, SoftwareAuthenticator>,
     /// The open request on `app/staging`.
     pub(super) request: (i64, DeployIntent),
+    /// The finished deploy of `v1.1.0` on `app/prod`.
+    pub(super) deploy: i64,
 }
 
 impl World {
@@ -391,6 +402,13 @@ impl World {
             .await
             .unwrap();
         let request = open_request(&store).await;
+        let deploy = run_deploy(
+            &store,
+            ("app/prod", "v1.1.0", '1'),
+            &json!({ "kind": "deployed" }),
+            &deployed_steps(),
+        )
+        .await;
         let mut names: Vec<String> = grant_sets().iter().map(|roles| holder(roles)).collect();
         names.extend(
             [
@@ -399,6 +417,7 @@ impl World {
                 CANARY_VIEWER,
                 FLEET_VIEWER,
                 BETA_VIEWER,
+                STAGING_VIEWER,
             ]
             .map(ToOwned::to_owned),
         );
@@ -421,6 +440,7 @@ impl World {
             sessions,
             keys,
             request,
+            deploy,
         }
     }
 
@@ -551,4 +571,64 @@ async fn open_request(store: &Store) -> (i64, DeployIntent) {
     let stored = store.insert_request(&mut tx, &request).await.unwrap();
     tx.commit().await.unwrap();
     (stored.id, intent)
+}
+
+/// The steps of a deploy that went well: a backup, the pull, and its checks.
+pub(super) fn deployed_steps() -> Value {
+    json!([
+        {
+            "name": "backup",
+            "millis": 40,
+            "failure": null,
+            "detail": { "kind": "backup", "files": 3, "directories": 1, "symlinks": 0, "bytes": 512 },
+        },
+        { "name": "pull", "millis": 1200, "failure": null },
+        {
+            "name": "checks",
+            "millis": 3000,
+            "failure": null,
+            "detail": {
+                "kind": "checks",
+                "checks": [{ "check": "container-healthy", "attempts": 2, "millis": 2900 }],
+            },
+        },
+    ])
+}
+
+/// Queues a deploy of `tag` at `fill`'s commit and digest on `deployment`, lets `home-1`
+/// claim it, and finishes it with a report of `outcome` and `steps`, each as the agent's
+/// protocol has it, through the store's own functions. Its release must be recorded.
+pub(super) async fn run_deploy(
+    store: &Store,
+    (deployment, tag, fill): (&str, &str, char),
+    outcome: &Value,
+    steps: &Value,
+) -> i64 {
+    let host: HostId = "home-1".parse().unwrap();
+    let new = NewDeploy {
+        deployment: deployment.parse().unwrap(),
+        host: host.clone(),
+        tag: tag.parse().unwrap(),
+        digest: world_digest(fill),
+        commit: fill.to_string().repeat(40).parse().unwrap(),
+    };
+    let mut tx = store.begin().await.unwrap();
+    let id = store.queue_deploy(&mut tx, &new).await.unwrap();
+    tx.commit().await.unwrap();
+    let work = store.next_work(&host).await.unwrap().work.unwrap();
+    assert_eq!(work.deploy_id, id);
+    let report: DeployReportBody = serde_json::from_value(json!({
+        "deploy_id": id.0,
+        "deployment": deployment,
+        "tag": tag,
+        "digest": world_digest(fill),
+        "outcome": outcome,
+        "steps": steps,
+    }))
+    .unwrap();
+    store
+        .finish_deploy(&host, &BoundedReport::new(&report))
+        .await
+        .unwrap();
+    i64::try_from(id.0).unwrap()
 }

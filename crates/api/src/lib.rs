@@ -11,6 +11,7 @@
 //! themselves, validated when they are read, and as strings in the schema.
 
 mod deployments;
+mod deploys;
 mod page;
 mod problem;
 mod releases;
@@ -20,6 +21,7 @@ pub use deployments::{
     DeploymentRef, DeploymentSummary, DeploymentView, GrantView, HoldView, MeView, Permission,
     PromotionView, ReleaseBrief, ReleaseStatus, RuleView, RunningView, Via,
 };
+pub use deploys::{DeployView, StepView, Why, WhyEvent, WhyKind};
 pub use page::Page;
 pub use problem::{Problem, ProblemCode};
 pub use releases::{

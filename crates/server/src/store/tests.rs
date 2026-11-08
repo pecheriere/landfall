@@ -1,5 +1,6 @@
 mod approvals_migration;
 mod commit_ranges_migration;
+mod deploy_history;
 mod latest_releases;
 mod read_only;
 

@@ -14,9 +14,8 @@ use std::collections::HashMap;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use landfall_api::{
-    CommitSource, CommitView, CommitsState, CommitsView, DeployBrief, DeployState, OriginView,
-    Outcome, Page, ReleaseBrief, ReleaseStory, ReleaseView, RequestBrief,
-    RequestState as RequestStateView,
+    CommitSource, CommitView, CommitsState, CommitsView, DeployBrief, OriginView, Page,
+    ReleaseBrief, ReleaseStory, ReleaseView, RequestBrief, RequestState as RequestStateView,
 };
 use landfall_core::config::{Config, Deployment};
 use landfall_core::ids::{DeploymentId, ReleaseTag, TagPattern};
@@ -39,7 +38,7 @@ use super::story::{RuleSaid, StatusExplained, StoryInputs, decided, recorded, st
 use super::visible::{shown_deployment, viewable};
 use crate::agent_api::{ApiProblem, ApiState};
 use crate::auth::{HumanProblem, Principal};
-use crate::store::history::{DeployRow, LastFinished, ReleaseRow, RequestRow};
+use crate::store::history::{DeployRow, LastFinished, ReleaseRow, RequestRow, outcome};
 use crate::store::views::RunningRow;
 use crate::store::{Hold, RangeState, RequestState, Store, StoreError, StoredRequest};
 use crate::watcher::commits::SettledByVersion;
@@ -246,20 +245,6 @@ fn view(row: &ReleaseRow, explained: &StatusExplained) -> ReleaseView {
         first_seen_at: row.first_seen_at,
         seen_at: row.seen_at,
     }
-}
-
-/// A finished deploy's outcome, by its stored name.
-fn outcome(name: &str) -> Result<Outcome, StoreError> {
-    Ok(match name {
-        "deployed" => Outcome::Deployed,
-        "rolled_back" => Outcome::RolledBack,
-        "nothing_changed" => Outcome::NothingChanged,
-        "failed_no_previous" => Outcome::FailedNoPrevious,
-        "rollback_failed" => Outcome::RollbackFailed,
-        "refused" => Outcome::Refused,
-        "deferred" => Outcome::Deferred,
-        _ => return Err(StoreError::Corrupt("outcome")),
-    })
 }
 
 /// Each of `deployments`' newest release, the first a list of its releases shows, and where
@@ -506,20 +491,14 @@ fn request_brief(row: RequestRow) -> RequestBrief {
     }
 }
 
-fn deploy_brief(row: &DeployRow) -> Result<DeployBrief, StoreError> {
-    let state = match row.state.as_str() {
-        "queued" => DeployState::Queued,
-        "claimed" => DeployState::Claimed,
-        "finished" => DeployState::Finished,
-        _ => return Err(StoreError::Corrupt("state")),
-    };
-    Ok(DeployBrief {
+fn deploy_brief(row: &DeployRow) -> DeployBrief {
+    DeployBrief {
         id: row.id,
-        state,
-        outcome: row.outcome.as_deref().map(outcome).transpose()?,
+        state: row.state,
+        outcome: row.outcome,
         created_at: row.created_at,
         finished_at: row.finished_at,
-    })
+    }
 }
 
 /// `GET /api/v1/deployments/{name}/{stage}/releases/{tag}`: one release, why it stands
@@ -590,7 +569,7 @@ async fn get(
         origin: origin_of(&row, origin)?,
         commits,
         requests: requests.into_iter().map(request_brief).collect(),
-        deploys: deploys.iter().map(deploy_brief).collect::<Result<_, _>>()?,
+        deploys: deploys.iter().map(deploy_brief).collect(),
     }))
 }
 

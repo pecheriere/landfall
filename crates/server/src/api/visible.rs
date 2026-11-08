@@ -41,15 +41,25 @@ pub(crate) fn shown_deployment(
 
 /// The deployment a path names as `raw`, if this principal may view it: `None` is a path that
 /// didn't decode, which names nothing, as one that isn't an id doesn't. Otherwise the refusal
-/// [`visibility`] gives.
+/// [`viewable_by_id`] gives.
 pub(crate) fn viewable<'a>(
     config: &'a Config,
     principal: &Principal,
     raw: Option<String>,
 ) -> Result<&'a Deployment, HumanProblem> {
-    let deployment = raw
-        .and_then(|raw| raw.parse::<DeploymentId>().ok())
-        .and_then(|id| config.deployment(&id));
+    let id = raw.and_then(|raw| raw.parse::<DeploymentId>().ok());
+    viewable_by_id(config, principal, id.as_ref())
+}
+
+/// The deployment `id` names, if the configuration has it and this principal may view it.
+/// Otherwise the refusal [`visibility`] gives: one the configuration no longer has is `404`
+/// to everyone, whatever its rows in the database.
+pub(crate) fn viewable_by_id<'a>(
+    config: &'a Config,
+    principal: &Principal,
+    id: Option<&DeploymentId>,
+) -> Result<&'a Deployment, HumanProblem> {
+    let deployment = id.and_then(|id| config.deployment(id));
     deployment
         .filter(|d| can(config, principal, d.id(), Permission::View))
         .ok_or_else(|| visibility(config, principal, deployment.map(Deployment::id)))

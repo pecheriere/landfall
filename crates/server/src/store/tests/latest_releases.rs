@@ -167,7 +167,7 @@ async fn opening_skips_a_release_it_cannot_read_and_fills_from_the_rest() {
 }
 
 /// What `EXPLAIN QUERY PLAN` says of `sql`, with `binds` text parameters, one line a step.
-async fn plan(store: &Store, sql: &str, binds: usize) -> Vec<String> {
+pub(super) async fn plan(store: &Store, sql: &str, binds: usize) -> Vec<String> {
     let explain = format!("EXPLAIN QUERY PLAN {sql}");
     let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
     for _ in 0..binds {

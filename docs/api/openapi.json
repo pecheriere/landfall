@@ -444,6 +444,108 @@
         ]
       }
     },
+    "/api/v1/deployments/{name}/{stage}/deploys": {
+      "get": {
+        "tags": [
+          "deploys"
+        ],
+        "summary": "A deployment's deploys",
+        "description": "The deploys of a deployment, newest first, a page at a time, each with the steps its host reported.",
+        "operationId": "listDeploys",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "How many deploys a page holds: from 1 to 100, 50 if left out.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "The last page's `next_cursor`, to get the page after it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of the deploys.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_DeployView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v1/deployments/{name}/{stage}/releases": {
       "get": {
         "tags": [
@@ -743,6 +845,150 @@
           "request": "a tag above what runs, or the first deploy",
           "rollback": "a tag below what runs"
         }
+      }
+    },
+    "/api/v1/deploys/{id}": {
+      "get": {
+        "tags": [
+          "deploys"
+        ],
+        "summary": "One deploy",
+        "description": "One deploy, with the steps its host reported. A deploy of a deployment the principal can't view, or the configuration no longer has, is `404`, as a number no deploy has.",
+        "operationId": "getDeploy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Plain digits with no leading zero: any other way of writing a number names nothing.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 42
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deploy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeployView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/deploys/{id}/why": {
+      "get": {
+        "tags": [
+          "deploys"
+        ],
+        "summary": "Why a deploy ended as it did",
+        "description": "What happened to a deploy, in time order, one sentence to act on, and the one thing to do next. Seen as `getDeploy` is.",
+        "operationId": "whyDeploy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Plain digits with no leading zero: any other way of writing a number names nothing.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 42
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Why it ended as it did.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Why"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/ReadForbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "view"
+            ]
+          },
+          {
+            "session": [
+              "view"
+            ]
+          }
+        ]
       }
     },
     "/api/v1/me": {
@@ -1083,6 +1329,133 @@
           "claimed",
           "finished"
         ]
+      },
+      "DeployView": {
+        "type": "object",
+        "description": "A deploy: a release sent to its deployment's host, and what the host said of it.",
+        "required": [
+          "id",
+          "deployment",
+          "host",
+          "tag",
+          "digest",
+          "commit",
+          "state",
+          "outcome",
+          "reason",
+          "rollback_reason",
+          "request",
+          "approved_by",
+          "created_at",
+          "claimed_at",
+          "finished_at",
+          "steps"
+        ],
+        "properties": {
+          "approved_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who signed that request, or `null`.",
+            "example": "operator"
+          },
+          "claimed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When its host took it, in seconds since the Unix epoch, or `null`."
+          },
+          "commit": {
+            "type": "string",
+            "description": "The release commit.",
+            "example": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was queued, in seconds since the Unix epoch."
+          },
+          "deployment": {
+            "type": "string",
+            "description": "The deployment.",
+            "example": "app/prod"
+          },
+          "digest": {
+            "type": "string",
+            "description": "The image digest sent.",
+            "example": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "finished_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When its host said how it went, in seconds since the Unix epoch, or `null`."
+          },
+          "host": {
+            "type": "string",
+            "description": "The host it was sent to.",
+            "example": "home-1"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deploy's number."
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Outcome",
+                "description": "How it went, `null` until it finished."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why, as its host said, quoted, or `null`. Hostile: escape it before showing it."
+          },
+          "request": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The number of the request it came from, or `null` for one the controller queued by\nitself."
+          },
+          "rollback_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why going back failed, as its host said, quoted, or `null`. Hostile: escape it before\nshowing it."
+          },
+          "state": {
+            "$ref": "#/components/schemas/DeployState",
+            "description": "Where it stands."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepView"
+            },
+            "description": "The steps its host reported, in order: at most 32."
+          },
+          "tag": {
+            "type": "string",
+            "description": "The release's tag.",
+            "example": "v1.3.0"
+          }
+        }
       },
       "DeploymentRef": {
         "type": "object",
@@ -1491,6 +1864,153 @@
           "refused",
           "deferred"
         ]
+      },
+      "Page_DeployView": {
+        "type": "object",
+        "description": "Some of a list, in its order, and where the rest begins.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "description": "A deploy: a release sent to its deployment's host, and what the host said of it.",
+              "required": [
+                "id",
+                "deployment",
+                "host",
+                "tag",
+                "digest",
+                "commit",
+                "state",
+                "outcome",
+                "reason",
+                "rollback_reason",
+                "request",
+                "approved_by",
+                "created_at",
+                "claimed_at",
+                "finished_at",
+                "steps"
+              ],
+              "properties": {
+                "approved_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Who signed that request, or `null`.",
+                  "example": "operator"
+                },
+                "claimed_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "description": "When its host took it, in seconds since the Unix epoch, or `null`."
+                },
+                "commit": {
+                  "type": "string",
+                  "description": "The release commit.",
+                  "example": "0123456789abcdef0123456789abcdef01234567"
+                },
+                "created_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "When it was queued, in seconds since the Unix epoch."
+                },
+                "deployment": {
+                  "type": "string",
+                  "description": "The deployment.",
+                  "example": "app/prod"
+                },
+                "digest": {
+                  "type": "string",
+                  "description": "The image digest sent.",
+                  "example": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                },
+                "finished_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "description": "When its host said how it went, in seconds since the Unix epoch, or `null`."
+                },
+                "host": {
+                  "type": "string",
+                  "description": "The host it was sent to.",
+                  "example": "home-1"
+                },
+                "id": {
+                  "type": "integer",
+                  "format": "int64",
+                  "description": "The deploy's number."
+                },
+                "outcome": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Outcome",
+                      "description": "How it went, `null` until it finished."
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Why, as its host said, quoted, or `null`. Hostile: escape it before showing it."
+                },
+                "request": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64",
+                  "description": "The number of the request it came from, or `null` for one the controller queued by\nitself."
+                },
+                "rollback_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Why going back failed, as its host said, quoted, or `null`. Hostile: escape it before\nshowing it."
+                },
+                "state": {
+                  "$ref": "#/components/schemas/DeployState",
+                  "description": "Where it stands."
+                },
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StepView"
+                  },
+                  "description": "The steps its host reported, in order: at most 32."
+                },
+                "tag": {
+                  "type": "string",
+                  "description": "The release's tag.",
+                  "example": "v1.3.0"
+                }
+              }
+            },
+            "description": "This page's items."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to send as `cursor` for the next page, opaque; `null` on the last one."
+          }
+        }
       },
       "Page_DeploymentSummary": {
         "type": "object",
@@ -2100,12 +2620,151 @@
           }
         }
       },
+      "StepView": {
+        "type": "object",
+        "description": "One step a host reported of a deploy.",
+        "required": [
+          "position",
+          "name",
+          "millis",
+          "failure",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "More about the step, as the controller stored it, bounded, or `null`: for checks,\n`{\"kind\": \"checks\", \"checks\": [{\"check\", \"attempts\", \"millis\"}]}`, each check's name\nquoted; for a backup, `{\"kind\": \"backup\", \"files\", \"directories\", \"symlinks\",\n\"bytes\"}`. A newer controller may add kinds."
+          },
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, quoted, or `null` if it did what it should. Hostile: escape it before\nshowing it."
+          },
+          "millis": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long it took, in milliseconds."
+          },
+          "name": {
+            "type": "string",
+            "description": "What was done, as the host named it, quoted. Hostile: escape it before showing it.",
+            "example": "\"pull\""
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Where it comes in the deploy, from 0.",
+            "minimum": 0
+          }
+        }
+      },
       "Via": {
         "type": "string",
         "description": "How a principal proved who they are.",
         "enum": [
           "token",
           "session"
+        ]
+      },
+      "Why": {
+        "type": "object",
+        "description": "Why a deploy ended as it did, or where it stands if it hasn't.",
+        "required": [
+          "deploy",
+          "outcome",
+          "summary",
+          "events",
+          "next"
+        ],
+        "properties": {
+          "deploy": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deploy's number."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WhyEvent"
+            },
+            "description": "What happened, in time order: the request and its approval, if any, then the queue,\nthe host taking it, each step, and the outcome."
+          },
+          "next": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NextAction",
+                "description": "What to do next, if anything."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outcome": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Outcome",
+                "description": "How it went, `null` until it finished."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "description": "One sentence to act on, with the host's text quoted in it. Escape it before showing it.",
+            "example": "v1.3.0 failed on home-1 at step \"checks\" and rolled back to the previous version; it won't be retried automatically"
+          }
+        }
+      },
+      "WhyEvent": {
+        "type": "object",
+        "description": "One thing that happened to a deploy.",
+        "required": [
+          "at",
+          "what",
+          "text"
+        ],
+        "properties": {
+          "at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When, in seconds since the Unix epoch, or `null` when that isn't recorded, as for a\nstep."
+          },
+          "text": {
+            "type": "string",
+            "description": "The controller's words for it, with the host's text quoted in them. Escape it before\nshowing it."
+          },
+          "what": {
+            "$ref": "#/components/schemas/WhyKind",
+            "description": "What kind of thing it was."
+          }
+        }
+      },
+      "WhyKind": {
+        "type": "string",
+        "description": "What kind of thing happened to a deploy.",
+        "enum": [
+          "requested",
+          "approved",
+          "queued",
+          "claimed",
+          "step",
+          "step_failed",
+          "rolled_back",
+          "rollback_failed",
+          "host_refused",
+          "deferred",
+          "finished"
         ]
       }
     },

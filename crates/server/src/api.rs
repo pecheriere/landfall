@@ -10,11 +10,13 @@
 //! with a stable code from the document's `Problem` schema. No answer carries a CORS header.
 
 mod deployments;
+mod deploys;
 mod openapi;
 mod query;
 mod releases;
 mod story;
 mod visible;
+mod why;
 
 use std::sync::LazyLock;
 
@@ -57,6 +59,7 @@ fn operations() -> OpenApiRouter<ApiState> {
     OpenApiRouter::with_openapi(openapi::ApiDoc::openapi())
         .merge(deployments::routes())
         .merge(releases::routes())
+        .merge(deploys::routes())
         .merge(requests::routes())
         .routes(routes!(document))
 }

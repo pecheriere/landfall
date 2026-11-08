@@ -16,10 +16,8 @@ openapi = ["dep:utoipa"]
 [dependencies]
 landfall-core.workspace = true
 serde.workspace = true
-utoipa = { workspace = true, optional = true }
-
-[dev-dependencies]
 serde_json.workspace = true
+utoipa = { workspace = true, optional = true }
 
 [lints]
 workspace = true
