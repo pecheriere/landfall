@@ -16,9 +16,11 @@ SHA-256. The tap pulls it: landfall holds no token for the tap and runs nothing 
 - The tap's checks refuse a downgrade and a release candidate, so release candidates never reach
   `brew upgrade`.
 - The tap's `scope` check lets a pull request that isn't signed by the owner only change a formula
-  that already exists. So the first stable release's formula is added by the owner, by a commit
-  signed with their key, after `python3 -I scripts/landfall.py fetch <version>
-  Formula/landfall.rb` in the tap. Every later release is automatic.
+  that already exists. So the first stable release's formula is added by the owner: on a branch
+  of the tap's `main`, where `scripts/landfall.py` lives once the tap's pull request adding it has
+  merged, `python3 -I scripts/landfall.py fetch <version> Formula/landfall.rb`, a commit signed
+  with the owner's commit key (not the release key), and a pull request in the tap.
+  `CONTRIBUTING.md` has the commands. Every later release is automatic.
 
 A stolen landfall token can run landfall's release workflow, but can't sign a tag, so it can't get
 a formula past the tap's checks, and it holds nothing that reaches the tap.

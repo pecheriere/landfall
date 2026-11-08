@@ -71,20 +71,33 @@ its own key.
 
    The tap's `scope` check lets a pull request that isn't signed by you only change a formula that
    already exists. So **the first stable release's formula is added by you,** once that release is
-   out, by a commit signed with your key, in a clone of the tap:
+   out, in a clone of the tap's `main`, where `scripts/landfall.py` lives once the tap's own pull
+   request adding it has merged:
 
    ```sh
+   git switch -c landfall-<version> origin/main
    python3 -I scripts/landfall.py fetch <version> Formula/landfall.rb
    git add Formula/landfall.rb && git commit -m "landfall <version>"
+   git push -u origin landfall-<version>
+   gh pr create --fill
    ```
 
-   The commit must carry your signature, as the tap's `scope` check wants, and the script verifies
-   what it fetches as the tap's workflow does. Every later stable release
+   The commit is signed with your **commit** key, one the tap lists as a maintainer's, not the
+   release key, which signs only tags. The script verifies what it fetches as the tap's workflow
+   does, and the pull request merges once the tap's checks pass. Every later stable release
    reaches the tap on its own.
 6. **If a `release` environment is left from before,** delete it: nothing names it any more.
+7. **Keep your own copy of the release keys,** outside any clone, which `scripts/release-tag`
+   trusts and the repository can't change: `${XDG_CONFIG_HOME:-~/.config}/landfall/release-signers`,
+   written as `crates/cli/assets/release-signers` is, writable by you alone (`chmod 600`), and not
+   a link. Make it from the keys in `SECURITY.md`, after comparing their fingerprints with a copy
+   you got some other way, such as the one you keep with the key itself. The helper refuses to sign
+   when the repository's signers differ from it, so for a rotation you change this file first, on
+   purpose.
 
 To rotate the key, let two overlap: release N carries both and is signed by the old one, and
-release N+1 is signed by the new one.
+release N+1 is signed by the new one. Add the new key to your own copy (step 7) before release N,
+and drop the old one from it with the release that drops it from the repository.
 
 ### For each release
 
@@ -107,12 +120,17 @@ release N+1 is signed by the new one.
 
    `<sha>` is the merge commit of the version bump's pull request, the one you saw. It refuses
    unless `origin/main` is exactly that commit, at that version, its dry run passed in full, and
-   the tag is new, here and on origin. It also refuses a change to
-   `crates/cli/assets/release-signers` since the last release unless you pass `--signers-change`,
-   and then shows the old and new fingerprints: compare them with `SECURITY.md` and with a copy you
-   got some other way. Before anything is signed it shows the commit and the dry run, every commit
-   since the last release with its signature status and files, and in full any change to the
-   signers file, `.github/`, `scripts/release-tag`, `Cargo.toml` and `Cargo.lock`. **Read them.**
+   the tag is new, here and on origin. It also refuses unless the keys in
+   `crates/cli/assets/release-signers` at that commit are exactly the keys in your own copy ("Once"
+   step 7, or `--trusted-signers <path>`), and then shows both sets of fingerprints. The last
+   release is the highest `v*` tag one of your keys signed: a key added in the repository can't
+   vouch for a tag, and any `v*` tag above it that none of your keys signed is named in a warning,
+   which you look into. Before anything is signed it shows the commit and the dry run, every commit
+   since that release with its signature status and files, and in full any change to the signers
+   file, `.github/`, `scripts/release-tag`, `Cargo.toml` and `Cargo.lock`, with any control
+   characters shown as escapes. **Read them.** With no release of yours behind it, as on the first
+   run, it shows the signers file whole with its fingerprints, lists the files in `.github/` and
+   `Cargo.lock` by name, and shows the rest whole.
    Then it asks you to type the version, with no flag to skip that, signs `v<version>` on that
    commit with git's signing key, checks the signature against the signers file, deletes the tag
    if it doesn't match, says what it pushes and pushes it. Name the release key with
