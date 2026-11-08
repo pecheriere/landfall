@@ -16,7 +16,8 @@ openapi = ["dep:utoipa"]
 [dependencies]
 landfall-core.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: a detail is kept as its JSON text, never as a tree.
+serde_json = { workspace = true, features = ["raw_value"] }
 utoipa = { workspace = true, optional = true }
 
 [lints]

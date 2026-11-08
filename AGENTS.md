@@ -15,9 +15,10 @@ passkey approvals. Agents drive it through a typed API. Design:
 - `landfall-api` (`crates/api`): the wire types of `/api/v1`, which the controller serialises
   and the CLI reads. No I/O: `requests`, `deployments` (who am I, and the deployments, with
   `DeploymentRef`, which never names one the reader can't view), `problem` (`Problem` and its
-  stable `ProblemCode`s) and `page`. Each enum that can grow has an `Unknown` for a value from a
-  newer controller, which no controller sends. Its `openapi` feature derives each type's schema,
-  and only the controller enables it.
+  stable `ProblemCode`s), `page` and `raw` (`RawJson`, the audit row's and a deploy step's
+  `detail` kept as their JSON text, never as a tree). Each enum that can grow has an `Unknown`
+  for a value from a newer controller, which no controller sends. Its `openapi` feature derives
+  each type's schema, and only the controller enables it.
 - `landfall-approval` (`crates/approval`): verifies a WebAuthn assertion against
   a key from local configuration, and parses an attestation, trusting none of it,
   for its key.
@@ -104,9 +105,22 @@ passkey approvals. Agents drive it through a typed API. Design:
   end-to-end tests; nothing on a command line leads to them.
 - `landfall-cli` (`crates/cli`, binary `landfall`): API client for humans and
   agents. A library plus a thin binary; modules: `cli` (the command line, exit
-  statuses), `verify` (`landfall verify`), `access` (the trust root's cache and the
-  operator's token), `project` (what landfall trusts about its own releases: its
-  repository, ids and workflow as constants, and `assets/release-signers`, read by the
+  statuses, `ApiArgs`, the API flags each API command flattens, never global, since `host
+  install` has its own `--controller`, and `run_with`, the library entry, which prints every
+  failure through `display::safe`), `settings` (where the controller is and which token goes
+  to it: flags, then the environment, then `cli.toml`; the token never in argv, a token file
+  regular, not a link, owned by the user and theirs alone), `api_client` (`/api/v1` with the token: no
+  proxy from the environment, no redirect followed, bodies capped, `ApiError` and its exit
+  status, and `segment`, the one way a value goes into a path), `display` (`safe` and `write_json`,
+  which escape controls, bidi and invisible characters in whatever the controller sent before a
+  terminal sees it), `whoami` (`landfall whoami`), `read` (`status`, `history`, `release`,
+  `releases`, `why`, `hosts`, `audit` and `approvals`, over the `Api` trait, used generically so
+  tests can use a fake; `status` pages within 1,000 deployments, 20 pages or 8 MiB of answers,
+  the others make at most three calls; answers are kept as text, never as a JSON tree;
+  `render`, each view for a person, every server string escaped), `verify`
+  (`landfall verify`), `access` (the trust root's cache and the operator's token), `project`
+  (what landfall trusts about its own releases: its repository, ids and workflow as constants,
+  and `assets/release-signers`, read by the
   same rule as `release_preflight.py`, whose test keeps the keys in the two test tables
   equal), `agent_release` (the names of an agent's files, and `AgentSource`, which
   `GitHubReleases` implements by that trust), and `host` (`host install` and `host upgrade`:

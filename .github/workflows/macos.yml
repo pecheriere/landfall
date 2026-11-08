@@ -9,6 +9,7 @@ on:
     paths:
       - Cargo.toml
       - crates/cli/**
+      - crates/api/**
       - crates/origin/**
       - crates/core/**
       - crates/approval/**
@@ -20,6 +21,7 @@ on:
     paths:
       - Cargo.toml
       - crates/cli/**
+      - crates/api/**
       - crates/origin/**
       - crates/core/**
       - crates/approval/**

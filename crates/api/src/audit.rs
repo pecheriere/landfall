@@ -3,6 +3,8 @@
 use landfall_core::ids::{DeploymentId, HostId};
 use serde::{Deserialize, Serialize};
 
+use crate::RawJson;
+
 /// One row of the audit log. There is no hash: checking the chain is
 /// `landfall-server audit verify`'s job, on the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,5 +40,5 @@ pub struct AuditEntry {
     /// makes, reads `{"unreadable": "..."}`, with its first 256 characters quoted. Text from
     /// hosts and GitHub is in here: escape it before showing it.
     #[cfg_attr(feature = "openapi", schema(value_type = Object))]
-    pub detail: serde_json::Value,
+    pub detail: RawJson,
 }

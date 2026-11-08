@@ -249,7 +249,11 @@ impl<'de> Deserialize<'de> for DeploymentRef {
 }
 
 /// When a deployment's releases go on to another, or came from one.
+// serde reads and writes it through `PromotionWire`, the same fields side by side: a flattened
+// field would make serde buffer every field it doesn't know into a tree first. The `flatten`
+// below is read only by the schema derive, which shows the fields as `allOf`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "PromotionWire", into = "PromotionWire")]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PromotionView {
     /// The other deployment.
@@ -258,6 +262,39 @@ pub struct PromotionView {
     pub deployment: DeploymentRef,
     /// How long a release must be healthy on the deployment promoted from, in seconds.
     pub healthy_for_secs: u64,
+}
+
+/// [`PromotionView`] on the wire: [`DeploymentRefWire`]'s fields, then `healthy_for_secs`.
+#[derive(Serialize, Deserialize)]
+struct PromotionWire {
+    deployment: Option<DeploymentId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unseen: bool,
+    healthy_for_secs: u64,
+}
+
+impl From<PromotionWire> for PromotionView {
+    fn from(wire: PromotionWire) -> Self {
+        Self {
+            deployment: DeploymentRefWire {
+                deployment: wire.deployment,
+                unseen: wire.unseen,
+            }
+            .into(),
+            healthy_for_secs: wire.healthy_for_secs,
+        }
+    }
+}
+
+impl From<PromotionView> for PromotionWire {
+    fn from(view: PromotionView) -> Self {
+        let DeploymentRefWire { deployment, unseen } = DeploymentRefWire::from(&view.deployment);
+        Self {
+            deployment,
+            unseen,
+            healthy_for_secs: view.healthy_for_secs,
+        }
+    }
 }
 
 /// When a deployment's releases deploy.

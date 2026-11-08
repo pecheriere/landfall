@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use landfall_api::{DeployState, Outcome};
+use landfall_api::{DeployState, Outcome, RawJson};
 use landfall_core::ids::{CommitSha, DeploymentId, HostId, ImageDigest, PrincipalId, ReleaseTag};
 use landfall_origin::fetch::MAX_LISTED_TAGS;
 use serde_json::Value;
@@ -139,7 +139,7 @@ pub(crate) struct StepRow {
     /// Why it failed, quoted and bounded, if it did.
     pub(crate) failure: Option<String>,
     /// More about it, as [`BoundedReport`](crate::report::BoundedReport) stored it.
-    pub(crate) detail: Option<Value>,
+    pub(crate) detail: Option<RawJson>,
 }
 
 /// The last finished deploy of a release with one digest.
@@ -220,7 +220,7 @@ fn step_from(row: &SqliteRow) -> Result<(i64, StepRow), StoreError> {
         .map_err(|_| StoreError::Corrupt("position"))?;
     let detail = row
         .try_get::<Option<String>, _>("detail")?
-        .map(|text| serde_json::from_str(&text))
+        .map(|text| serde_json::from_str::<RawJson>(&text))
         .transpose()?;
     let step = StepRow {
         position,
