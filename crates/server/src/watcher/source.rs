@@ -20,7 +20,7 @@ use landfall_origin::trust::{Refresh, TrustRoot, load_trusted_root};
 use tokio::sync::Mutex;
 
 use super::ReleaseSource;
-use crate::agent_api::log;
+use crate::logger::log;
 
 /// The longest the trust root goes without a refresh.
 const REFRESH_EVERY: Duration = Duration::from_hours(24);

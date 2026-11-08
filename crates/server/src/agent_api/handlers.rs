@@ -21,8 +21,9 @@ use tokio::time::{Instant, sleep_until};
 
 use super::ApiState;
 use super::client_source::ClientSource;
-use super::problem::{ApiProblem, log};
+use super::problem::ApiProblem;
 use super::signed::{Signed, read_body};
+use crate::logger::log;
 use crate::report::BoundedReport;
 use crate::store::{StoreError, WorkPick};
 

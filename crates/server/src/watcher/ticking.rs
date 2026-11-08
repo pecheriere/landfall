@@ -13,7 +13,7 @@ use super::{
     REPOS_AT_ONCE, ReleaseSource, Stop, TickSummary, WatcherState, settle_whole_hold,
     watch_deployment,
 };
-use crate::agent_api::log;
+use crate::logger::log;
 use crate::store::Store;
 
 const RAN_PAST_DEADLINE: &str = "looking at its repository ran past the deadline of a tick";

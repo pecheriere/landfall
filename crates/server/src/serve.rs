@@ -48,7 +48,8 @@ use tower::ServiceExt as _;
 
 use self::linger::linger;
 use self::write_deadline::WriteDeadline;
-use crate::agent_api::{RefusalLog, log, source_key};
+use crate::agent_api::{RefusalLog, source_key};
+use crate::logger::log;
 
 /// How long to wait before accepting again after `accept` itself failed, as it
 /// does when the process is out of file descriptors.
@@ -78,7 +79,8 @@ pub struct ServeOptions {
     /// How long stopping waits for requests in flight. Those still running then get no answer.
     pub drain_timeout: Duration,
     /// How long stopping then waits for those to be gone. Each goes the next time it runs, so this
-    /// is only for a handler blocking its thread, on a stuck stderr say, which can't be stopped.
+    /// is only for a handler blocking its thread, which can't be stopped. Logging doesn't: see
+    /// `logger`.
     /// With `TimeoutStopSec=30` in the guide, this leaves room for what stopping does after it.
     pub cut_off_timeout: Duration,
     /// How long a connection that has given its last answer waits for the client to close its

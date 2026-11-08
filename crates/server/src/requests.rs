@@ -57,10 +57,11 @@ use serde_json::json;
 use sqlx::{Sqlite, Transaction};
 
 use crate::agent_api::{
-    ApiProblem, ApiState, deadline, json as json_answer, log, note_client_source, read_body,
+    ApiProblem, ApiState, deadline, json as json_answer, note_client_source, read_body,
 };
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
+use crate::logger::log;
 use crate::store::{RequestSnapshot, RequestState, StoreError, StoredRequest, WatchedRunning};
 
 const BAD_BODY: &str = "the body is not a valid request";
