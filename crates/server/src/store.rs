@@ -37,6 +37,7 @@ pub use self::agent::NONCE_LIFETIME_SECS;
 pub use self::ceremonies::SESSION_LIFETIME_SECS;
 pub(crate) use self::ceremonies::{NewPasskey, Redeemed};
 pub use self::commits::{CommitRange, NewRange, RangeState, WantedRange};
+pub(crate) use self::deploys::REPORT_REFUSALS;
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
     FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,

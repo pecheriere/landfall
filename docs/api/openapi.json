@@ -1386,19 +1386,19 @@
           },
           "detail": {
             "type": "object",
-            "description": "The particulars, as the controller recorded them. A row whose detail isn't JSON, which\nonly someone editing the database makes, reads `{\"unreadable\": \"...\"}`, with its first\n256 characters quoted. Text from hosts and GitHub is in here: escape it before showing\nit."
+            "description": "The particulars: the fields its kind shows, as the controller recorded them, and\nnothing else of what it recorded. A deployment named in it is shown as one this\nprincipal can't view would be, a host they can't see as `null`, and a reason that could\nname either is said again in the rule's words, or left out. A kind with nothing to show\nhas `{}`. A row whose detail isn't a JSON object, which only someone editing the database\nmakes, reads `{\"unreadable\": \"...\"}`, with its first 256 characters quoted. Text from\nhosts and GitHub is in here: escape it before showing it."
           },
           "host": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The host it is about, or `null`.",
+            "description": "The host it is about, or `null`: also `null` for a host this principal can't see, as\n`getHost` decides.",
             "example": "home-1"
           },
           "kind": {
             "type": "string",
-            "description": "What it records, such as `deploy_queued`. A newer controller may add kinds.",
+            "description": "What it records, such as `deploy_queued`. A newer controller may add kinds. A name this\ncontroller doesn't know, which only someone editing the database writes, is quoted.",
             "example": "deploy_queued"
           },
           "seq": {
@@ -2233,19 +2233,19 @@
                 },
                 "detail": {
                   "type": "object",
-                  "description": "The particulars, as the controller recorded them. A row whose detail isn't JSON, which\nonly someone editing the database makes, reads `{\"unreadable\": \"...\"}`, with its first\n256 characters quoted. Text from hosts and GitHub is in here: escape it before showing\nit."
+                  "description": "The particulars: the fields its kind shows, as the controller recorded them, and\nnothing else of what it recorded. A deployment named in it is shown as one this\nprincipal can't view would be, a host they can't see as `null`, and a reason that could\nname either is said again in the rule's words, or left out. A kind with nothing to show\nhas `{}`. A row whose detail isn't a JSON object, which only someone editing the database\nmakes, reads `{\"unreadable\": \"...\"}`, with its first 256 characters quoted. Text from\nhosts and GitHub is in here: escape it before showing it."
                 },
                 "host": {
                   "type": [
                     "string",
                     "null"
                   ],
-                  "description": "The host it is about, or `null`.",
+                  "description": "The host it is about, or `null`: also `null` for a host this principal can't see, as\n`getHost` decides.",
                   "example": "home-1"
                 },
                 "kind": {
                   "type": "string",
-                  "description": "What it records, such as `deploy_queued`. A newer controller may add kinds.",
+                  "description": "What it records, such as `deploy_queued`. A newer controller may add kinds. A name this\ncontroller doesn't know, which only someone editing the database writes, is quoted.",
                   "example": "deploy_queued"
                 },
                 "seq": {

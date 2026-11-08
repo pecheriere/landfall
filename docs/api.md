@@ -294,11 +294,39 @@ a deployment there and no `view`, `403 forbidden`.
 
 A deployment the configuration no longer has is in no one's view, so its rows aren't listed,
 whatever the database still holds. Each entry has its `seq`, its time, its `kind`, the
-`deployment` and `host` it is about, and its `detail` as the controller recorded it. There is no
-hash: `landfall-server audit verify` checks the chain. A detail that isn't a JSON object, which
-only someone editing the database writes, reads `{"unreadable": "..."}`, its first 256
-characters quoted, rather than failing the page. A detail holds text from hosts and GitHub:
-escape it before showing it.
+`deployment` and `host` it is about, and its `detail`. There is no hash:
+`landfall-server audit verify` checks the chain.
+
+A row stays as it was written, and some rows hold words that name another deployment or host:
+the watcher's reason for a release that waits for promotion names the deployment it waits on,
+and a refused report names what the report claimed. So an entry never shows a row as stored:
+
+- `host` is `null` unless the principal may see that host, by the rule `getHost` follows: a
+  host's own rows are only listed then, but a deployment's row can name another host, such as one
+  that signed a report of a deploy that wasn't its own, or the host the deployment was on before;
+- `detail` holds only the fields its kind lists, and drops anything else the row holds. A kind
+  with no list shows `{}`, and so does a kind this controller doesn't know, whose name is then
+  quoted;
+- a deployment a detail names, as a request's end does, is shown as a promotion's is:
+  `{"deployment": "app/prod"}`, or `{"deployment": null, "unseen": true}` for one the principal
+  can't view. A host it names is `null` unless they may see it;
+- free text is shown where its writer can't name another deployment or host: what a host said
+  of its own deploy, why verifying or fetching the deployment's own releases failed, why a request
+  ended or was refused. A `rule_decision`'s reason is said again in the rule's own words when it
+  is one of them, and is left out otherwise, as when the release waits for promotion: its
+  `decision` says `manual`, and the deployment's view and the release's story say where it waits
+  as the principal may be told. A `report_refused` row shows its reason only when it is one of
+  the controller's own that name nothing: `no such deploy`, `another host's deploy`, `never
+  handed out`.
+
+Rows of `request_refused`, `approval_refused` and `cancel_refused` name who was refused, in
+`by`: the principal, how they proved it, and the id of their token if they used one, never the
+token. That includes a principal with no grant on the deployment at all, whom the deployment's
+viewers should know is trying (spec 8.3). `deploy_requested` names who asked the same way.
+
+A detail that isn't a JSON object, which only someone editing the database writes, reads
+`{"unreadable": "..."}`, its first 256 characters quoted, rather than failing the page. A detail
+holds text from hosts and GitHub: escape it before showing it.
 
 `deployment`, `host` and `kind` narrow the page. `host` is the host's own rows and those of the
 deployments the configuration puts on it. `kind` must be a name the log uses, such as

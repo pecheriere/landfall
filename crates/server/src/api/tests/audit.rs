@@ -14,7 +14,7 @@ use crate::audit::{AuditEvent, EventKind};
 
 /// Writes a row of `kind` about `deployment` and `host`, as the controller does, and gives
 /// its `seq`.
-async fn write(
+pub(super) async fn write(
     hosts: &Hosts,
     kind: EventKind,
     deployment: Option<&str>,
@@ -24,7 +24,7 @@ async fn write(
         kind,
         deployment: deployment.map(|d| d.parse().unwrap()),
         host: host.map(|h| h.parse().unwrap()),
-        detail: json!({ "n": 1 }),
+        detail: json!({ "tag": "v1.2.0", "n": 1 }),
     };
     hosts.store.record(&event).await.unwrap();
     sqlx::query_scalar("SELECT max(seq) FROM audit_events")
@@ -34,7 +34,7 @@ async fn write(
 }
 
 /// A page's items and its next cursor.
-fn page(answer: &Answer) -> (Vec<Value>, Option<String>) {
+pub(super) fn page(answer: &Answer) -> (Vec<Value>, Option<String>) {
     assert_eq!(answer.status, StatusCode::OK, "{answer:?}");
     let body = answer.json();
     let cursor = body["next_cursor"].as_str().map(ToOwned::to_owned);
@@ -42,7 +42,11 @@ fn page(answer: &Answer) -> (Vec<Value>, Option<String>) {
 }
 
 /// Every row `caller` is listed at `path`, page after page, and the pages' lengths.
-async fn every_row(hosts: &Hosts, path: &str, caller: Caller<'_>) -> (Vec<Value>, Vec<usize>) {
+pub(super) async fn every_row(
+    hosts: &Hosts,
+    path: &str,
+    caller: Caller<'_>,
+) -> (Vec<Value>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut lengths = Vec::new();
     let mut cursor: Option<String> = None;
@@ -61,7 +65,7 @@ async fn every_row(hosts: &Hosts, path: &str, caller: Caller<'_>) -> (Vec<Value>
     }
 }
 
-fn seqs(rows: &[Value]) -> Vec<i64> {
+pub(super) fn seqs(rows: &[Value]) -> Vec<i64> {
     rows.iter()
         .map(|row| row["seq"].as_i64().unwrap())
         .collect()
@@ -138,7 +142,8 @@ async fn audit_rows_follow_view_in_sql() {
     assert_eq!(row["deployment"], "app/prod");
     assert_eq!(row["host"], "home-1");
     assert_eq!(row["kind"], "deploy_queued");
-    assert_eq!(row["detail"], json!({ "n": 1 }));
+    // A `deploy_queued` row shows the fields its kind lists, and nothing else it holds.
+    assert_eq!(row["detail"], json!({ "tag": "v1.2.0" }));
     assert_eq!(row["ts"], super::hosts::NOW);
     assert_eq!(row.as_object().unwrap().len(), 6, "{row}");
 }
@@ -520,7 +525,7 @@ async fn tampered_detail_is_unreadable_not_an_error() {
     let (rows, _) = page(&answer);
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[3]["seq"], good);
-    assert_eq!(rows[3]["detail"], json!({ "n": 1 }));
+    assert_eq!(rows[3]["detail"], json!({ "tag": "v1.2.0" }));
     let unreadable: Vec<&str> = rows[..3]
         .iter()
         .map(|row| {

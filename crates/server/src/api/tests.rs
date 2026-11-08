@@ -2,6 +2,7 @@
 //! store's own functions.
 
 mod audit;
+mod audit_detail;
 mod deployments;
 mod deploys;
 mod document;

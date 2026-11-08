@@ -17,13 +17,14 @@ use axum::extract::State;
 use landfall_api::{AuditEntry, Page};
 use landfall_core::config::Deployment;
 use landfall_core::ids::{DeploymentId, HostId};
-use landfall_core::text::quoted;
+use landfall_core::text::{quoted, shown};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use self::detail::Reader;
 use super::ApiJson;
 use super::openapi::{
     BadOrigin, BadRequest, Busy, Internal, RateLimited, SlowRequest, Unauthenticated,
@@ -35,6 +36,8 @@ use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal};
 use crate::store::AuditRow;
 use crate::store::views::{AuditBranches, AuditScope};
+
+mod detail;
 
 /// How much of a detail that isn't a JSON object an entry quotes, in characters.
 const UNREADABLE_CHARS: usize = 256;
@@ -62,20 +65,23 @@ struct AuditQuery {
     cursor: Option<String>,
 }
 
-/// A row as the API shows it. A detail that isn't a JSON object, which only someone editing
-/// the database writes, is shown quoted, as unreadable, rather than failing the page.
-fn entry(row: AuditRow) -> AuditEntry {
+/// A row as `reader` may see it: its detail as its kind shows it, and its host only if they
+/// may see that host. A detail that isn't a JSON object, which only someone editing the
+/// database writes, is shown quoted, as unreadable, rather than failing the page, and so is a
+/// kind this version doesn't know.
+fn entry(reader: &Reader<'_>, row: AuditRow) -> AuditEntry {
+    let kind = row.kind.parse::<EventKind>().ok();
     let detail = match serde_json::from_str::<Value>(&row.detail) {
-        Ok(object @ Value::Object(_)) => object,
+        Ok(Value::Object(stored)) => reader.detail(kind, &stored),
         _ => json!({ "unreadable": quoted(&row.detail, UNREADABLE_CHARS) }),
     };
     AuditEntry {
         seq: row.seq,
         ts: row.ts,
-        kind: row.kind,
+        kind: kind.map_or_else(|| shown(&row.kind), |kind| kind.as_str().to_owned()),
         // Each row was selected by a configured deployment's id, or a host's.
         deployment: row.deployment.and_then(|id| id.parse().ok()),
-        host: row.host.and_then(|id| id.parse().ok()),
+        host: reader.host(row.host.as_deref()),
         detail,
     }
 }
@@ -158,8 +164,9 @@ async fn list(
         .then(|| rows.last())
         .flatten()
         .map(|last| Cursor::new(CursorList::Audit, last.seq.to_string()).encode());
+    let reader = Reader::new(state.config(), &principal);
     Ok(ApiJson(Page {
-        items: rows.into_iter().map(entry).collect(),
+        items: rows.into_iter().map(|row| entry(&reader, row)).collect(),
         next_cursor,
     }))
 }
