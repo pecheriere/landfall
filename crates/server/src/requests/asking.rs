@@ -4,35 +4,30 @@ use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use landfall_api::{NewRequest, Problem, RequestView};
 use landfall_core::config::{Deployment, Permission};
 use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::intent::DeployIntent;
 use landfall_core::rule::{Decision, decide};
 use semver::Version;
-use serde::Deserialize;
 use sqlx::{Sqlite, Transaction};
 
 use super::{
-    Stop, Subject, no_store, parsed_body, ready_host, refuse_alone, refuse_in, refused, view,
-    visibility,
+    Stop, Subject, parsed_body, ready_host, refuse_alone, refuse_in, refused, view, visibility,
 };
-use crate::agent_api::{ApiState, json as json_answer};
+use crate::agent_api::ApiState;
+use crate::api::{
+    ApiJson, ApiQuery, BadRequest, BodyTooLarge, Busy, DeploymentPath, Forbidden, Internal,
+    NoQuery, NotFound, RateLimited, SlowRequest, Unauthenticated,
+};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};
-use crate::store::{NewRequest, StoreError};
+use crate::store::{NewRequest as StoredNewRequest, StoreError};
 
 /// A request is one tag, at most 128 bytes.
 const MAX_REQUEST_BODY_BYTES: usize = 1024;
 
 const NO_GRANT_TO_ASK: &str = "no grant lets this principal ask for this deployment";
-
-/// The body.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AskBody {
-    tag: ReleaseTag,
-}
 
 /// Everything about a request but its nonce, judged in `tx`: the intent to record, and
 /// whether it is a rollback. A rollback by someone who may do one cancels the open request it
@@ -137,14 +132,59 @@ async fn judge_request(
 }
 
 /// The handler.
+#[utoipa::path(
+    post,
+    path = "/api/v1/deployments/{name}/{stage}/requests",
+    operation_id = "requestDeploy",
+    tag = "requests",
+    summary = "Ask for a deploy",
+    description = "Asks for a verified release to be deployed, once an approver signs it. The \
+                   controller makes the intent from its own records; the client names a tag and \
+                   nothing else.",
+    params(DeploymentPath, NoQuery),
+    request_body = NewRequest,
+    security(("token" = ["request", "rollback"]), ("session" = ["request", "rollback"])),
+    extensions((
+        "x-landfall-grant" = json!({
+            "request": "a tag above what runs, or the first deploy",
+            "rollback": "a tag below what runs",
+        })
+    )),
+    responses(
+        (
+            status = 201,
+            description = "The request, waiting for an approver. A rollback by someone with \
+                           the `rollback` grant cancels the request it finds open.",
+            body = RequestView,
+        ),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthenticated),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+        (status = 408, response = SlowRequest),
+        (
+            status = 409,
+            description = "Nothing can be asked for now: `request_open`, `deployment_busy`, \
+                           `host_not_ready`, `release_not_verified`, `release_refused` or \
+                           `promotion_pending`.",
+            body = Problem,
+            content_type = "application/problem+json",
+        ),
+        (status = 413, response = BodyTooLarge),
+        (status = 429, response = RateLimited),
+        (status = 500, response = Internal),
+        (status = 503, response = Busy),
+    ),
+)]
 pub(super) async fn ask(
     State(state): State<ApiState>,
     principal: Principal,
-    path: Result<Path<(String, String)>, PathRejection>,
+    ApiQuery(NoQuery {}): ApiQuery<NoQuery>,
+    path: Result<Path<DeploymentPath>, PathRejection>,
     body: Body,
-) -> Result<Response, HumanProblem> {
+) -> Result<(StatusCode, ApiJson<RequestView>), HumanProblem> {
     let config = state.config();
-    let raw = path.map_or_else(|_| String::new(), |Path((a, b))| format!("{a}/{b}"));
+    let raw = path.map_or_else(|_| String::new(), |Path(path)| path.raw());
     let deployment = raw
         .parse::<DeploymentId>()
         .ok()
@@ -170,7 +210,7 @@ pub(super) async fn ask(
         )
         .await);
     };
-    let asked: AskBody = match parsed_body(&state, body, MAX_REQUEST_BODY_BYTES).await {
+    let asked: NewRequest = match parsed_body(&state, body, MAX_REQUEST_BODY_BYTES).await {
         Ok(asked) => asked,
         Err((problem, why)) => {
             return Err(refuse_alone(&state, &principal, subject, problem, why).await);
@@ -199,7 +239,7 @@ pub(super) async fn ask(
     store.expire_requests(&mut tx, now).await?;
     match judge_request(&state, &mut tx, &principal, (d, tag, &version), nonce).await {
         Ok((intent, is_rollback)) => {
-            let request = NewRequest {
+            let request = StoredNewRequest {
                 host: d.host(),
                 intent,
                 requested_by: principal.id(),
@@ -210,9 +250,10 @@ pub(super) async fn ask(
             tx.commit().await.map_err(StoreError::from)?;
             let can_approve = can(config, &principal, d.id(), Permission::Approve);
             // Whoever asked may cancel it.
-            let mut answer = json_answer(&view(&stored, can_approve, true), &no_store());
-            *answer.status_mut() = StatusCode::CREATED;
-            Ok(answer)
+            Ok((
+                StatusCode::CREATED,
+                ApiJson(view(&stored, can_approve, true)),
+            ))
         }
         Err(Stop::Refused(refusal)) => {
             refuse_in(&state, tx, &principal, subject, &refusal).await?;

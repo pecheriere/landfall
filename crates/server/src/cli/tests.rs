@@ -102,6 +102,14 @@ fn parse(args: &[&str]) -> Cli {
 }
 
 #[tokio::test]
+async fn openapi_prints_the_document_as_served() {
+    let mut out = Vec::new();
+    let openapi = parse(&["landfall-server", "openapi"]);
+    assert_eq!(execute(openapi, &mut out).await.unwrap(), EXIT_OK);
+    assert_eq!(out, crate::api::openapi_document().into_bytes());
+}
+
+#[tokio::test]
 async fn enrol_code_prints_only_the_code_and_audit_verify_sees_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("controller.db");

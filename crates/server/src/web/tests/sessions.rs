@@ -205,7 +205,8 @@ async fn signed_out_session_is_refused() {
     assert_eq!(rows[0]["principal"], "alice");
 }
 
-/// One session in the budget table, used once, by someone registered.
+/// One session in the budget tables, for state changes and reads, used once each, by someone
+/// registered.
 async fn a_session_with_a_budget(h: &Harness) {
     let gina = h.registered("gina").await;
     let session = h.signed_in(&gina).await;
@@ -213,7 +214,8 @@ async fn a_session_with_a_budget(h: &Harness) {
         .post("/api/v1/approvals/1/cancel", Some(&session), &json!({}))
         .await;
     assert_ne!(used.status, StatusCode::TOO_MANY_REQUESTS, "{used:?}");
-    assert_eq!(h.state.session_budgets(), 1);
+    assert_eq!(list_status(&h.app, &session).await, StatusCode::OK);
+    assert_eq!(h.state.session_budgets(), (1, 1));
 }
 
 #[tokio::test]
@@ -221,7 +223,7 @@ async fn registering_again_lets_go_of_the_budgets_of_the_sessions_it_ended() {
     let h = Harness::new().await;
     a_session_with_a_budget(&h).await;
     h.registered("gina").await;
-    assert_eq!(h.state.session_budgets(), 0);
+    assert_eq!(h.state.session_budgets(), (0, 0));
 }
 
 #[tokio::test]
@@ -229,10 +231,10 @@ async fn upkeep_lets_go_of_the_budgets_of_expired_sessions() {
     let h = Harness::new().await;
     a_session_with_a_budget(&h).await;
     crate::web::tend(&h.state).await;
-    assert_eq!(h.state.session_budgets(), 1);
+    assert_eq!(h.state.session_budgets(), (1, 1));
     h.clock.advance(SESSION_LIFETIME_SECS);
     crate::web::tend(&h.state).await;
-    assert_eq!(h.state.session_budgets(), 0);
+    assert_eq!(h.state.session_budgets(), (0, 0));
 }
 
 /// Each would be a row per request otherwise, from a stolen token, as sign-out spares only sessions.

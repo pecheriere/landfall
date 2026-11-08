@@ -24,7 +24,7 @@ mod problem;
 mod token;
 
 pub(crate) use self::budget::{
-    Budget, MAX_SESSIONS_PER_PRINCIPAL, Spender, Spent, flush_dropped, keep_flushing,
+    Budget, Dropped, MAX_SESSIONS_PER_PRINCIPAL, Spender, Spent, flush_dropped, keep_flushing,
 };
 pub(crate) use self::grants::{can, named_in_config, sees};
 #[cfg(test)]

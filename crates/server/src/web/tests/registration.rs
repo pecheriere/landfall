@@ -8,7 +8,7 @@ use super::{
     Harness, ORIGIN, REGISTER_BEGIN, REGISTER_FINISH, RP_ID, attestation_body, b64, sign_in_body,
 };
 use crate::agent_api::Limits;
-use crate::auth::{HumanProblem, PasskeyInvite};
+use crate::auth::PasskeyInvite;
 use crate::store::{NewPasskey, Redeemed, Store};
 
 const INVITE_LIFETIME: i64 = 60 * 60;
@@ -478,7 +478,7 @@ async fn with_no_approval_settings_it_refuses_clearly() {
     ] {
         let answer = h.post(path, None, &json!({})).await;
         assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
-        assert_eq!(answer.code(), HumanProblem::ApprovalsNotConfigured.code());
+        assert_eq!(answer.code(), "approvals_not_configured");
     }
     // The pages load, and say so when they try.
     assert_eq!(h.get("/sign-in").await.status, StatusCode::OK);

@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 
 use self::tokens::{PasskeyInviteArgs, TokenCommand};
 use crate::agent_api::{ApiState, Limits};
+use crate::api::openapi_document;
 use crate::audit::AuditReport;
 use crate::auth::{flush_dropped, keep_flushing};
 use crate::logger::{self, Logger, hides_text, push_escaped};
@@ -92,6 +93,9 @@ enum Command {
     /// `audit verify` does for it. A copy of the database file alone is no backup: a
     /// running controller's latest changes are in the file beside it.
     Backup(BackupArgs),
+    /// Print the OpenAPI document of `/api/v1`, the same bytes `serve` gives at
+    /// `/api/v1/openapi.json`.
+    Openapi,
 }
 
 #[derive(Debug, Subcommand)]
@@ -611,6 +615,11 @@ async fn execute(cli: Cli, out: &mut impl Write) -> Result<u8, CliError> {
             command: AuditCommand::Show(args),
         } => audit_show(args, out).await,
         Command::Backup(args) => backup(args, out).await,
+        Command::Openapi => {
+            out.write_all(openapi_document().as_bytes())
+                .map_err(CliError::Output)?;
+            Ok(EXIT_OK)
+        }
     }
 }
 

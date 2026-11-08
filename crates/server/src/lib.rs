@@ -2,6 +2,7 @@
 //! state and the audit log, and coordinates the agents.
 
 pub mod agent_api;
+pub mod api;
 pub mod audit;
 pub mod auth;
 pub mod cli;
@@ -47,7 +48,7 @@ pub fn router(state: ApiState) -> Router {
         .with_state(state.store().clone());
     health
         .merge(agent_api::router(state.clone()))
-        .merge(requests::router(state.clone()))
+        .merge(api::router(state.clone()))
         .merge(web::router(state))
         .layer(middleware::map_response(web::security_headers))
 }

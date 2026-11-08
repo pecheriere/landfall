@@ -1043,11 +1043,14 @@ number.
 log or crowd out the agents' writes: 120 at once, refilling at one a second. Each session has its
 own, and a principal's tokens share one, so a stolen cookie can exhaust only itself: not the
 person's other sessions, their tokens, or signing in, and signing out is never refused by a budget.
-So if a session is being used up, the person can still end it. Reads don't count, and neither use
-comes near it in normal work. Over it, a call gets `429 rate_limited` with `Retry-After`, and
-writes nothing. The count of those goes in an `access_throttled` audit row, with how many were
-`dropped`, at the next call within the budget or within one watcher interval, whichever is
-first, and when the controller stops. It names the principal and whether by `token`, `session` or
+So if a session is being used up, the person can still end it. Reads have a budget of their own,
+300 at once refilling at ten a second, which state changes never touch (see
+[`api.md`](api.md#budgets)), and neither use comes near either in normal work. Over a budget, a
+call gets `429 rate_limited` with `Retry-After`, and writes nothing. The count of those goes in an
+`access_throttled` audit row, with how many were `dropped`, at the next state change within the
+budget or within one watcher interval, whichever is first, and when the controller stops. A count
+of reads says `"reads": true` and waits for the watcher interval or stopping, as a read never
+writes. It names the principal and whether by `token`, `session` or
 `sign_in`, and no particular token, since it can be another of the principal's that comes next: to
 find which, look at the rows around it. The count is kept in memory, so a crash loses one not yet
 written.
@@ -1075,7 +1078,10 @@ no budget, and writes no row of its own. `SameSite=Strict` doesn't stop a page o
 subdomain from sending the cookie, as that is the same site, so this must be free. They are counted,
 and written as one `access_refused` row each watcher interval, with how many `attempts`, when the
 first was and from where. A jump in those means someone is sending a person's cookie from another
-origin, and it may be their browser doing so at a page's bidding.
+origin, and it may be their browser doing so at a page's bidding. A read with a session whose
+`Sec-Fetch-Site` says another site sent it (anything but `same-origin` or `none`) is refused with
+`bad_origin` and counted the same way, as `SameSite=Strict` sends the cookie on a same-site `GET`
+too, and such a page could otherwise spend the person's read budget.
 
 **A request nothing can read** (`request_unreadable`, 500), from a hand-edited or damaged
 database, costs only itself. The controller's log names its row, it is left out of `GET

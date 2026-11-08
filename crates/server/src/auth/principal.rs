@@ -1,19 +1,21 @@
 //! Who is asking: an extractor over a token or a session.
 //!
 //! A [`Principal`] can only come out of this extractor, and this extractor makes the
-//! exact-`Origin` check on any state change that came with a session. So a handler that
-//! takes a principal can't forget the check, and a route that doesn't take one has nobody
-//! to act for. A token needs no such check: a browser never attaches one by itself.
-//! Sessions are begun by sign-in, in its own module; this only reads them.
+//! exact-`Origin` check on any state change that came with a session, and the `Sec-Fetch-Site`
+//! check on any read that did. So a handler that takes a principal can't forget either check,
+//! and a route that doesn't take one has nobody to act for. A token needs neither: a browser
+//! never attaches one by itself. Then it takes the call's cost from the credential's budget: a
+//! state change's from one, and a read's from another. Sessions are begun by sign-in, in its own
+//! module; this only reads them.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use axum::http::{Extensions, HeaderMap, Method, header};
+use axum::http::{Extensions, HeaderMap, HeaderName, Method, header};
 use landfall_core::config::Config;
 use landfall_core::ids::PrincipalId;
 use serde_json::{Value, json};
 
-use super::budget::{Spender, Spent, throttled_event};
+use super::budget::{Dropped, Spender, Spent, throttled_event};
 use super::grants::named_in_config;
 use super::problem::HumanProblem;
 use super::token::{ApiToken, SessionToken};
@@ -23,6 +25,10 @@ use crate::web::FailureKind;
 /// The session cookie. `__Host-` makes a browser refuse it unless it is `Secure`, from
 /// this very host, with no `Domain` and `Path=/`.
 pub(crate) const SESSION_COOKIE: &str = "__Host-landfall-session";
+
+/// Which site a browser says sent a request: `same-origin`, `same-site`, `cross-site`, or `none`
+/// for one a person started.
+const SEC_FETCH_SITE: HeaderName = HeaderName::from_static("sec-fetch-site");
 
 /// How a principal proved who it is. This is what tells the kinds apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +89,11 @@ struct CountBeingWritten<'a> {
 impl Drop for CountBeingWritten<'_> {
     fn drop(&mut self) {
         if !self.written {
-            self.state.keep_dropped(self.spender.clone(), self.dropped);
+            self.state.keep_dropped(Dropped {
+                spender: self.spender.clone(),
+                reads: false,
+                count: self.dropped,
+            });
         }
     }
 }
@@ -97,8 +107,7 @@ pub(crate) async fn spend_budget(
     extensions: &Extensions,
     spender: &Spender,
 ) -> Result<(), HumanProblem> {
-    let store = state.store();
-    let now = store.now()?;
+    let now = state.store().now()?;
     match state.spend_budget(spender, now) {
         Spent::Over => {
             state.note_refusal(extensions, "a call over its budget");
@@ -109,19 +118,40 @@ pub(crate) async fn spend_budget(
                 _ => HumanProblem::OverBudget,
             })
         }
-        Spent::Within { dropped: 0 } => Ok(()),
-        Spent::Within { dropped } => {
-            let mut count = CountBeingWritten {
-                state,
-                spender,
-                dropped,
-                written: false,
-            };
-            store.record(&throttled_event(spender, dropped)).await?;
-            count.written = true;
-            Ok(())
-        }
+        Spent::Within { dropped } => write_down(state, spender, dropped).await,
     }
+}
+
+/// The same for a read, from the budget for reads: over it, the read is refused. A read writes
+/// nothing either way: how many were refused waits for the flush, so a read can't fail on that.
+fn spend_read_budget(
+    state: &ApiState,
+    extensions: &Extensions,
+    spender: &Spender,
+) -> Result<(), HumanProblem> {
+    if state.spend_read_budget(spender, state.store().now()?) {
+        Ok(())
+    } else {
+        state.note_refusal(extensions, "a read over its budget");
+        Err(HumanProblem::ReadsOverBudget)
+    }
+}
+
+/// Writes down a count of state changes taken from the table, or puts it back if that fails.
+async fn write_down(state: &ApiState, spender: &Spender, dropped: u64) -> Result<(), HumanProblem> {
+    if dropped == 0 {
+        return Ok(());
+    }
+    let mut count = CountBeingWritten {
+        state,
+        spender,
+        dropped,
+        written: false,
+    };
+    let event = throttled_event(spender, dropped, false);
+    state.store().record(&event).await?;
+    count.written = true;
+    Ok(())
 }
 
 /// What a request presents.
@@ -194,10 +224,23 @@ pub(crate) fn origin_matches(headers: &HeaderMap, config: &Config) -> bool {
     }
 }
 
+/// Whether a session's read may have come from the controller's own pages: its one
+/// `Sec-Fetch-Site` says `same-origin`, or `none` for one a person started, or it has none, as
+/// from a client that isn't a browser. Sent twice, or as anything else, it didn't.
+fn read_from_own_pages(headers: &HeaderMap) -> bool {
+    let mut sites = headers.get_all(SEC_FETCH_SITE).iter();
+    match (sites.next(), sites.next()) {
+        (None, _) => true,
+        (Some(site), None) => matches!(site.as_bytes(), b"same-origin" | b"none"),
+        (Some(_), Some(_)) => false,
+    }
+}
+
 /// Who a request's credential says it is, with a session's token if that's what it is, and with
-/// the `Origin` check made on a session's state change. That comes before any budget: a page on
-/// a sibling subdomain can send a person's cookie with a bad `Origin`, as `SameSite` doesn't stop
-/// it, and that must cost them nothing. It writes no row either, only a count.
+/// a session's call checked for where it came from: by its `Origin` for a state change, and by
+/// `Sec-Fetch-Site` for a read. That comes before any budget: a page on a sibling subdomain can
+/// send a person's cookie, as `SameSite` doesn't stop it, and that must cost them nothing. It
+/// writes no row either, only a count.
 async fn identified(
     parts: &Parts,
     state: &ApiState,
@@ -225,24 +268,30 @@ async fn identified(
         return Err(HumanProblem::Unauthenticated);
     };
     let principal = Principal { id, via };
-    if principal.is_human()
-        && !is_safe(&parts.method)
-        && !origin_matches(&parts.headers, state.config())
-    {
-        count_bad_origin(state, parts, &principal.id)?;
-        return Err(HumanProblem::BadOrigin);
+    if principal.is_human() {
+        let refused = if is_safe(&parts.method) {
+            (!read_from_own_pages(&parts.headers))
+                .then_some("a read with a session, sent by another site")
+        } else {
+            (!origin_matches(&parts.headers, state.config()))
+                .then_some("a state change with a session, not from the configured origin")
+        };
+        if let Some(reason) = refused {
+            count_bad_origin(state, parts, &principal.id, reason)?;
+            return Err(HumanProblem::BadOrigin);
+        }
     }
     Ok((principal, session))
 }
 
-/// Counts a session's state change from another origin. It goes in the capped log now and the
+/// Counts a session's call from elsewhere, for `reason`. It goes in the capped log now and the
 /// audit log as a count, by [`tend`](crate::web::tend).
 fn count_bad_origin(
     state: &ApiState,
     parts: &Parts,
     principal: &PrincipalId,
+    reason: &'static str,
 ) -> Result<(), HumanProblem> {
-    let reason = "a state change with a session, not from the configured origin";
     state.note_refusal(&parts.extensions, &format!("{reason}, for {principal}"));
     let source = source_of(&parts.extensions);
     let now = state.store().now()?;
@@ -257,14 +306,16 @@ impl FromRequestParts<ApiState> for Principal {
 
     async fn from_request_parts(parts: &mut Parts, state: &ApiState) -> Result<Self, HumanProblem> {
         let (principal, session) = identified(parts, state).await?;
-        if !is_safe(&parts.method) {
-            let spender = match session {
-                Some(session) => Spender::Session {
-                    hash: session.hash(),
-                    principal: principal.id.clone(),
-                },
-                None => Spender::Tokens(principal.id.clone()),
-            };
+        let spender = match session {
+            Some(session) => Spender::Session {
+                hash: session.hash(),
+                principal: principal.id.clone(),
+            },
+            None => Spender::Tokens(principal.id.clone()),
+        };
+        if is_safe(&parts.method) {
+            spend_read_budget(state, &parts.extensions, &spender)?;
+        } else {
             spend_budget(state, &parts.extensions, &spender).await?;
         }
         Ok(principal)

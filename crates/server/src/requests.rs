@@ -39,25 +39,23 @@ mod approving;
 mod asking;
 mod cancelling;
 
-use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header;
-use axum::middleware;
-use axum::response::Response;
-use axum::routing::{any, get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use landfall_api::{ApprovalsView, IntentView, RequestState as RequestStateView, RequestView};
 use landfall_core::config::{Config, Deployment, Permission};
-use landfall_core::ids::{DeploymentId, HostId, PrincipalId, ReleaseTag};
-use landfall_core::intent::DeployIntent;
+use landfall_core::ids::{DeploymentId, ReleaseTag};
 use landfall_core::text::shown;
-use serde::Serialize;
 use serde_json::json;
 use sqlx::{Sqlite, Transaction};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 
-use crate::agent_api::{
-    ApiProblem, ApiState, deadline, json as json_answer, note_client_source, read_body,
+use crate::agent_api::{ApiProblem, ApiState, read_body};
+use crate::api::{
+    ApiJson, ApiQuery, BadOrigin, BadRequest, Busy, IdPath, Internal, NoQuery, RateLimited,
+    SlowRequest, Unauthenticated,
 };
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
@@ -68,37 +66,19 @@ const BAD_BODY: &str = "the body is not a valid request";
 const UNREADABLE_BODY: &str = "the body could not be read within its limits";
 
 /// A request, as a principal may see it, with what a passkey signs.
-#[derive(Debug, Serialize)]
-struct RequestView<'a> {
-    id: i64,
-    host: &'a HostId,
-    intent: &'a DeployIntent,
-    challenge: String,
-    state: &'static str,
-    requested_by: &'a PrincipalId,
-    created_at: i64,
-    expires_at: i64,
-    can_approve: bool,
-    can_cancel: bool,
-}
-
-fn view(request: &StoredRequest, can_approve: bool, can_cancel: bool) -> RequestView<'_> {
+fn view(request: &StoredRequest, can_approve: bool, can_cancel: bool) -> RequestView {
     RequestView {
         id: request.id,
-        host: &request.host,
-        intent: &request.intent,
+        host: request.host.clone(),
+        intent: IntentView::from(&request.intent),
         challenge: URL_SAFE_NO_PAD.encode(request.intent.challenge()),
-        state: "awaiting_approval",
-        requested_by: &request.requested_by,
+        state: RequestStateView::AwaitingApproval,
+        requested_by: request.requested_by.clone(),
         created_at: request.created_at,
         expires_at: request.expires_at,
         can_approve,
         can_cancel,
     }
-}
-
-fn no_store() -> [(header::HeaderName, &'static str); 1] {
-    [(header::CACHE_CONTROL, "no-store")]
 }
 
 /// What was refused and why. The reason is the controller's own text, or quoted.
@@ -248,25 +228,19 @@ fn visibility(
     }
 }
 
-/// A request number as a path has it: plain digits with no leading zero, so that one
-/// request has one path.
-fn request_number(raw: &str) -> Option<i64> {
-    let canonical = !raw.starts_with('0') && raw.bytes().all(|b| b.is_ascii_digit());
-    canonical.then(|| raw.parse().ok()).flatten()
-}
-
 /// The request a path names, as it is now. One nothing can read gets a clear refusal, in the
 /// audit log as `kind`, for who may know of it, and for anyone else reads as one that isn't
 /// there.
 async fn named_request(
     state: &ApiState,
     principal: &Principal,
-    raw: &str,
+    path: &IdPath,
     kind: EventKind,
 ) -> Result<Option<StoredRequest>, HumanProblem> {
-    let Some(id) = request_number(raw) else {
+    let Some(id) = path.number() else {
         return Ok(None);
     };
+    let raw = path.id.as_str();
     let store = state.store();
     match store.request(id).await {
         Ok(found) => Ok(found),
@@ -322,13 +296,40 @@ fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
 /// `GET /api/v1/approvals`: what this principal may see that waits for an approver, each
 /// saying whether they could sign it or cancel it. Changes nothing. A request past its time is left out
 /// here, whether or not the next tick of the watcher has ended it yet.
+#[utoipa::path(
+    get,
+    path = "/api/v1/approvals",
+    operation_id = "listApprovals",
+    tag = "requests",
+    summary = "What waits for an approver",
+    description = "The open requests on deployments this principal may approve or view, each \
+                   saying whether they could sign it or cancel it. A request past its time is \
+                   left out.",
+    params(NoQuery),
+    security(("token" = []), ("session" = [])),
+    responses(
+        (
+            status = 200,
+            description = "The open requests on deployments this principal may approve or view.",
+            body = ApprovalsView,
+        ),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthenticated),
+        (status = 403, response = BadOrigin),
+        (status = 408, response = SlowRequest),
+        (status = 429, response = RateLimited),
+        (status = 500, response = Internal),
+        (status = 503, response = Busy),
+    ),
+)]
 async fn list(
     State(state): State<ApiState>,
     principal: Principal,
-) -> Result<Response, HumanProblem> {
+    ApiQuery(NoQuery {}): ApiQuery<NoQuery>,
+) -> Result<ApiJson<ApprovalsView>, HumanProblem> {
     let config = state.config();
     let open = state.store().open_requests(state.store().now()?).await?;
-    let views: Vec<RequestView<'_>> = open
+    let approvals = open
         .iter()
         .filter_map(|request| {
             let id = &request.intent.deployment;
@@ -342,35 +343,16 @@ async fn list(
             })
         })
         .collect();
-    Ok(json_answer(&json!({ "approvals": views }), &no_store()))
+    Ok(ApiJson(ApprovalsView { approvals }))
 }
 
-async fn not_found() -> HumanProblem {
-    HumanProblem::NotFound
-}
-
-async fn method_not_allowed() -> HumanProblem {
-    HumanProblem::MethodNotAllowed
-}
-
-/// The API's routes, with every answer `application/problem+json` that isn't a success.
-pub(crate) fn router(state: ApiState) -> Router {
-    let limit = state.limits().request_timeout;
-    Router::new()
-        .route(
-            "/api/v1/deployments/{name}/{stage}/requests",
-            post(asking::ask),
-        )
-        .route("/api/v1/approvals", get(list))
-        .route("/api/v1/approvals/{id}", post(approving::approve))
-        .route("/api/v1/approvals/{id}/cancel", post(cancelling::cancel))
-        .route("/api/v1", any(not_found))
-        .route("/api/v1/", any(not_found))
-        .route("/api/v1/{*rest}", any(not_found))
-        .method_not_allowed_fallback(method_not_allowed)
-        .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(limit, deadline))
-        .layer(middleware::from_fn_with_state(state, note_client_source))
+/// The API's operations on requests.
+pub(crate) fn routes() -> OpenApiRouter<ApiState> {
+    OpenApiRouter::new()
+        .routes(routes!(asking::ask))
+        .routes(routes!(list))
+        .routes(routes!(approving::approve))
+        .routes(routes!(cancelling::cancel))
 }
 
 #[cfg(test)]

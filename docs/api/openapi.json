@@ -1,0 +1,840 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "landfall",
+    "description": "The landfall controller's API for people and their agents. Within `/api/v1`, fields and values are only added: an older client works with a newer controller.",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/api/v1/approvals": {
+      "get": {
+        "tags": [
+          "requests"
+        ],
+        "summary": "What waits for an approver",
+        "description": "The open requests on deployments this principal may approve or view, each saying whether they could sign it or cancel it. A request past its time is left out.",
+        "operationId": "listApprovals",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The open requests on deployments this principal may approve or view.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/BadOrigin"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": []
+          },
+          {
+            "session": []
+          }
+        ]
+      }
+    },
+    "/api/v1/approvals/{id}": {
+      "post": {
+        "tags": [
+          "requests"
+        ],
+        "summary": "Approve a request",
+        "description": "Signs a request with a passkey's assertion over its challenge, as the controller's page does. A token never approves.",
+        "operationId": "approveRequest",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Plain digits with no leading zero: any other way of writing a number names nothing.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 42
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewApproval"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The request was approved, and its deploy is queued for its host, which checks the approval again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Approved"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "description": "No grant lets this principal approve here, a session's state change didn't come from the controller's origin, or the assertion isn't one by this principal for this request: `forbidden`, `bad_origin`, `assertion_refused`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "409": {
+            "description": "The request can't be approved now: `request_closed`, `request_stale`, `request_expired`, `request_cancelled`, `release_not_verified`, `deployment_busy`, `host_not_ready` or `promotion_pending`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalOrUnreadable"
+          },
+          "503": {
+            "description": "The database is busy, so wait for `Retry-After`, or the configuration has no `[approval]` settings: `busy`, `approvals_not_configured`.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "description": "With `busy`: seconds to wait."
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "approve"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/approvals/{id}/cancel": {
+      "post": {
+        "tags": [
+          "requests"
+        ],
+        "summary": "Cancel a request",
+        "description": "For who asked, and for who could approve it or roll back past it. It takes no body: all it can do is stop something from running.",
+        "operationId": "cancelRequest",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Plain digits with no leading zero: any other way of writing a number names nothing.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "example": 42
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request was cancelled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cancelled"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "409": {
+            "description": "The request is no longer open: `request_closed`, `request_stale`, `request_expired` or `request_cancelled`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalOrUnreadable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "requester",
+              "rollback"
+            ]
+          },
+          {
+            "session": [
+              "requester",
+              "approve",
+              "rollback"
+            ]
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{name}/{stage}/requests": {
+      "post": {
+        "tags": [
+          "requests"
+        ],
+        "summary": "Ask for a deploy",
+        "description": "Asks for a verified release to be deployed, once an approver signs it. The controller makes the intent from its own records; the client names a tag and nothing else.",
+        "operationId": "requestDeploy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The deployment's name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "stage",
+            "in": "path",
+            "description": "The deployment's stage.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "prod"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The request, waiting for an approver. A rollback by someone with the `rollback` grant cancels the request it finds open.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RequestView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
+          "409": {
+            "description": "Nothing can be asked for now: `request_open`, `deployment_busy`, `host_not_ready`, `release_not_verified`, `release_refused` or `promotion_pending`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
+          }
+        },
+        "security": [
+          {
+            "token": [
+              "request",
+              "rollback"
+            ]
+          },
+          {
+            "session": [
+              "request",
+              "rollback"
+            ]
+          }
+        ],
+        "x-landfall-grant": {
+          "request": "a tag above what runs, or the first deploy",
+          "rollback": "a tag below what runs"
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "api"
+        ],
+        "summary": "This document",
+        "description": "Public, as it says nothing about this controller: the same bytes from every controller of this version.",
+        "operationId": "getOpenApi",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "This document.",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          }
+        },
+        "security": [
+          {}
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApprovalsView": {
+        "type": "object",
+        "description": "What waits for an approver, as far as this principal may see.",
+        "required": [
+          "approvals"
+        ],
+        "properties": {
+          "approvals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RequestView"
+            },
+            "description": "The open requests, at most one for each deployment."
+          }
+        }
+      },
+      "Approved": {
+        "type": "object",
+        "description": "A request that was approved, and the deploy it became.",
+        "required": [
+          "request",
+          "deploy_id"
+        ],
+        "properties": {
+          "deploy_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The deploy queued for its host.",
+            "minimum": 0
+          },
+          "request": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The request's number."
+          }
+        }
+      },
+      "AssertionBody": {
+        "type": "object",
+        "description": "A `WebAuthn` assertion, each field in base64url without padding.",
+        "required": [
+          "credential_id",
+          "authenticator_data",
+          "client_data_json",
+          "signature"
+        ],
+        "properties": {
+          "authenticator_data": {
+            "type": "string",
+            "description": "The authenticator's data, as signed."
+          },
+          "client_data_json": {
+            "type": "string",
+            "description": "The browser's client data, as hashed into the signature."
+          },
+          "credential_id": {
+            "type": "string",
+            "description": "The credential that signed."
+          },
+          "signature": {
+            "type": "string",
+            "description": "The signature."
+          }
+        },
+        "additionalProperties": false
+      },
+      "Cancelled": {
+        "type": "object",
+        "description": "A request that was cancelled.",
+        "required": [
+          "request",
+          "state"
+        ],
+        "properties": {
+          "request": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The request's number."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RequestState",
+            "description": "Where it stands now: `cancelled`."
+          }
+        }
+      },
+      "IntentView": {
+        "type": "object",
+        "description": "Exactly what an approver signs, with the same JSON as the intent a host checks.",
+        "required": [
+          "deployment",
+          "tag",
+          "commit",
+          "digest",
+          "expected_running",
+          "nonce"
+        ],
+        "properties": {
+          "commit": {
+            "type": "string",
+            "description": "The commit the tag points at, as verified.",
+            "example": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "deployment": {
+            "type": "string",
+            "description": "The deployment that would change.",
+            "example": "app/prod"
+          },
+          "digest": {
+            "type": "string",
+            "description": "The image digest it would run, as verified.",
+            "example": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          },
+          "expected_running": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The digest the host must be running when it deploys, `null` for a first deploy."
+          },
+          "nonce": {
+            "type": "string",
+            "description": "The one-time value that makes an approval unrepeatable: 64 lowercase hex digits.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "tag": {
+            "type": "string",
+            "description": "The release tag it would run.",
+            "example": "v1.3.0"
+          }
+        }
+      },
+      "NewApproval": {
+        "type": "object",
+        "description": "An approval: a passkey's assertion over the request's challenge.",
+        "required": [
+          "assertion"
+        ],
+        "properties": {
+          "assertion": {
+            "$ref": "#/components/schemas/AssertionBody",
+            "description": "The assertion, as the browser gave it."
+          }
+        },
+        "additionalProperties": false
+      },
+      "NewRequest": {
+        "type": "object",
+        "description": "A request for a deploy: a tag, and nothing the controller would take on trust.",
+        "required": [
+          "tag"
+        ],
+        "properties": {
+          "tag": {
+            "type": "string",
+            "description": "The release to deploy.",
+            "example": "v1.3.0"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Problem": {
+        "type": "object",
+        "description": "A refusal, as every `/api/v1` answer that isn't a success has it.",
+        "required": [
+          "code",
+          "title",
+          "status"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ProblemCode",
+            "description": "What a client should act on: it never changes its meaning."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The HTTP status.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "For people, and may change. Hostile in a client: escape it before showing it."
+          }
+        }
+      },
+      "ProblemCode": {
+        "type": "string",
+        "description": "The stable codes of a `Problem`. A code never changes its meaning, and new ones are only\nadded.",
+        "enum": [
+          "unauthenticated",
+          "bad_origin",
+          "forbidden",
+          "not_found",
+          "method_not_allowed",
+          "request_open",
+          "deployment_busy",
+          "host_not_ready",
+          "release_not_verified",
+          "release_refused",
+          "promotion_pending",
+          "request_stale",
+          "request_expired",
+          "request_closed",
+          "request_cancelled",
+          "request_unreadable",
+          "assertion_refused",
+          "approvals_not_configured",
+          "rate_limited",
+          "invite_refused",
+          "registration_refused",
+          "sign_in_refused",
+          "ceremonies_busy",
+          "unsigned",
+          "bad_nonce",
+          "bad_signature",
+          "invalid_code",
+          "already_enrolled",
+          "key_in_use",
+          "bad_request",
+          "body_too_large",
+          "slow_request",
+          "nonces_exhausted",
+          "busy",
+          "unknown_deploy",
+          "not_claimed",
+          "internal"
+        ]
+      },
+      "RequestState": {
+        "type": "string",
+        "description": "Where a request stands. Values are added as answers come to carry them.",
+        "enum": [
+          "awaiting_approval",
+          "cancelled"
+        ]
+      },
+      "RequestView": {
+        "type": "object",
+        "description": "A request, as a principal may see it, with what a passkey signs.",
+        "required": [
+          "id",
+          "host",
+          "intent",
+          "challenge",
+          "state",
+          "requested_by",
+          "created_at",
+          "expires_at",
+          "can_approve",
+          "can_cancel"
+        ],
+        "properties": {
+          "can_approve": {
+            "type": "boolean",
+            "description": "Whether this principal could sign it."
+          },
+          "can_cancel": {
+            "type": "boolean",
+            "description": "Whether this principal could cancel it."
+          },
+          "challenge": {
+            "type": "string",
+            "description": "The intent's `WebAuthn` challenge, in base64url without padding."
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it was asked for, in seconds since the Unix epoch."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When it ends unless signed, in seconds since the Unix epoch."
+          },
+          "host": {
+            "type": "string",
+            "description": "The host it would deploy on.",
+            "example": "home-1"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The request's number."
+          },
+          "intent": {
+            "$ref": "#/components/schemas/IntentView",
+            "description": "What an approver signs."
+          },
+          "requested_by": {
+            "type": "string",
+            "description": "Who asked for it.",
+            "example": "operator"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RequestState",
+            "description": "Where it stands."
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadOrigin": {
+        "description": "A session's read that its `Sec-Fetch-Site` says another site sent: anything but `same-origin` or `none`, when it is there. `bad_origin`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "The body or the query string isn't what this operation takes, or the query string is over 2 KiB: `bad_request`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "BodyTooLarge": {
+        "description": "The body is over this operation's limit: `body_too_large`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Busy": {
+        "description": "The database is busy: wait for `Retry-After`. `busy`.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The principal may see this and no grant lets it do that, or a session's state change didn't come from the controller's origin: `forbidden`, `bad_origin`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Internal": {
+        "description": "The controller failed. Its log says how, and the answer doesn't: `internal`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "InternalOrUnreadable": {
+        "description": "The controller failed, or can't read this request's row: `internal`, `request_unreadable`. Its log says which row, and such a request ends by itself when its time is up.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No such thing, as far as this principal may know: one they have no grant on reads the same as one that doesn't exist. `not_found`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Too many requests: wait for `Retry-After`. `rate_limited`.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "SlowRequest": {
+        "description": "The request, its body included, took longer than the controller waits: `slow_request`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Unauthenticated": {
+        "description": "No credentials, or ones that aren't good: `unauthenticated`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "session": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-landfall-session",
+        "description": "A passkey sign-in on the controller's own pages. A state change also needs the configured `Origin`, and a read a `Sec-Fetch-Site` of `same-origin` or `none`, or none at all."
+      },
+      "token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "An API token from `landfall-server token`. A token never approves."
+      }
+    }
+  }
+}

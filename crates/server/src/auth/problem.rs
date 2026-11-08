@@ -3,6 +3,7 @@
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use landfall_api::ProblemCode;
 
 use crate::agent_api::{ApiProblem, problem_response};
 use crate::store::StoreError;
@@ -46,8 +47,10 @@ pub(crate) enum HumanProblem {
     AssertionRefused,
     /// The configuration has no `[approval]`.
     ApprovalsNotConfigured,
-    /// This principal has asked for too many state changes.
+    /// This credential has asked for too many state changes.
     OverBudget,
+    /// This credential has made too many reads.
+    ReadsOverBudget,
     /// An invite's code that is wrong, used or expired: the same answer for every way of that.
     InviteRefused,
     /// A registration with a good code whose ceremony didn't check out.
@@ -69,97 +72,98 @@ pub(crate) enum HumanProblem {
 impl HumanProblem {
     /// The answer's status, stable code and text for people. `None` for a shared one,
     /// which knows its own.
-    fn parts(self) -> Option<(StatusCode, &'static str, &'static str)> {
+    fn parts(self) -> Option<(StatusCode, ProblemCode, &'static str)> {
         let conflict = StatusCode::CONFLICT;
         Some(match self {
             Self::Unauthenticated => (
                 StatusCode::UNAUTHORIZED,
-                "unauthenticated",
+                ProblemCode::Unauthenticated,
                 "valid credentials are required",
             ),
             Self::BadOrigin => (
                 StatusCode::FORBIDDEN,
-                "bad_origin",
+                ProblemCode::BadOrigin,
                 "this request did not come from the controller's own origin",
             ),
             Self::Forbidden => (
                 StatusCode::FORBIDDEN,
-                "forbidden",
+                ProblemCode::Forbidden,
                 "no grant allows this here",
             ),
-            Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "there is no such thing"),
+            Self::NotFound => (
+                StatusCode::NOT_FOUND,
+                ProblemCode::NotFound,
+                "there is no such thing",
+            ),
             Self::MethodNotAllowed => (
                 StatusCode::METHOD_NOT_ALLOWED,
-                "method_not_allowed",
+                ProblemCode::MethodNotAllowed,
                 "this path does not take this method",
             ),
             Self::RequestOpen => (
                 conflict,
-                "request_open",
+                ProblemCode::RequestOpen,
                 "this deployment already has a request waiting for an approver",
             ),
             Self::DeploymentBusy => (
                 conflict,
-                "deployment_busy",
+                ProblemCode::DeploymentBusy,
                 "this deployment has a deploy queued or running; try again when it ends",
             ),
             Self::HostNotReady => (
                 conflict,
-                "host_not_ready",
+                ProblemCode::HostNotReady,
                 "this deployment's host has not reported it, or cannot take a deploy now",
             ),
             Self::ReleaseNotVerified => (
                 conflict,
-                "release_not_verified",
+                ProblemCode::ReleaseNotVerified,
                 "the controller has no verified record of this release for this configuration",
             ),
             Self::ReleaseRefused => (
                 conflict,
-                "release_refused",
+                ProblemCode::ReleaseRefused,
                 "the deployment's rule refuses this release, and an approval would not change it",
             ),
             Self::PromotionPending => (
                 conflict,
-                "promotion_pending",
+                ProblemCode::PromotionPending,
                 "this release has not been healthy for long enough where it is promoted from",
             ),
             Self::RequestStale => (
                 conflict,
-                "request_stale",
+                ProblemCode::RequestStale,
                 "what is running changed since this request was made; ask again for a new one",
             ),
             Self::RequestExpired => (
                 conflict,
-                "request_expired",
+                ProblemCode::RequestExpired,
                 "this request waited too long; ask again for a new one",
             ),
             Self::RequestClosed => (
                 conflict,
-                "request_closed",
+                ProblemCode::RequestClosed,
                 "this request was already approved",
             ),
             Self::RequestCancelled => (
                 conflict,
-                "request_cancelled",
+                ProblemCode::RequestCancelled,
                 "this request was cancelled; ask again for a new one",
             ),
             Self::RequestUnreadable => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "request_unreadable",
+                ProblemCode::RequestUnreadable,
                 "the controller cannot read this request; its log names the row, and it ends by \
                  itself when its time is up",
             ),
             Self::AssertionRefused => (
                 StatusCode::FORBIDDEN,
-                "assertion_refused",
+                ProblemCode::AssertionRefused,
                 "this assertion is not one by you for this request",
             ),
-            Self::ApprovalsNotConfigured => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "approvals_not_configured",
-                "the configuration has no [approval] settings",
-            ),
-            Self::OverBudget
+            Self::ApprovalsNotConfigured
+            | Self::OverBudget
+            | Self::ReadsOverBudget
             | Self::InviteRefused
             | Self::RegistrationRefused
             | Self::SignInRefused
@@ -169,49 +173,62 @@ impl HumanProblem {
         })
     }
 
-    /// The same, for what registering and signing in refuse, and for budgets. `None` for anything
-    /// else.
-    fn ceremony_parts(self) -> Option<(StatusCode, &'static str, &'static str)> {
+    /// The same, for what registering and signing in refuse, approving too when nothing is
+    /// configured for it, and for budgets. `None` for anything else.
+    fn ceremony_parts(self) -> Option<(StatusCode, ProblemCode, &'static str)> {
         Some(match self {
+            Self::ApprovalsNotConfigured => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ProblemCode::ApprovalsNotConfigured,
+                "the configuration has no [approval] settings",
+            ),
             Self::OverBudget => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
+                ProblemCode::RateLimited,
                 "too many state changes by this principal",
+            ),
+            Self::ReadsOverBudget => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ProblemCode::RateLimited,
+                "too many reads by this credential",
             ),
             Self::InviteRefused => (
                 StatusCode::FORBIDDEN,
-                "invite_refused",
+                ProblemCode::InviteRefused,
                 "this link is not valid; ask for a new one",
             ),
             Self::RegistrationRefused => (
                 StatusCode::BAD_REQUEST,
-                "registration_refused",
+                ProblemCode::RegistrationRefused,
                 "this passkey could not be registered; try again from the link",
             ),
             Self::SignInRefused => (
                 StatusCode::FORBIDDEN,
-                "sign_in_refused",
+                ProblemCode::SignInRefused,
                 "this passkey cannot sign in here, or the attempt took too long; try again",
             ),
             Self::CeremoniesBusy => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "ceremonies_busy",
+                ProblemCode::CeremoniesBusy,
                 "too many sign-ins are under way; try again shortly",
             ),
             Self::SignInsSpent { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
+                ProblemCode::RateLimited,
                 "too many sign-ins for this person; try again in a few minutes",
             ),
             _ => return None,
         })
     }
 
-    /// The stable code, for an audit row.
-    pub(crate) fn code(self) -> &'static str {
+    /// The stable code, for an audit row. A variant with no parts of its own answers as
+    /// `internal`, and so does its code.
+    pub(crate) fn code(self) -> ProblemCode {
         match self {
             Self::Shared(shared) => shared.code(),
-            other => other.parts().map_or("", |(_, code, _)| code),
+            other => other
+                .parts()
+                .map_or(ProblemCode::Internal, |(_, code, _)| code),
         }
     }
 }
@@ -234,6 +251,12 @@ impl IntoResponse for HumanProblem {
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        }
+        // Reads refill many a second, so the next comes within one.
+        if self == Self::ReadsOverBudget {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
         if let Self::SignInsSpent { retry_after_secs } = self {
             response

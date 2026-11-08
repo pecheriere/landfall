@@ -19,6 +19,8 @@ allow = [
     "CDLA-Permissive-2.0",
     "Zlib",
     "BlueOak-1.0.0",
+    # OSI-approved and public-domain-equivalent; borrow-or-share, under jsonschema, has only it.
+    "MIT-0",
 ]
 
 [bans]
