@@ -49,11 +49,13 @@ TRUST_CODE = (
     "crates/origin/assets/",
     "crates/core/src/tag.rs",
     "crates/core/src/release.rs",
-    "crates/core/src/config/signer.rs",
+    "crates/core/src/config/",
+    "crates/agent/src/daemon.rs",
     "crates/agent/src/daemon/verifier.rs",
     "crates/agent/src/daemon/judge.rs",
     "crates/cli/src/verify.rs",
     "crates/cli/src/host.rs",
+    "crates/cli/src/host/",
     "crates/cli/src/project.rs",
     "crates/cli/src/agent_release.rs",
     "crates/cli/assets/",
@@ -115,14 +117,18 @@ def good_jobs() -> list[dict[str, object]]:
 def without_test_modules(source: str) -> str:
     """Return Rust source without its inline `#[cfg(test)] mod … { … }` blocks.
 
-    Braces are counted, so a brace inside a string in a test module could end it early. That
-    errs towards checking more, not less.
+    Braces are counted, so a brace inside a string in a test module could end it early, which
+    checks more, not less. If a cut never balances, the whole file is kept, as production code
+    could follow what looked like a test module.
     """
+    whole = source
     while found := TEST_MODULE.search(source):
         depth, end = 1, found.end()
         while depth and end < len(source):
             depth += {"{": 1, "}": -1}.get(source[end], 0)
             end += 1
+        if depth:
+            return whole
         source = source[: found.start()] + source[end:]
     return source
 
@@ -532,6 +538,12 @@ class ReadingTests(unittest.TestCase):
             '    fn f() { if x { include_str!("b"); } }\n}\nconst C: &str = include_str!("c");\n'
         )
         self.assertEqual(INCLUDE.findall(without_test_modules(source)), ["a", "c"])
+        # A `{` in a test module's string leaves the count open: then nothing is cut at all.
+        unbalanced = (
+            '#[cfg(test)]\nmod tests {\n    const S: &str = "{";\n}\n'
+            'const P: &str = include_str!("p");\n'
+        )
+        self.assertEqual(INCLUDE.findall(without_test_modules(unbalanced)), ["p"])
 
     def test_every_file_built_into_a_verifying_crate_is_shown(self) -> None:
         """A new embedded key or trust root can't arrive unseen, as a line in `--stat`."""
