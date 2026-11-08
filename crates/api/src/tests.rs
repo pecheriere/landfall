@@ -74,6 +74,11 @@ fn a_deployment_one_cannot_view_is_never_named() {
     let unseen_json = json!({ "deployment": null, "unseen": true, "healthy_for_secs": 3600 });
     assert_eq!(serde_json::to_value(&seen).unwrap(), seen_json);
     assert_eq!(serde_json::to_value(&unseen).unwrap(), unseen_json);
+    // The bytes too, in this order: the deployment's fields, then the wait.
+    assert_eq!(
+        serde_json::to_string(&unseen).unwrap(),
+        r#"{"deployment":null,"unseen":true,"healthy_for_secs":3600}"#
+    );
     assert_eq!(
         serde_json::from_value::<PromotionView>(seen_json).unwrap(),
         seen

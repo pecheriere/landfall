@@ -406,3 +406,55 @@ async fn a_wide_deep_audit_detail_is_held_as_its_text() {
     assert_eq!(out.matches("{\"\\u{9b}\":0}").count(), count);
     assert_eq!(out.lines().count(), 1);
 }
+
+/// A deployment answer near 4 MiB whose promotion carries a large field this CLI doesn't know,
+/// wide and nested, from a real controller's socket: read straight into its type, which skips
+/// the field rather than buffering it, and printed.
+#[tokio::test]
+async fn a_large_unknown_field_in_a_promotion_is_skipped() {
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::api_client::{ApiClient, BODY_CAP};
+
+    let mut value = super::deployment();
+    value["promote_to"] = json!({
+        "deployment": "app/staging",
+        "healthy_for_secs": 3600,
+        "from_the_future": "WIDE",
+    });
+    let shell = value.to_string();
+    let deep = format!("{}{{\"k\":0}}{}", "[".repeat(100), "]".repeat(100));
+    let count = (BODY_CAP - shell.len() - 1024) / (deep.len() + 1);
+    let wide = format!("[{}]", vec![deep.as_str(); count].join(","));
+    let body = shell.replacen("\"WIDE\"", &wide, 1);
+    assert!(
+        body.len() <= BODY_CAP && body.len() > BODY_CAP - 4096,
+        "{}",
+        body.len()
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(path("/api/v1/deployments/app/prod"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(&server)
+        .await;
+    let settings = crate::settings::Settings {
+        controller: landfall_core::controller_url::ControllerUrl::parse(&server.uri(), true)
+            .unwrap(),
+        token: None,
+    };
+    let client = ApiClient::new(&settings).unwrap();
+
+    let command = super::parse("status app/prod");
+    let mut out = Vec::new();
+    crate::read::run_with(&command, &client, &mut out, false)
+        .await
+        .unwrap();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("promotes to app/staging after 3600 s healthy\n"),
+        "{out}"
+    );
+    assert!(!out.contains("[[["), "{out}");
+}
