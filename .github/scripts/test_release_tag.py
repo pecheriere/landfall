@@ -144,6 +144,8 @@ class FakeRun:
     def __init__(self) -> None:
         """Answer as a clean checkout whose main is a bumped, dry-run commit after v1.2.2."""
         self.calls: list[tuple[str, ...]] = []
+        # What each `-c user.signingkey=…` handed to git was; calls are recorded without it.
+        self.signing_keys: list[str] = []
         # `git verify-tag` by the ref it checks; the allowed-signers path differs each time.
         self.verified = {f"refs/tags/{TAG}": done(), f"refs/tags/{PREVIOUS}": done()}
         self.answers: dict[tuple[str, ...], subprocess.CompletedProcess] = {
@@ -170,6 +172,7 @@ class FakeRun:
             ("git", "rev-parse", "--verify", f"refs/tags/{TAG}^{{commit}}"): done(f"{SHA}\n"),
             ("git", "tag", "--delete", TAG): done(),
             PUSH_ARGS: done(),
+            ("ssh-add", "-L"): done(f"{KEY} comment\n"),
         }
         self.runs([a_run()])
         self.jobs(good_jobs())
@@ -189,6 +192,9 @@ class FakeRun:
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess:
         """Answer one command."""
         call = tuple(args)
+        if call[1:2] == ("-c",) and call[2].startswith("user.signingkey="):
+            self.signing_keys.append(call[2].removeprefix("user.signingkey="))
+            call = (call[0], *call[3:])
         self.calls.append(call)
         if "verify-tag" in call:
             return self.verified.get(call[-1], done(returncode=1, stderr="no such tag"))
@@ -315,10 +321,9 @@ class FlowTests(unittest.TestCase):
 
     def test_a_signing_key_is_given_to_git_for_the_tag_alone(self) -> None:
         """As `-c user.signingkey`, one argument, whatever it holds."""
-        key = "key::ssh-ed25519 AAAA with spaces"
-        self.fake.answers[("git", "-c", f"user.signingkey={key}", *TAG_ARGS[1:])] = done()
+        key = f"key::{KEY} with spaces"
         self.release(signing_key=key)
-        self.assertIn(("git", "-c", f"user.signingkey={key}", *TAG_ARGS[1:]), self.fake.calls)
+        self.assertEqual(self.fake.signing_keys, [key])
 
     def test_a_key_with_a_control_character_is_refused(self) -> None:
         """A newline in a config value is never what was meant."""
