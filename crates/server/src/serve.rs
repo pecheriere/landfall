@@ -28,7 +28,7 @@ mod linger;
 mod write_deadline;
 
 use std::collections::HashMap;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -165,7 +165,8 @@ async fn serve_connection(
     cut_off: watch::Receiver<bool>,
     _held: (OwnedSemaphorePermit, SourceSlot),
 ) {
-    // Boxed, so that the connection is `Unpin` and can give its stream back when it's done.
+    // Boxed, so that the connection is `Unpin`: polled through a reference, it can still give its
+    // stream back when it's done.
     let service = service_fn(move |mut request: Request<Incoming>| {
         request.extensions_mut().insert(ConnectInfo(peer));
         Box::pin(app.clone().oneshot(request.map(Body::new)))
@@ -177,10 +178,11 @@ async fn serve_connection(
             TokioIo::new(WriteDeadline::new(stream, options.write_timeout)),
             service,
         );
-    // Done without shutting the stream, which is the linger's to do. An error ends it as well:
-    // whatever hyper could still send has gone.
+    // hyper ends it as it would anyway: the answer flushed whole, then the stream shut for
+    // writing. Only the closing is left for the linger. An error ends it as well: whatever hyper
+    // could still send has gone.
     let ended = tokio::select! {
-        result = poll_fn(|cx| connection.poll_without_shutdown(cx)) => {
+        result = &mut connection => {
             drop(result);
             true
         }
@@ -190,10 +192,9 @@ async fn serve_connection(
     if !ended {
         Pin::new(&mut connection).graceful_shutdown();
         let finished = tokio::select! {
-            finished = tokio::time::timeout(
-                options.finish_timeout,
-                poll_fn(|cx| connection.poll_without_shutdown(cx)),
-            ) => finished.is_ok(),
+            finished = tokio::time::timeout(options.finish_timeout, &mut connection) => {
+                finished.is_ok()
+            }
             () = until_closing(cut_off.clone()) => false,
         };
         if !finished {

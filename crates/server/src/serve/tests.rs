@@ -51,7 +51,8 @@ async fn start(options: ServeOptions) -> Server {
         .route("/slow", get(slow))
         .route("/big", get(big))
         .route("/hang", get(std::future::pending::<()>))
-        .route("/ignores", post(ignores));
+        .route("/ignores", post(ignores))
+        .route("/ignores-big", post(big));
     serving(app, options).await
 }
 
@@ -98,9 +99,36 @@ async fn answered_before_its_body(server: &Server) -> TcpStream {
     stream
 }
 
+/// The linger starts only once the whole answer has gone: one larger than the socket buffers,
+/// to a request whose body never comes, read only after a while, arrives whole.
+#[tokio::test]
+async fn a_large_answer_to_a_body_never_read_arrives_whole() {
+    let server = start(options()).await;
+    let mut stream = TcpStream::connect(server.addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /ignores-big HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\
+              Content-Length: 2\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut got))
+        .await
+        .expect("the server should close the connection")
+        .unwrap();
+    let (head, body) = got.split_at(got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4);
+    assert!(head.starts_with(b"HTTP/1.1 200"));
+    assert_eq!(body.len(), BIG);
+}
+
 /// A body nobody read, arriving after the answer, would make closing reset the connection, and
 /// the reset throws away an answer the client hasn't read yet. The connection lingers for it
-/// instead.
+/// instead. The reset has 100 ms to come back before the answer is read, so on a starved machine
+/// a build without the linger can still pass this: it tells the two apart only when it runs on
+/// time, which it does unloaded. And only on macOS: Linux keeps an answer whose end came before
+/// the reset, so there it's the next test, whose answer is still on its way, that shows it.
 #[tokio::test]
 async fn an_answer_sent_before_its_body_arrives_is_not_lost() {
     let server = start(options()).await;
@@ -110,6 +138,33 @@ async fn an_answer_sent_before_its_body_arrives_is_not_lost() {
     let answer = read_to_close(&mut stream).await;
     assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     assert!(answer.ends_with("answered"), "{answer}");
+}
+
+/// The same with an answer larger than the socket buffers, whose end is still on its way when
+/// the body arrives. Without the linger this fails on Linux as on macOS, though on Linux not
+/// every time: 7 runs in 10 when it was written.
+#[tokio::test]
+async fn a_large_answer_sent_before_its_body_arrives_is_not_lost() {
+    let server = start(options()).await;
+    let mut stream = TcpStream::connect(server.addr).await.unwrap();
+    stream
+        .write_all(
+            b"POST /ignores-big HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\
+              Content-Length: 2\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut byte = [0];
+    stream.peek(&mut byte).await.unwrap();
+    stream.write_all(b"{}").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut got))
+        .await
+        .expect("the server should close the connection")
+        .unwrap();
+    let (_, body) = got.split_at(got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4);
+    assert_eq!(body.len(), BIG);
 }
 
 #[tokio::test]
@@ -551,8 +606,8 @@ fn a_source_slot_is_given_back_and_leaves_nothing_behind() {
     assert!(counts.lock().unwrap().is_empty());
 }
 
-/// A client that keeps sending after its answer, and never closes, holds its place only for the
-/// linger: the next connection waits that long, and no longer.
+/// A client that keeps sending after its answer, and never closes, holds its place for the linger,
+/// and then the next connection is served.
 #[tokio::test]
 async fn a_lingering_connection_gives_its_place_back() {
     let linger = Duration::from_millis(300);
@@ -562,10 +617,11 @@ async fn a_lingering_connection_gives_its_place_back() {
         ..options()
     })
     .await;
+    // Before the answer, so before the linger begins, however slowly this runs.
+    let started = Instant::now();
     let mut first = answered_before_its_body(&server).await;
     let answer = read_to_close(&mut first).await;
     assert!(answer.ends_with("answered"), "{answer}");
-    let started = Instant::now();
     let sending = tokio::spawn(async move {
         while first.write_all(b"more").await.is_ok() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -576,7 +632,7 @@ async fn a_lingering_connection_gives_its_place_back() {
     second.write_all(REQUEST).await.unwrap();
     let answer = read_to_close(&mut second).await;
     assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
-    assert!(started.elapsed() >= linger / 2, "{:?}", started.elapsed());
+    assert!(started.elapsed() >= linger, "{:?}", started.elapsed());
     sending.abort();
 }
 
