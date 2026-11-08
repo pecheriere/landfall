@@ -153,7 +153,7 @@ the repository and in your copy, until N+1 is out.
    Then it asks you to type the version, with no flag to skip that, signs `v<version>` on that
    commit with git's signing key, checks the signature against the signers file, deletes the tag
    if it doesn't match, says what it pushes and pushes it. It signs with the key in your own copy
-   ("Once" step 7), which git reads as a public key file, so there is no flag for it; during a
+   ("Once" step 7), which it passes to git as `key::<type> <base64>`, so there is no flag for it; during a
    rotation that file holds two keys, so name the signing one with `--signing-key <path to a file
    holding it>` or `--signing-key "key::ssh-ed25519 <base64>"`, keeping the space. Before asking, it
    checks that your SSH agent offers that key: `SSH_AUTH_SOCK` has to reach the agent that holds the

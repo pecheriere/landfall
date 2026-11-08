@@ -192,9 +192,13 @@ class FakeRun:
     def __call__(self, args: Sequence[str]) -> subprocess.CompletedProcess:
         """Answer one command."""
         call = tuple(args)
-        if call[1:2] == ("-c",) and call[2].startswith("user.signingkey="):
-            self.signing_keys.append(call[2].removeprefix("user.signingkey="))
-            call = (call[0], *call[3:])
+        if (
+            call[1:5:2] == ("-c", "-c")
+            and call[2] == "gpg.format=ssh"
+            and "user.signingkey=" in call[4]
+        ):
+            self.signing_keys.append(call[4].removeprefix("user.signingkey="))
+            call = (call[0], *call[5:])
         self.calls.append(call)
         if "verify-tag" in call:
             return self.verified.get(call[-1], done(returncode=1, stderr="no such tag"))
@@ -323,7 +327,7 @@ class FlowTests(unittest.TestCase):
         """As `-c user.signingkey`, one argument, whatever it holds."""
         key = f"key::{KEY} with spaces"
         self.release(signing_key=key)
-        self.assertEqual(self.fake.signing_keys, [key])
+        self.assertEqual(self.fake.signing_keys, [f"key::{KEY}"])
 
     def test_a_key_with_a_control_character_is_refused(self) -> None:
         """A newline in a config value is never what was meant."""

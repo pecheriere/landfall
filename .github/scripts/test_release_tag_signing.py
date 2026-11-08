@@ -56,9 +56,10 @@ class SigningKeyTests(unittest.TestCase):
         return path
 
     def test_a_trusted_file_with_one_key_signs_by_default(self) -> None:
-        """Git gets the file's own path, which it reads as a public key file."""
+        """Git gets the key itself, not the file, so its comment lines can't matter."""
+        self.trusted = trusted_file(self, f"# one\n# two\n{KEY}\n# three\n")
         self.release()
-        self.assertEqual(self.fake.signing_keys, [str(self.trusted.absolute())])
+        self.assertEqual(self.fake.signing_keys, [f"key::{KEY}"])
         self.assertIn(AGENT, self.fake.calls)
 
     def test_two_trusted_keys_refuse_without_a_signing_key(self) -> None:
@@ -75,7 +76,7 @@ class SigningKeyTests(unittest.TestCase):
         self.fake.answers[AGENT] = done(f"{NEW_KEY}\n")
         path = self.key_file(f"{NEW_KEY} release\n")
         self.release(signing_key=str(path))
-        self.assertEqual(self.fake.signing_keys, [str(path)])
+        self.assertEqual(self.fake.signing_keys, [f"key::{NEW_KEY}"])
 
     def test_a_key_in_the_agent_among_others_is_found(self) -> None:
         """By type and base64, whatever the comment."""
@@ -115,7 +116,7 @@ class SigningKeyTests(unittest.TestCase):
             release_tag.release_tag(request, failing, self.owner.terminal())
 
     def test_an_explicit_path_is_used_and_its_key_checked_in_the_agent(self) -> None:
-        """The path goes to git as given; the agent must hold the key the file holds."""
+        """Git gets the key the file holds, which the agent must hold too."""
         path = self.key_file(f"{OTHER} mine\n")
         self.refused("SSH_AUTH_SOCK", signing_key=str(path))
         self.setUp()
@@ -124,13 +125,12 @@ class SigningKeyTests(unittest.TestCase):
         with self.assertRaisesRegex(release_tag.RefusedError, "isn't signed by a key"):
             self.fake.verified[f"refs/tags/{TAG}"] = done(returncode=1, stderr="no principal")
             self.release(signing_key=str(path))
-        self.assertEqual(self.fake.signing_keys, [str(path)])
+        self.assertEqual(self.fake.signing_keys, [f"key::{OTHER}"])
 
     def test_a_key_value_is_parsed_for_the_agent_check(self) -> None:
-        """`key::` then the key, with its space; git gets the value whole."""
-        value = f"key::{KEY}"
-        self.release(signing_key=value)
-        self.assertEqual(self.fake.signing_keys, [value])
+        """`key::` then the key, with its space; git gets it re-rendered without any comment."""
+        self.release(signing_key=f"key::{KEY} a comment")
+        self.assertEqual(self.fake.signing_keys, [f"key::{KEY}"])
         self.setUp()
         self.refused("SSH_AUTH_SOCK", signing_key=f"key::{OTHER}")
 
