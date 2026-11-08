@@ -1,10 +1,12 @@
 //! What reaches a terminal: text from the controller is hostile, so every string it sent is
 //! escaped before it is printed, in human output, in `--json` and on the error path.
 //!
-//! The escaped characters are those a terminal acts on or that reorder what it shows: C0
-//! controls, DEL, C1 controls (`U+009B` alone starts a CSI on many terminals), and the bidi
-//! and line controls: `U+061C`, `U+200E`, `U+200F`, `U+2028`, `U+2029`, `U+202A` to `U+202E`
-//! and `U+2066` to `U+2069`.
+//! The escaped characters are those a terminal acts on, that reorder what it shows, or that
+//! show as nothing: C0 controls, DEL, C1 controls (`U+009B` alone starts a CSI on many
+//! terminals), the bidi and line controls (`U+061C`, `U+200E`, `U+200F`, `U+2028`, `U+2029`,
+//! `U+202A` to `U+202E` and `U+2066` to `U+2069`), and the invisible ones (`U+00AD`, `U+200B`
+//! to `U+200D`, `U+2060` and `U+FEFF`), which could hide a character in a name. In human
+//! output a backslash is doubled too, so that hostile text can't pass for an escape.
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -16,32 +18,38 @@ use serde_json::ser::{Formatter, PrettyFormatter};
 #[cfg(test)]
 mod tests;
 
-/// Whether a terminal could act on `c`, or reorder what follows it, other than as text.
+/// Whether a terminal could act on `c`, reorder what follows it, or show it as nothing.
 fn is_dangerous(c: char) -> bool {
     matches!(
         c,
         '\u{0}'..='\u{1f}'
             | '\u{7f}'..='\u{9f}'
+            | '\u{ad}'
             | '\u{61c}'
-            | '\u{200e}'
-            | '\u{200f}'
+            | '\u{200b}'..='\u{200f}'
             | '\u{2028}'
             | '\u{2029}'
             | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
     )
 }
 
-/// `text` with every character [`is_dangerous`] says, other than those `keep` says, written
-/// as `\u{XX}`. Borrowed when there is none.
-fn escaped(text: &str, keep: impl Fn(char) -> bool) -> Cow<'_, str> {
-    let escape = |c: char| is_dangerous(c) && !keep(c);
+/// `text` for one line of a terminal: every character the module names, `\r` and `\n`
+/// included, as `\u{XX}`, and a backslash as `\\`, so that what looks like an escape is
+/// one. Borrowed when there is nothing to escape.
+#[must_use]
+pub fn safe(text: &str) -> Cow<'_, str> {
+    let escape = |c: char| c == '\\' || is_dangerous(c);
     if !text.chars().any(escape) {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len() + 8);
     for c in text.chars() {
-        if escape(c) {
+        if c == '\\' {
+            out.push_str("\\\\");
+        } else if is_dangerous(c) {
             // Writing to a String cannot fail.
             let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
         } else {
@@ -49,19 +57,6 @@ fn escaped(text: &str, keep: impl Fn(char) -> bool) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
-}
-
-/// `text` for one line of a terminal: every control, including `\r` and `\n`, and every bidi
-/// and line control, as `\u{XX}`.
-#[must_use]
-pub fn safe(text: &str) -> Cow<'_, str> {
-    escaped(text, |_| false)
-}
-
-/// [`safe`], keeping `\n`, for text that is several lines on purpose.
-#[must_use]
-pub fn safe_lines(text: &str) -> Cow<'_, str> {
-    escaped(text, |c| c == '\n')
 }
 
 /// The name `value` has on the wire, such as `not_found` or `token`, or `unknown` for one
@@ -73,8 +68,9 @@ pub(crate) fn wire_name<T: Serialize>(value: &T) -> String {
     }
 }
 
-/// Prints `value` as pretty JSON and a newline. `serde_json` already escapes C0 controls; DEL,
-/// C1 and the bidi and line controls are escaped too, as `\uXXXX`, so the output parses back
+/// Prints `value` as pretty JSON and a newline. `serde_json` already escapes C0 controls and
+/// the backslash; DEL, C1, the bidi and line controls and the invisible ones are escaped too,
+/// as `\uXXXX`, so the output parses back
 /// to the same value and a terminal acts on none of it.
 ///
 /// # Errors

@@ -10,7 +10,7 @@ use std::process::Command;
 
 use landfall_api::{ProblemCode, ReleaseBrief, ReleaseStatus};
 use serde_json::json;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::{ApiClient, ApiError, BODY_CAP};
@@ -108,34 +108,21 @@ async fn bearer_is_sent_when_there_is_a_token_and_not_otherwise() {
 }
 
 #[tokio::test]
-async fn query_and_body_are_sent() {
+async fn query_is_sent_encoded() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/approvals/7/cancel"))
-        .and(header("content-type", "application/json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"state": "cancelled"})))
-        .mount(&server)
-        .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/deployments"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
         .mount(&server)
         .await;
 
-    let client = client(&server, Some(TOKEN));
-    let answer = client
-        .post("/api/v1/approvals/7/cancel", &json!({"reason": "x"}))
-        .await
-        .unwrap();
-    assert_eq!(answer, json!({"state": "cancelled"}));
-    client
+    client(&server, Some(TOKEN))
         .get("/api/v1/deployments", &[("limit", "10"), ("cursor", "a&b")])
         .await
         .unwrap();
 
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests[0].body, br#"{"reason":"x"}"#);
-    assert_eq!(requests[1].url.query(), Some("limit=10&cursor=a%26b"));
+    assert_eq!(requests[0].url.query(), Some("limit=10&cursor=a%26b"));
 }
 
 #[tokio::test]

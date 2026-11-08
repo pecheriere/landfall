@@ -108,9 +108,9 @@ passkey approvals. Agents drive it through a typed API. Design:
   install` has its own `--controller`, and `run_with`, the library entry, which prints every
   failure through `display::safe`), `settings` (where the controller is and which token goes
   to it: flags, then the environment, then `cli.toml`; the token never in argv, a token file
-  regular, not a link and its owner's alone), `api_client` (`/api/v1` with the token: no
+  regular, not a link, owned by the user and theirs alone), `api_client` (`/api/v1` with the token: no
   proxy from the environment, no redirect followed, bodies capped, `ApiError` and its exit
-  status), `display` (`safe`, `safe_lines` and `write_json`, which escape controls and bidi
+  status), `display` (`safe` and `write_json`, which escape controls, bidi and invisible
   characters in whatever the controller sent before a terminal sees it), `whoami` (`landfall
   whoami`), `verify` (`landfall verify`), `access` (the trust root's cache and the
   operator's token), `project` (what landfall trusts about its own releases: its

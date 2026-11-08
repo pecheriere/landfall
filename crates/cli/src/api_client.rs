@@ -13,7 +13,6 @@ use landfall_core::controller_url::ControllerUrl;
 use landfall_core::protocol::PROBLEM_CONTENT_TYPE;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode, redirect};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -90,25 +89,6 @@ impl ApiClient {
             url.query_pairs_mut().extend_pairs(query);
         }
         self.send(self.http.get(url)).await
-    }
-
-    /// `POST path` with `body` as JSON, and the body of its answer.
-    ///
-    /// # Errors
-    ///
-    /// An [`ApiError`] for anything but a success with a JSON body within the cap.
-    pub async fn post<B: Serialize>(
-        &self,
-        path: &str,
-        body: &B,
-    ) -> Result<serde_json::Value, ApiError> {
-        let body = serde_json::to_vec(body).map_err(ApiError::Parse)?;
-        let request = self
-            .http
-            .post(self.controller.join(path))
-            .header(CONTENT_TYPE, "application/json")
-            .body(body);
-        self.send(request).await
     }
 
     /// `value` as one of the API's types. Fields and values from a newer controller are
@@ -245,7 +225,7 @@ pub enum ApiError {
     /// has no query and no credentials.
     #[error("cannot reach the controller")]
     Network(#[source] reqwest::Error),
-    /// The answer isn't the JSON this CLI reads, or a body couldn't be written.
+    /// The answer isn't the JSON this CLI reads.
     #[error("the controller's answer is not one this CLI can read")]
     Parse(#[source] serde_json::Error),
 }
