@@ -684,7 +684,9 @@ the script for longer than that, the next step opens another, with the same line
 once more. Take that line as your cue, as `ssh` itself may say nothing of a key waiting for a touch
 here. The connection's socket is in a private directory in `/tmp`, which goes when `landfall` ends. If
 `landfall` was killed that directory stays, with nothing in it worth keeping, and the connection ends
-by itself within 60 s.
+by itself within 60 s. Asking the connection whether it's still there, or to close, goes to its socket
+and nowhere else: those two calls have `ProxyCommand=false` ahead of yours, as `ssh` would otherwise
+log in by itself to ask a connection that dies just then, and take that login for an answer.
 
 **`sudo`:** all of it runs as one `sudo sh -c '<script>'`, with the script as an argument, so that no
 file a login can write is run as root. Already root, it runs without `sudo`. At a terminal `sudo` may
