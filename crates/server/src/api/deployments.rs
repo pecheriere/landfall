@@ -28,7 +28,7 @@ use super::openapi::{
 };
 use super::query::{ApiQuery, Cursor, CursorList, DeploymentPath, Limit, NoQuery};
 use super::releases;
-use super::visible::{shown_deployment, viewable};
+use super::visible::{shown_deployment, viewable, viewable_deployments};
 use crate::agent_api::ApiState;
 use crate::auth::{HumanProblem, Principal, can, sees};
 use crate::store::StoredRequest;
@@ -139,7 +139,7 @@ pub(super) fn host_said<'a>(
 }
 
 /// What every deployment's summary is read from, read once for a whole answer.
-struct Facts {
+pub(super) struct Facts {
     running: HashMap<DeploymentId, RunningRow>,
     open: Vec<StoredRequest>,
     /// Each deployment's newest release and where it stands, if it has one.
@@ -149,7 +149,7 @@ struct Facts {
 impl Facts {
     /// What the hosts last said about `deployments`, the open requests, `open`, and each
     /// one's newest release.
-    async fn of(
+    pub(super) async fn of(
         state: &ApiState,
         principal: &Principal,
         deployments: &[&Deployment],
@@ -202,7 +202,7 @@ fn waiting(
     (request.map(|request| request.id), needs_you)
 }
 
-fn summary(
+pub(super) fn summary(
     config: &Config,
     principal: &Principal,
     deployment: &Deployment,
@@ -261,10 +261,7 @@ async fn list(
         .transpose()?;
     let limit = Limit::or_default(query.limit);
     let open = open_requests(&state).await?;
-    let mut shown: Vec<&Deployment> = config
-        .deployments()
-        .iter()
-        .filter(|d| can(config, &principal, d.id(), Permission::View))
+    let mut shown: Vec<&Deployment> = viewable_deployments(config, &principal)
         .filter(|d| query.host.as_ref().is_none_or(|host| d.host() == host))
         .filter(|d| {
             query

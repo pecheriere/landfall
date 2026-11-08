@@ -105,6 +105,15 @@ impl TagPath {
     }
 }
 
+/// A host, by its id.
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Path)]
+pub(crate) struct HostPath {
+    /// The host's id.
+    #[param(example = "home-1")]
+    pub(crate) host: String,
+}
+
 /// A row by its number.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Path)]
@@ -117,13 +126,13 @@ pub(crate) struct IdPath {
 impl IdPath {
     /// The number, if the path writes one the one way it can be written.
     pub(crate) fn number(&self) -> Option<i64> {
-        request_number(&self.id)
+        id_number(&self.id)
     }
 }
 
-/// A number as a path has it: plain digits with no leading zero, so that one row has one
-/// path.
-fn request_number(raw: &str) -> Option<i64> {
+/// A row's number as a path or a cursor has it: plain digits with no leading zero, so that
+/// one row has one path.
+pub(super) fn id_number(raw: &str) -> Option<i64> {
     let canonical = !raw.starts_with('0') && raw.bytes().all(|b| b.is_ascii_digit());
     canonical.then(|| raw.parse().ok()).flatten()
 }

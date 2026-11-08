@@ -20,6 +20,14 @@ const DRIFT_REASON: &str = "the running state differs from what the agent deploy
 /// Why a request made for another running digest can't be approved any more.
 const RUNNING_MOVED: &str = "the running digest moved after the request was made";
 
+/// Why a report was refused, in the controller's own words, which name nothing: the reasons
+/// of a `report_refused` row the API may show. Its other reason names what the report claimed.
+pub(crate) const REPORT_REFUSALS: [&str; 3] =
+    [NO_SUCH_DEPLOY, ANOTHER_HOSTS_DEPLOY, NOT_HANDED_OUT];
+const NO_SUCH_DEPLOY: &str = "no such deploy";
+const ANOTHER_HOSTS_DEPLOY: &str = "another host's deploy";
+const NOT_HANDED_OUT: &str = "never handed out";
+
 /// How often an unchanged report is noted, seconds: a poll costs no write beyond it.
 const REPORT_NOTE_EVERY_SECS: i64 = 60;
 
@@ -283,7 +291,7 @@ impl Store {
             Err(_) => None,
         };
         let Some(row) = row else {
-            let refused = refused_report(host, report.deploy_id, None, "no such deploy");
+            let refused = refused_report(host, report.deploy_id, None, NO_SUCH_DEPLOY);
             self.append(&mut tx, &refused).await?;
             tx.commit().await?;
             return Err(StoreError::UnknownDeploy);
@@ -294,7 +302,7 @@ impl Store {
                 host,
                 report.deploy_id,
                 Some(deployment),
-                "another host's deploy",
+                ANOTHER_HOSTS_DEPLOY,
             );
             self.append(&mut tx, &refused).await?;
             tx.commit().await?;
@@ -315,7 +323,7 @@ impl Store {
             "claimed" => {}
             "queued" => {
                 let refused =
-                    refused_report(host, report.deploy_id, Some(deployment), "never handed out");
+                    refused_report(host, report.deploy_id, Some(deployment), NOT_HANDED_OUT);
                 self.append(&mut tx, &refused).await?;
                 tx.commit().await?;
                 return Err(StoreError::NotClaimed);

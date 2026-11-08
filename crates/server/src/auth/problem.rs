@@ -51,6 +51,8 @@ pub(crate) enum HumanProblem {
     OverBudget,
     /// This credential has made too many reads.
     ReadsOverBudget,
+    /// An audit page over more deployments and hosts than one query reads.
+    AuditTooWide,
     /// An invite's code that is wrong, used or expired: the same answer for every way of that.
     InviteRefused,
     /// A registration with a good code whose ceremony didn't check out.
@@ -164,6 +166,7 @@ impl HumanProblem {
             Self::ApprovalsNotConfigured
             | Self::OverBudget
             | Self::ReadsOverBudget
+            | Self::AuditTooWide
             | Self::InviteRefused
             | Self::RegistrationRefused
             | Self::SignInRefused
@@ -174,7 +177,8 @@ impl HumanProblem {
     }
 
     /// The same, for what registering and signing in refuse, approving too when nothing is
-    /// configured for it, and for budgets. `None` for anything else.
+    /// configured for it, for budgets, and for the bound on an audit page. `None` for anything
+    /// else.
     fn ceremony_parts(self) -> Option<(StatusCode, ProblemCode, &'static str)> {
         Some(match self {
             Self::ApprovalsNotConfigured => (
@@ -191,6 +195,12 @@ impl HumanProblem {
                 StatusCode::TOO_MANY_REQUESTS,
                 ProblemCode::RateLimited,
                 "too many reads by this credential",
+            ),
+            Self::AuditTooWide => (
+                StatusCode::BAD_REQUEST,
+                ProblemCode::BadRequest,
+                "this audit page would read too many deployments and hosts at once; filter it by \
+                 deployment or host",
             ),
             Self::InviteRefused => (
                 StatusCode::FORBIDDEN,

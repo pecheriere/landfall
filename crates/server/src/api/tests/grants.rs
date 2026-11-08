@@ -52,6 +52,31 @@ fn prod_release(_: &World) -> String {
     "/api/v1/deployments/app/prod/releases/v1.3.0".to_owned()
 }
 
+fn prod_deploys(_: &World) -> String {
+    "/api/v1/deployments/app/prod/deploys".to_owned()
+}
+
+fn the_deploy(world: &World) -> String {
+    format!("/api/v1/deploys/{}", world.deploy)
+}
+
+fn why_the_deploy(world: &World) -> String {
+    format!("/api/v1/deploys/{}/why", world.deploy)
+}
+
+fn hosts(_: &World) -> String {
+    "/api/v1/hosts".to_owned()
+}
+
+/// The host of `app/prod` and `app/staging`, where [`OUTSIDER`] views nothing.
+fn home_1(_: &World) -> String {
+    "/api/v1/hosts/home-1".to_owned()
+}
+
+fn audit(_: &World) -> String {
+    "/api/v1/audit".to_owned()
+}
+
 fn prod_requests(_: &World) -> String {
     "/api/v1/deployments/app/prod/requests".to_owned()
 }
@@ -128,6 +153,48 @@ pub(super) const CASES: &[Case] = &[
         role: "view",
         method: Method::GET,
         path: prod_release,
+        body: None,
+    },
+    Case {
+        operation: "listDeploys",
+        role: "view",
+        method: Method::GET,
+        path: prod_deploys,
+        body: None,
+    },
+    Case {
+        operation: "getDeploy",
+        role: "view",
+        method: Method::GET,
+        path: the_deploy,
+        body: None,
+    },
+    Case {
+        operation: "whyDeploy",
+        role: "view",
+        method: Method::GET,
+        path: why_the_deploy,
+        body: None,
+    },
+    Case {
+        operation: "listHosts",
+        role: ANYONE,
+        method: Method::GET,
+        path: hosts,
+        body: None,
+    },
+    Case {
+        operation: "getHost",
+        role: "view",
+        method: Method::GET,
+        path: home_1,
+        body: None,
+    },
+    Case {
+        operation: "listAudit",
+        role: ANYONE,
+        method: Method::GET,
+        path: audit,
         body: None,
     },
     Case {

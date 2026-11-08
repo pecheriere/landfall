@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::{
     CommitSource, CommitsState, CommitsView, Decision, DeployState, DeploymentRef, IntentView,
     NewApproval, NewRequest, NextKind, Outcome, Permission, Problem, ProblemCode, PromotionView,
-    ReleaseStatus, RequestState, Via,
+    ReleaseStatus, RequestState, Via, WhyKind,
 };
 
 fn intent(expected_running: Option<&str>) -> DeployIntent {
@@ -120,6 +120,7 @@ fn release_values_from_a_newer_controller_read_as_unknown_and_are_never_sent() {
     unknown("guessed", &CommitsState::Unknown);
     unknown("vanished", &DeployState::Unknown);
     unknown("exploded", &Outcome::Unknown);
+    unknown("teleported", &WhyKind::Unknown);
 }
 
 #[test]

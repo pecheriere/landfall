@@ -1,5 +1,7 @@
 mod approvals_migration;
+mod audit_page;
 mod commit_ranges_migration;
+mod deploy_history;
 mod latest_releases;
 mod read_only;
 
@@ -498,7 +500,7 @@ async fn migrations_run_on_an_empty_file_and_are_idempotent() {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-    assert_eq!(applied, 7);
+    assert_eq!(applied, 8);
     assert_eq!(chain(&store).await, (2, None));
 }
 

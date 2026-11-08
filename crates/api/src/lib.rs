@@ -10,16 +10,22 @@
 //! The `openapi` feature derives each type's OpenAPI schema. Core identifiers appear as
 //! themselves, validated when they are read, and as strings in the schema.
 
+mod audit;
 mod deployments;
+mod deploys;
+mod hosts;
 mod page;
 mod problem;
 mod releases;
 mod requests;
 
+pub use audit::AuditEntry;
 pub use deployments::{
     DeploymentRef, DeploymentSummary, DeploymentView, GrantView, HoldView, MeView, Permission,
     PromotionView, ReleaseBrief, ReleaseStatus, RuleView, RunningView, Via,
 };
+pub use deploys::{DeployView, StepView, Why, WhyEvent, WhyKind};
+pub use hosts::{HostView, HostsView};
 pub use page::Page;
 pub use problem::{Problem, ProblemCode};
 pub use releases::{

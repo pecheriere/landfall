@@ -68,6 +68,14 @@ only what they may see.
 | `whoAmI` | any | the same |
 | `listDeployments` | any, filtered by `view` | the same |
 | `getDeployment` | `view` | `view` |
+| `listReleases` | `view` | `view` |
+| `getRelease` | `view` | `view` |
+| `listDeploys` | `view` | `view` |
+| `getDeploy` | `view` | `view` |
+| `whyDeploy` | `view` | `view` |
+| `listHosts` | any, filtered by `view` | the same |
+| `getHost` | `view` | `view` |
+| `listAudit` | any, filtered by `view` | the same |
 | `requestDeploy` | `request`, `rollback` | `request`, `rollback` |
 | `approveRequest` | never | `approve` |
 | `cancelRequest` | `requester`, `rollback` | `requester`, `approve`, `rollback` |
@@ -217,6 +225,127 @@ again from its new commit, and two deployments of one repository share one list.
   Only releases first recorded after the controller was upgraded to this version are compared:
   nothing is fetched for the history it already had.
 
+## Deploys, and why each ended as it did
+
+`listDeploys` (`GET /api/v1/deployments/{name}/{stage}/deploys`) lists a deployment's deploys,
+newest first, a page at a time. `getDeploy` (`GET /api/v1/deploys/{id}`) is one deploy: the
+release sent (`tag`, `digest`, `commit`) and to which `host`, its `state` (`queued`, `claimed` or
+`finished`) and `outcome`, its host's `reason` and `rollback_reason`, the `request` it came from
+and who signed it (`approved_by`), both `null` for one the controller queued by itself, when it
+was queued, taken and finished, and its `steps`. Each step has its position, its name, how long
+it took, its `failure`, and its `detail` as the controller stored it, bounded: for checks, each
+check with its attempts and milliseconds; for a backup, what it copied. A list gives every
+deploy's steps too.
+
+`whyDeploy` (`GET /api/v1/deploys/{id}/why`) says why a deploy ended as it did, or where it
+stands if it hasn't:
+
+- `events`, in time order: who asked (`requested`) and who signed (`approved`), for a deploy
+  that came from a request, then `queued`, `claimed`, each step (`step`, or `step_failed` with
+  its failure), and how it ended: `rolled_back`, `rollback_failed`, `host_refused`, `deferred`,
+  or `finished` for a deploy that runs, changed nothing, or failed with nothing to go back to.
+  A step has no time of its own, so its `at` is `null`;
+- `summary`, one sentence to act on, naming the tag and the host;
+- `next`, the one thing to do: `request` a newer release, or a retry, which an approver signs,
+  after a rollback or a failure with nothing to go back to; `recover`, with
+  `landfall-agent recover` on the host, after a failed rollback; `fix_host` after a refusal,
+  quoting the host's reason, since a host refusing what the controller sent it is an alert;
+  `wait` while it is queued or claimed, after the host said not now, or after it changed
+  nothing; `none` once it runs.
+
+An `outcome` of `null` on a deploy whose `state` is `finished` is an outcome this controller
+can't read, recorded by a newer one: the deploy is still listed and shown, here and in a
+release's story, and `why` says it can't explain it. The controller never sends an outcome
+name its own document doesn't list.
+
+A step's name and failure, and a host's reasons, are the host's words, quoted when they were
+stored, and `events` and `summary` quote them: escape them before showing them.
+
+A deploy's `host` is the host it was sent to, named only to a principal who may see that host,
+as `getHost` and the audit log show hosts: through a deployment on it now that they may view.
+A deploy made before its deployment moved to another host can have gone to a host they can't
+see; its `host` is then `null`, and `why` says "a host you can't view".
+
+Seeing a deploy takes `view` on its deployment. With no grant there, a deploy is the same
+`404 not_found` as a number no deploy has, and with some other grant it is `403 forbidden`. A
+deploy of a deployment the configuration no longer has is `404` to everyone, as is that
+deployment's list, whatever the database still holds of it.
+
+## Hosts and the audit log
+
+There is no grant on a host or on the audit log: both are seen through the deployments a
+principal may view.
+
+`listHosts` (`GET /api/v1/hosts`) lists, by id, each host the configuration puts a deployment
+on that the principal may view, and `getHost` (`GET /api/v1/hosts/{host}`) is one of them. A
+host shows only those deployments, each as `listDeployments` shows it, and never one the
+principal can't view. It says when it enrolled (`enrolled_at`, `null` if it never has), whether
+its configuration differs from the controller's (`config_drift`), and when it last reported
+(`last_report`): the newest report among the deployments shown, so it says nothing of when the
+host last spoke of one the principal can't view. A host with no deployment the principal holds
+a grant on is `404 not_found`, the same as a host no deployment names; with some other grant on
+a deployment there and no `view`, `403 forbidden`.
+
+`listAudit` (`GET /api/v1/audit`) is the audit log, newest first, a page at a time, holding:
+
+- each row about a deployment the principal may view, whatever its kind;
+- each row about a host alone, with no deployment, whose kind is `host_enrolled` or
+  `config_drift`, where the principal may view a deployment the configuration puts on that host.
+  Other rows about a host alone, such as `enrol_code_issued`, `enrol_refused` (which can name
+  another host) and a `report_refused` with no deployment, stay on the controller;
+- never a row about neither: API tokens, passkeys, sign-ins and throttling. No grant covers
+  them, and a stolen token is the threat they would serve. `landfall-server audit show` reads
+  them on the controller.
+
+A deployment the configuration no longer has is in no one's view, so its rows aren't listed,
+whatever the database still holds. Each entry has its `seq`, its time, its `kind`, the
+`deployment` and `host` it is about, and its `detail`. There is no hash:
+`landfall-server audit verify` checks the chain.
+
+A row stays as it was written, and some rows hold words that name another deployment or host:
+the watcher's reason for a release that waits for promotion names the deployment it waits on,
+and a refused report names what the report claimed. So an entry never shows a row as stored:
+
+- `host` is `null` unless the principal may see that host, by the rule `getHost` follows: a
+  host's own rows are only listed then, but a deployment's row can name another host, such as one
+  that signed a report of a deploy that wasn't its own, or the host the deployment was on before;
+- `detail` holds only the fields its kind lists, and drops anything else the row holds. A kind
+  with no list shows `{}`, and so does a kind this controller doesn't know, whose name is then
+  quoted;
+- a deployment a detail names, as a request's end does, is shown as a promotion's is:
+  `{"deployment": "app/prod"}`, or `{"deployment": null, "unseen": true}` for one the principal
+  can't view. A host it names is `null` unless they may see it;
+- free text is shown where its writer can't name another deployment or host: what a host said
+  of its own deploy, why verifying or fetching the deployment's own releases failed, why a request
+  ended or was refused. A `rule_decision`'s reason is said again in the rule's own words when it
+  is one of them, and is left out otherwise, as when the release waits for promotion: its
+  `decision` says `manual`, and the deployment's view and the release's story say where it waits
+  as the principal may be told. A `report_refused` row shows its reason only when it is one of
+  the controller's own that name nothing: `no such deploy`, `another host's deploy`, `never
+  handed out`.
+
+Rows of `request_refused`, `approval_refused` and `cancel_refused` name who was refused, in
+`by`: the principal, how they proved it, and the id of their token if they used one, never the
+token. That includes a principal with no grant on the deployment at all, whom the deployment's
+viewers should know is trying (spec 8.3). `deploy_requested` names who asked the same way.
+
+A detail that isn't a JSON object, which only someone editing the database writes, reads
+`{"unreadable": "..."}`, its first 256 characters quoted, rather than failing the page. A detail
+holds text from hosts and GitHub: escape it before showing it.
+
+`deployment`, `host` and `kind` narrow the page. `host` is the host's own rows and those of the
+deployments the configuration puts on it. `kind` must be a name the log uses, such as
+`deploy_queued`, or the request is `400 bad_request`. A `deployment` or `host` the principal
+can't see gives an empty page, never `403` or `404`, so a filter says nothing of what exists.
+What the principal may see is applied in the query, before the page is cut, so a page is never
+short and a cursor can't reach a row outside it. The query reads each deployment and each host's
+two kinds from an index of its own, at most 400 at once: a principal who may view more is
+refused with `400 bad_request` and asked to filter by `deployment` or `host`.
+
+Sequence numbers, like deploy and request numbers, are shared by the whole controller, so a gap
+between two rows a principal sees is activity they can't see. That is accepted: it tells them
+how much happened, never what.
+
 ## Refusals
 
 Every answer that isn't a success is `application/problem+json` (RFC 9457):
@@ -252,8 +381,9 @@ A cursor is opaque: it belongs to the list that gave it, and one from another li
 was changed, is refused with `400 bad_request`. A page is never short of what the principal
 may see: what they may not see is left out before the page is cut, not after.
 
-`listDeployments` is paged in order of deployment id, and `listReleases` in order of version. `listApprovals` isn't paged, as the
-configuration bounds it: a deployment has at most one open request.
+`listDeployments` is paged in order of deployment id, `listReleases` in order of version, and
+`listDeploys` and `listAudit` newest first. `listApprovals` and `listHosts` aren't paged, as
+the configuration bounds them: a deployment has at most one open request, and one host.
 
 ## Versions
 

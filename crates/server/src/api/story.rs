@@ -176,7 +176,7 @@ fn explained(status: ReleaseStatus, reasons: Vec<String>, next: NextAction) -> S
 }
 
 /// `what`, and the stored words after it when there are any.
-fn with_reason(what: &str, reason: &str) -> String {
+pub(super) fn with_reason(what: &str, reason: &str) -> String {
     if reason.is_empty() {
         what.to_owned()
     } else {

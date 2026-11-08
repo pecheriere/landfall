@@ -37,6 +37,7 @@ pub use self::agent::NONCE_LIFETIME_SECS;
 pub use self::ceremonies::SESSION_LIFETIME_SECS;
 pub(crate) use self::ceremonies::{NewPasskey, Redeemed};
 pub use self::commits::{CommitRange, NewRange, RangeState, WantedRange};
+pub(crate) use self::deploys::REPORT_REFUSALS;
 pub use self::deploys::{NewDeploy, ReportAck, WorkPick};
 pub use self::releases::{
     FinishedDeploy, Hold, REPORT_FRESH_SECS, ReleaseDecision, Seen, StoredRelease, WatchView,
@@ -275,6 +276,11 @@ fn migrator() -> Migrator {
             7,
             "latest_releases",
             include_str!("../migrations/0007_latest_releases.sql"),
+        ),
+        migration(
+            8,
+            "audit_indexes",
+            include_str!("../migrations/0008_audit_indexes.sql"),
         ),
     ])
 }
@@ -525,19 +531,7 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned();
-        let mut read = Vec::with_capacity(rows.len());
-        for row in rows.iter().rev() {
-            read.push(AuditRow {
-                seq: row.try_get(0)?,
-                ts: row.try_get(1)?,
-                kind: text(row.try_get(2)?),
-                deployment: row.try_get::<Option<Vec<u8>>, _>(3)?.map(text),
-                host: row.try_get::<Option<Vec<u8>>, _>(4)?.map(text),
-                detail: text(row.try_get(5)?),
-            });
-        }
-        Ok(read)
+        rows.iter().rev().map(views::audit_row).collect()
     }
 
     /// Moves everything from the WAL into the main file, so copying that file

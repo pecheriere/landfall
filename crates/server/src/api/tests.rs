@@ -1,15 +1,20 @@
 //! `/api/v1` through the controller's real router, on an in-memory store seeded through the
 //! store's own functions.
 
+mod audit;
+mod audit_detail;
 mod deployments;
+mod deploys;
 mod document;
 mod grants;
+mod hosts;
 mod promotions;
 mod query;
 mod reads;
 mod releases;
 mod schemas;
 mod story;
+mod why;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,13 +28,14 @@ use landfall_approval::{Ceremony, SoftwareAuthenticator};
 use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, HostId, ImageDigest, PrincipalId, ReleaseTag};
 use landfall_core::intent::DeployIntent;
-use landfall_core::protocol::{DeployedRelease, Phase, RunningState};
+use landfall_core::protocol::{DeployReportBody, DeployedRelease, Phase, RunningState};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 use crate::agent_api::{ApiState, Limits};
 use crate::auth::{ApiToken, SessionToken};
-use crate::store::{ManualClock, NewRequest, ReleaseDecision, Seen, Store};
+use crate::report::BoundedReport;
+use crate::store::{ManualClock, NewDeploy, NewRequest, ReleaseDecision, Seen, Store};
 
 /// `operator` may view `app/prod` and ask for its releases, and is its approver by key, with
 /// no grant to approve.
@@ -206,6 +212,9 @@ pub(super) const FLEET_VIEWER: &str = "fleet-viewer";
 /// Who holds `view` on `app/beta`, and not on `app/canary`, which promotes to it.
 pub(super) const BETA_VIEWER: &str = "beta-viewer";
 
+/// Who holds `view` on `app/staging`, and no grant on `app/prod`.
+pub(super) const STAGING_VIEWER: &str = "staging-viewer";
+
 const WORLD_ORIGIN: &str = "https://landfall.example.com";
 const WORLD_RP_ID: &str = "landfall.example.com";
 
@@ -240,8 +249,8 @@ fn world_digest(fill: char) -> ImageDigest {
         .unwrap()
 }
 
-/// `app/prod`, `app/staging`, `app/other`, `app/canary` and `app/beta`, all on `home-1`,
-/// with `app/canary` promoting to `app/beta` after an hour. Every holder of a set of grants
+/// `app/prod`, `app/staging`, `app/canary` and `app/beta` on `home-1`, and `app/other` on
+/// `home-2`, with `app/canary` promoting to `app/beta` after an hour. Every holder of a set of grants
 /// has it on `app/prod` and `app/staging`, and each holder of `approve` is an approver of
 /// every deployment by key.
 fn world_config(keys: &HashMap<String, SoftwareAuthenticator>) -> String {
@@ -262,19 +271,19 @@ fn world_config(keys: &HashMap<String, SoftwareAuthenticator>) -> String {
     let promotion = "promote_to = { deployment = \"app/beta\", healthy_for = \"1h\" }\n";
     sections.extend(
         [
-            (1, "prod", ""),
-            (2, "staging", ""),
-            (3, "other", ""),
-            (4, "canary", promotion),
-            (4, "beta", ""),
+            (1, "prod", "home-1", ""),
+            (2, "staging", "home-1", ""),
+            (3, "other", "home-2", ""),
+            (4, "canary", "home-1", promotion),
+            (4, "beta", "home-1", ""),
         ]
-        .map(|(repo, stage, extra)| {
+        .map(|(repo, stage, host, extra)| {
             format!(
                 r#"
 [[deployment]]
 id = "app/{stage}"
 repo = {{ name = "example/app", id = {repo}, owner_id = 9 }}
-host = "home-1"
+host = "{host}"
 compose = {{ dir = "/srv/{stage}", service = "app" }}
 origin = {{ workflow = ".github/workflows/release.yml", tags = "v*", signed_tags = false }}
 rule = {{ auto = "patch", approve = "minor", approvers = [{listed}] }}
@@ -300,6 +309,7 @@ checks = ["container-healthy"]
     sections.push(grant(CANARY_VIEWER, &["app/canary"], &["view"]));
     sections.push(grant(FLEET_VIEWER, &["app/canary", "app/beta"], &["view"]));
     sections.push(grant(BETA_VIEWER, &["app/beta"], &["view"]));
+    sections.push(grant(STAGING_VIEWER, &["app/staging"], &["view"]));
     sections.concat()
 }
 
@@ -321,17 +331,74 @@ pub(super) enum Caller<'a> {
     Session(&'a str),
 }
 
+/// A token and a session for each principal, by name.
+pub(super) struct Credentials {
+    pub(super) tokens: HashMap<String, ApiToken>,
+    pub(super) sessions: HashMap<String, SessionToken>,
+}
+
+impl Credentials {
+    /// A new token and an hour's session for each of `names`.
+    pub(super) async fn issue(store: &Store, names: &[impl AsRef<str>]) -> Self {
+        let mut tokens = HashMap::new();
+        let mut sessions = HashMap::new();
+        for name in names {
+            let name = name.as_ref();
+            let (_, token) = store.create_token(&name.parse().unwrap()).await.unwrap();
+            tokens.insert(name.to_owned(), token);
+            sessions.insert(
+                name.to_owned(),
+                store.begin_session_for_test(name, 3600).await,
+            );
+        }
+        Self { tokens, sessions }
+    }
+
+    /// What `router` answers to `method` on `path` from `caller`, with `body` as JSON if any.
+    pub(super) async fn send(
+        &self,
+        router: &Router,
+        method: Method,
+        path: &str,
+        caller: Caller<'_>,
+        body: Option<String>,
+    ) -> Answer {
+        let mut request = Request::builder().method(method).uri(path);
+        match caller {
+            Caller::Nobody => {}
+            Caller::Token(name) => {
+                let token = self.tokens[name].reveal();
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            Caller::Session(name) => {
+                let session = self.sessions[name].reveal();
+                request = request
+                    .header(header::COOKIE, format!("__Host-landfall-session={session}"))
+                    .header(header::ORIGIN, WORLD_ORIGIN);
+            }
+        }
+        if body.is_some() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        let body = body.map_or_else(Body::empty, Body::from);
+        answer(router, request.body(body).unwrap()).await
+    }
+}
+
 /// A controller in a known state, which only grants decide `requestDeploy` on `app/prod`:
 ///
 /// - `app/prod` runs `v1.2.0`, and `v1.3.0` above it and `v1.1.0` below it are verified. It
 ///   has no open request and no promotion.
 /// - `app/staging` runs `v2.0.0`, `v2.1.0` is verified, and [`REQUESTER`] has asked for it:
 ///   the open request `approveRequest` and `cancelRequest` act on.
-/// - `app/other` has nothing, and [`OUTSIDER`] may view it.
+/// - `app/other`, on `home-2`, has nothing, and [`OUTSIDER`] may view it: no deployment on
+///   `home-1`.
 /// - `app/canary` runs `v3.0.0` and promotes to `app/beta`, which has nothing. Neither is
 ///   `app/prod`, where a promotion would answer `requestDeploy` with `promotion_pending`.
 ///   [`CANARY_VIEWER`] may view `app/canary` alone, [`FLEET_VIEWER`] both, and [`BETA_VIEWER`]
 ///   `app/beta` alone.
+/// - `app/prod` deployed `v1.1.0` before, by itself: the finished deploy `deploy`, with its
+///   steps and checks. [`STAGING_VIEWER`] may view `app/staging` alone.
 ///
 /// Every principal has a token and a session. Time stands still until a test moves `clock`.
 pub(super) struct World {
@@ -339,11 +406,12 @@ pub(super) struct World {
     pub(super) state: ApiState,
     pub(super) store: Store,
     pub(super) clock: Arc<ManualClock>,
-    pub(super) tokens: HashMap<String, ApiToken>,
-    pub(super) sessions: HashMap<String, SessionToken>,
+    pub(super) credentials: Credentials,
     keys: HashMap<String, SoftwareAuthenticator>,
     /// The open request on `app/staging`.
     pub(super) request: (i64, DeployIntent),
+    /// The finished deploy of `v1.1.0` on `app/prod`.
+    pub(super) deploy: i64,
 }
 
 impl World {
@@ -391,6 +459,13 @@ impl World {
             .await
             .unwrap();
         let request = open_request(&store).await;
+        let deploy = run_deploy(
+            &store,
+            ("app/prod", "v1.1.0", '1'),
+            &json!({ "kind": "deployed" }),
+            &deployed_steps(),
+        )
+        .await;
         let mut names: Vec<String> = grant_sets().iter().map(|roles| holder(roles)).collect();
         names.extend(
             [
@@ -399,28 +474,20 @@ impl World {
                 CANARY_VIEWER,
                 FLEET_VIEWER,
                 BETA_VIEWER,
+                STAGING_VIEWER,
             ]
             .map(ToOwned::to_owned),
         );
-        let mut tokens = HashMap::new();
-        let mut sessions = HashMap::new();
-        for name in names {
-            let (_, token) = store.create_token(&name.parse().unwrap()).await.unwrap();
-            tokens.insert(name.clone(), token);
-            sessions.insert(
-                name.clone(),
-                store.begin_session_for_test(&name, 3600).await,
-            );
-        }
+        let credentials = Credentials::issue(&store, &names).await;
         Self {
             app: crate::router(state.clone()),
             state,
             store,
             clock,
-            tokens,
-            sessions,
+            credentials,
             keys,
             request,
+            deploy,
         }
     }
 
@@ -432,25 +499,9 @@ impl World {
         caller: Caller<'_>,
         body: Option<String>,
     ) -> Answer {
-        let mut request = Request::builder().method(method).uri(path);
-        match caller {
-            Caller::Nobody => {}
-            Caller::Token(name) => {
-                let token = self.tokens[name].reveal();
-                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-            }
-            Caller::Session(name) => {
-                let session = self.sessions[name].reveal();
-                request = request
-                    .header(header::COOKIE, format!("__Host-landfall-session={session}"))
-                    .header(header::ORIGIN, WORLD_ORIGIN);
-            }
-        }
-        if body.is_some() {
-            request = request.header(header::CONTENT_TYPE, "application/json");
-        }
-        let body = body.map_or_else(Body::empty, Body::from);
-        answer(&self.app, request.body(body).unwrap()).await
+        self.credentials
+            .send(&self.app, method, path, caller, body)
+            .await
     }
 
     /// The body of an approval of the open request, signed by `name`'s passkey as the
@@ -551,4 +602,64 @@ async fn open_request(store: &Store) -> (i64, DeployIntent) {
     let stored = store.insert_request(&mut tx, &request).await.unwrap();
     tx.commit().await.unwrap();
     (stored.id, intent)
+}
+
+/// The steps of a deploy that went well: a backup, the pull, and its checks.
+pub(super) fn deployed_steps() -> Value {
+    json!([
+        {
+            "name": "backup",
+            "millis": 40,
+            "failure": null,
+            "detail": { "kind": "backup", "files": 3, "directories": 1, "symlinks": 0, "bytes": 512 },
+        },
+        { "name": "pull", "millis": 1200, "failure": null },
+        {
+            "name": "checks",
+            "millis": 3000,
+            "failure": null,
+            "detail": {
+                "kind": "checks",
+                "checks": [{ "check": "container-healthy", "attempts": 2, "millis": 2900 }],
+            },
+        },
+    ])
+}
+
+/// Queues a deploy of `tag` at `fill`'s commit and digest on `deployment`, lets `home-1`
+/// claim it, and finishes it with a report of `outcome` and `steps`, each as the agent's
+/// protocol has it, through the store's own functions. Its release must be recorded.
+pub(super) async fn run_deploy(
+    store: &Store,
+    (deployment, tag, fill): (&str, &str, char),
+    outcome: &Value,
+    steps: &Value,
+) -> i64 {
+    let host: HostId = "home-1".parse().unwrap();
+    let new = NewDeploy {
+        deployment: deployment.parse().unwrap(),
+        host: host.clone(),
+        tag: tag.parse().unwrap(),
+        digest: world_digest(fill),
+        commit: fill.to_string().repeat(40).parse().unwrap(),
+    };
+    let mut tx = store.begin().await.unwrap();
+    let id = store.queue_deploy(&mut tx, &new).await.unwrap();
+    tx.commit().await.unwrap();
+    let work = store.next_work(&host).await.unwrap().work.unwrap();
+    assert_eq!(work.deploy_id, id);
+    let report: DeployReportBody = serde_json::from_value(json!({
+        "deploy_id": id.0,
+        "deployment": deployment,
+        "tag": tag,
+        "digest": world_digest(fill),
+        "outcome": outcome,
+        "steps": steps,
+    }))
+    .unwrap();
+    store
+        .finish_deploy(&host, &BoundedReport::new(&report))
+        .await
+        .unwrap();
+    i64::try_from(id.0).unwrap()
 }
