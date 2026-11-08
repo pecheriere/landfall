@@ -28,6 +28,7 @@ use axum::http::{HeaderName, HeaderValue, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
+use landfall_core::config::Config;
 use serde::Serialize;
 use utoipa::OpenApi as _;
 use utoipa_axum::router::OpenApiRouter;
@@ -54,6 +55,14 @@ impl<T: Serialize> IntoResponse for ApiJson<T> {
     fn into_response(self) -> Response {
         json(&self.0, &NO_STORE)
     }
+}
+
+/// Where an approver signs a request with a passkey: the configured `[approval]` origin and
+/// `/approvals`, or `None` without one. Every answer that says so takes it from here.
+pub(crate) fn approve_url(config: &Config) -> Option<String> {
+    config
+        .approval()
+        .map(|approval| format!("{}/approvals", approval.origin()))
 }
 
 /// Every `/api/v1` operation, with the document's fixed part.

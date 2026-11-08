@@ -346,6 +346,27 @@ Sequence numbers, like deploy and request numbers, are shared by the whole contr
 between two rows a principal sees is activity they can't see. That is accepted: it tells them
 how much happened, never what.
 
+## Asking for a deploy
+
+`requestDeploy` (`POST /api/v1/deployments/{name}/{stage}/requests`) takes the tag to deploy,
+`{"tag": "v1.3.0"}`, and makes the intent from the controller's own records. A tag above what
+runs, or a first deploy, takes `request`; a tag below takes `rollback`, and a rollback by
+someone with that grant takes the place of a request already open on the deployment.
+
+`"rollback": true` says the request means a rollback, as `landfall rollback` sends. Then a tag
+that isn't lower than what runs is refused with `409 not_a_rollback`, and so is any tag when
+nothing runs or what runs isn't a version, so nobody asks for an upgrade under the `rollback`
+grant's name by mistake. That is decided before an open request is looked at, so the refusal
+changes nothing but its `request_refused` audit row: an open request stays open. Without the
+flag, or with it `false`, the tag alone decides, as before. A client leaves the flag out when
+it is `false`, as `landfall` does, so a controller that doesn't know it, which refuses a field
+it doesn't know with `400 bad_request`, is sent it only by a rollback.
+
+Each request in an answer, from `requestDeploy` and in `listApprovals`, has `approve_url`:
+where an approver signs it with a passkey, the configured `[approval]` origin and
+`/approvals`, or `null` without `[approval]`. Approving takes a session; an agent's token
+can't. `cancelRequest` (`POST /api/v1/approvals/{id}/cancel`) takes no body.
+
 ## Refusals
 
 Every answer that isn't a success is `application/problem+json` (RFC 9457):

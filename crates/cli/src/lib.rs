@@ -4,6 +4,7 @@
 mod access;
 pub mod agent_release;
 pub mod api_client;
+pub mod ask;
 pub mod cli;
 pub mod display;
 pub mod host;

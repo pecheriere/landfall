@@ -5,11 +5,12 @@
 use std::sync::Mutex;
 
 use clap::Parser;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use super::{Api, ReadCommand, run_with};
-use crate::api_client::ApiError;
+use super::{ReadCommand, run_with};
+use crate::api_client::{Api, ApiError};
 use crate::cli::CliError;
 
 mod commands;
@@ -76,10 +77,7 @@ pub(crate) const CALLS: &[(&str, &[Call])] = &[
     ("audit", &[("GET", "/api/v1/audit", "/api/v1/audit")]),
     (
         "approvals",
-        &[
-            ("GET", "/api/v1/approvals", "/api/v1/approvals"),
-            ("GET", "/api/v1/me", "/api/v1/me"),
-        ],
+        &[("GET", "/api/v1/approvals", "/api/v1/approvals")],
     ),
 ];
 
@@ -102,10 +100,12 @@ pub(crate) fn typed<T: DeserializeOwned>(value: &Value) -> T {
 
 type Answer = Box<dyn Fn(&str, &[(String, String)]) -> Result<Value, ApiError> + Send + Sync>;
 
-/// An API that answers from a function and records each call: its path and query.
+/// An API that answers from a function and records each call: a `GET`'s path and query, and
+/// a `POST`'s path and body, which it answers as a `GET` of its path with no query.
 pub(crate) struct FakeApi {
     answer: Answer,
     calls: Mutex<Vec<Recorded>>,
+    posts: Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl FakeApi {
@@ -115,6 +115,7 @@ impl FakeApi {
         Self {
             answer: Box::new(answer),
             calls: Mutex::new(Vec::new()),
+            posts: Mutex::new(Vec::new()),
         }
     }
 
@@ -123,8 +124,14 @@ impl FakeApi {
         Self::new(|path, _| Ok(fixture(path)))
     }
 
+    /// The `GET`s, in order.
     pub(crate) fn calls(&self) -> Vec<Recorded> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The `POST`s, in order: each path, and its body as sent.
+    pub(crate) fn posted(&self) -> Vec<(String, Option<String>)> {
+        self.posts.lock().unwrap().clone()
     }
 }
 
@@ -140,6 +147,17 @@ impl Api for FakeApi {
             .collect();
         let answer = (self.answer)(path, &query);
         self.calls.lock().unwrap().push((path.to_owned(), query));
+        std::future::ready(answer.map(|value| value.to_string()))
+    }
+
+    fn post<B: Serialize + Sync>(
+        &self,
+        path: &str,
+        body: Option<&B>,
+    ) -> impl Future<Output = Result<String, ApiError>> + Send {
+        let body = body.map(|body| serde_json::to_string(body).unwrap());
+        let answer = (self.answer)(path, &[]);
+        self.posts.lock().unwrap().push((path.to_owned(), body));
         std::future::ready(answer.map(|value| value.to_string()))
     }
 }
@@ -176,12 +194,6 @@ pub(crate) fn fixture(path: &str) -> Value {
         "/api/v1/hosts/home-1" => host(),
         "/api/v1/audit" => json!({"items": [audit()], "next_cursor": null}),
         "/api/v1/approvals" => json!({"approvals": [request()]}),
-        "/api/v1/me" => json!({
-            "principal": "ci",
-            "via": "token",
-            "grants": [{"deployment": "app/prod", "can": ["view", "request"]}],
-            "approve_url": "https://landfall.example.com/approvals",
-        }),
         other => panic!("no fixture for {other}"),
     }
 }
@@ -356,5 +368,6 @@ pub(crate) fn request() -> Value {
         "expires_at": 1_700_086_600,
         "can_approve": false,
         "can_cancel": true,
+        "approve_url": "https://landfall.example.com/approvals",
     })
 }

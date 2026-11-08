@@ -13,7 +13,7 @@ use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::{ApiClient, ApiError, BODY_CAP, deployment_path, segment};
+use super::{ApiClient, ApiError, BODY_CAP, NO_BODY, deployment_path, segment};
 use crate::cli::ApiArgs;
 use crate::settings::{Env, Files, Settings, TokenFileError, resolve};
 
@@ -108,6 +108,68 @@ async fn bearer_is_sent_when_there_is_a_token_and_not_otherwise() {
         .to_str()
         .unwrap();
     assert_eq!(agent, concat!("landfall/", env!("CARGO_PKG_VERSION")));
+}
+
+#[tokio::test]
+async fn post_sends_its_body_as_json_with_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 7})))
+        .mount(&server)
+        .await;
+
+    let client = client(&server, Some(TOKEN));
+    let answer = client
+        .post(
+            "/api/v1/deployments/app/prod/requests",
+            Some(&json!({"tag": "v1.3.0"})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer, r#"{"id":7}"#);
+    client
+        .post("/api/v1/approvals/7/cancel", NO_BODY)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let (ask, cancel) = (&requests[0], &requests[1]);
+    assert_eq!(ask.url.path(), "/api/v1/deployments/app/prod/requests");
+    assert_eq!(ask.body, br#"{"tag":"v1.3.0"}"#);
+    assert_eq!(ask.headers.get("content-type").unwrap(), "application/json");
+    // A call that takes no body is sent none, and says of none that it is JSON.
+    assert_eq!(cancel.url.path(), "/api/v1/approvals/7/cancel");
+    assert_eq!(cancel.body, Vec::<u8>::new());
+    assert!(cancel.headers.get("content-type").is_none());
+    for request in &requests {
+        assert_eq!(request.method.as_str(), "POST");
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            &format!("Bearer {TOKEN}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_body_that_cannot_be_written_is_its_own_error_and_sends_nothing() {
+    let server = MockServer::start().await;
+    // JSON keys are strings: a map keyed by pairs can't be written.
+    let body = std::collections::BTreeMap::from([((1, 2), 3)]);
+    let error = client(&server, Some(TOKEN))
+        .post("/api/v1/approvals/7/cancel", Some(&body))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ApiError::Body(_)), "{error:?}");
+    assert_eq!(error.exit_code(), 2);
+    assert!(
+        error
+            .to_string()
+            .starts_with("cannot write the request's body"),
+        "{error}"
+    );
+    assert!(!everything_about(&error).contains(TOKEN));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ mod grants;
 mod hostile;
 mod promotion;
 mod requesting;
+mod rollback_flag;
 mod staleness;
 mod unreadable;
 

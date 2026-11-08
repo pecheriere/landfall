@@ -101,9 +101,7 @@ async fn me(
             Via::Token
         },
         grants,
-        approve_url: config
-            .approval()
-            .map(|approval| format!("{}/approvals", approval.origin())),
+        approve_url: super::approve_url(config),
     })
 }
 

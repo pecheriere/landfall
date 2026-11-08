@@ -185,7 +185,7 @@ fn each_command_calls_its_operation() {
         assert_eq!(sent, query, "{line}");
     }
 
-    // With nothing open, approvals doesn't ask who it is; with --json, it prints the list.
+    // With nothing open, approvals says so; with --json, it prints the list.
     let api = FakeApi::new(|path, _| {
         Ok(match path {
             "/api/v1/approvals" => json!({"approvals": []}),
@@ -217,10 +217,11 @@ fn approvals_say_where_an_approver_signs() {
         "{out}"
     );
 
+    // Each request says where it is signed.
     let api = FakeApi::new(|path, _| {
         let mut value = fixture(path);
-        if path == "/api/v1/me" {
-            value["approve_url"] = Value::Null;
+        if path == "/api/v1/approvals" {
+            value["approvals"][0]["approve_url"] = Value::Null;
         }
         Ok(value)
     });
@@ -230,7 +231,7 @@ fn approvals_say_where_an_approver_signs() {
         out.contains("This controller has no [approval] settings, so nobody can approve yet."),
         "{out}"
     );
-    // Only an open request is said to be signable; anything else asks nobody who it is.
+    // Only an open request is said to be signable.
     let api = FakeApi::new(|path, _| {
         Ok(match path {
             "/api/v1/approvals" => {

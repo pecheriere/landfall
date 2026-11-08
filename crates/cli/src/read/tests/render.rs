@@ -108,12 +108,17 @@ fn hostile_text_is_escaped_in_human_output() {
     assert_escaped("audit", &text, 3);
     assert!(text.contains("nested=[\"h\\\\u001b]0;owned"), "{text}");
 
-    // approvals: the nonce, and where /me says an approver signs.
+    // approvals: the nonce, and where the request says an approver signs.
     let mut value = request();
     value["intent"]["nonce"] = hostile.clone();
-    let view = typed(&json!({"approvals": [value]}));
-    let text = printed(|out| render::approvals(&view, Some(HOSTILE), out));
+    value["approve_url"] = hostile.clone();
+    let view = typed(&json!({"approvals": [value.clone()]}));
+    let text = printed(|out| render::approvals(&view, out));
     assert_escaped("approvals", &text, 2);
+
+    // request deploy and rollback: the same request, alone.
+    let view = typed(&value);
+    assert_escaped("request", &printed(|out| render::request(&view, out)), 2);
 }
 
 #[test]

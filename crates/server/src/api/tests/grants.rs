@@ -94,9 +94,9 @@ fn tag_above(_: &World) -> String {
     json!({ "tag": "v1.3.0" }).to_string()
 }
 
-/// A tag below what runs on `app/prod`.
+/// A tag below what runs on `app/prod`, said to be a rollback, as `landfall rollback` asks.
 fn tag_below(_: &World) -> String {
-    json!({ "tag": "v1.1.0" }).to_string()
+    json!({ "tag": "v1.1.0", "rollback": true }).to_string()
 }
 
 fn signed_by_the_approver(world: &World) -> String {
@@ -617,6 +617,32 @@ async fn each_role_is_refused_the_case_it_does_not_govern() {
         tried.contains(&"requestDeploy: rollback asking for the request case".to_owned()),
         "{tried:?}"
     );
+}
+
+/// A rollback that isn't one is refused for what it is, whoever asks, as the document says,
+/// and changes nothing.
+#[tokio::test]
+async fn a_rollback_of_a_higher_tag_is_not_a_rollback_as_documented() {
+    let doc = served_document().await;
+    for role in ["rollback", "request"] {
+        let world = World::seed().await;
+        let before = world.rows().await;
+        let name = holder(&[role]);
+        let body = json!({ "tag": "v1.3.0", "rollback": true }).to_string();
+        let answer = world
+            .send(
+                Method::POST,
+                &prod_requests(&world),
+                Caller::Token(&name),
+                Some(body),
+            )
+            .await;
+        let what = format!("{role} asking to roll back to a higher tag");
+        assert_eq!(answer.status, StatusCode::CONFLICT, "{what}: {answer:?}");
+        assert_eq!(answer.code(), "not_a_rollback", "{what}");
+        assert_eq!(world.rows().await, before, "{what}");
+        assert_documented(&doc, "requestDeploy", &what, &answer);
+    }
 }
 
 #[tokio::test]

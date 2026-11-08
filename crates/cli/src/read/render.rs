@@ -1,13 +1,13 @@
-//! Each read command's view for a person. Every string the controller sent goes through
-//! [`safe`] before it is printed, and every enum through [`wire_name`], so a value from a newer
-//! controller reads `unknown`.
+//! Each read command's view for a person, and the asking commands' view of a request. Every
+//! string the controller sent goes through [`safe`] before it is printed, and every enum
+//! through [`wire_name`], so a value from a newer controller reads `unknown`.
 
 use std::borrow::Cow;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 
 use landfall_api::{
-    ApprovalsView, AuditEntry, CommitsState, CommitsView, DeployView, DeploymentSummary,
+    ApprovalsView, AuditEntry, Cancelled, CommitsState, CommitsView, DeployView, DeploymentSummary,
     DeploymentView, HostView, HostsView, NextAction, Page, PromotionView, RawJson, ReleaseStory,
     ReleaseView, RequestState, RequestView, RunningView, Why,
 };
@@ -525,9 +525,8 @@ pub(crate) fn audit(page: &Page<AuditEntry>, out: &mut dyn Write) -> io::Result<
     more_line(page.next_cursor.is_some(), out)
 }
 
-/// Where an approver signs an open request, and that agents can't: `landfall request`
-/// prints it too.
-pub(crate) fn approval_line(approve_url: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
+/// Where an approver signs an open request, and that agents can't.
+fn approval_line(approve_url: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
     match approve_url {
         Some(url) => writeln!(
             out,
@@ -541,12 +540,9 @@ pub(crate) fn approval_line(approve_url: Option<&str>, out: &mut dyn Write) -> i
     }
 }
 
-/// One request waiting for an approver: what it would deploy, and what an approver signs.
-fn request(
-    request: &RequestView,
-    approve_url: Option<&str>,
-    out: &mut dyn Write,
-) -> io::Result<()> {
+/// One request: what it would deploy, what an approver signs, and, while it is open, where.
+/// `landfall request deploy`, `landfall rollback` and `landfall approvals` print it.
+pub(crate) fn request(request: &RequestView, out: &mut dyn Write) -> io::Result<()> {
     let intent = &request.intent;
     writeln!(
         out,
@@ -568,25 +564,31 @@ fn request(
     );
     writeln!(out, "  expects running {expected}")?;
     writeln!(out, "  nonce {}", safe(&intent.nonce))?;
-    // Only an open request can be signed: the controller lists only those, and anything else
-    // a newer one sends is shown for what it is.
+    // Only an open request can be signed, and anything else a newer controller sends is
+    // shown for what it is.
     if request.state == RequestState::AwaitingApproval {
-        approval_line(approve_url, out)?;
+        approval_line(request.approve_url.as_deref(), out)?;
     }
     Ok(())
 }
 
 /// The requests waiting for an approver.
-pub(crate) fn approvals(
-    approvals: &ApprovalsView,
-    approve_url: Option<&str>,
-    out: &mut dyn Write,
-) -> io::Result<()> {
+pub(crate) fn approvals(approvals: &ApprovalsView, out: &mut dyn Write) -> io::Result<()> {
     if approvals.approvals.is_empty() {
         return writeln!(out, "nothing waits for an approver");
     }
     for view in &approvals.approvals {
-        request(view, approve_url, out)?;
+        request(view, out)?;
     }
     Ok(())
+}
+
+/// A request that `landfall cancel` ended, and where it stands now.
+pub(crate) fn cancelled(cancelled: &Cancelled, out: &mut dyn Write) -> io::Result<()> {
+    writeln!(
+        out,
+        "request {}: {}",
+        cancelled.request,
+        safe(&wire_name(&cancelled.state))
+    )
 }

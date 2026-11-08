@@ -849,7 +849,7 @@
           "requests"
         ],
         "summary": "Ask for a deploy",
-        "description": "Asks for a verified release to be deployed, once an approver signs it. The controller makes the intent from its own records; the client names a tag and nothing else.",
+        "description": "Asks for a verified release to be deployed, once an approver signs it. The controller makes the intent from its own records; the client names a tag, and says with `rollback` when it means a rollback, and nothing else. The answer says where an approver signs it, in `approve_url`.",
         "operationId": "requestDeploy",
         "parameters": [
           {
@@ -910,7 +910,7 @@
             "$ref": "#/components/responses/SlowRequest"
           },
           "409": {
-            "description": "Nothing can be asked for now: `request_open`, `deployment_busy`, `host_not_ready`, `release_not_verified`, `release_refused` or `promotion_pending`.",
+            "description": "Nothing can be asked for now: `request_open`, `deployment_busy`, `host_not_ready`, `release_not_verified`, `release_refused` or `promotion_pending`. Or one meant as a rollback isn't: `not_a_rollback`, for a tag that isn't lower than what runs, or any tag when nothing runs or what runs isn't a version.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2089,11 +2089,16 @@
       },
       "NewRequest": {
         "type": "object",
-        "description": "A request for a deploy: a tag, and nothing the controller would take on trust.",
+        "description": "A request for a deploy: a tag, whether it is meant as a rollback, and nothing the\ncontroller would take on trust.",
         "required": [
           "tag"
         ],
         "properties": {
+          "rollback": {
+            "type": "boolean",
+            "description": "That this is meant as a rollback: then a tag that isn't lower than what runs, or any\ntag when nothing runs or what runs isn't a version, is refused as `not_a_rollback`.\nLeft out when `false`, so that a controller that doesn't know it is never sent it\nunless it is meant.",
+            "default": false
+          },
           "tag": {
             "type": "string",
             "description": "The release to deploy.",
@@ -2609,6 +2614,7 @@
           "not_found",
           "method_not_allowed",
           "request_open",
+          "not_a_rollback",
           "deployment_busy",
           "host_not_ready",
           "release_not_verified",
@@ -2876,9 +2882,18 @@
           "created_at",
           "expires_at",
           "can_approve",
-          "can_cancel"
+          "can_cancel",
+          "approve_url"
         ],
         "properties": {
+          "approve_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an approver signs it with a passkey: the configured `[approval]` origin and\n`/approvals`, or `null` without one. Agents can't approve.",
+            "example": "https://landfall.example.com/approvals"
+          },
           "can_approve": {
             "type": "boolean",
             "description": "Whether this principal could sign it."
