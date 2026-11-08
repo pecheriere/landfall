@@ -3,7 +3,9 @@
 The same fakes as `test_release_tag.py`: no real git, agent or terminal.
 """
 
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +16,6 @@ from test_release_tag import (
     NEW_KEY,
     SHA,
     SIGNERS,
-    TAG,
     TAG_ARGS,
     FakeRun,
     FakeTerminal,
@@ -23,6 +24,7 @@ from test_release_tag import (
 )
 
 AGENT = ("ssh-add", "-L")
+PROGRAM = ("git", "config", "--get", "gpg.ssh.program")
 OTHER = "ssh-ed25519 " + "C" * 68
 
 
@@ -117,22 +119,71 @@ class SigningKeyTests(unittest.TestCase):
 
     def test_an_explicit_path_is_used_and_its_key_checked_in_the_agent(self) -> None:
         """Git gets the key the file holds, which the agent must hold too."""
+        self.trust_both()
         path = self.key_file(f"{OTHER} mine\n")
         self.refused("SSH_AUTH_SOCK", signing_key=str(path))
-        self.setUp()
         self.fake.answers[AGENT] = done(f"{OTHER}\n")
-        self.fake.answers[("git", "show", f"{SHA}:{SIGNERS}")] = done(f"{KEY}\n")
-        with self.assertRaisesRegex(release_tag.RefusedError, "isn't signed by a key"):
-            self.fake.verified[f"refs/tags/{TAG}"] = done(returncode=1, stderr="no principal")
-            self.release(signing_key=str(path))
+        self.release(signing_key=str(path))
         self.assertEqual(self.fake.signing_keys, [f"key::{OTHER}"])
 
     def test_a_key_value_is_parsed_for_the_agent_check(self) -> None:
         """`key::` then the key, with its space; git gets it re-rendered without any comment."""
-        self.release(signing_key=f"key::{KEY} a comment")
+        self.trust_both()
+        self.release(signing_key=f"key::{KEY}")
         self.assertEqual(self.fake.signing_keys, [f"key::{KEY}"])
         self.setUp()
+        self.trust_both()
         self.refused("SSH_AUTH_SOCK", signing_key=f"key::{OTHER}")
+        self.refused("isn't an SSH public key", signing_key=f"key::{KEY} a comment")
+
+    def trust_both(self) -> None:
+        """Trust KEY and OTHER, in the owner's file and in the repository's."""
+        self.trusted = trusted_file(self, f"{KEY}\n{OTHER}\n")
+        self.fake.answers[("git", "show", f"{SHA}:{SIGNERS}")] = done(f"{KEY}\n{OTHER}\n")
+
+    def test_a_key_outside_the_trusted_set_is_refused_before_the_review(self) -> None:
+        """Nothing is fetched, shown or asked, and the agent isn't consulted."""
+        self.refused("isn't in your trusted signers", signing_key=f"key::{OTHER}")
+        self.assertEqual(self.fake.calls, [("git", "rev-parse", "--show-toplevel")])
+        self.assertEqual(self.owner.events, [])
+
+    def test_another_signing_program_skips_the_agent_check_and_says_so(self) -> None:
+        """Only `ssh-keygen` asks the agent; the signature is verified afterwards anyway."""
+        self.fake.answers[PROGRAM] = done("/opt/signer/op-ssh-sign\n")
+        self.fake.answers[AGENT] = done("")
+        self.release()
+        self.assertNotIn(AGENT, self.fake.calls)
+        self.assertRegex(self.owner.shown(), "git signs with /opt/signer/op-ssh-sign")
+        self.assertIn(TAG_ARGS, self.fake.calls)
+
+    def test_ssh_keygen_by_any_path_still_gets_the_agent_check(self) -> None:
+        """A named or an absolute `ssh-keygen` is git's own default."""
+        for program in ("ssh-keygen", "/usr/bin/ssh-keygen"):
+            with self.subTest(program=program):
+                self.setUp()
+                self.fake.answers[PROGRAM] = done(f"{program}\n")
+                self.fake.answers[AGENT] = done(f"{OTHER}\n")
+                self.refused("SSH_AUTH_SOCK")
+                self.assertIn(AGENT, self.fake.calls)
+
+    def test_output_that_isnt_utf8_is_decoded_and_refused_cleanly(self) -> None:
+        """A comment in any encoding must not become a traceback."""
+        code = "import sys; sys.stdout.buffer.write(b'ssh-ed25519 \\xff\\n')"
+        result = release_tag.run_command([sys.executable, "-c", code])
+        self.assertEqual(result.returncode, 0)
+        self.fake.answers[AGENT] = result
+        self.refused("SSH_AUTH_SOCK")
+
+    def test_a_relative_path_named_like_a_key_type_is_a_path(self) -> None:
+        """Only `<type> <base64>`, whole, is a key; `ssh-release.pub` is a file."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        Path(directory.name, "ssh-release.pub").write_text(f"{KEY}\n", encoding="utf-8")
+        before = Path.cwd()
+        os.chdir(directory.name)
+        self.addCleanup(os.chdir, before)
+        self.release(signing_key="ssh-release.pub")
+        self.assertEqual(self.fake.signing_keys, [f"key::{KEY}"])
 
     def test_a_file_that_isnt_one_key_is_refused(self) -> None:
         """Two keys, none, or text that isn't a key."""

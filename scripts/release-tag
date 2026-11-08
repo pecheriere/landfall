@@ -85,6 +85,9 @@ ORIGIN = re.compile(
 )
 SIGNING_KEY = re.compile(r"[^\x00-\x1f\x7f]+")
 AGENT_KEY_TYPE = re.compile(r"[a-z0-9@.-]+")
+# A signing key given in full, as `<type> <base64>` or `key::<type> <base64>`; any other is a path.
+KEY_BLOB = re.compile(r"[A-Za-z0-9+/]+={0,2}", re.ASCII)
+KEY_LITERAL = re.compile(r"(?:key::)?[a-z0-9@.-]+ [A-Za-z0-9+/]+={0,2}", re.ASCII)
 
 WORKFLOW = ".github/workflows/release.yml"
 SIGNERS_FILE = "crates/cli/assets/release-signers"
@@ -165,7 +168,8 @@ def run_command(args: Sequence[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
             list(args),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
@@ -561,7 +565,9 @@ def check_request(request: Request, terminal: Terminal) -> None:
 def key_parts(line: str) -> tuple[str, str] | None:
     """Return a public key line's type and base64, or None if it isn't one."""
     match line.split():
-        case [key_type, blob, *_] if AGENT_KEY_TYPE.fullmatch(key_type):
+        case [key_type, blob, *_] if AGENT_KEY_TYPE.fullmatch(key_type) and KEY_BLOB.fullmatch(
+            blob
+        ):
             try:
                 base64.b64decode(blob, validate=True)
             except binascii.Error:
@@ -600,8 +606,8 @@ def signing_choice(request: Request, trusted: list[str]) -> tuple[str, str]:
             )
             raise RefusedError(msg)
         parts = key_parts(trusted[0])
-    elif value.startswith(("key::", "ssh-")):
-        parts = key_parts(value.removeprefix("key::"))
+    elif KEY_LITERAL.fullmatch(value) or value.startswith("key::"):
+        parts = key_parts(value.removeprefix("key::")) if KEY_LITERAL.fullmatch(value) else None
     else:
         return key_of_file(value)
     if parts is None:
@@ -610,8 +616,19 @@ def signing_choice(request: Request, trusted: list[str]) -> tuple[str, str]:
     return parts
 
 
-def require_in_agent(run: Run, key: tuple[str, str]) -> None:
-    """Refuse unless the SSH agent offers this key, as git signs through it."""
+def require_in_agent(run: Run, key: tuple[str, str], say: Callable[[str], None]) -> None:
+    """Refuse unless the SSH agent offers this key, if git signs through it.
+
+    Only `ssh-keygen`, git's default, asks the agent at SSH_AUTH_SOCK. Another `gpg.ssh.program`
+    signs its own way, so the agent check doesn't apply: the signature is still verified after.
+    """
+    program = run(["git", "config", "--get", "gpg.ssh.program"]).stdout.strip()
+    if program and Path(program).name != "ssh-keygen":
+        say(
+            f"git signs with {shown(program)} (gpg.ssh.program), so the SSH agent check doesn't "
+            "apply; the signature is still verified after signing."
+        )
+        return
     found: list[tuple[str, str]] = []
     # No ssh-add, or no answer in time, is the same refusal as an agent without the key.
     with contextlib.suppress(RefusedError):
@@ -705,10 +722,17 @@ def release_tag(request: Request, run: Run, terminal: Terminal) -> str:
     check_request(request, terminal)
     checkout = Path(output_of(run, ["git", "rev-parse", "--show-toplevel"]).strip())
     trusted = read_trusted(request.trusted_signers, checkout, os.getuid())
+    chosen = signing_choice(request, trusted) if request.signing_key is not None else None
+    if chosen is not None and chosen not in map(key_parts, trusted):
+        msg = (
+            f"the signing key {fingerprint(' '.join(chosen))} isn't in your trusted signers "
+            "file, so no tag it signs could be released"
+        )
+        raise RefusedError(msg)
     state = ready(request, trusted, run)
     show(state, run, terminal.say)
-    key = signing_choice(request, trusted)
-    require_in_agent(run, key)
+    key = chosen or signing_choice(request, trusted)
+    require_in_agent(run, key, terminal.say)
     try:
         typed = terminal.ask(f"Type {request.version} to sign {state.tag} at {state.sha}: ")
     except EOFError as error:

@@ -173,6 +173,7 @@ class FakeRun:
             ("git", "tag", "--delete", TAG): done(),
             PUSH_ARGS: done(),
             ("ssh-add", "-L"): done(f"{KEY} comment\n"),
+            ("git", "config", "--get", "gpg.ssh.program"): done(returncode=1),
         }
         self.runs([a_run()])
         self.jobs(good_jobs())
@@ -325,7 +326,7 @@ class FlowTests(unittest.TestCase):
 
     def test_a_signing_key_is_given_to_git_for_the_tag_alone(self) -> None:
         """As `-c user.signingkey`, one argument, whatever it holds."""
-        key = f"key::{KEY} with spaces"
+        key = f"key::{KEY}"
         self.release(signing_key=key)
         self.assertEqual(self.fake.signing_keys, [f"key::{KEY}"])
 
