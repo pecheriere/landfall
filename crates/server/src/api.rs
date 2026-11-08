@@ -10,6 +10,7 @@
 //! with a stable code from the document's `Problem` schema. No answer carries a CORS header.
 
 mod openapi;
+mod query;
 
 use std::sync::LazyLock;
 
@@ -24,7 +25,11 @@ use utoipa::OpenApi as _;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-pub(crate) use self::openapi::{BadRequest, Forbidden, NotFound, RateLimited, Unauthenticated};
+pub(crate) use self::openapi::{
+    BadRequest, BodyTooLarge, Busy, Forbidden, Internal, InternalOrUnreadable, NotFound,
+    RateLimited, SlowRequest, Unauthenticated,
+};
+pub(crate) use self::query::{ApiQuery, DeploymentPath, IdPath, NoQuery};
 use crate::agent_api::{ApiState, deadline, json, note_client_source};
 use crate::auth::HumanProblem;
 use crate::requests;
@@ -75,14 +80,18 @@ static DOCUMENT: LazyLock<String> = LazyLock::new(openapi_document);
     summary = "This document",
     description = "Public, as it says nothing about this controller: the same bytes from every \
                    controller of this version.",
+    params(NoQuery),
     security(()),
-    responses((
-        status = 200,
-        description = "This document.",
-        content_type = "application/json",
-    )),
+    responses(
+        (
+            status = 200,
+            description = "This document.",
+            content_type = "application/json",
+        ),
+        (status = 400, response = BadRequest),
+    ),
 )]
-async fn document() -> Response {
+async fn document(ApiQuery(NoQuery {}): ApiQuery<NoQuery>) -> Response {
     let mut response = Response::new(Body::from(Bytes::from_static(DOCUMENT.as_bytes())));
     let headers = response.headers_mut();
     headers.insert(

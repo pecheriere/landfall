@@ -19,7 +19,10 @@ use super::{
     refuse_in, refused, visibility,
 };
 use crate::agent_api::ApiState;
-use crate::api::{ApiJson, BadRequest, NotFound, RateLimited, Unauthenticated};
+use crate::api::{
+    ApiJson, ApiQuery, BadRequest, BodyTooLarge, IdPath, InternalOrUnreadable, NoQuery, NotFound,
+    RateLimited, SlowRequest, Unauthenticated,
+};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};
 use crate::report::REFUSAL_SHOWN_CHARS;
@@ -213,7 +216,7 @@ async fn approve_in(
     summary = "Approve a request",
     description = "Signs a request with a passkey's assertion over its challenge, as the \
                    controller's page does. A token never approves.",
-    params(("id" = i64, Path, description = "The request's number.", example = 42)),
+    params(IdPath, NoQuery),
     request_body = NewApproval,
     security(("session" = ["approve"])),
     responses(
@@ -235,34 +238,48 @@ async fn approve_in(
             content_type = "application/problem+json",
         ),
         (status = 404, response = NotFound),
+        (status = 408, response = SlowRequest),
         (
             status = 409,
             description = "The request can't be approved now: `request_closed`, \
                            `request_stale`, `request_expired`, `request_cancelled`, \
-                           `deployment_busy`, `host_not_ready` or `promotion_pending`.",
+                           `release_not_verified`, `deployment_busy`, `host_not_ready` or \
+                           `promotion_pending`.",
             body = Problem,
             content_type = "application/problem+json",
         ),
+        (status = 413, response = BodyTooLarge),
         (status = 429, response = RateLimited),
+        (status = 500, response = InternalOrUnreadable),
+        (
+            status = 503,
+            description = "The database is busy, so wait for `Retry-After`, or the configuration \
+                           has no `[approval]` settings: `busy`, `approvals_not_configured`.",
+            body = Problem,
+            content_type = "application/problem+json",
+            headers(("Retry-After" = i64, description = "With `busy`: seconds to wait.")),
+        ),
     ),
 )]
 pub(super) async fn approve(
     State(state): State<ApiState>,
     principal: Principal,
-    path: Result<Path<String>, PathRejection>,
+    ApiQuery(NoQuery {}): ApiQuery<NoQuery>,
+    path: Result<Path<IdPath>, PathRejection>,
     body: Body,
 ) -> Result<ApiJson<Approved>, HumanProblem> {
     let config = state.config();
     let store = state.store();
-    let raw = path.map_or_else(|_| String::new(), |Path(raw)| raw);
-    let stored = named_request(&state, &principal, &raw, EventKind::ApprovalRefused).await?;
+    let path = path.map_or_else(|_| IdPath { id: String::new() }, |Path(path)| path);
+    let raw = path.id.as_str();
+    let stored = named_request(&state, &principal, &path, EventKind::ApprovalRefused).await?;
     let deployment = stored
         .as_ref()
         .and_then(|request| config.deployment(&request.intent.deployment));
     let subject = Subject {
         kind: EventKind::ApprovalRefused,
         deployment,
-        about: stored.is_none().then_some(raw.as_str()),
+        about: stored.is_none().then_some(raw),
         request: stored.as_ref().map(|request| request.id),
         tag: stored.as_ref().map(|request| &request.intent.tag),
     };

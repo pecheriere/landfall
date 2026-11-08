@@ -97,3 +97,5 @@ utoipa-axum = { version = "0.3.0", default-features = false }
 # Validates real answers against the document, in tests. No default features, so
 # it never fetches a `$ref` over the network or from a file.
 jsonschema = { version = "0.60.2", default-features = false }
+# Query strings of /api/v1, into typed parameters. Already in the tree through reqwest.
+serde_urlencoded = "0.7.1"

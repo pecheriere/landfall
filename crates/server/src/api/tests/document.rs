@@ -3,7 +3,8 @@
 
 use std::collections::BTreeSet;
 
-use axum::http::{StatusCode, header};
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse as _;
 use serde_json::Value;
 
@@ -358,5 +359,37 @@ async fn api_answers_have_no_cors_headers() {
             .filter(|name| name.as_str().starts_with("access-control-"))
             .collect();
         assert!(cors.is_empty(), "{cors:?} in {answer:?}");
+    }
+}
+
+#[tokio::test]
+async fn refusals_are_never_stored() {
+    let app = App::new().await;
+    let token = app.token("operator").await;
+    let delete = Request::delete("/api/v1/approvals")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    for (answer, status) in [
+        (
+            app.get("/api/v1/approvals", None, None).await,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            app.get("/api/v1/approvals?x=1", Some(&token), None).await,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            app.get("/api/v1/nothing", Some(&token), None).await,
+            StatusCode::NOT_FOUND,
+        ),
+        (app.send(delete).await, StatusCode::METHOD_NOT_ALLOWED),
+    ] {
+        assert_eq!(answer.status, status, "{answer:?}");
+        assert_eq!(
+            answer.headers[header::CACHE_CONTROL],
+            "no-store",
+            "{answer:?}"
+        );
     }
 }

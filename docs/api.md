@@ -64,10 +64,33 @@ Every answer that isn't a success is `application/problem+json` (RFC 9457):
 ```
 
 Act on `code`, which never changes its meaning; the document's `ProblemCode` schema lists
-every one. `title` is for people and may change. A `429 rate_limited` comes with
-`Retry-After`, in seconds. The answers operations share are the document's reusable
-responses: `Unauthenticated` (401), `Forbidden` (403), `NotFound` (404), `RateLimited` (429)
-and `BadRequest` (400).
+every one. `title` is for people and may change. A `429 rate_limited` and a `503 busy` come
+with `Retry-After`, in seconds. Each operation's `responses` lists every refusal it can give,
+with the codes each status can carry. The answers operations share are the document's reusable
+responses: `BadRequest` (400), `Unauthenticated` (401), `Forbidden` (403), `NotFound` (404),
+`SlowRequest` (408), `BodyTooLarge` (413), `RateLimited` (429), `Internal` and
+`InternalOrUnreadable` (500), and `Busy` (503).
+
+## Paths and query strings
+
+A query string is at most 2 KiB, and a parameter the operation doesn't take is refused with
+`400 bad_request`, not ignored. An operation with no parameters refuses any query string.
+
+An id in a path, such as a request's number, is plain digits with no leading zero, so one row
+has one path. Any other way of writing a number, such as `01`, `+1` or `1.0`, or one too large
+to be an id, names nothing and is `404 not_found`.
+
+## Pages
+
+A list that can grow comes a page at a time, as `{"items": [...], "next_cursor": ...}`. `limit`
+is how many items a page holds, from 1 to 100, 50 if left out. To get the next page, send the
+same request with `cursor` set to the last page's `next_cursor`; on the last page it is `null`.
+A cursor is opaque: it belongs to the list that gave it, and one from another list, or one that
+was changed, is refused with `400 bad_request`. A page is never short of what the principal
+may see: what they may not see is left out before the page is cut, not after.
+
+`listApprovals` isn't paged, as the configuration bounds it: a deployment has at most one open
+request.
 
 ## Versions
 
@@ -76,4 +99,5 @@ values are only added; an older CLI works with a newer controller. So a client i
 it doesn't know, and reads a value it doesn't know, such as a new problem code, as unknown.
 What a client sends is still refused if it has a field the controller doesn't know.
 
-Every success is `application/json` with `Cache-Control: no-store`, the document included.
+Every answer has `Cache-Control: no-store`: a success, which is `application/json`, the
+document included, and a refusal.

@@ -53,7 +53,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::agent_api::{ApiProblem, ApiState, read_body};
-use crate::api::{ApiJson, RateLimited, Unauthenticated};
+use crate::api::{
+    ApiJson, ApiQuery, BadRequest, Busy, IdPath, Internal, NoQuery, RateLimited, SlowRequest,
+    Unauthenticated,
+};
 use crate::audit::{AuditEvent, EventKind};
 use crate::auth::{HumanProblem, Principal, can, sees};
 use crate::logger::log;
@@ -225,25 +228,19 @@ fn visibility(
     }
 }
 
-/// A request number as a path has it: plain digits with no leading zero, so that one
-/// request has one path.
-fn request_number(raw: &str) -> Option<i64> {
-    let canonical = !raw.starts_with('0') && raw.bytes().all(|b| b.is_ascii_digit());
-    canonical.then(|| raw.parse().ok()).flatten()
-}
-
 /// The request a path names, as it is now. One nothing can read gets a clear refusal, in the
 /// audit log as `kind`, for who may know of it, and for anyone else reads as one that isn't
 /// there.
 async fn named_request(
     state: &ApiState,
     principal: &Principal,
-    raw: &str,
+    path: &IdPath,
     kind: EventKind,
 ) -> Result<Option<StoredRequest>, HumanProblem> {
-    let Some(id) = request_number(raw) else {
+    let Some(id) = path.number() else {
         return Ok(None);
     };
+    let raw = path.id.as_str();
     let store = state.store();
     match store.request(id).await {
         Ok(found) => Ok(found),
@@ -308,6 +305,7 @@ fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
     description = "The open requests on deployments this principal may approve or view, each \
                    saying whether they could sign it or cancel it. A request past its time is \
                    left out.",
+    params(NoQuery),
     security(("token" = []), ("session" = [])),
     responses(
         (
@@ -315,13 +313,18 @@ fn closed(state: RequestState) -> Option<(HumanProblem, &'static str)> {
             description = "The open requests on deployments this principal may approve or view.",
             body = ApprovalsView,
         ),
+        (status = 400, response = BadRequest),
         (status = 401, response = Unauthenticated),
+        (status = 408, response = SlowRequest),
         (status = 429, response = RateLimited),
+        (status = 500, response = Internal),
+        (status = 503, response = Busy),
     ),
 )]
 async fn list(
     State(state): State<ApiState>,
     principal: Principal,
+    ApiQuery(NoQuery {}): ApiQuery<NoQuery>,
 ) -> Result<ApiJson<ApprovalsView>, HumanProblem> {
     let config = state.config();
     let open = state.store().open_requests(state.store().now()?).await?;

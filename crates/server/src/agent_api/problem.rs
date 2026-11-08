@@ -95,7 +95,7 @@ impl ApiProblem {
             Self::BadRequest => (
                 StatusCode::BAD_REQUEST,
                 ProblemCode::BadRequest,
-                "the body is not a valid request",
+                "the request is not one this endpoint takes",
             ),
             Self::BodyTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -141,7 +141,8 @@ impl ApiProblem {
     }
 }
 
-/// An `application/problem+json` answer.
+/// An `application/problem+json` answer, which no cache keeps: a refusal is about the request
+/// it answers, and a later one may not be refused.
 pub(crate) fn problem_response(status: StatusCode, code: ProblemCode, title: &str) -> Response {
     let problem = Problem {
         code,
@@ -153,10 +154,12 @@ pub(crate) fn problem_response(status: StatusCode, code: ProblemCode, title: &st
     let body = serde_json::to_vec(&problem).unwrap_or_default();
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(PROBLEM_CONTENT_TYPE),
     );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

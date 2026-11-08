@@ -53,7 +53,8 @@ passkey approvals. Agents drive it through a typed API. Design:
   the one place that says what a principal may do, each principal's budget for state
   changes, secrets that are only stored hashed, and the human API's problem answers),
   `api` (`/api/v1`: one `OpenApiRouter` registers each route with its annotation, `ApiJson` is
-  every success, and `openapi` the document's fixed part: its schemes and shared refusals; the
+  every success, `query` the path and query-string parameters, a query string refusing any it
+  doesn't take, and `openapi` the document's fixed part: its schemes and shared refusals; the
   document is served at `/api/v1/openapi.json`, printed by `openapi` and checked in as
   `docs/api/openapi.json`, which a test compares), `requests` (the human API's routes: `asking`
   for a deploy, `approving` one and `cancelling` one), `web` (the browser's side: the static

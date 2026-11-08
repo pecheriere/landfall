@@ -18,6 +18,7 @@
         "summary": "What waits for an approver",
         "description": "The open requests on deployments this principal may approve or view, each saying whether they could sign it or cancel it. A request past its time is left out.",
         "operationId": "listApprovals",
+        "parameters": [],
         "responses": {
           "200": {
             "description": "The open requests on deployments this principal may approve or view.",
@@ -29,11 +30,23 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
           },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
           }
         },
         "security": [
@@ -58,11 +71,12 @@
           {
             "name": "id",
             "in": "path",
-            "description": "The request's number.",
+            "description": "Plain digits with no leading zero: any other way of writing a number names nothing.",
             "required": true,
             "schema": {
               "type": "integer",
-              "format": "int64"
+              "format": "int64",
+              "minimum": 1
             },
             "example": 42
           }
@@ -107,8 +121,11 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
           "409": {
-            "description": "The request can't be approved now: `request_closed`, `request_stale`, `request_expired`, `request_cancelled`, `deployment_busy`, `host_not_ready` or `promotion_pending`.",
+            "description": "The request can't be approved now: `request_closed`, `request_stale`, `request_expired`, `request_cancelled`, `release_not_verified`, `deployment_busy`, `host_not_ready` or `promotion_pending`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -117,8 +134,33 @@
               }
             }
           },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalOrUnreadable"
+          },
+          "503": {
+            "description": "The database is busy, so wait for `Retry-After`, or the configuration has no `[approval]` settings: `busy`, `approvals_not_configured`.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "description": "With `busy`: seconds to wait."
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -142,11 +184,12 @@
           {
             "name": "id",
             "in": "path",
-            "description": "The request's number.",
+            "description": "Plain digits with no leading zero: any other way of writing a number names nothing.",
             "required": true,
             "schema": {
               "type": "integer",
-              "format": "int64"
+              "format": "int64",
+              "minimum": 1
             },
             "example": 42
           }
@@ -162,6 +205,9 @@
               }
             }
           },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
           },
@@ -170,6 +216,9 @@
           },
           "404": {
             "$ref": "#/components/responses/NotFound"
+          },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
           },
           "409": {
             "description": "The request is no longer open: `request_closed`, `request_stale`, `request_expired` or `request_cancelled`.",
@@ -183,6 +232,12 @@
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalOrUnreadable"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
           }
         },
         "security": [
@@ -265,6 +320,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "408": {
+            "$ref": "#/components/responses/SlowRequest"
+          },
           "409": {
             "description": "Nothing can be asked for now: `request_open`, `deployment_busy`, `host_not_ready`, `release_not_verified`, `release_refused` or `promotion_pending`.",
             "content": {
@@ -275,8 +333,17 @@
               }
             }
           },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          },
           "429": {
             "$ref": "#/components/responses/RateLimited"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/Busy"
           }
         },
         "security": [
@@ -307,12 +374,16 @@
         "summary": "This document",
         "description": "Public, as it says nothing about this controller: the same bytes from every controller of this version.",
         "operationId": "getOpenApi",
+        "parameters": [],
         "responses": {
           "200": {
             "description": "This document.",
             "content": {
               "application/json": {}
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
           }
         },
         "security": [
@@ -625,7 +696,34 @@
     },
     "responses": {
       "BadRequest": {
-        "description": "The body isn't the request this operation takes: `bad_request`.",
+        "description": "The body or the query string isn't what this operation takes, or the query string is over 2 KiB: `bad_request`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "BodyTooLarge": {
+        "description": "The body is over this operation's limit: `body_too_large`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Busy": {
+        "description": "The database is busy: wait for `Retry-After`. `busy`.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
         "content": {
           "application/problem+json": {
             "schema": {
@@ -636,6 +734,26 @@
       },
       "Forbidden": {
         "description": "The principal may see this and no grant lets it do that, or a session's state change didn't come from the controller's origin: `forbidden`, `bad_origin`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "Internal": {
+        "description": "The controller failed. Its log says how, and the answer doesn't: `internal`.",
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "InternalOrUnreadable": {
+        "description": "The controller failed, or can't read this request's row: `internal`, `request_unreadable`. Its log says which row, and such a request ends by itself when its time is up.",
         "content": {
           "application/problem+json": {
             "schema": {
@@ -663,6 +781,16 @@
             }
           }
         },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      },
+      "SlowRequest": {
+        "description": "The request, its body included, took longer than the controller waits: `slow_request`.",
         "content": {
           "application/problem+json": {
             "schema": {

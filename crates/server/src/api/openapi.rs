@@ -24,7 +24,18 @@ use utoipa::{Modify, ToResponse};
     ),
     components(
         schemas(Problem),
-        responses(Unauthenticated, Forbidden, NotFound, RateLimited, BadRequest),
+        responses(
+            Unauthenticated,
+            Forbidden,
+            NotFound,
+            RateLimited,
+            BadRequest,
+            SlowRequest,
+            BodyTooLarge,
+            Internal,
+            InternalOrUnreadable,
+            Busy,
+        ),
     ),
     modifiers(&Schemes),
 )]
@@ -100,18 +111,50 @@ refusal!(
 );
 refusal!(
     BadRequest,
-    "The body isn't the request this operation takes: `bad_request`."
+    "The body or the query string isn't what this operation takes, or the query string is \
+     over 2 KiB: `bad_request`."
 );
+refusal!(
+    SlowRequest,
+    "The request, its body included, took longer than the controller waits: `slow_request`."
+);
+refusal!(
+    BodyTooLarge,
+    "The body is over this operation's limit: `body_too_large`."
+);
+refusal!(
+    Internal,
+    "The controller failed. Its log says how, and the answer doesn't: `internal`."
+);
+refusal!(
+    InternalOrUnreadable,
+    "The controller failed, or can't read this request's row: `internal`, \
+     `request_unreadable`. Its log says which row, and such a request ends by itself when its \
+     time is up."
+);
+
+/// A refusal to wait out, as `Retry-After` says.
+fn wait(description: &str) -> Response {
+    let seconds = Header::new(ObjectBuilder::new().schema_type(Type::Integer));
+    problem(description).header("Retry-After", seconds).build()
+}
 
 /// Too many requests by this principal or from this source.
 pub(crate) struct RateLimited;
 
 impl<'r> ToResponse<'r> for RateLimited {
     fn response() -> (&'r str, RefOr<Response>) {
-        let wait = Header::new(ObjectBuilder::new().schema_type(Type::Integer));
-        let response = problem("Too many requests: wait for `Retry-After`. `rate_limited`.")
-            .header("Retry-After", wait)
-            .build();
+        let response = wait("Too many requests: wait for `Retry-After`. `rate_limited`.");
         ("RateLimited", response.into())
+    }
+}
+
+/// The database is busy with another writer.
+pub(crate) struct Busy;
+
+impl<'r> ToResponse<'r> for Busy {
+    fn response() -> (&'r str, RefOr<Response>) {
+        let response = wait("The database is busy: wait for `Retry-After`. `busy`.");
+        ("Busy", response.into())
     }
 }

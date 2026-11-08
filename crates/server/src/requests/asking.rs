@@ -16,7 +16,10 @@ use super::{
     Stop, Subject, parsed_body, ready_host, refuse_alone, refuse_in, refused, view, visibility,
 };
 use crate::agent_api::ApiState;
-use crate::api::{ApiJson, BadRequest, Forbidden, NotFound, RateLimited, Unauthenticated};
+use crate::api::{
+    ApiJson, ApiQuery, BadRequest, BodyTooLarge, Busy, DeploymentPath, Forbidden, Internal,
+    NoQuery, NotFound, RateLimited, SlowRequest, Unauthenticated,
+};
 use crate::audit::EventKind;
 use crate::auth::{HumanProblem, Principal, can};
 use crate::store::{NewRequest as StoredNewRequest, StoreError};
@@ -138,10 +141,7 @@ async fn judge_request(
     description = "Asks for a verified release to be deployed, once an approver signs it. The \
                    controller makes the intent from its own records; the client names a tag and \
                    nothing else.",
-    params(
-        ("name" = String, Path, description = "The deployment's name.", example = "app"),
-        ("stage" = String, Path, description = "The deployment's stage.", example = "prod"),
-    ),
+    params(DeploymentPath, NoQuery),
     request_body = NewRequest,
     security(("token" = ["request", "rollback"]), ("session" = ["request", "rollback"])),
     extensions((
@@ -161,6 +161,7 @@ async fn judge_request(
         (status = 401, response = Unauthenticated),
         (status = 403, response = Forbidden),
         (status = 404, response = NotFound),
+        (status = 408, response = SlowRequest),
         (
             status = 409,
             description = "Nothing can be asked for now: `request_open`, `deployment_busy`, \
@@ -169,17 +170,21 @@ async fn judge_request(
             body = Problem,
             content_type = "application/problem+json",
         ),
+        (status = 413, response = BodyTooLarge),
         (status = 429, response = RateLimited),
+        (status = 500, response = Internal),
+        (status = 503, response = Busy),
     ),
 )]
 pub(super) async fn ask(
     State(state): State<ApiState>,
     principal: Principal,
-    path: Result<Path<(String, String)>, PathRejection>,
+    ApiQuery(NoQuery {}): ApiQuery<NoQuery>,
+    path: Result<Path<DeploymentPath>, PathRejection>,
     body: Body,
 ) -> Result<(StatusCode, ApiJson<RequestView>), HumanProblem> {
     let config = state.config();
-    let raw = path.map_or_else(|_| String::new(), |Path((a, b))| format!("{a}/{b}"));
+    let raw = path.map_or_else(|_| String::new(), |Path(path)| path.raw());
     let deployment = raw
         .parse::<DeploymentId>()
         .ok()
