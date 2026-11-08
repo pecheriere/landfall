@@ -1673,8 +1673,11 @@
             "description": "When its host said how it went, in seconds since the Unix epoch, or `null`."
           },
           "host": {
-            "type": "string",
-            "description": "The host it was sent to.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The host it was sent to, or `null` when the reader may not see that host: a host is\nseen through a deployment on it now that the reader may view, as `getHost` shows it.\nA deploy made before its deployment moved can have been sent to a host it no longer is\non.",
             "example": "home-1"
           },
           "id": {
@@ -2347,8 +2350,11 @@
                   "description": "When its host said how it went, in seconds since the Unix epoch, or `null`."
                 },
                 "host": {
-                  "type": "string",
-                  "description": "The host it was sent to.",
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "The host it was sent to, or `null` when the reader may not see that host: a host is\nseen through a deployment on it now that the reader may view, as `getHost` shows it.\nA deploy made before its deployment moved can have been sent to a host it no longer is\non.",
                   "example": "home-1"
                 },
                 "id": {

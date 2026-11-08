@@ -2,14 +2,20 @@
 //! steps, for each outcome and for a deploy not yet finished.
 
 use landfall_api::{DeployState, NextKind, Outcome, WhyKind};
+use landfall_core::ids::HostId;
 use landfall_core::protocol::DeployReportBody;
 use serde_json::json;
 
-use crate::api::why::explain;
+use crate::api::why::{UNSEEN_HOST, explain};
 use crate::report::BoundedReport;
 use crate::store::history::{DeployRow, StepRow};
 
 const AT: i64 = 1_800_000_000;
+
+/// The deploy's host, as a reader who may see it is told it.
+fn home() -> HostId {
+    "home-1".parse().unwrap()
+}
 
 /// A deploy of `v1.3.0` on `app/prod` to `home-1`, asked for by `ci` and signed by
 /// `operator`, in `state` with `outcome`.
@@ -141,7 +147,7 @@ fn explain_table() {
     ];
     for (state, outcome, steps, after, next) in rows {
         let row = deploy(state, outcome);
-        let why = explain(&row, &steps);
+        let why = explain(&row, &steps, Some(&home()));
         let label = format!("{state:?} {outcome:?}");
         assert_eq!(why.deploy, 7, "{label}");
         assert_eq!(why.outcome, outcome, "{label}");
@@ -169,6 +175,7 @@ fn next_says_what_to_run_and_where() {
     let recover = explain(
         &deploy(DeployState::Finished, Some(Outcome::RollbackFailed)),
         &[],
+        Some(&home()),
     );
     let detail = recover.next.unwrap().detail;
     assert!(detail.contains("landfall-agent recover"), "{detail}");
@@ -179,14 +186,18 @@ fn next_says_what_to_run_and_where() {
         recover.summary
     );
 
-    let refused = explain(&deploy(DeployState::Finished, Some(Outcome::Refused)), &[]);
+    let refused = explain(
+        &deploy(DeployState::Finished, Some(Outcome::Refused)),
+        &[],
+        Some(&home()),
+    );
     let detail = refused.next.unwrap().detail;
     assert!(detail.contains("\"digest not allowed here\""), "{detail}");
     assert!(detail.contains("alert"), "{detail}");
 
     let rolled_back = deploy(DeployState::Finished, Some(Outcome::RolledBack));
     let steps = [step(0, "checks", Some("container unhealthy"))];
-    let why = explain(&rolled_back, &steps);
+    let why = explain(&rolled_back, &steps, Some(&home()));
     assert_eq!(
         why.summary,
         "v1.3.0 failed on home-1 at step \"checks\" and rolled back to the previous version; \
@@ -222,7 +233,7 @@ fn a_step_failure_is_quoted_not_raw() {
     };
     let mut row = deploy(DeployState::Finished, Some(Outcome::RolledBack));
     row.reason.clone_from(&bounded.reason);
-    let why = explain(&row, &[failing]);
+    let why = explain(&row, &[failing], Some(&home()));
     let event = why
         .events
         .iter()
@@ -245,7 +256,11 @@ fn a_step_failure_is_quoted_not_raw() {
 
 #[test]
 fn approver_and_requester_are_named() {
-    let why = explain(&deploy(DeployState::Finished, Some(Outcome::Deployed)), &[]);
+    let why = explain(
+        &deploy(DeployState::Finished, Some(Outcome::Deployed)),
+        &[],
+        Some(&home()),
+    );
     let requested = &why.events[0];
     assert_eq!(requested.what, WhyKind::Requested);
     assert_eq!(requested.at, Some(AT - 100));
@@ -260,7 +275,7 @@ fn approver_and_requester_are_named() {
     automatic.requested_by = None;
     automatic.requested_at = None;
     automatic.approved_by = None;
-    let why = explain(&automatic, &[]);
+    let why = explain(&automatic, &[], Some(&home()));
     let kinds: Vec<WhyKind> = why.events.iter().map(|event| event.what).collect();
     assert_eq!(
         kinds,
@@ -271,4 +286,34 @@ fn approver_and_requester_are_named() {
         "{}",
         why.events[0].text
     );
+}
+
+#[test]
+fn a_host_the_reader_cannot_view_is_never_named() {
+    let states = [
+        (DeployState::Queued, None),
+        (DeployState::Claimed, None),
+        (DeployState::Finished, Some(Outcome::Deployed)),
+        (DeployState::Finished, Some(Outcome::RolledBack)),
+        (DeployState::Finished, Some(Outcome::NothingChanged)),
+        (DeployState::Finished, Some(Outcome::FailedNoPrevious)),
+        (DeployState::Finished, Some(Outcome::RollbackFailed)),
+        (DeployState::Finished, Some(Outcome::Refused)),
+        (DeployState::Finished, Some(Outcome::Deferred)),
+    ];
+    for (state, outcome) in states {
+        let why = explain(&deploy(state, outcome), &[], None);
+        let next = why.next.as_ref().map(|next| next.detail.clone());
+        let texts: Vec<&String> = why
+            .events
+            .iter()
+            .map(|event| &event.text)
+            .chain([&why.summary])
+            .chain(next.as_ref())
+            .collect();
+        for text in &texts {
+            assert!(!text.contains("home-1"), "{state:?} {outcome:?}: {text}");
+        }
+        assert!(why.summary.contains(UNSEEN_HOST), "{}", why.summary);
+    }
 }

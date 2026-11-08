@@ -6,6 +6,8 @@
 //! Seeing a deployment's state takes `view`. A host is seen through the deployments on it:
 //! only those a principal may view, and not at all without one.
 
+use std::collections::BTreeSet;
+
 use landfall_api::DeploymentRef;
 use landfall_core::config::{Config, Deployment, Permission};
 use landfall_core::ids::{DeploymentId, HostId};
@@ -75,6 +77,18 @@ pub(crate) fn viewable_deployments<'a>(
         .deployments()
         .iter()
         .filter(move |d| can(config, principal, d.id(), Permission::View))
+}
+
+/// The hosts this principal may see: those the configuration puts a deployment on that they
+/// may view, as `getHost` shows them. Any other host is never named to them, not even one a
+/// deployment they view was on before.
+pub(crate) fn viewable_hosts<'a>(
+    config: &'a Config,
+    principal: &'a Principal,
+) -> BTreeSet<&'a HostId> {
+    viewable_deployments(config, principal)
+        .map(Deployment::host)
+        .collect()
 }
 
 /// The deployments the configuration puts on the host `raw` names that this principal may

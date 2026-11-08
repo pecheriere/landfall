@@ -12,13 +12,13 @@
 use std::collections::BTreeSet;
 
 use landfall_api::DeploymentRef;
-use landfall_core::config::{Config, Deployment};
+use landfall_core::config::Config;
 use landfall_core::ids::{DeploymentId, HostId};
 use landfall_core::rule::{Decision, Refusal, reason, refusal_reason};
 use semver::Version;
 use serde_json::{Map, Value, json};
 
-use super::super::visible::{shown_deployment, viewable_deployments};
+use super::super::visible::{shown_deployment, viewable_hosts};
 use crate::audit::EventKind;
 use crate::auth::Principal;
 use crate::store::REPORT_REFUSALS;
@@ -179,9 +179,7 @@ pub(super) struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     pub(super) fn new(config: &'a Config, principal: &'a Principal) -> Self {
-        let hosts = viewable_deployments(config, principal)
-            .map(Deployment::host)
-            .collect();
+        let hosts = viewable_hosts(config, principal);
         Self {
             config,
             principal,

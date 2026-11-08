@@ -1,7 +1,9 @@
 //! A deployment's deploys, one deploy with its steps, and why it ended as it did:
 //! `listDeploys`, `getDeploy` and `whyDeploy`.
 
-use axum::http::{Method, StatusCode};
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 
 use super::{
@@ -264,13 +266,36 @@ async fn deploy_of_a_deployment_no_longer_configured_is_not_found() {
     )
     .await;
     let reader = holder(&["view", "request", "approve", "rollback"]);
-    let then = format!(
+    let paths = [
+        format!("/api/v1/deploys/{old}"),
+        format!("/api/v1/deploys/{old}/why"),
+        "/api/v1/deployments/app/old/deploys".to_owned(),
+    ];
+    // While it was configured, the reader saw all of it.
+    let configured = with_deployment(&world, ("app/old", 5, "home-1"), &reader);
+    for path in &paths {
+        let answer = get_from(&world, &configured, path, &reader).await;
+        assert_eq!(answer.status, StatusCode::OK, "{path}: {answer:?}");
+    }
+    // Now it isn't, and nobody is told of it.
+    let missing = get_as(&world, "/api/v1/deploys/999999", &reader).await;
+    for path in &paths {
+        let answer = get_as(&world, path, &reader).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(answer.body, missing.body, "{path}");
+    }
+}
+
+/// The controller's router on the [`World`]'s store, under its configuration with one more
+/// deployment, `id` of repository `repo` on `host`, which `reader` may view.
+fn with_deployment(world: &World, (id, repo, host): (&str, u32, &str), reader: &str) -> Router {
+    let config = format!(
         "{}
 [[deployment]]
-id = \"app/old\"
-repo = {{ name = \"example/app\", id = 5, owner_id = 9 }}
-host = \"home-1\"
-compose = {{ dir = \"/srv/old\", service = \"app\" }}
+id = \"{id}\"
+repo = {{ name = \"example/app\", id = {repo}, owner_id = 9 }}
+host = \"{host}\"
+compose = {{ dir = \"/srv/extra\", service = \"app\" }}
 origin = {{ workflow = \".github/workflows/release.yml\", tags = \"v*\", signed_tags = false }}
 rule = {{ auto = \"patch\", approvers = [{}] }}
 checks = [\"container-healthy\"]
@@ -281,34 +306,26 @@ deployments = [{}]
 can = [\"view\"]
 ",
         world_config(&world.keys),
-        quoted_list(&[reader.as_str()]),
-        quoted_list(&["app/old"]),
+        quoted_list(&[reader]),
+        quoted_list(&[id]),
     );
-    let then = landfall_approval::parse_config(then.as_bytes()).unwrap();
-    let paths = [
-        format!("/api/v1/deploys/{old}"),
-        format!("/api/v1/deploys/{old}/why"),
-        "/api/v1/deployments/app/old/deploys".to_owned(),
-    ];
-    // While it was configured, the reader saw all of it.
-    let configured = crate::router(ApiState::new(world.store.clone(), then, Limits::default()));
-    let token = world.credentials.tokens[&reader].reveal();
-    for path in &paths {
-        let request = axum::http::Request::builder()
-            .uri(path)
-            .header("authorization", format!("Bearer {token}"))
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let answer = super::answer(&configured, request).await;
-        assert_eq!(answer.status, StatusCode::OK, "{path}: {answer:?}");
-    }
-    // Now it isn't, and nobody is told of it.
-    let missing = get_as(&world, "/api/v1/deploys/999999", &reader).await;
-    for path in &paths {
-        let answer = get_as(&world, path, &reader).await;
-        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
-        assert_eq!(answer.body, missing.body, "{path}");
-    }
+    let config = landfall_approval::parse_config(config.as_bytes()).unwrap();
+    crate::router(ApiState::new(
+        world.store.clone(),
+        config,
+        Limits::default(),
+    ))
+}
+
+/// What `router` answers `reader`'s token for a `GET` of `path`.
+async fn get_from(world: &World, router: &Router, path: &str, reader: &str) -> Answer {
+    let token = world.credentials.tokens[reader].reveal();
+    let request = Request::builder()
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    super::answer(router, request).await
 }
 
 /// A finished deploy of `tag` on `deployment`, sent to `host`, whose stored outcome is a name
@@ -390,4 +407,55 @@ async fn an_unreadable_deploy_of_a_removed_deployment_is_not_found() {
         assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}: {answer:?}");
         assert_eq!(answer.body, missing.body, "{path}");
     }
+}
+
+#[tokio::test]
+async fn a_host_one_cannot_view_is_never_named() {
+    let world = World::seed().await;
+    // `app/prod` ran on `home-2` before it moved to `home-1`: an old deploy, sent there, that
+    // rolled back.
+    let old: i64 = sqlx::query_scalar(
+        "INSERT INTO deploys (deployment, host, tag, digest, commit_sha, state, outcome, reason,
+                              created_at, claimed_at, finished_at)
+         VALUES ('app/prod', 'home-2', 'v1.1.0', ?, ?, 'finished', 'rolled_back',
+                 '\"unhealthy\"', 1700000000, 1700000001, 1700000002)
+         RETURNING id",
+    )
+    .bind(format!("sha256:{}", "1".repeat(64)))
+    .bind("1".repeat(40))
+    .fetch_one(world.store.pool())
+    .await
+    .unwrap();
+    let paths = [
+        format!("/api/v1/deploys/{old}"),
+        format!("/api/v1/deploys/{old}/why"),
+        PROD_DEPLOYS.to_owned(),
+    ];
+    // `home-2` runs only `app/edge` now, which this viewer of `app/prod` can't view.
+    let reader = holder(&["view", "request", "approve", "rollback"]);
+    let edge = with_deployment(&world, ("app/edge", 6, "home-2"), &reader);
+    for path in &paths {
+        let answer = get_from(&world, &edge, path, &viewer()).await;
+        assert_eq!(answer.status, StatusCode::OK, "{path}: {answer:?}");
+        let body = String::from_utf8(answer.body).unwrap();
+        assert!(!body.contains("home-2"), "{path}: {body}");
+    }
+    let one = get_from(&world, &edge, &paths[0], &viewer()).await.json();
+    assert_eq!(one["host"], Value::Null);
+    let why = get_from(&world, &edge, &paths[1], &viewer()).await.json();
+    assert!(
+        why["summary"]
+            .as_str()
+            .unwrap()
+            .contains("a host you can't view"),
+        "{why}"
+    );
+    // Who may view `app/edge` sees `home-2`, as `getHost` shows it to them.
+    for path in &paths {
+        let answer = get_from(&world, &edge, path, &reader).await;
+        let body = String::from_utf8(answer.body).unwrap();
+        assert!(body.contains("home-2"), "{path}: {body}");
+    }
+    let one = get_from(&world, &edge, &paths[0], &reader).await.json();
+    assert_eq!(one["host"], "home-2");
 }

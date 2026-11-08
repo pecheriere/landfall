@@ -40,9 +40,15 @@ pub struct DeployView {
     /// The deployment.
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "app/prod"))]
     pub deployment: DeploymentId,
-    /// The host it was sent to.
-    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "home-1"))]
-    pub host: HostId,
+    /// The host it was sent to, or `null` when the reader may not see that host: a host is
+    /// seen through a deployment on it now that the reader may view, as `getHost` shows it.
+    /// A deploy made before its deployment moved can have been sent to a host it no longer is
+    /// on.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = Option<String>, required = true, example = "home-1")
+    )]
+    pub host: Option<HostId>,
     /// The release's tag.
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "v1.3.0"))]
     pub tag: ReleaseTag,

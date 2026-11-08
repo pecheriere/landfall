@@ -3,11 +3,14 @@
 //!
 //! The events come in time order: who asked and who signed, if it came from a request, then
 //! the queue, its host taking it, each step, and the outcome. The summary is one sentence an
-//! agent can act on, naming the tag and the host, and `next` the one thing to do. The host's
+//! agent can act on, naming the tag and the host, and `next` the one thing to do. The host is
+//! named only to a reader who may see it, as `getHost` shows it, and is otherwise "a host you
+//! can't view". The host's
 //! words are shown as they were stored, quoted when they were recorded; only the deploy's own
 //! deployment is concerned, which whoever reads this may view.
 
 use landfall_api::{DeployState, NextAction, NextKind, Outcome, Why, WhyEvent, WhyKind};
+use landfall_core::ids::HostId;
 
 use super::story::with_reason;
 use crate::store::history::{DeployRow, StepRow};
@@ -20,21 +23,27 @@ fn next(kind: NextKind, detail: String) -> NextAction {
     NextAction { kind, detail }
 }
 
-/// What happened to `deploy`, its steps being `steps`, why, and what to do next.
+/// What a host the reader can't see is called: they are never told its name.
+pub(crate) const UNSEEN_HOST: &str = "a host you can't view";
+
+/// What happened to `deploy`, its steps being `steps`, why, and what to do next. `host` is
+/// the deploy's host as the reader may see it: `None` names it [`UNSEEN_HOST`].
 #[must_use]
-pub(crate) fn explain(deploy: &DeployRow, steps: &[StepRow]) -> Why {
-    let mut events = asked(deploy);
+pub(crate) fn explain(deploy: &DeployRow, steps: &[StepRow], host: Option<&HostId>) -> Why {
+    let host = host.map_or_else(|| UNSEEN_HOST.to_owned(), ToString::to_string);
+    let host = host.as_str();
+    let mut events = asked(deploy, host);
     events.extend(steps.iter().map(step_event));
     let reason = deploy.reason.as_deref().unwrap_or("");
     if let Some(outcome) = deploy.outcome {
-        let (what, text) = ended(deploy, outcome, reason);
+        let (what, text) = ended(deploy, host, outcome, reason);
         events.push(event(deploy.finished_at, what, text));
     }
     let failed_at = steps
         .iter()
         .find(|step| step.failure.is_some())
         .map_or_else(String::new, |step| format!(" at step {}", step.name));
-    let (summary, next) = said(deploy, reason, &failed_at);
+    let (summary, next) = said(deploy, host, reason, &failed_at);
     Why {
         deploy: deploy.id,
         outcome: deploy.outcome,
@@ -45,8 +54,7 @@ pub(crate) fn explain(deploy: &DeployRow, steps: &[StepRow]) -> Why {
 }
 
 /// Who asked for it and who signed it, if anyone did, then its queue and its host taking it.
-fn asked(deploy: &DeployRow) -> Vec<WhyEvent> {
-    let host = &deploy.host;
+fn asked(deploy: &DeployRow, host: &str) -> Vec<WhyEvent> {
     let mut events = Vec::new();
     if let Some(by) = &deploy.requested_by {
         let number = deploy
@@ -90,8 +98,7 @@ fn step_event(step: &StepRow) -> WhyEvent {
 }
 
 /// The last event: how it ended, in the host's words.
-fn ended(deploy: &DeployRow, outcome: Outcome, reason: &str) -> (WhyKind, String) {
-    let host = &deploy.host;
+fn ended(deploy: &DeployRow, host: &str, outcome: Outcome, reason: &str) -> (WhyKind, String) {
     match outcome {
         Outcome::Deployed => (WhyKind::Finished, format!("it runs on {host}")),
         Outcome::RolledBack => (
@@ -143,8 +150,13 @@ fn ended(deploy: &DeployRow, outcome: Outcome, reason: &str) -> (WhyKind, String
 
 /// The summary and the next action: by the outcome once it finished, and by its state until
 /// then.
-fn said(deploy: &DeployRow, reason: &str, failed_at: &str) -> (String, Option<NextAction>) {
-    let (tag, host) = (&deploy.tag, &deploy.host);
+fn said(
+    deploy: &DeployRow,
+    host: &str,
+    reason: &str,
+    failed_at: &str,
+) -> (String, Option<NextAction>) {
+    let tag = &deploy.tag;
     let not_retried = "it won't be retried automatically";
     match (deploy.state, deploy.outcome) {
         (DeployState::Queued, _) => (

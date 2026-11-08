@@ -261,6 +261,11 @@ name its own document doesn't list.
 A step's name and failure, and a host's reasons, are the host's words, quoted when they were
 stored, and `events` and `summary` quote them: escape them before showing them.
 
+A deploy's `host` is the host it was sent to, named only to a principal who may see that host,
+as `getHost` and the audit log show hosts: through a deployment on it now that they may view.
+A deploy made before its deployment moved to another host can have gone to a host they can't
+see; its `host` is then `null`, and `why` says "a host you can't view".
+
 Seeing a deploy takes `view` on its deployment. With no grant there, a deploy is the same
 `404 not_found` as a number no deploy has, and with some other grant it is `403 forbidden`. A
 deploy of a deployment the configuration no longer has is `404` to everyone, as is that

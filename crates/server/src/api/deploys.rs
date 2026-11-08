@@ -6,11 +6,16 @@
 //! the same `404` as a number no deploy has, and some other grant is `403`. A deploy of a
 //! deployment the configuration no longer has is `404` to everyone. A list is newest first, a
 //! page at a time on the index of a deployment's deploys, with the steps of the whole page
-//! read at once. These change nothing.
+//! read at once. A deploy's host is named only to a reader who may see it, as `getHost` and
+//! the audit log show hosts: a deploy made before its deployment moved can name a host the
+//! reader can't. These change nothing.
+
+use std::collections::BTreeSet;
 
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use landfall_api::{DeployView, Page, StepView, Why};
+use landfall_core::ids::HostId;
 use serde::Deserialize;
 use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
@@ -23,7 +28,7 @@ use super::openapi::{
 use super::query::{
     ApiQuery, Cursor, CursorList, DeploymentPath, IdPath, Limit, NoQuery, id_number,
 };
-use super::visible::{viewable, viewable_by_id};
+use super::visible::{viewable, viewable_by_id, viewable_hosts};
 use super::why::explain;
 use crate::agent_api::{ApiProblem, ApiState};
 use crate::auth::{HumanProblem, Principal};
@@ -51,11 +56,16 @@ fn step_view(step: StepRow) -> StepView {
     }
 }
 
-fn view(row: DeployRow, steps: Vec<StepRow>) -> DeployView {
+/// `row`'s host, if `hosts`, those the reader may see, hold it.
+fn shown_host<'a>(row: &'a DeployRow, hosts: &BTreeSet<&HostId>) -> Option<&'a HostId> {
+    Some(&row.host).filter(|host| hosts.contains(host))
+}
+
+fn view(row: DeployRow, steps: Vec<StepRow>, hosts: &BTreeSet<&HostId>) -> DeployView {
     DeployView {
         id: row.id,
+        host: shown_host(&row, hosts).cloned(),
         deployment: row.deployment,
-        host: row.host,
         tag: row.tag,
         digest: row.digest,
         commit: row.commit,
@@ -150,11 +160,12 @@ async fn list(
         .map(|last| Cursor::new(CursorList::Deploys, last.id.to_string()).encode());
     let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
     let mut steps = store.steps_of(&ids).await?;
+    let hosts = viewable_hosts(state.config(), &principal);
     let items = rows
         .into_iter()
         .map(|row| {
             let of_it = steps.remove(&row.id).unwrap_or_default();
-            view(row, of_it)
+            view(row, of_it, &hosts)
         })
         .collect();
     Ok(ApiJson(Page { items, next_cursor }))
@@ -191,7 +202,8 @@ async fn get(
     path: Result<Path<IdPath>, PathRejection>,
 ) -> Result<ApiJson<DeployView>, HumanProblem> {
     let (row, steps) = named_deploy(&state, &principal, path).await?;
-    Ok(ApiJson(view(row, steps)))
+    let hosts = viewable_hosts(state.config(), &principal);
+    Ok(ApiJson(view(row, steps, &hosts)))
 }
 
 /// `GET /api/v1/deploys/{id}/why`: why a deploy ended as it did.
@@ -224,7 +236,8 @@ async fn why(
     path: Result<Path<IdPath>, PathRejection>,
 ) -> Result<ApiJson<Why>, HumanProblem> {
     let (row, steps) = named_deploy(&state, &principal, path).await?;
-    Ok(ApiJson(explain(&row, &steps)))
+    let hosts = viewable_hosts(state.config(), &principal);
+    Ok(ApiJson(explain(&row, &steps, shown_host(&row, &hosts))))
 }
 
 /// The API's operations on deploys.
