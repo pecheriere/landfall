@@ -6,17 +6,17 @@
 
 **Architecture:** The agent labels each container with `landfall.deployment`, `landfall.version`, `landfall.commit` and the new `landfall.deploy`. Docker's journald driver copies those labels onto each log line, and the operator's Vector forwards the lines to VictoriaLogs. The controller queries VictoriaLogs read-only. The query is built only from the deploy's own row and the configuration's validated field names, never from a string the caller sent, and every value in it is quoted. It runs within a time window, a line cap, a byte cap, a timeout, a per-credential budget and a global concurrency cap. Notifications come from the audit log, which is already the one record of everything that happens. A notifier task reads new audit rows after a cursor kept per webhook. It maps each row exhaustively to an event or to nothing, keeps only rows about the webhook's own deployments, and puts each event in a durable outbox. A sender per webhook delivers the events in order, signed by the Standard Webhooks scheme (HMAC-SHA256), with no proxy, no redirects, timeouts and size caps. A resolver refuses private, loopback and link-local addresses unless the webhook allows the private network, and refuses link-local always. Retries back off with jitter for up to 24 hours. Neither part can block or fail a deploy: logs are only read when asked, and notifications run in their own task over their own tables.
 
-**Tech Stack:** Rust 1.99 (edition 2024). New direct dependencies: `hmac` 0.13 in `landfall-server` (already in `Cargo.lock` at 0.13.0, built on the workspace's `sha2` 0.11), and `reqwest` as a direct dependency of `landfall-server` (already in the tree through `landfall-origin`, rustls only, with `stream`). Task 3 confirms both against `crate-age` and `deny.toml`. Two container images are used only by `#[ignore]`d `docker_` tests: VictoriaLogs and Vector, each pinned by digest to a release at least 7 days old. Nothing else is new.
+**Tech Stack:** Rust 1.99 (edition 2024). New direct dependencies: `hmac` 0.13 in `landfall-server` (already in `Cargo.lock` at 0.13.0, built on the workspace's `sha2` 0.11), and `reqwest` as a direct dependency of `landfall-server` (already in the tree through `landfall-origin`, rustls only, with `stream`). Task 3 confirms both against `crate-age` and `deny.toml`. Two container images are used only by `#[ignore]`d `docker_` tests: VictoriaLogs and Vector, each pinned by digest to a release at least 7 days old, which CI may pull (the owner agreed, 2026-11-08). Nothing else is new.
 
-**Spec:** `docs/design/landfall.md`, sections 2 (logs and webhook goals; the "silent failure" anti-goal), 4 (controller → VictoriaLogs, read-only), 7.2 (notify on success, failure and a failed rollback, which is critical), 8.2 and 8.3 (grants and what the API may show), 8.4 (approval notifications through any webhook, warden included), 9 (deploys' logs as an API resource, `landfall logs`), 10 (labels, journald, Vector, VictoriaLogs, "logs aren't configured") and 12. Plan 07's rulings on visibility, budgets, problem answers, the OpenAPI document and the grant test still stand.
+**Spec:** `docs/design/landfall.md`, sections 2 (logs and webhook goals; the "silent failure" anti-goal), 4 (controller → VictoriaLogs, read-only), 7.2 (notify on success, failure and a failed rollback, which is critical), 8.2 and 8.3 (grants and what the API may show; this plan changes both: a `logs` grant in 8.2, and two controller-wide alerts a webhook may opt into in 8.3), 6.1 (the fleet file goes to every host, so this plan adds a controller-only secrets file beside it), 8.4 (approval notifications through any webhook, warden included), 9 (deploys' logs as an API resource, `landfall logs`), 10 (labels, journald, Vector, VictoriaLogs, "logs aren't configured") and 12. Plan 07's rulings on visibility, budgets, problem answers, the OpenAPI document and the grant test still stand.
 
 ## Rulings made while writing this plan
 
 The spec is the authority. Each ruling below decides something the spec leaves open, or names the spec line it follows, and says what it costs if it is wrong.
 
 - **Five PRs, eleven tasks, in order.**
-  - PR A: labels and the deploy id (Task 1), the `[logs]` and `[[webhook]]` configuration (Task 2), and the controller's secrets file with its outbound network policy (Task 3).
-  - PR B: the VictoriaLogs client (Task 4) and `getDeployLogs` (Task 5).
+  - PR A: labels and the deploy id (Task 1), the `[logs]` and `[[webhook]]` configuration (Task 2), and the controller's secrets file, which holds each webhook's URL and key, with its outbound network policy (Task 3).
+  - PR B: the VictoriaLogs client (Task 4) and `getDeployLogs` under the new `logs` grant (Task 5).
   - PR C: logs against a real VictoriaLogs and a real journald pipeline (Task 6), and `landfall logs` (Task 7).
   - PR D: webhook events and their signature (Task 8), and the outbox the notifier fills (Task 9).
   - PR E: delivery, `landfall-server webhook test` and wiring into `serve` (Task 10), then end to end, and the docs and spec (Task 11).
@@ -24,13 +24,42 @@ The spec is the authority. Each ruling below decides something the spec leaves o
   Each PR is reviewable alone and leaves `main` working. *If wrong:* a later PR reshapes a configuration key an earlier one shipped, before any release.
 - **The labels are the spec's, `landfall.*`, and the deploy id is `landfall.deploy`.** Section 10 left the choice to this plan. The code writes `dev.landfall.*`, a reverse-DNS prefix, which by Docker's convention claims a domain. The spec names `landfall.*`. Neither name is read by any code: `pinned_image` reads only the image line, and drift compares images. So nothing breaks. An override written before this plan, restored by a rollback, keeps its old labels until the next deploy, and `docs/operations.md` says so. The journald driver turns a label key into a field name by upper-casing it and replacing what journald doesn't allow with `_`, so `landfall.deploy` becomes `LANDFALL_DEPLOY`. Task 6's Linux test pins that rather than trusting this paragraph. *If wrong:* the operator's Vector config renames a field, which `[logs]` already allows.
 - **The deploy id reaches the override through `DeployPlan`.** `DeployPlan::from_verified` gains `deploy_id: DeployId`. The daemon has it from `DeployWork`, and the tests that call `deploy::run` pass one. `recover` and rollback restore saved bytes and write no new label. *If wrong:* nothing that decides reads a label; logs of a restored container sit under the previous deploy's id, which is what that container is.
-- **Logs are read by deploy, under `view`.** Section 9 lists logs under deploys as an API resource, and section 8.2 has no logs grant. So `getDeployLogs` takes `view` on the deploy's deployment, by plan 07's visibility rule: `404` without any grant there, `403` with another grant, and `404` for a deployment the configuration no longer has. Application logs can hold more than state does, so whether logs deserve their own grant is an open question for the owner. Adding one later is a spec change and one `can()` arm. *If wrong:* an agent token with `view` reads logs, which today it can already read on the host's journal if it has a shell there, and the budget bounds how fast it reads.
+- **Logs are read by deploy, under a grant of their own, `logs` (the owner's decision, 2026-11-08).** Section 9 lists logs under deploys as an API resource. An application's logs can hold secrets it printed, which state never holds, so an AI agent given `view` to watch deploys must not read them by that grant alone. Task 5 changes spec 8.2 to add `logs` beside `view`, `request`, `approve` and `rollback`, per principal and deployment, exact ids, as every grant is.
+  - **`getDeployLogs` takes `logs` on the deploy's deployment**, by plan 07's visibility rule: `404` without any grant there, `403` with another grant (`view` alone included), and `404` for a deployment the configuration no longer has.
+  - **`logs` implies nothing, and nothing implies it.** That is how grants work today: `can()` in `crates/server/src/auth/grants.rs` checks each `Permission` alone, and `request` doesn't imply `view` either. `view` doesn't imply `logs`, which is the point of the decision. `logs` doesn't imply `view`: a holder of `logs` alone learns, from a logs answer, the deploy's deployment, its window (`since`, `until`) and whether it was claimed, which the lines themselves say more of, and nothing else. Making `logs` require `view` in the configuration would refuse a file for a harmless combination, and would break the grant test's rule that each role is tried alone (`holder_of`). `docs/configuration.md` recommends granting the two together.
+  - **A token may hold `logs`.** Unlike `approve`, nothing about logs needs a person: an agent investigating a failed deploy is the use the goal names.
+  - **In code:** `Permission::Logs` (`"logs"`) in `crates/core/src/config/mod.rs`, one arm in `can()` (`Permission::View | Permission::Request | Permission::Rollback | Permission::Logs => granted`), `Permission::Logs` on the wire in `crates/api/src/deployments.rs` (an older CLI reads it as `Unknown`, which it already handles), one more entry in `PERMISSIONS` in `crates/server/src/api/deployments.rs`, so `whoAmI` lists it, and a generalisation of `visible::viewable_by_id` to `permitted_by_id(config, principal, id, permission)`, which `viewable_by_id` calls with `View`.
+
+  *If wrong:* an operator who wanted `view` to cover logs adds `"logs"` to each grant, one word per grant.
 - **The query is built from the controller's own values only.** The LogsQL text is `<deployment_field>:=<q(deployment id)> <deploy_field>:=<q(deploy id)> | sort by (_time) | offset <k> | limit <n+1> | fields _time, _msg`. `q` is LogsQL's double-quoted string, with `\` and `"` escaped and every control character written as `\uXXXX`. Field names come from the configuration and must match `[A-Za-z_][A-Za-z0-9_]{0,63}`. The deployment id comes from the deploy's row, and the deploy id is an integer. Times go in the HTTP `start` and `end` parameters as RFC 3339, made by `jiff` from integers. `k` and `n` are integers the controller bounds. Nothing the caller sends reaches the query as text: `since`, `until` and `limit` are parsed as integers first, and the cursor decodes to integers and is checked against the path's deploy id. A test against the real VictoriaLogs (Task 6) stores lines whose deployment value holds `"`, `\`, `|`, ` OR `, `*` and a newline, and shows that each exact match returns its own line and no other. *If wrong:* the escaping test fails there before it ships.
 - **The window, the caps and the pages.** The lower bound is the deploy's `claimed_at` minus 60 seconds. A deploy never claimed has no container, and gets `state: "not_started"` without a query. The default upper bound is `finished_at` plus 600 seconds, or now while it runs. `since` and `until` (unix seconds) may move the window anywhere from the lower bound to now, so an agent can read today's lines of a container still running. A `since` below the lower bound is raised to it, and the answer echoes the window used. A span over 24 hours, or `until` not after `since`, is `400 bad_request`. `limit` is 1 to 1,000, default 200. Each message is cut at 8 KiB on a character boundary, marked `cut: true`. The VictoriaLogs answer is read as a stream under 8 MiB, and over that is `502 logs_unavailable` (too large). Lines come oldest first, a page at a time. The cursor (list `logs`) holds `<deploy id>.<last _time in ns>.<lines already given at that ns>`. The next query starts at that time, with `offset` skipping those lines. The offset is capped at 100,000, and past it the cursor is refused. Lines with the same nanosecond may page unstably, and `docs/api.md` says so. *If wrong:* a very chatty container needs more pages, never a bigger answer.
 - **"Not configured" is a state, a failing VictoriaLogs is a problem.** Section 10 says the view says logs aren't configured. So without `[logs]` the answer is `200` with `state: "not_configured"` and no lines. That is a fact about this controller that an agent should read, not an error to retry. A VictoriaLogs that times out, refuses, answers other than 200, or sends something that doesn't parse or is too large is `502 logs_unavailable`. Its title names which of those, never the URL or the body. So the CLI exits 2, as for any server error. *If wrong:* a script treating every 200 as lines reads `state` first, as `docs/api.md` says.
 - **Field names are configured, with defaults from the journald pipeline.** `[logs]` holds `deployment_field` (default `LANDFALL_DEPLOYMENT`) and `deploy_field` (default `LANDFALL_DEPLOY`). VictoriaLogs' own `_time` and `_msg` are fixed. `docs/operations.md` gives the Vector configuration that Task 6 runs, so the defaults are the names that configuration produces. *If wrong:* an operator with Vector's `docker_logs` source sets the two names to its `label.*` fields.
-- **The controller's secrets live in one file outside the fleet configuration.** The fleet file is reviewed in a repository and copied to every host (section 6.1), so it holds no secret. `landfall-server serve --secrets <FILE>` reads a TOML file. It must be a regular file opened with no-follow, owned by the controller's user, with `mode & 0o077 == 0`, and at most 16 KiB. It holds `[webhook.<name>] key = "whsec_<base64>"` (24 to 64 random bytes, the Standard Webhooks key form) and an optional `[logs] bearer = "<token>"` for a VictoriaLogs behind an authenticating proxy. Every `[[webhook]]` needs a key, and `serve` refuses to start without one, naming the webhook. A key for a webhook the configuration doesn't have is refused too, as a typo. Keys and the bearer have redacted `Debug`, no `Display`, and appear in no log line, audit row, API answer or error. *If wrong:* the operator keeps one more file with mode 0600, as they do for the database.
-- **The webhook's URL is in the fleet file, without credentials.** It is where notifications go, which a reviewer should see. It is refused with userinfo (`user:pass@`) or a fragment, so no credential sits in the reviewed file by accident. A receiver that takes a capability in its path, such as a Home Assistant webhook id, has that path visible to whoever reads the fleet file, hosts included. `docs/operations.md` says so, and says the signature is the authentication a receiver should check. Whether the URL should move to the secrets file is an open question for the owner. *If wrong:* the URL moves to `[webhook.<name>] url` in the secrets file, and the fleet file keeps the name, events and deployments.
+- **The controller's secrets live in one file outside the fleet configuration.** The fleet file is reviewed in a repository and copied to every host (section 6.1), so it holds no secret. `landfall-server serve --secrets <FILE>` reads a TOML file. It must be a regular file opened with no-follow, owned by the controller's user, with `mode & 0o077 == 0`, and at most 16 KiB. Its schema, keyed by webhook name:
+
+  ```toml
+  [webhook.home-assistant]
+  url = "https://hooks.example.com/landfall"
+  key = "whsec_<base64>"
+
+  [logs]
+  bearer = "<token>"
+  ```
+
+  - `key` is 24 to 64 random bytes in the Standard Webhooks key form. `url` is the webhook's address (next ruling). `[logs] bearer` is optional, for a VictoriaLogs behind an authenticating proxy. `[logs]` may be left out, and any table or key not listed here is refused (`deny_unknown_fields`).
+  - **Every `[[webhook]]` in the fleet file needs a `[webhook.<name>]` with both `url` and `key`.** `serve` refuses to start without one, naming the webhook and the missing key, and so does `webhook test`. With no `--secrets` at all, a configuration with webhooks is refused the same way.
+  - **A `[webhook.<name>]` that no `[[webhook]]` names is refused too, not warned about.** It is either a typo, whose intended webhook is then refused anyway for having no entry, or a webhook taken out of the fleet file whose URL, a capability, should be deleted rather than kept on disk with nothing reading it. A warning would go to a log nobody reads at start-up. The fleet file is read once, at start-up (`ServeArgs::config`'s doc), so the operator edits both files and then restarts, and no window exists in which a correct pair is refused. If the spec's re-read on SIGHUP (6.1) is built later, it must re-read the secrets file with the fleet file and keep the old pair when the new one doesn't check. *If wrong:* removing a webhook takes one more edit before the restart.
+  - Keys, URLs and the bearer have redacted `Debug`, no `Display`, and appear in no log line, audit row, API answer or error.
+
+  *If wrong:* the operator keeps one more file with mode 0600, as they do for the database.
+- **The webhook's URL is a capability, so it lives in the secrets file (the owner's decision, 2026-11-08).** A receiver often takes a capability in its URL: a Home Assistant webhook id, a token in a query string. In the fleet file it would be readable on every host and in the config repository. So the fleet file's `[[webhook]]` keeps the name, what it receives (`events`, `deployments`, `controller_alerts`) and the network policy (`allow_private_network`), which a reviewer should see, and the secrets file holds where it goes. The consequences:
+  - **Parsing moves.** Core's configuration no longer sees a webhook URL, so it can't check it. `secrets::load(path, &config)` parses each `url` with core's `TargetUrl::parse(text, webhook.policy())`, after the fleet file is parsed, with the policy that fleet file sets: `https` or `http` only, no userinfo, no fragment, `http` only with `allow_private_network`, and an IP-literal host checked by `net::allows`. So the literal SSRF check runs when secrets load, at start-up and in `webhook test`, before the database opens. A query string is allowed, since it is where some receivers take their token.
+  - **`[logs] url` stays in the fleet file**, parsed by core as before: it names the operator's own service, holds no capability, and its bearer is already in the secrets file.
+  - **The URL is never shown.** Not in a log line, an audit row (`webhook_gave_up`, `webhook_dropped`, `webhook_tested` name the webhook), an API answer (no route reads webhooks), an error (`TargetError`, `SecretsError` and `OutboundError` name the webhook and the reason, never the text; `reqwest::Error::without_url`), `Debug` (`WebhookSecret`'s is redacted, and core's `TargetUrl` prints only its scheme), or `webhook test`'s output.
+  - **The configuration's hash no longer covers it.** Moving or rotating a receiver changes the secrets file and needs a controller restart, and doesn't put every host in configuration drift.
+  - **A reviewer no longer sees where notifications go**, only what each named webhook receives and whether it may reach the private network. The operator who holds the secrets file decides where.
+
+  *If wrong:* the URL moves back to `[[webhook]] url`, and `secrets::load` drops one key.
 - **Signatures follow Standard Webhooks.** The spec says nothing on signing. Standard Webhooks is a published scheme with receiver libraries in many languages, so a receiver needn't write its own check. Each request carries:
   - `webhook-id: landfall-<audit seq>`, the same on every retry, which a receiver uses to drop duplicates;
   - `webhook-timestamp: <unix seconds of this attempt>`;
@@ -43,7 +72,7 @@ The spec is the authority. Each ruling below decides something the spec leaves o
   - **`Never`** is refused always.
   - **`http://`** is allowed only with `allow_private_network = true`, and then only to private or loopback addresses. A Home Assistant on the LAN is the common case, and HMAC keeps it from being forged.
 
-  The check runs twice. Once on an IP literal in the URL when the configuration is parsed, since the connector doesn't resolve literals. Then in a custom `reqwest` DNS resolver on every connection, which drops each address the policy refuses and fails if none is left. So a name that resolves to `169.254.169.254`, or that changes after start-up (DNS rebinding), connects nowhere. `[logs] url` goes through the same policy, as the operator's own service: `https://` anywhere but `Never`, and `http://` only to private or loopback. *If wrong:* a receiver at a link-local address can't be reached, and the operator gives it another address.
+  The check runs twice. Once on an IP literal in the URL, since the connector doesn't resolve literals: for a webhook when the secrets file is loaded against the configuration, and for `[logs] url` when the configuration is parsed. Then in a custom `reqwest` DNS resolver on every connection, which drops each address the policy refuses and fails if none is left. So a name that resolves to `169.254.169.254`, or that changes after start-up (DNS rebinding), connects nowhere. `[logs] url` goes through the same policy, as the operator's own service: `https://` anywhere but `Never`, and `http://` only to private or loopback. *If wrong:* a receiver at a link-local address can't be reached, and the operator gives it another address.
 - **Notifications come from the audit log, at least once, in order.** Every event the spec wants notified is already an audit row, written in the transaction that decided it. So the notifier reads `audit_events` after its cursor, which can't miss a row: SQLite has one writer, so `seq` order is commit order. It writes the events and the advanced cursor in one transaction. Each webhook has its own cursor. A webhook new to the configuration starts at the current head, with no backfill. A webhook taken out of the configuration has its cursor and outbox deleted at start-up. A sender delivers one event at a time per webhook, oldest first, at most 5 a second. A crash re-sends at most the event in flight, under the same `webhook-id`. *If wrong:* a receiver sees a duplicate it can drop by id.
 - **The events, their severities and what each carries.** One pure function, `events::from_row`, has an exhaustive `match` on `EventKind`, so a new kind doesn't compile until it says whether it notifies:
 
@@ -56,12 +85,18 @@ The spec is the authority. Each ruling below decides something the spec leaves o
   | `release_refused` | `release_seen` with `refused` | warning |
   | `config_drift` | `config_drift` | warning |
   | `running_drift` | `running_drift` | warning |
+  | `controller_alert` | `sign_in_barred_key`, `access_throttled`, only to a webhook with `controller_alerts = true` | `sign_in_barred_key`: critical (the kind's doc: "treat it as an alert"); `access_throttled`: warning |
   | `test` | `landfall-server webhook test` only | info |
 
-  Every other kind gives no event. An event carries `type`, `id`, `at`, `severity`, `deployment`, `host`, a one-line `summary` in the controller's words, and typed `data`. `approval_needed` adds `approve_url` from `[approval]`, so a phone notification can open the page.
+  Every other kind gives no event. `from_row` says which kind of subscription a row needs, a `Topic`: `Deployment(EventName)` for the rows above `controller_alert`, `Controller` for the two alerts. An event carries `type`, `id`, `at`, `severity`, `deployment`, `host`, a one-line `summary` in the controller's words, and typed `data`. `approval_needed` adds `approve_url` from `[approval]`, so a phone notification can open the page.
 
-  Free text comes only from fields whose writer can't name another deployment: a host's `reason` and `rollback_reason` for its own deploy, and the verifier's `refused` for this deployment's own repository. Those fields are already quoted and bounded by `landfall_core::text`. Rule reasons and request reasons, which can name a promotion source or who cancelled, are left out. *If wrong:* a notification says less than the audit row, and links to where the rest is read.
-- **A webhook hears only of its own deployments.** `[[webhook]]` has `deployments` (exact ids, no globs, as grants are) and `events`, both non-empty, and each name must exist. A row with a deployment is sent only if that deployment is listed. A host-only row (`config_drift`) is sent only if a listed deployment is on that host, which is plan 07's audit rule. Controller-wide rows (tokens, passkeys, sign-ins) are never sent, by the same reason as spec 8.3. Whether an operator should be able to get `sign_in_barred_key` alerts by webhook is an open question. *If wrong:* the operator lists one more deployment.
+  Free text comes only from fields whose writer can't name another deployment: a host's `reason` and `rollback_reason` for its own deploy, and the verifier's `refused` for this deployment's own repository. Those fields are already quoted and bounded by `landfall_core::text`. Rule reasons and request reasons, which can name a promotion source or who cancelled, are left out. A `controller_alert` carries the alert's kind, the principal, the credential kind (`via`), the count, and for `access_throttled` which allowance (`changes`, `reads` or `logs`). It leaves out the source addresses `sign_in_barred_key` records, and any session or token id: they stay with `landfall-server audit show`, which the summary names. *If wrong:* a notification says less than the audit row, and links to where the rest is read.
+- **A webhook hears only of its own deployments.** `[[webhook]]` has `deployments` (exact ids, no globs, as grants are) and `events`, non-empty unless the webhook only takes controller alerts (below), and each name must exist. A row with a deployment is sent only if that deployment is listed. A host-only row (`config_drift`) is sent only if a listed deployment is on that host, which is plan 07's audit rule.
+  - **Controller-wide alerts by opt-in (the owner's decision, 2026-11-08).** `[[webhook]]` takes `controller_alerts` (default `false`). With it `true`, the webhook also receives `sign_in_barred_key` (someone holds a key registered for a principal) and `access_throttled` (a credential went over a budget), as `controller_alert`. Spec 8.3 keeps controller-wide rows away from the API because no per-deployment grant covers them and a stolen agent token is the threat they would serve; a webhook isn't a token, and the reviewed fleet file says which receiver gets them. Task 8 changes spec 8.3's text to say so. Both kinds are already aggregated before they are written (ceremonies' failure counts, the budget's dropped counts), so an attacker can't make the receiver hear more than one row per count and flush.
+  - **Every other controller-wide row is never sent**, `controller_alerts` or not: tokens, passkeys, sign-ins, refused registrations, and the webhook's own `webhook_gave_up`, `webhook_dropped` and `webhook_tested`, so a failing webhook can't feed itself.
+  - `events` and `deployments` must be both non-empty or both empty, and both empty only with `controller_alerts = true`: a webhook that can receive nothing is a mistake the configuration refuses.
+
+  *If wrong:* the operator lists one more deployment, or turns `controller_alerts` off.
 - **Retries, give-ups and bounds.**
   - **Retried:** a 2xx is delivered. A 408, 429 or 5xx, a timeout or a connection failure is retried, honouring `Retry-After` up to the cap.
   - **Given up at once:** any 3xx (redirects are never followed), and every other 4xx.
@@ -73,16 +108,16 @@ The spec is the authority. Each ruling below decides something the spec leaves o
   - **Bodies:** a request body is at most 16 KiB, with summaries cut to fit. A response body is never read beyond 4 KiB, and never logged.
 
   *If wrong:* a receiver down for more than a day misses what happened meanwhile, and the audit rows say what it missed.
-- **Logs have a budget of their own.** A logs query costs VictoriaLogs far more than a read costs SQLite. So each credential gets a logs bucket of 20 at once, refilling at 1 a second, beside its read bucket. The controller runs at most 4 VictoriaLogs queries at once, and a fifth is `503 busy` at once, never queued. Over the bucket the answer is `429 rate_limited`, titled "too many log queries by this credential", with `Retry-After`, counted in `access_throttled` with `"logs": true`. *If wrong:* an agent paging a long window waits a few seconds.
+- **Logs have a budget of their own.** A logs query costs VictoriaLogs far more than a read costs SQLite. So each credential gets a logs bucket of 20 at once, refilling at 1 a second, beside its read bucket. The controller runs at most 4 VictoriaLogs queries at once, and a fifth is `503 busy` at once, never queued. Over the bucket the answer is `429 rate_limited`, titled "too many log queries by this credential", with `Retry-After`, counted in `access_throttled` with `"logs": true`. `throttled_event(spender, dropped, reads: bool)` in `auth/budget.rs` takes a `Allowance { Changes, Reads, Logs }` (not `Bucket`, which `agent_api/rate_limit.rs` already names) instead, and writes `"reads": true`, `"logs": true` or neither, so existing rows read the same. *If wrong:* an agent paging a long window waits a few seconds.
 - **The payload's schema is in the OpenAPI document.** `WebhookEvent` lives in `landfall-api` and derives its schema. It goes in the document's top-level `webhooks` (OpenAPI 3.1) if `utoipa` 6 writes that, and in `components.schemas` with a reference from `info.description` if not. Task 8 checks which, and records it. A test validates real payloads against that schema. *If wrong:* the schema is in components only, and `docs/api.md` points there.
-- **`landfall-server webhook test --config <FILE> --secrets <FILE> [--db <FILE>] <NAME>`** sends one signed `test` event at once, through the same client and policy, and prints the status. It writes nothing but, with `--db`, its audit row, `webhook_tested`. An operator setting up Home Assistant needs to see one arrive. *If wrong:* one subcommand to remove.
+- **`landfall-server webhook test --config <FILE> --secrets <FILE> [--db <FILE>] <NAME>`** sends one signed `test` event at once, to the URL in the secrets file, through the same client and policy, and prints the webhook's name and the status, never the URL. It writes nothing but, with `--db`, its audit row, `webhook_tested`. An operator setting up Home Assistant needs to see one arrive. *If wrong:* one subcommand to remove.
 
 ## Global Constraints
 
 - `rust-toolchain.toml` 1.99; workspace lints apply. No `#[allow]` or `#[expect]` without `reason = "..."`. `unsafe_code` is forbidden. No `unwrap` or `expect` outside tests. Public error enums are `#[non_exhaustive]`.
-- Source files stay under about 800 lines of code. Tests go in their own files, as `foo/tests.rs` and `foo/tests/<scenario>.rs`, naming what they import. `crates/server/src/cli.rs` (570), `store.rs` (589), `watcher.rs` (668), `config/mod.rs` (561) and `config/raw.rs` (555) take only what a task names; new code goes in new files. `crates/server/src/api/tests/deployments.rs` (746) and `watcher/tests/commits.rs` (650) take nothing.
+- Source files stay under about 800 lines of code. Tests go in their own files, as `foo/tests.rs` and `foo/tests/<scenario>.rs`, naming what they import. `crates/server/src/cli.rs` (570), `store.rs` (589), `watcher.rs` (668), `config/mod.rs` (561) and `config/raw.rs` (555) take only what a task names; new code goes in new files. `crates/server/src/api/tests/deployments.rs` (746) and `watcher/tests/commits.rs` (650) take nothing. `api/tests/grants.rs` (646) takes only Task 5's `CASES` row and its path function, and `api/tests.rs` (552) only the `logs` role.
 - Every `/api/v1` route takes a `Principal` first. Query strings are capped at 2 KiB and refuse unknown parameters. Every answer is JSON with `Cache-Control: no-store` and no CORS header, and every refusal is `application/problem+json` with a stable `code` in the document's `Problem` schema.
-- No secret anywhere it can be read: webhook keys, the VictoriaLogs bearer and the secrets file's contents never appear in an answer, a log line, an audit row, an error or `Debug` output. A webhook's URL is never logged: logs and audit rows name the webhook by `name`.
+- No secret anywhere it can be read: webhook URLs and keys, the VictoriaLogs bearer and the secrets file's contents never appear in an answer, a log line, an audit row, an error or `Debug` output. A webhook's URL is a secret like its key: logs, audit rows, errors and `webhook test` name the webhook by `name`.
 - Every outbound request (VictoriaLogs and webhooks) is made by a `reqwest` client built by `outbound::client` only. That means `.no_proxy()`, `redirect::Policy::none()`, `https_only` when the URL is `https://`, the policy's resolver, a connect and a total timeout, a streamed body under a cap, and `User-Agent: landfall/<version>`.
 - Nothing about logs or notifications may block, slow or fail a deploy, a report or the watcher. The notifier and senders are their own tasks. Their database writes are short transactions of their own, and a failure there is logged and retried, never propagated.
 - Hostile text (log lines, hosts' reasons, receiver answers) is never logged by the controller. It is JSON-escaped in answers and escaped again by the CLI's `display::safe` before a terminal sees it.
@@ -94,15 +129,16 @@ The spec is the authority. Each ruling below decides something the spec leaves o
 
 | Operation | Path | Roles | Task |
 |---|---|---|---|
-| `getDeployLogs` | `GET /api/v1/deploys/{id}/logs` | T, S: `view` | 5 |
+| `getDeployLogs` | `GET /api/v1/deploys/{id}/logs` | T, S: `logs` | 5 |
 
 ## Review Focus
 
 1. **A crafted value reaching LogsQL.** A `since` of `1 OR *`, a `limit` of `1|delete`, a cursor whose payload holds `"`, a deployment id at the edge of its grammar, a field name with a space in the configuration. Each must be refused before any query, or arrive quoted so that it matches only itself → Task 2 `field_names_outside_the_grammar_are_refused`; Task 4 `quoting_escapes_quotes_backslashes_and_controls`, `query_is_built_from_integers_and_validated_ids_only`; Task 5 `non_integer_window_and_limit_are_refused`, `a_cursor_of_another_deploy_is_refused`; Task 6 `docker_logs_exact_match_is_exact_for_hostile_values`.
-2. **A webhook that reaches inside the network.** A URL naming `169.254.169.254`, `[::ffff:169.254.169.254]`, `[64:ff9b::a9fe:a9fe]`, `localhost` or a public name that later resolves to `10.0.0.5`. A 302 to an internal address. A proxy in the environment. Each must connect nowhere unless the webhook allows the private network, and link-local never → Task 2 `literal_addresses_follow_the_policy`; Task 3 `class_table`, `resolver_drops_refused_addresses`, `a_rebinding_name_connects_nowhere`; Task 10 `redirect_is_given_up_not_followed`, `proxy_in_the_environment_is_not_used`.
-3. **A notification telling a receiver about a deployment it isn't configured for.** A host-only row from a host with only other deployments. A request cancelled by a rollback of another deployment. A rule reason naming a promotion source. A controller-wide row → Task 8 `rows_outside_the_webhooks_deployments_give_nothing`, `host_rows_need_a_listed_deployment_on_that_host`, `controller_wide_rows_never_notify`, `no_free_text_from_a_writer_that_can_name_another_deployment`.
+2. **A webhook that reaches inside the network.** A URL naming `169.254.169.254`, `[::ffff:169.254.169.254]`, `[64:ff9b::a9fe:a9fe]`, `localhost` or a public name that later resolves to `10.0.0.5`. A 302 to an internal address. A proxy in the environment. Each must connect nowhere unless the webhook allows the private network, and link-local never → Task 2 `class_table`, `target_url_literals_follow_the_policy`; Task 3 `webhook_url_literals_follow_the_webhooks_policy`, `resolver_drops_refused_addresses`, `a_rebinding_name_connects_nowhere`; Task 10 `redirect_is_given_up_not_followed`, `proxy_in_the_environment_is_not_used`.
+3. **A notification telling a receiver about a deployment it isn't configured for.** A host-only row from a host with only other deployments. A request cancelled by a rollback of another deployment. A rule reason naming a promotion source. A controller-wide row to a webhook without `controller_alerts`, or any controller-wide row but the two alerts to one with it → Task 8 `rows_outside_the_webhooks_deployments_give_nothing`, `host_rows_need_a_listed_deployment_on_that_host`, `controller_alerts_reach_only_webhooks_that_opt_in`, `other_controller_wide_rows_never_notify`, `controller_alerts_carry_no_sources_or_credential_ids`, `no_free_text_from_a_writer_that_can_name_another_deployment`.
 4. **A receiver that is slow, down, or hostile.** It hangs for a minute, answers 500 for two days, sends a 1 GiB body or redirects. Deploys and the watcher must go on unaffected, nothing past the caps is read or kept, and retries must back off and stop → Task 10 `a_hanging_receiver_times_out_and_is_retried`, `backoff_doubles_with_jitter_to_the_cap`, `undelivered_after_24_hours_is_given_up_and_audited`, `a_huge_answer_is_not_read`; Task 11 `a_dead_receiver_does_not_slow_a_deploy`.
-5. **A secret leaking.** The webhook key, the VictoriaLogs bearer or the secrets file's text appearing in `Debug`, an error, a log line, an audit row or an answer. A secrets file others can read, or a link → Task 3 `secrets_debug_is_redacted`, `readable_or_linked_secrets_file_is_refused`; Task 10 `no_log_line_or_audit_row_holds_the_key_or_url`.
+5. **A secret leaking.** The webhook's URL or key, the VictoriaLogs bearer or the secrets file's text appearing in `Debug`, an error, a log line, an audit row, an answer or `webhook test`'s output. A secrets file others can read, or a link. A URL left in the fleet file, where every host reads it → Task 2 `a_url_in_the_fleet_file_is_refused`, `target_url_debug_shows_only_the_scheme`; Task 3 `secrets_debug_is_redacted`, `webhook_urls_appear_in_no_error`, `readable_or_linked_secrets_file_is_refused`; Task 9 `gave_up_deletes_and_audits_without_url_or_key`; Task 10 `no_log_line_or_audit_row_holds_the_key_or_url`, `webhook_test_prints_the_name_not_the_url`.
+6. **Logs read by a grant that doesn't cover them.** A token with `view`, or with every grant but `logs`, reading a deploy's logs; a holder of `logs` alone reading state → Task 5 `view_alone_cannot_read_logs`, the `CASES` row for `getDeployLogs` under `logs` (the grant test tries every other role there, and every role but `view` against each `view` operation), `whoami_lists_logs_only_where_granted`.
 
 ## Pre-flight: tasks sharing files or interfaces
 
@@ -112,13 +148,14 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 |---|---|---|
 | `crates/agent/src/compose.rs`, `deploy.rs`, `deploy/files.rs`, `daemon/judge.rs`, and every `DeployPlan::from_verified` and `render_override` caller | 1 | Nothing later touches them |
 | `crates/core/src/config/{mod,raw}.rs`, new `config/{logs,webhook}.rs` | 2 | Task 2 adds the sections; Tasks 4, 8 and 10 read them through getters |
-| `crates/core/src/net.rs` (`AddrClass`, `class`) | 2, 3 | Task 2 creates it for the literal check; Task 3's resolver calls it |
+| `crates/core/src/net.rs` (`AddrClass`, `class`, `TargetUrl`) | 2, 3 | Task 2 creates it for `[logs] url`'s literal check; Task 3's `secrets::load` parses webhook URLs with `TargetUrl::parse`, and its resolver calls `allows` |
 | `Cargo.toml`, `crates/server/Cargo.toml` | 3 | `hmac`, `reqwest` (`rustls`, `stream`); dev: `wiremock` |
-| `crates/server/src/secrets.rs`, `outbound.rs` | 3 | Task 3 creates both; Tasks 4 and 10 use `outbound::client` and `Secrets` |
+| `crates/server/src/secrets.rs`, `outbound.rs` | 3 | Task 3 creates both; Tasks 4 and 10 use `outbound::client`, `Secrets` and `WebhookSecret` (a webhook's URL and key) |
 | `crates/server/src/cli.rs` (`ServeArgs`, `serve_watching`) | 3, 10 | Task 3 adds `--secrets` and loads it; Task 10 spawns the notifier and adds `webhook test` |
 | `crates/server/src/agent_api.rs` (`ApiState::new`, `Limits`) | 4, 5 | Task 4 adds the optional `LogsClient` to `ApiState`; Task 5 adds `logs_rate_per_second`, `logs_burst`, `logs_concurrency` |
-| `crates/server/src/auth/budget.rs`, `auth/problem.rs`, `crates/api/src/problem.rs` | 5 | `spend_logs`, `LogsOverBudget`, `LogsUnavailable` |
-| `crates/server/src/api.rs`, `api/query.rs` (`CursorList::Logs`), `api/tests.rs`, `api/tests/grants.rs` | 5 | One `routes!` merge, one cursor list, one seed, one `CASES` row |
+| `crates/server/src/auth/budget.rs`, `auth/problem.rs`, `crates/api/src/problem.rs` | 5 | `spend_logs`, `Allowance`, `LogsOverBudget`, `LogsUnavailable` |
+| `Permission` in `crates/core/src/config/mod.rs` and `crates/api/src/deployments.rs`; `auth/grants.rs` (`can`); `api/deployments.rs` (`PERMISSIONS`); `api/visible.rs` (`permitted_by_id`) | 5 | The `logs` grant; Task 8 reads nothing of it |
+| `crates/server/src/api.rs`, `api/query.rs` (`CursorList::Logs`), `api/tests.rs` (`ROLES`, `grant_sets`), `api/tests/grants.rs` | 5 | One `routes!` merge, one cursor list, one seed and the `logs` role, one `CASES` row |
 | `crates/api/src/lib.rs` | 5, 8 | `logs`; `webhook` |
 | `crates/server/src/audit.rs` (`EventKind`) | 9 | `WebhookGaveUp`, `WebhookDropped`, `WebhookTested`; `api/audit/detail.rs`'s exhaustive match lists them as never shown |
 | `crates/server/migrations/0009_webhooks.sql`, `store.rs` (`mod webhooks;`) | 9 | One migration, one module line |
@@ -126,7 +163,9 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 | `docs/api.md` | 5, 8 | Logs; the webhook payload |
 | `crates/cli/src/read.rs`, `read/render.rs`, `cli/tests.rs` | 7 | `Logs` command, its renderer, the OpenAPI row |
 | `.github/workflows/ci.yml` | 6 | One step for the server's `docker_` tests; zizmor clean |
-| `docs/operations.md`, `docs/design/landfall.md`, `README.md`, `AGENTS.md` | 6 (logs section), 11 (the rest) | |
+| `docs/design/landfall.md` | 5 (8.2, and the section 12 row on logs), 8 (8.3), 11 (the rest) | Each PR changes the spec where its behaviour changes |
+| `docs/configuration.md` | 2 (`[logs]`, `[[webhook]]`, validation rules), 5 (the `logs` grant) | |
+| `docs/operations.md`, `README.md`, `AGENTS.md` | 6 (logs section), 11 (the rest) | |
 
 ## What the next plans hold
 
@@ -158,7 +197,7 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 
 ### Task 2: `[logs]` and `[[webhook]]` in the fleet configuration
 
-**Files:** Create `crates/core/src/net.rs`, `crates/core/src/net/tests.rs`, `crates/core/src/config/logs.rs`, `crates/core/src/config/webhook.rs`, `crates/core/src/config/tests/{logs,webhooks}.rs`. Modify `crates/core/src/lib.rs` (`pub mod net;`), `crates/core/src/config/mod.rs` (fields, getters, error variants, `mod` lines), `crates/core/src/config/raw.rs` (raw sections and their conversion), `crates/core/src/config/tests.rs` (`mod` lines).
+**Files:** Create `crates/core/src/net.rs`, `crates/core/src/net/tests.rs`, `crates/core/src/config/logs.rs`, `crates/core/src/config/webhook.rs`, `crates/core/src/config/tests/{logs,webhooks}.rs`. Modify `crates/core/src/lib.rs` (`pub mod net;`), `crates/core/src/config/mod.rs` (fields, getters, error variants, `mod` lines), `crates/core/src/config/raw.rs` (raw sections and their conversion), `crates/core/src/config/tests.rs` (`mod` lines), `docs/configuration.md` (`[logs]` and `[[webhook]]` sections, their validation rules, and that a webhook's URL and key are in the controller's secrets file, not here).
 
 **Interfaces:**
 - `net.rs`: `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum AddrClass { Public, Private, Loopback, Never }` and `#[must_use] pub fn class(ip: IpAddr) -> AddrClass`, by the ranges in the Rulings, judging IPv4-mapped, IPv4-compatible and `64:ff9b::/96` addresses by their embedded IPv4. `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct NetPolicy { pub private: bool }`, and `#[must_use] pub fn allows(policy: NetPolicy, https: bool, ip: IpAddr) -> bool`, with this table:
@@ -169,15 +208,16 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   | `Public` | allowed | refused |
   | `Private`, `Loopback` | allowed with `private` | allowed with `private` |
 
-  `pub struct TargetUrl { url: Url, https: bool }` with `TargetUrl::parse(text: &str, policy: NetPolicy) -> Result<TargetUrl, TargetError>`. It takes `https` or `http` only. It refuses userinfo and a fragment, refuses `http` without `policy.private`, and checks an IP-literal host with `allows`. A host name is checked at connection time instead. It has getters `url()`, `https()` and `host_literal() -> Option<IpAddr>`. `TargetError` is `#[non_exhaustive]` and never repeats the URL, which may hold a capability path.
+  `pub struct TargetUrl { url: Url, https: bool }` with `TargetUrl::parse(text: &str, policy: NetPolicy) -> Result<TargetUrl, TargetError>`. It takes `https` or `http` only. It refuses userinfo and a fragment, refuses `http` without `policy.private`, and checks an IP-literal host with `allows`. A host name is checked at connection time instead. It has getters `url()`, `https()` and `host_literal() -> Option<IpAddr>`. Its `Debug` is written by hand and prints only the scheme (`TargetUrl { scheme: "https", .. }`), because the server's secrets hold webhook URLs in it. `TargetError` is `#[non_exhaustive]` and never repeats the URL, which may hold a capability path or a token in its query. `TargetUrl` lives in core so that one parser serves both `[logs] url` here and webhook URLs in the server's secrets file (Task 3).
 - `config/logs.rs`: `pub struct Logs { url: TargetUrl, deployment_field: String, deploy_field: String, timeout: Duration, account_id: Option<u32>, project_id: Option<u32> }`, with getters. TOML: `url` (required), `deployment_field` (default `LANDFALL_DEPLOYMENT`), `deploy_field` (default `LANDFALL_DEPLOY`), `timeout_secs` (1 to 30, default 10), `account_id`, `project_id`. A field name must match `[A-Za-z_][A-Za-z0-9_]{0,63}`, and the two must differ. The policy is `NetPolicy { private: true }`: the operator's own service, so `http://` to the private network is allowed and `Never` isn't.
-- `config/webhook.rs`: `pub struct Webhook { name: WebhookName, url: TargetUrl, events: BTreeSet<EventName>, deployments: BTreeSet<DeploymentId>, policy: NetPolicy }`, with getters. `WebhookName` matches `[a-z0-9][a-z0-9-]{0,31}`. `pub enum EventName { ApprovalNeeded, ApprovalClosed, DeployFinished, DeployRefused, ReleaseRefused, ConfigDrift, RunningDrift }`, written `snake_case` (`test` can't be subscribed; every webhook gets it from `webhook test`). TOML: `[[webhook]]` with `name`, `url`, `events`, `deployments` and `allow_private_network` (default false). `events` and `deployments` must be non-empty, every deployment must exist, and names are distinct.
+- `config/webhook.rs`: `pub struct Webhook { name: WebhookName, events: BTreeSet<EventName>, deployments: BTreeSet<DeploymentId>, controller_alerts: bool, policy: NetPolicy }`, with getters. No URL: it is in the secrets file (Rulings). `WebhookName` matches `[a-z0-9][a-z0-9-]{0,31}`, implements `Deserialize` by `FromStr`, so the server's secrets file keys its tables by it, and `Ord`. `pub enum EventName { ApprovalNeeded, ApprovalClosed, DeployFinished, DeployRefused, ReleaseRefused, ConfigDrift, RunningDrift }`, written `snake_case` (`test` can't be subscribed; every webhook gets it from `webhook test`; `controller_alert` isn't an `EventName`: `controller_alerts` subscribes to it). TOML: `[[webhook]]` with `name`, `events` (default empty), `deployments` (default empty), `controller_alerts` (default false) and `allow_private_network` (default false), and `deny_unknown_fields`. `events` and `deployments` must be both non-empty or both empty, and both empty only with `controller_alerts = true`. Every deployment must exist, and names are distinct. A `url` key gets its own `ConfigError` variant, saying a webhook's URL goes in the controller's secrets file, rather than serde's unknown-field message; it doesn't repeat the value.
 - `Config` gains `logs: Option<Logs>` and `webhooks: Vec<Webhook>`, with `pub fn logs(&self) -> Option<&Logs>`, `pub fn webhooks(&self) -> &[Webhook]` and `pub fn webhook(&self, name: &WebhookName) -> Option<&Webhook>`. New `ConfigError` variants each name the section and the value through `shown_in_config`. The URL is never shown whole, only its scheme and the reason.
 
 - [ ] **Step 1: Failing tests.**
   - In `net/tests.rs`: `class_table`, with at least `8.8.8.8` and `2001:4860::1` (Public), `10.0.0.5`, `172.16.0.1`, `192.168.1.1`, `100.64.0.1` and `fd00::1` (Private), `127.0.0.1` and `::1` (Loopback), and `169.254.169.254`, `fe80::1`, `0.0.0.0`, `::`, `224.0.0.1`, `255.255.255.255`, `192.0.2.10`, `::ffff:169.254.169.254`, `::ffff:127.0.0.1` (Loopback through the mapping), `64:ff9b::a9fe:a9fe` (Never) and `64:ff9b::808:808` (Public). Also `policy_table`, for each class × scheme × `private`.
   - In `config/tests/logs.rs`: `logs_parse_with_defaults`, `field_names_outside_the_grammar_are_refused` (`a b`, `a"b`, `a:b`, empty, 65 characters, a leading digit), `the_two_fields_must_differ`, `timeout_outside_1_to_30_is_refused`, `logs_url_with_userinfo_is_refused_without_repeating_it`, `logs_url_at_link_local_is_refused`, `no_logs_section_is_none`.
-  - In `config/tests/webhooks.rs`: `webhook_parses`, `unknown_event_is_refused`, `test_cannot_be_subscribed`, `empty_events_or_deployments_are_refused`, `unknown_deployment_is_refused`, `duplicate_names_are_refused`, `bad_names_are_refused`, `literal_addresses_follow_the_policy` (`https://10.0.0.5/` refused without `allow_private_network` and accepted with it; `https://[::ffff:169.254.169.254]/` and `http://169.254.169.254/` refused with it; `http://hooks.example.com/` refused without it), `fragment_and_userinfo_are_refused`, and `the_hash_covers_the_new_sections`.
+  - In `net/tests.rs`, for `TargetUrl::parse` directly: `target_url_literals_follow_the_policy` (`https://10.0.0.5/` refused without `private` and accepted with it; `https://[::ffff:169.254.169.254]/` and `http://169.254.169.254/` refused with it; `http://hooks.example.com/` refused without it; `https://hooks.example.com/landfall?token=x` accepted), `target_url_refuses_fragment_userinfo_and_other_schemes` (each error's `Display` holds neither the path nor the query), `target_url_debug_shows_only_the_scheme`.
+  - In `config/tests/webhooks.rs`: `webhook_parses`, `unknown_event_is_refused`, `test_cannot_be_subscribed`, `events_and_deployments_go_together` (one empty and the other not is refused), `a_webhook_that_receives_nothing_is_refused` (both empty without `controller_alerts`), `a_controller_alerts_only_webhook_parses` (both empty with it), `unknown_deployment_is_refused`, `duplicate_names_are_refused`, `bad_names_are_refused`, `a_url_in_the_fleet_file_is_refused` (the error names the secrets file and doesn't hold the URL's path), and `the_hash_covers_the_new_sections`.
 
   Run: `cargo nextest run -p landfall-core`. Expected: FAIL.
 - [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-core -p landfall-agent -p landfall-server`. Expected: PASS. Hosts ignore both sections, and the agent's tests are unchanged.
@@ -185,16 +225,16 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 
 ### Task 3: The controller's secrets file, and one way to make an outbound client
 
-**Files:** Create `crates/server/src/secrets.rs`, `crates/server/src/secrets/tests.rs`, `crates/server/src/outbound.rs`, `crates/server/src/outbound/tests.rs`. Modify `Cargo.toml` and `crates/server/Cargo.toml` (`hmac`, `reqwest` with `rustls` and `stream`; dev: `wiremock`), `crates/server/src/lib.rs` (`mod secrets; mod outbound;`), `crates/server/src/cli.rs` (`ServeArgs.secrets: Option<PathBuf>`, loaded and checked against the configuration before the database opens), `crates/server/src/cli/tests.rs`, `deny.toml` (licences only, if needed).
+**Files:** Create `crates/server/src/secrets.rs`, `crates/server/src/secrets/tests.rs`, `crates/server/src/outbound.rs`, `crates/server/src/outbound/tests.rs`. Modify `Cargo.toml` and `crates/server/Cargo.toml` (`hmac`, `reqwest` with `rustls` and `stream`; `toml` and `url`, already workspace dependencies through core, for the secrets file and `TargetUrl`'s `Url`; dev: `wiremock`), `crates/server/src/lib.rs` (`mod secrets; mod outbound;`), `crates/server/src/cli.rs` (`ServeArgs.secrets: Option<PathBuf>`, loaded by `secrets::load(path, &config)`, or `none_needed`, before the database opens), `crates/server/src/cli/tests.rs`, `deny.toml` (licences only, if needed).
 
 **Interfaces:**
 - `secrets.rs`:
-  - `pub(crate) struct Secrets { webhooks: BTreeMap<WebhookName, WebhookKey>, logs_bearer: Option<Bearer> }`.
-  - `pub(crate) fn load(path: &Path) -> Result<Secrets, SecretsError>` opens the file with `O_NOFOLLOW` and checks the open descriptor: a regular file, owned by the effective uid, `mode & 0o077 == 0`, at most 16 KiB. It is TOML with `deny_unknown_fields`.
-  - `pub(crate) fn check(secrets: &Secrets, config: &Config) -> Result<(), SecretsError>` requires a key for each webhook and refuses a key for an unknown one.
+  - `pub(crate) struct Secrets { webhooks: BTreeMap<WebhookName, WebhookSecret>, logs_bearer: Option<Bearer> }`, with `webhook(&self, name: &WebhookName) -> Option<&WebhookSecret>` and `logs_bearer(&self) -> Option<&Bearer>`.
+  - `pub(crate) struct WebhookSecret { url: TargetUrl, key: WebhookKey }`, with getters, a hand-written `Debug` that prints neither (`WebhookSecret { .. }`), and no `Display`.
+  - `pub(crate) fn load(path: &Path, config: &Config) -> Result<Secrets, SecretsError>`. It opens the file with `O_NOFOLLOW` and checks the open descriptor: a regular file, owned by the effective uid, `mode & 0o077 == 0`, at most 16 KiB. It parses TOML with `deny_unknown_fields`, into a raw form whose `url` is a plain string held only inside `load`. Then it checks the file against `config`, so that no `Secrets` exists unchecked: each `[[webhook]]` must have a `[webhook.<name>]` with `url` and `key`; a `[webhook.<name>]` no `[[webhook]]` names is refused (Rulings); and each `url` goes through `TargetUrl::parse(url, webhook.policy())`, so the literal-address policy and the scheme rule are those the fleet file sets for that webhook.
+  - `pub(crate) fn none_needed(config: &Config) -> Result<Secrets, SecretsError>`, for `serve` without `--secrets`: an empty `Secrets` if the configuration has no webhook, and otherwise the error `load` gives for the first webhook without an entry.
   - `WebhookKey` holds the decoded bytes (24 to 64) of `whsec_<standard base64>`. `Bearer` holds 1 to 512 visible ASCII characters. Both have redacted `Debug` and no `Display`.
-  - `SecretsError` names the path and the key's webhook, never a value.
-  - With no `--secrets`, a configuration with webhooks is refused at start-up, saying which webhook needs a key.
+  - `SecretsError` is `#[non_exhaustive]`. It names the path, the webhook and which key (`url`, `key` or `bearer`) and why (missing, malformed, refused by the network policy with the `TargetError` reason), never a value. A TOML syntax error is reported by line and column only: `toml`'s own message quotes the offending text, which may be a URL or a key, so it is never passed on.
 - `outbound.rs`:
   - `pub(crate) struct Target<'a> { pub url: &'a TargetUrl, pub policy: NetPolicy, pub connect: Duration, pub total: Duration }`.
   - `pub(crate) fn client(target: &Target<'_>, resolver: Arc<dyn Lookup>) -> Result<reqwest::Client, OutboundError>` builds the client by the Global Constraints, with `dns_resolver(Arc<PolicyResolver>)`.
@@ -205,7 +245,17 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 
 - [ ] **Step 1: Check the crates.** `hmac` 0.13 and `reqwest`'s `dns_resolver` and `stream` at versions `crate-age` accepts, their licences against `deny.toml`, and `cargo tree -e normal` showing no OpenSSL. Record the findings in the PR.
 - [ ] **Step 2: Failing tests.**
-  - In `secrets/tests.rs`: `secrets_parse`, `readable_or_linked_secrets_file_is_refused` (0640, 0604 and a symlink to a 0600 file), `oversized_file_is_refused`, `short_or_long_key_is_refused`, `key_without_whsec_prefix_is_refused`, `every_webhook_needs_a_key`, `a_key_for_an_unknown_webhook_is_refused`, `secrets_debug_is_redacted` (the key's base64 and the bearer appear in neither `Debug` nor any error's `Display`).
+  - In `secrets/tests.rs`:
+    - `secrets_parse`: two webhooks and a bearer.
+    - `readable_or_linked_secrets_file_is_refused` (0640, 0604 and a symlink to a 0600 file), `oversized_file_is_refused`.
+    - `short_or_long_key_is_refused`, `key_without_whsec_prefix_is_refused`.
+    - `every_webhook_needs_a_url_and_a_key`: an entry missing either, and a webhook with no entry, are each refused naming the webhook and the key.
+    - `an_entry_for_an_unknown_webhook_is_refused`.
+    - `webhook_url_literals_follow_the_webhooks_policy`: `https://10.0.0.5/` refused for a webhook without `allow_private_network` and accepted for one with it; `http://169.254.169.254/` and `https://[64:ff9b::a9fe:a9fe]/` refused for both; `http://hooks.example.com/` refused without it.
+    - `fragment_and_userinfo_in_a_webhook_url_are_refused`.
+    - `without_secrets_a_configuration_with_webhooks_is_refused`, and `without_secrets_no_webhooks_is_fine` (`none_needed`).
+    - `secrets_debug_is_redacted`: the key's base64, the URL's path (`/capability-token`) and query, and the bearer appear in no `Debug` of `Secrets`, `WebhookSecret`, `WebhookKey` or `Bearer`.
+    - `webhook_urls_appear_in_no_error`: every refusal above, and a TOML syntax error on the `url` line, hold neither the URL's path nor its query in `Display` or `Debug`.
   - In `outbound/tests.rs`, with `wiremock` on loopback:
     - `resolver_drops_refused_addresses`: a lookup giving `[169.254.169.254, 10.0.0.5]` under `private: true` leaves `10.0.0.5`.
     - `a_rebinding_name_connects_nowhere`: a name whose lookup gives `127.0.0.1` under `private: false` fails as `Refused`, and the mock receives nothing.
@@ -215,7 +265,7 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
     - `proxy_in_the_environment_is_not_used`, as plan 07's CLI test does it: a child process with `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` set.
     - `read_capped_stops_at_the_cap`.
     - `errors_hold_no_url`: the path `/capability-token` appears in no error's `Display` or `Debug`.
-  - In `cli/tests.rs`: `serve_refuses_webhooks_without_secrets`.
+  - In `cli/tests.rs`: `serve_refuses_webhooks_without_secrets`, `serve_refuses_a_webhook_url_the_policy_refuses` (before the database file is created).
 
   Run: `cargo nextest run -p landfall-server secrets outbound`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Run: `cargo nextest run -p landfall-server`. Expected: PASS.
@@ -257,7 +307,8 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 
 ### Task 5: `GET /api/v1/deploys/{id}/logs`
 
-**Files:** Create `crates/api/src/logs.rs`, `crates/server/src/api/logs.rs`, `crates/server/src/api/tests/logs.rs`. Modify `crates/api/src/lib.rs`, `crates/api/src/problem.rs` (`LogsUnavailable`), `crates/server/src/api.rs` (`.merge(logs::routes())`), `crates/server/src/api/query.rs` (`CursorList::Logs`), `crates/server/src/api/openapi.rs` (a `LogsUnavailable` response; `503` reuses the existing `Busy`), `crates/server/src/auth/budget.rs` (logs bucket, `spend_logs`, `throttled_event` gains `logs: bool`), `crates/server/src/auth/problem.rs` (`LogsOverBudget`, `LogsUnavailable`), `crates/server/src/agent_api.rs` (`Limits`), `crates/server/src/api/tests.rs` (seed: a claimed and finished deploy on `app/prod`, a fake VictoriaLogs), `crates/server/src/api/tests/grants.rs` (one `CASES` row), `docs/api.md`, `docs/api/openapi.json`.
+**Files:** Create `crates/api/src/logs.rs`, `crates/server/src/api/logs.rs`, `crates/server/src/api/tests/logs.rs`. Modify `crates/api/src/lib.rs`, `crates/api/src/problem.rs` (`LogsUnavailable`), `crates/server/src/api.rs` (`.merge(logs::routes())`), `crates/server/src/api/query.rs` (`CursorList::Logs`), `crates/server/src/api/openapi.rs` (a `LogsUnavailable` response; `503` reuses the existing `Busy`), `crates/server/src/auth/budget.rs` (logs bucket, `spend_logs`, `throttled_event` takes an `Allowance` for its `reads: bool`), `crates/server/src/auth/problem.rs` (`LogsOverBudget`, `LogsUnavailable`), `crates/server/src/agent_api.rs` (`Limits`), `crates/server/src/api/tests.rs` (seed: a claimed and finished deploy on `app/prod`, a fake VictoriaLogs; `ROLES` gains `"logs"`, last, so every existing holder keeps its name; `grant_sets` counts to `1 << ROLES.len()` rather than a fixed 16), `crates/server/src/api/tests/grants.rs` (one `CASES` row), `crates/server/src/api/tests/deployments.rs` (only the expected `can` lists of `a_tokens_grants_never_list_approve`, which gain `"logs"`; nothing else, as it is at 746), `docs/api.md`, `docs/api/openapi.json`.
+For the `logs` grant: `crates/core/src/config/mod.rs` (`Permission::Logs`), `crates/core/src/config/tests/parsing.rs`, `crates/api/src/deployments.rs` (`Permission::Logs`), `crates/server/src/auth/grants.rs` (`can`'s arm), `crates/server/src/api/deployments.rs` (`PERMISSIONS` gains `(Permission::Logs, Granted::Logs)`), `crates/server/src/api/visible.rs` (`permitted_by_id`), `docs/configuration.md` (`[[grant]]`'s `can` and validation rule 7), `docs/design/landfall.md` (8.2, and section 12).
 
 **Interfaces:**
 - `landfall-api`:
@@ -269,10 +320,12 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 - `Budget::spend_logs(&mut self, spender: &Spender, now: i64) -> bool`, with its own dropped counts.
 - `api/logs.rs`:
   - `LogsQuery { since: Option<i64>, until: Option<i64>, limit: Option<LogsLimit>, cursor: Option<String> }`, `deny_unknown_fields`, deriving `IntoParams`. `LogsLimit(u16)` is 1 to 1,000, default 200.
-  - The handler takes, in this order: the `Principal` (charged a read as every route is), the deploy by `viewable_by_id`, then `spend_logs`. Then come the window (Rulings), `not_configured` without a client, `not_started` without `claimed_at`, and the query.
+  - The handler takes, in this order: the `Principal` (charged a read as every route is), the deploy, refused unless `permitted_by_id(config, principal, deployment, Permission::Logs)` passes (`404` or `403` by `visibility`, as `viewable_by_id` gives them), then `spend_logs`. Then come the window (Rulings), `not_configured` without a client, `not_started` without `claimed_at`, and the query.
   - The cursor is decoded with `CursorList::Logs`, and its `after` parsed as `<deploy>.<ns>.<k>`. A deploy other than the path's, a `k` over 100,000 or an `ns` outside the window is `400 bad_request`.
   - `LogsError::Busy` is `503 busy`. The other errors are `502 logs_unavailable` with the error's fixed title.
-- `#[utoipa::path]` with `operation_id = "getDeployLogs"`, `security(("token" = ["view"]), ("session" = ["view"]))`, and responses 200, 400, 401, 403, 404, 429, 502 and 503.
+- `#[utoipa::path]` with `operation_id = "getDeployLogs"`, `security(("token" = ["logs"]), ("session" = ["logs"]))`, and responses 200, 400, 401, 403, 404, 429, 502 and 503.
+- The `logs` grant, by the Rulings: `Permission::Logs` in core and on the wire, `can()`'s arm, `PERMISSIONS`, and `pub(crate) fn permitted_by_id<'a>(config: &'a Config, principal: &Principal, id: Option<&DeploymentId>, permission: Permission) -> Result<&'a Deployment, HumanProblem>` in `visible.rs`, of which `viewable_by_id` becomes the `View` case.
+- Spec 8.2 becomes: "Per principal and deployment (exact ids, no globs in v0): `view`, `request`, `approve` (humans with a registered passkey only, enforced in code), `rollback` (request a manual rollback, which still needs approval), `logs` (read a deploy's container logs; apart from `view` because an application's logs can hold secrets it printed, so an agent trusted to watch state doesn't read them unless granted). No grant implies another. Grants live in the same reviewed config file." Section 12 gains a row: logs read with a stolen token: the `logs` grant, apart from `view`, the logs budget, the global cap; residual: what the application wrote to its logs, for a token that holds `logs`.
 
 - [ ] **Step 1: Failing tests** in `api/tests/logs.rs`, with a fake VictoriaLogs (`wiremock`) behind a real `LogsClient`:
   - `lines_of_a_deploy_come_oldest_first`.
@@ -292,10 +345,12 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   - `logs_throttles_are_counted_with_logs_true`.
   - `logs_of_an_unseen_deploy_are_not_found`.
   - `logs_of_a_deployment_no_longer_configured_are_not_found`.
+  - `view_alone_cannot_read_logs`: a token holding `view` on `app/prod` gets `403` and the fake receives nothing; the same principal's token after `logs` is added to the grant gets `200`.
 
-  Also the `CASES` row for `getDeployLogs` (`view`). The grant test and `every_success_answer_matches_its_documented_schema` then cover it.
+  Also the `CASES` row for `getDeployLogs` (role `logs`). With `"logs"` in `ROLES`, the grant test then tries a holder of every other role (`view` included) there and expects `403`, a holder of `logs` alone and expects `200`, and a holder of every role but `view`, `logs` included, against every `view` operation and expects `403`. `every_success_answer_matches_its_documented_schema` covers the answer.
+  In `api/tests/deployments.rs`'s `a_tokens_grants_never_list_approve`, the expected lists gain `"logs"`. In `crates/core/src/config/tests/parsing.rs`: `the_logs_grant_parses`. In `api/tests/logs.rs` too, so `deployments.rs` takes no new test: `whoami_lists_logs_only_where_granted`.
   Expected: FAIL.
-- [ ] **Step 2: Implement; regenerate the document.** Document the operation, the window, the caps, the states, the budget, the unstable order of same-nanosecond lines, and that logs are the container's own words, unverified and possibly secret-bearing, in `docs/api.md`. Run: `cargo nextest run -p landfall-server -p landfall-api`. Expected: PASS.
+- [ ] **Step 2: Implement; regenerate the document.** Document the operation, its `logs` grant (in the grants table, and in the list of grants beside `view`), the window, the caps, the states, the budget, the unstable order of same-nanosecond lines, and that logs are the container's own words, unverified and possibly secret-bearing, in `docs/api.md`. In `docs/configuration.md`, `can` lists `"logs"`, says it is apart from `view` and why, and recommends granting the two together. Change spec 8.2 and add the section 12 row, as above. Run: `cargo nextest run -p landfall-server -p landfall-api`. Expected: PASS.
 - [ ] **Step 3: Gate; security review of PR B. Commit:** `feat(api): a deploy's logs, by its id and window`. Open PR B.
 
 ## PR C: logs for real, and from the CLI
@@ -327,21 +382,24 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   - the network rule;
   - that an override restored from before plan 08 has no `landfall.deploy` label until the next deploy;
   - that the agent's `no_log_match` check works with journald, as `docker logs` reads it;
-  - that logs may hold secrets the application prints, and that `view` reads them.
+  - that logs may hold secrets the application prints, which is why reading them takes the `logs` grant and `view` doesn't.
 - [ ] **Step 3: Gate; `uvx zizmor .`. Commit:** `test(logs): against a real VictoriaLogs and a real journald pipeline`.
 
 ### Task 7: `landfall logs`
 
-**Files:** Modify `crates/cli/src/read.rs` (`ReadCommand::Logs(LogsArgs)`), `crates/cli/src/read/render.rs` (`logs`), `crates/cli/src/read/tests/{render,commands}.rs`, `crates/cli/src/cli/tests.rs` (`every_cli_call_is_in_the_openapi_document` gains `getDeployLogs`), and `render.rs`'s `why` (a last line, `logs: landfall logs <id>`).
+**Files:** Modify `crates/cli/src/read.rs` (`ReadCommand::Logs(LogsArgs)`), `crates/cli/src/read/render.rs` (`logs`), `crates/cli/src/read/tests/{render,commands}.rs`, `crates/cli/src/cli/tests.rs` (`every_cli_call_is_in_the_openapi_document` gains `getDeployLogs`; `whoami_prints_the_logs_grant`), and `render.rs`'s `why` (a last line, `logs: landfall logs <id>`). `render.rs` is at 518 lines of code; if `logs` and its helpers would take it past about 750, put them in a new `read/render/logs.rs` in this PR.
 
 **Interfaces:**
 - `landfall logs <DEPLOY_ID> [--since <TIME>] [--until <TIME>] [--limit <N>] [--all]`, with the flattened `ApiArgs`. `TIME` is unix seconds or RFC 3339, parsed by `jiff` and sent as unix seconds. One page by default. `--all` follows `next_cursor` up to 20 pages, 10,000 lines or 8 MiB of answers, or until a cursor repeats, and then prints a line saying which.
 - Human output: one line per log line, `<at> <message>`, with the message through `display::safe` (so a newline inside a message is escaped and every entry stays one line), and ` [cut]` after a cut one. `not_configured` prints "this controller has no [logs] settings, so it can't read logs", and `not_started` prints "this deploy was never claimed by its host, so it has no logs". Both exit 0. `--json` prints the body as received, and with `--all`, `{"items": [...]}` of every line, as `status` does.
 - `502 logs_unavailable` and `503 busy` exit 2 by plan 07's statuses.
+- A `403 forbidden` from `getDeployLogs` exits as any refusal does, and adds one line after the problem: "reading logs takes the `logs` grant on the deploy's deployment, which `view` doesn't give; `landfall whoami` lists yours". An agent holding `view` meets this first, so the hint saves it a guess.
+- `landfall whoami` prints `logs` like any grant, through `wire_name`; no code changes there, only a test.
 
 - [ ] **Step 1: Failing tests.**
   - In `read/tests/render.rs`: `log_lines_are_escaped_one_per_line` (messages holding `\x1b]0;x\x07`, `\r`, `\n`, `\u{9b}2J` and `\u{202e}`; each output line starts with a timestamp, and none of those bytes appears), `not_configured_and_not_started_say_why`, `cut_lines_are_marked`, `why_ends_with_the_logs_command`.
-  - In `read/tests/commands.rs`: `logs_sends_the_window_as_unix_seconds`, `rfc3339_and_unix_times_are_both_taken`, `a_bad_time_is_refused_before_any_call`, `logs_all_stops_at_its_bounds_and_says_so`, `logs_unavailable_exits_2`.
+  - In `read/tests/commands.rs`: `logs_sends_the_window_as_unix_seconds`, `rfc3339_and_unix_times_are_both_taken`, `a_bad_time_is_refused_before_any_call`, `logs_all_stops_at_its_bounds_and_says_so`, `logs_unavailable_exits_2`, `forbidden_logs_name_the_logs_grant`.
+  - In `cli/tests.rs`: `whoami_prints_the_logs_grant` (a `can` of `["view", "logs"]` prints `view, logs`).
 
   Expected: FAIL.
 - [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-cli`. Expected: PASS.
@@ -351,7 +409,7 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 
 ### Task 8: Events from audit rows, and their signature
 
-**Files:** Create `crates/api/src/webhook.rs`, `crates/server/src/notify.rs`, `crates/server/src/notify/events.rs`, `crates/server/src/notify/sign.rs`, `crates/server/src/notify/tests.rs`, `crates/server/src/notify/tests/{events,sign,schema}.rs`. Modify `crates/api/src/lib.rs`, `crates/server/src/lib.rs` (`mod notify;`), `crates/server/src/api/openapi.rs` (the payload's schema, by the Rulings), `docs/api.md` (a section, "Webhook events"), `docs/api/openapi.json`.
+**Files:** Create `crates/api/src/webhook.rs`, `crates/server/src/notify.rs`, `crates/server/src/notify/events.rs`, `crates/server/src/notify/sign.rs`, `crates/server/src/notify/tests.rs`, `crates/server/src/notify/tests/{events,sign,schema}.rs`. Modify `crates/api/src/lib.rs`, `crates/server/src/lib.rs` (`mod notify;`), `crates/server/src/api/openapi.rs` (the payload's schema, by the Rulings), `docs/api.md` (a section, "Webhook events"), `docs/api/openapi.json`, `docs/design/landfall.md` (8.3).
 
 **Interfaces:**
 - `landfall-api::webhook`:
@@ -365,13 +423,17 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
     - `ReleaseRefused { tag: ReleaseTag, reason: String }`;
     - `ConfigDrift { drifted: bool }`;
     - `RunningDrift { drift: bool }`;
+    - `ControllerAlert { alert: AlertKind, principal: PrincipalId, via: Option<Via>, count: u64, allowance: Option<Allowance> }`, where `AlertKind` is `SignInBarredKey` or `AccessThrottled`, `count` is the row's `attempts` or `dropped`, and `allowance` (`changes`, `reads` or `logs`) is set for `access_throttled` only. `Via` is the wire type `whoAmI` already uses. Nothing else of the row: no `sources`, no session or token id;
     - `Test {}`.
+
+    `AlertKind` and the wire `Allowance` have an `Unknown`, as every growable wire enum does.
 
     `Outcome` is plan 07's.
 - `notify/events.rs`:
   - `pub(crate) struct Row<'a> { pub seq: i64, pub ts: i64, pub kind: EventKind, pub deployment: Option<&'a DeploymentId>, pub host: Option<&'a HostId>, pub detail: &'a str }`.
-  - `#[must_use] pub(crate) fn from_row(row: &Row<'_>, config: &Config) -> Option<(EventName, WebhookEvent)>` has the exhaustive `match` of the Rulings' table, reads only the listed fields of `detail`, and gives `None` for a detail that doesn't parse.
-  - `#[must_use] pub(crate) fn wanted(webhook: &Webhook, config: &Config, name: EventName, row: &Row<'_>) -> bool` holds the scope rule: subscribed event; deployment listed; or, for a host-only row, a listed deployment on that host by the current configuration.
+  - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) enum Topic { Deployment(EventName), Controller }`.
+  - `#[must_use] pub(crate) fn from_row(row: &Row<'_>, config: &Config) -> Option<(Topic, WebhookEvent)>` has the exhaustive `match` of the Rulings' table, reads only the listed fields of `detail`, and gives `None` for a detail that doesn't parse.
+  - `#[must_use] pub(crate) fn wanted(webhook: &Webhook, config: &Config, topic: Topic, row: &Row<'_>) -> bool` holds the scope rule. `Deployment(name)`: subscribed event, and the row's deployment listed, or, for a host-only row, a listed deployment on that host by the current configuration. `Controller`: `webhook.controller_alerts()`, and nothing else.
   - `pub(crate) const MAX_BODY: usize = 16 * 1024` and `pub(crate) fn body(event: &WebhookEvent) -> Vec<u8>`, which cuts `summary`, then `reason` and `rollback_reason`, on character boundaries until the JSON fits.
   - `summary` is one line made by the controller, such as `v1.2.3 rolled back on home-1: <reason>` or `v1.3.0 of app/prod waits for an approver`, with the quoted reason as stored.
 - `notify/sign.rs`:
@@ -385,7 +447,9 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
     - `other_kinds_give_nothing`: every other `EventKind`, by an exhaustive list in the test.
     - `rows_outside_the_webhooks_deployments_give_nothing`.
     - `host_rows_need_a_listed_deployment_on_that_host`: `config_drift` on `home-1` reaches a webhook for `app/prod` on `home-1`, and not one for `app/edge` on `home-2`.
-    - `controller_wide_rows_never_notify`: `token_created`, `signed_in`, `sign_in_barred_key`, `webhook_gave_up` and `webhook_dropped`.
+    - `controller_alerts_reach_only_webhooks_that_opt_in`: `sign_in_barred_key` and `access_throttled` (each allowance) give `controller_alert` with the table's severities to a webhook with `controller_alerts = true`, whatever its deployments, and nothing to one without.
+    - `other_controller_wide_rows_never_notify`: `token_created`, `token_revoked`, `passkey_invite_issued`, `passkey_registered`, `signed_in`, `sign_in_refused`, `registration_refused`, `access_refused` and `signed_out`, to a webhook with `controller_alerts = true` (Task 9 adds `webhook_gave_up` and `webhook_dropped` to this list).
+    - `controller_alerts_carry_no_sources_or_credential_ids`: a `sign_in_barred_key` row whose `sources` hold `10.0.0.5` gives a payload without it.
     - `no_free_text_from_a_writer_that_can_name_another_deployment`: a `request_cancelled` whose reason names `app/secret`, and a `deploy_requested` from a promotion; neither payload contains `app/secret`.
     - `approval_needed_links_to_the_approval_page`, and to nothing without `[approval]`.
     - `a_detail_that_does_not_parse_gives_nothing`.
@@ -398,12 +462,12 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   - In `notify/tests/schema.rs`: `every_event_matches_the_documented_schema`, which validates one payload of each type with `jsonschema` against the document.
 
   Run: `cargo nextest run -p landfall-server notify`. Expected: FAIL.
-- [ ] **Step 3: Implement; regenerate the document.** Document the event types, fields, severities, scope rule, signature headers and the at-least-once, ordered promise in `docs/api.md`. Run: `cargo nextest run -p landfall-server -p landfall-api`. Expected: PASS.
+- [ ] **Step 3: Implement; regenerate the document.** Document the event types, fields, severities, scope rule (with `controller_alerts`), signature headers and the at-least-once, ordered promise in `docs/api.md`. In spec 8.3, after "They stay with `landfall-server audit show` on the controller.", add: "Two of them, a key that may not sign in being used (`sign_in_barred_key`) and a credential over its budget (`access_throttled`), also go to a webhook the reviewed file marks `controller_alerts = true`, by principal and count only: a webhook isn't a token, and the file says who receives them." Run: `cargo nextest run -p landfall-server -p landfall-api`. Expected: PASS.
 - [ ] **Step 4: Gate. Commit:** `feat(notify): webhook events from the audit log, signed by Standard Webhooks`.
 
 ### Task 9: The outbox, filled from the audit log
 
-**Files:** Create `crates/server/migrations/0009_webhooks.sql`, `crates/server/src/store/webhooks.rs`, `crates/server/src/store/tests/webhooks.rs`, `crates/server/src/notify/scan.rs`, `crates/server/src/notify/tests/scan.rs`. Modify `crates/server/src/store.rs` (`mod webhooks;`), `crates/server/src/store/tests.rs` (`mod webhooks;`), `crates/server/src/audit.rs` (`WebhookGaveUp = "webhook_gave_up"`, `WebhookDropped = "webhook_dropped"`, `WebhookTested = "webhook_tested"`), `crates/server/src/api/audit/detail.rs` (the three listed with the never-shown kinds), `crates/server/src/notify.rs`.
+**Files:** Create `crates/server/migrations/0009_webhooks.sql`, `crates/server/src/store/webhooks.rs`, `crates/server/src/store/tests/webhooks.rs`, `crates/server/src/notify/scan.rs`, `crates/server/src/notify/tests/scan.rs`. Modify `crates/server/src/store.rs` (`mod webhooks;`), `crates/server/src/store/tests.rs` (`mod webhooks;`), `crates/server/src/audit.rs` (`WebhookGaveUp = "webhook_gave_up"`, `WebhookDropped = "webhook_dropped"`, `WebhookTested = "webhook_tested"`), `crates/server/src/api/audit/detail.rs` (the three listed with the never-shown kinds), `crates/server/src/notify.rs`, `crates/server/src/notify/tests/events.rs` (the three new kinds in `other_controller_wide_rows_never_notify`).
 
 **Interfaces:**
 - `0009_webhooks.sql`:
@@ -435,7 +499,8 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
     - `scan_enqueues_only_wanted_events`.
     - `scan_resumes_after_a_restart_without_repeats`.
     - `scan_reads_at_most_500_rows_a_pass`.
-    - `webhook_rows_never_enqueue_events`: a `webhook_gave_up` row gives nothing.
+    - `webhook_rows_never_enqueue_events`: a `webhook_gave_up` row gives nothing, to a webhook with `controller_alerts = true` too.
+  - In `notify/tests/events.rs`, `other_controller_wide_rows_never_notify` gains the three new kinds.
     - `a_scan_failure_is_logged_and_the_next_pass_goes_on`.
 
   Run: `cargo nextest run -p landfall-server webhooks scan`. Expected: FAIL.
@@ -453,12 +518,12 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   - `pub(crate) const FIRST: Duration = Duration::from_secs(10)`, `CAP: Duration = Duration::from_secs(900)`, `GIVE_UP_AFTER: Duration = Duration::from_secs(86_400)`.
   - `#[must_use] pub(crate) fn delay(attempts: u32, retry_after: Option<Duration>, random: u64) -> Duration` gives `step = min(FIRST * 2^attempts, CAP)` and returns `step / 2 + random % (step / 2 + 1)`. A `Retry-After` within `CAP` replaces it if larger. The random value is injected, from `getrandom` in production.
 - `notify/send.rs`:
-  - `pub(crate) struct Sender { client: reqwest::Client, url: Url, key: WebhookKey, name: WebhookName }`, built through `outbound::client` with connect 5 s and total 10 s.
+  - `pub(crate) struct Sender { client: reqwest::Client, url: Url, key: WebhookKey, name: WebhookName }`, with a hand-written `Debug` showing only `name`. `Sender::new(webhook: &Webhook, secret: &WebhookSecret, lookup: Arc<dyn Lookup>) -> Result<Sender, OutboundError>` takes the policy from the fleet file's `Webhook` and the URL and key from the secrets file, and builds the client through `outbound::client` with connect 5 s and total 10 s.
   - `pub(crate) async fn send(&self, id: &str, body: &[u8], now: i64) -> Verdict`: `POST` with `Content-Type: application/json`, the three signature headers, and the body. It never reads the response body beyond 4 KiB, and drops it.
   - `pub(crate) enum Verdict { Delivered, Retry { status: Option<u16>, retry_after: Option<Duration> }, GiveUp { status: Option<u16>, why: GaveUp } }`, by the Rulings.
   - `pub(crate) async fn deliver_loop(store, sender, stop)` takes the oldest due event, sends it, records the verdict, and gives up an event whose `queued_at` is more than `GIVE_UP_AFTER` ago. It sleeps until the next due time or 200 ms, whichever is later, and stops when `stop` turns true. Each verdict other than `Delivered` is logged through `logger` as `webhook <name>: <status or error kind>, attempt <n>`, and nothing more.
-- `notify::run` runs `scan_once` every `SCAN_INTERVAL` and one `deliver_loop` per webhook, each as its own task. A store error in any of them is logged and retried at its next turn, and never ends `serve`.
-- `cli/webhook.rs`: `landfall-server webhook test --config <FILE> --secrets <FILE> [--db <FILE>] <NAME>` builds the `test` event (`id` `landfall-test-<unix ns>`, deployment and host `null`), sends it once through `Sender`, prints the verdict, writes `webhook_tested` with `{webhook, status}` if `--db` is given, and exits 0 on `Delivered` and 1 otherwise.
+- `notify::run` builds one `Sender` per `config.webhooks()` entry from `secrets.webhook(name)`, which `secrets::load` has already guaranteed exists, and runs `scan_once` every `SCAN_INTERVAL` and one `deliver_loop` per webhook, each as its own task. A store error in any of them is logged and retried at its next turn, and never ends `serve`.
+- `cli/webhook.rs`: `landfall-server webhook test --config <FILE> --secrets <FILE> [--db <FILE>] <NAME>` parses the configuration, loads the secrets against it with `secrets::load` (so the same refusals as `serve`, the URL's policy check included, come first), builds the `test` event (`id` `landfall-test-<unix ns>`, deployment and host `null`), sends it once through `Sender`, prints `webhook <name>: <verdict>` and never the URL, writes `webhook_tested` with `{webhook, status}` if `--db` is given, and exits 0 on `Delivered` and 1 otherwise.
 
 - [ ] **Step 1: Failing tests.**
   - In `notify/tests/backoff.rs`: `backoff_doubles_with_jitter_to_the_cap` (a table of attempts × random edges, every value in `[step/2, step]`), `retry_after_is_honoured_up_to_the_cap`.
@@ -477,7 +542,7 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
     - `no_log_line_or_audit_row_holds_the_key_or_url`: after a give-up, `logger::gate`'s captured stderr and every audit row are searched for the key's base64 and the URL's path.
     - `proxy_in_the_environment_is_not_used`.
     - `stop_ends_the_loop_with_the_event_kept`.
-  - In `cli/tests/webhook.rs`: `webhook_test_sends_one_signed_test_event`, `webhook_test_of_an_unknown_name_fails`, `webhook_test_exits_1_on_refusal`.
+  - In `cli/tests/webhook.rs`: `webhook_test_sends_one_signed_test_event` (to the URL from the secrets file), `webhook_test_of_an_unknown_name_fails`, `webhook_test_exits_1_on_refusal`, `webhook_test_refuses_secrets_that_dont_match_the_config` (a missing entry, and an entry for no webhook), `webhook_test_prints_the_name_not_the_url` (stdout and stderr hold neither the URL's path nor its query, on success and on a refusal).
 
   Run: `cargo nextest run -p landfall-server notify webhook`. Expected: FAIL.
 - [ ] **Step 2: Implement.** Run: `cargo nextest run -p landfall-server`. Expected: PASS, with `serve_upkeep` and `stuck_stderr` unchanged.
@@ -485,7 +550,7 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 
 ### Task 11: End to end, and the docs
 
-**Files:** Create `crates/agent/tests/e2e/notify.rs`. Modify `crates/agent/tests/e2e/main.rs` (`mod notify;`), `crates/agent/tests/e2e/world.rs` (a webhook receiver on loopback, the secrets file, `[[webhook]]` with `allow_private_network`), `docs/operations.md`, `docs/design/landfall.md`, `docs/api.md`, `README.md`, `AGENTS.md`.
+**Files:** Create `crates/agent/tests/e2e/notify.rs`. Modify `crates/agent/tests/e2e/main.rs` (`mod notify;`), `crates/agent/tests/e2e/world.rs` (a webhook receiver on loopback, the secrets file holding its URL and key with mode 0600, `[[webhook]]` with `allow_private_network` and no URL), `docs/operations.md`, `docs/configuration.md`, `docs/design/landfall.md`, `docs/api.md`, `README.md`, `AGENTS.md`.
 
 **Interfaces:**
 - The e2e world gains `Receiver`, an axum server on `127.0.0.1:0` that records each request's headers and body and answers what the test sets (200, 500 or a hang).
@@ -500,26 +565,32 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   Run: `cargo nextest run -p landfall-agent --test e2e notify`. Expected: PASS.
 - [ ] **Step 2: Docs.**
   - `docs/operations.md`, a new section, "Notifications", after "Logs". It covers:
-    - `[[webhook]]` and each key;
-    - the secrets file, its rules and `whsec_` keys, made with `head -c 32 /dev/urandom | base64`;
+    - `[[webhook]]` and each key (`name`, `events`, `deployments`, `controller_alerts`, `allow_private_network`), and that it has no URL;
+    - the secrets file: its rules (owner-only, no link, 16 KiB), its schema keyed by webhook name (`url` and `key` for each, `[logs] bearer`), that every webhook needs an entry and an entry with no webhook is refused, `whsec_` keys made with `head -c 32 /dev/urandom | base64`, and that changing either file takes a controller restart;
+    - why the URL is in the secrets file: a receiver's URL is often a capability (a Home Assistant webhook id), the fleet file goes to every host, and landfall never logs, audits or prints it;
     - the event table;
     - the scope rule;
     - the network rule, and why link-local is never reached;
-    - that the URL is visible to whoever reads the fleet file;
+    - `controller_alerts`: the two alerts, what they carry and leave out, and that they go only to a webhook that opts in;
     - how to verify a signature, with the test vector between the marker lines `docs_vector_matches` reads;
     - retries, give-ups and the audit rows they write;
-    - Home Assistant: a webhook trigger, `allow_private_network = true`, and a notification from `trigger.json.summary`;
+    - Home Assistant: a webhook trigger, its URL in the secrets file, `allow_private_network = true` in the fleet file, and a notification from `trigger.json.summary`;
     - warden as a receiver;
     - `landfall-server webhook test`;
     - that a webhook new to the file starts from now.
+  - `docs/configuration.md`: `[[webhook]]` gains `controller_alerts` if Task 2's text didn't already say it, and points to `docs/operations.md` for the secrets file.
   - `docs/design/landfall.md`:
+    - Section 4: "Controller → webhook receivers (signed POST, outbound only)" beside the VictoriaLogs line.
+    - Section 6.1: the controller's secrets (each webhook's URL and key, the VictoriaLogs bearer) are in a separate file only the controller's user can read, never in the fleet file, which every host receives.
     - Section 9: `landfall logs` built.
     - Section 10: what exists — the labels, journald, Vector, VictoriaLogs, `[logs]`, the window and the caps, "not configured".
     - Section 8.4: approval notifications built, through any webhook.
-    - Section 12, three rows:
-      - a webhook used to reach inside the network: the address policy, no redirects, no proxy; residual: an allowed private receiver can be made to receive at most what the events carry;
+    - Section 12, three more rows:
+      - a webhook used to reach inside the network: the address policy, set in the reviewed fleet file and checked on the URL's literal at start-up and on every resolved address, no redirects, no proxy; residual: an allowed private receiver can be made to receive at most what the events carry;
       - a forged notification: HMAC; residual: whoever holds the secrets file;
-      - logs read with a stolen token: `view` only, the logs budget, the global cap; residual: what the application wrote to its logs.
+      - a receiver's capability URL leaked: it is only in the controller's secrets file, never in the fleet file, a log, an audit row or an answer; residual: whoever can read the controller's secrets file.
+
+      (The row on logs read with a stolen token is Task 5's.)
   - `docs/api.md`: complete for both.
   - `README.md`: one line each for logs and notifications.
   - `AGENTS.md`: the server's `secrets`, `outbound`, `logs` and `notify` modules; the agent's labels; the `docker_logs` tests and what they need.
@@ -535,7 +606,8 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
   - Section 2, the "silent failure" anti-goal: every refusal, failed check and rollback is notified as `deploy_finished`, `deploy_refused` or `release_refused` (Task 8). A webhook that can't deliver is itself recorded (Task 9).
   - Section 4, controller → VictoriaLogs read-only: Task 4 only reads.
   - Section 7.2, notify on success and failure, with a failed rollback critical: Task 8's table.
-  - Sections 8.2 and 8.3: logs under `view` (Task 5); webhook scope by configured deployments, controller-wide rows never (Task 8).
+  - Sections 8.2 and 8.3: logs under the new `logs` grant, with spec 8.2 changed (Task 5); webhook scope by configured deployments, and of controller-wide rows only `sign_in_barred_key` and `access_throttled`, only to a webhook with `controller_alerts = true`, with spec 8.3 changed (Task 8).
+  - Section 6.1: the fleet file holds no secret; webhook URLs and keys are in the controller's secrets file (Task 3), and the spec says so (Task 11).
   - Section 8.4, approval notifications through any webhook: `approval_needed` (Task 8), with warden documented as a receiver (Task 11).
   - Section 9, deploys with logs as a resource, and `landfall logs`: Tasks 5 and 7.
   - Section 10, every sentence: labels with the deploy id (Task 1), journald and Vector (Task 6), the URL in configuration (Task 2), by deploy id and time window (Task 5), "not configured" (Task 5).
@@ -543,31 +615,32 @@ Run the tasks in order. These are the places where two tasks meet, so a parallel
 - **The brief's requirements.**
   - Signed payloads: Standard Webhooks HMAC-SHA256.
   - Timeouts, size caps and no redirects: `outbound`.
-  - SSRF: `net::class`, the literal check and the policy resolver.
+  - SSRF: `net::class`, the literal check (on the secrets file's URLs against the fleet file's policy) and the policy resolver.
   - Retries with backoff and jitter: Task 10.
   - Never blocking deploys: own tasks, own tables; Task 11 `a_dead_receiver_does_not_slow_a_deploy`.
   - No hidden deployments or hosts: Task 8.
-  - Secrets never logged: Tasks 3 and 10.
-  - Logs scoped per deploy and grant: Task 5.
+  - Secrets never logged, the webhook URL counted as one: Tasks 2 (`TargetUrl`'s `Debug`), 3, 9 and 10.
+  - Logs scoped per deploy and by their own grant: Task 5.
   - Injection impossible: Task 4, with the real proof in Task 6.
   - Size and time bounds, and the read budget: Tasks 4 and 5.
   - Escaped CLI output: Task 7.
-  - The OpenAPI document and the grant test: Task 5's `CASES` row.
+  - The OpenAPI document and the grant test: Task 5's `CASES` row under `logs`, and `logs` in the test's `ROLES`.
 - **Types.**
   - `NetPolicy`, `AddrClass`, `TargetUrl` (Task 2) are used by Task 3's resolver and clients.
   - `Logs`, `Webhook`, `WebhookName`, `EventName` (Task 2) are used by Tasks 4, 8, 9 and 10.
-  - `Secrets`, `WebhookKey`, `Bearer`, `Lookup`, `outbound::client`, `read_capped` (Task 3) are used by Tasks 4 and 10.
+  - `Secrets`, `WebhookSecret`, `WebhookKey`, `Bearer`, `Lookup`, `outbound::client`, `read_capped` (Task 3) are used by Tasks 4 and 10.
+  - `Permission::Logs`, `permitted_by_id` and `Allowance` (Task 5) are used by Task 8's `controller_alert` (`Allowance`, through the audit row's detail) and Task 7's hint.
   - `LogsClient`, `LogsQuery`, `LogLine`, `LogsError` (Task 4) are used by Task 5.
   - `LogsView` and `LogsState` (Task 5) are used by Task 7.
-  - `WebhookEvent`, `EventData`, `Row`, `from_row`, `wanted`, `body`, `signature` (Task 8) are used by Tasks 9 and 10.
+  - `WebhookEvent`, `EventData`, `Topic`, `Row`, `from_row`, `wanted`, `body`, `signature` (Task 8) are used by Tasks 9 and 10.
   - The store's webhook functions and the three new `EventKind`s (Task 9) are used by Task 10.
   - `DeployPlan::deploy_id` (Task 1) feeds the label that Tasks 5 and 6 query by.
-- **File sizes.** All new code is in new files: `net.rs`, `config/{logs,webhook}.rs`, `secrets.rs`, `outbound.rs`, `logs/`, `api/logs.rs`, `notify/`, `store/webhooks.rs`, `cli/webhook.rs`. `cli.rs`, `store.rs`, `config/mod.rs` and `config/raw.rs` gain only module lines, fields, getters and a spawn; `raw.rs` grows by its two raw sections, about 50 lines, staying under 650.
+- **File sizes.** All new code is in new files: `net.rs`, `config/{logs,webhook}.rs`, `secrets.rs`, `outbound.rs`, `logs/`, `api/logs.rs`, `notify/`, `store/webhooks.rs`, `cli/webhook.rs`. `cli.rs`, `store.rs`, `config/mod.rs` and `config/raw.rs` gain only module lines, fields, getters and a spawn; `raw.rs` grows by its two raw sections, about 50 lines, staying under 650. `config/mod.rs` gains one `Permission` variant (Task 5). `api/tests/grants.rs` (646) gains one `CASES` row and a path function, about 12 lines; `api/tests.rs` (552) a role and the seed. `cli/read/render.rs` (518) splits `logs` into `read/render/logs.rs` if it would pass about 750.
 - **Proportion:** eleven tasks in five PRs, with interfaces and test names. The only code in the plan is the shape of the query and the backoff formula, which the tests alone don't fix.
 
-## Open questions
+## Owner's decisions (2026-11-08)
 
-1. **Should webhook URLs move out of the fleet file into the secrets file?** In the fleet file a reviewer sees where notifications go, but a capability path (such as a Home Assistant webhook id) is then readable on every host and in the config repository. The plan keeps it in the fleet file, refuses credentials in it, and documents the exposure.
-2. **Should logs have their own grant rather than riding on `view`?** Section 8.2 has none, so the plan follows the spec. Application logs can carry secrets that state never does. A `logs` grant is a spec change and one `can()` arm.
-3. **Should controller-wide alerts (`sign_in_barred_key`, `access_throttled`) be sendable by webhook?** The plan never sends controller-wide rows, by spec 8.3's reasoning about tokens. A webhook isn't a token, though, and a barred key being used is the kind of thing an operator wants on a phone.
-4. **Is the owner fine with CI pulling VictoriaLogs and Vector images (pinned by digest, at least 7 days old) for the `docker_logs` tests?** They are the only way to pin the LogsQL quoting and the journald field names against the real thing.
+1. **Webhook URLs live in the controller's secrets file**, next to each webhook's `whsec_` key, keyed by webhook name. The fleet file's `[[webhook]]` keeps its name, what it receives and its network policy, and no URL. Rulings: "The controller's secrets live in one file outside the fleet configuration" and "The webhook's URL is a capability"; Tasks 2, 3, 10 and 11.
+2. **Logs have their own grant, `logs`**, not `view`: logs can hold secrets an application printed, and an AI agent with `view` must not get them by that alone. A spec 8.2 change. Ruling: "Logs are read by deploy, under a grant of their own"; Tasks 5 and 7.
+3. **Controller-wide security alerts may go by webhook**, opt-in per webhook with `controller_alerts = true`: `sign_in_barred_key` and `access_throttled`, and no other controller-wide row. A spec 8.3 change. Ruling: "A webhook hears only of its own deployments"; Tasks 2 and 8.
+4. **CI may pull VictoriaLogs and Vector images**, pinned by digest and at least 7 days old, for the `docker_logs` tests. Task 6.
