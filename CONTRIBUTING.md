@@ -152,8 +152,15 @@ the repository and in your copy, until N+1 is out.
    `Cargo.lock` by name, and shows the rest whole.
    Then it asks you to type the version, with no flag to skip that, signs `v<version>` on that
    commit with git's signing key, checks the signature against the signers file, deletes the tag
-   if it doesn't match, says what it pushes and pushes it. Name the release key with
-   `--signing-key "key::ssh-ed25519 <base64>"` if it isn't git's default. Leave out `--push` to see
+   if it doesn't match, says what it pushes and pushes it. It signs with the key in your own copy
+   ("Once" step 7), which it passes to git as `key::<type> <base64>`, so there is no flag for it; during a
+   rotation that file holds two keys, so name the signing one with `--signing-key <path to a file
+   holding it>` or `--signing-key "key::ssh-ed25519 <base64>"`, keeping the space. Before asking, it
+   checks that your SSH agent offers that key: `SSH_AUTH_SOCK` has to reach the agent that holds the
+   release key, such as 1Password's. `IdentityAgent` in `~/.ssh/config` covers `ssh` alone, not git
+   signing. If `gpg.ssh.program` names something other than `ssh-keygen`, git signs its own way, so
+   it says so and skips that check; the signature is verified after signing either way. A
+   `--signing-key` that isn't one of your trusted keys is refused before the review. Leave out `--push` to see
    the push command instead. **The first time, run it without `--push`,** as its checks of a dry
    run's jobs haven't met a real one yet: a refusal there costs nothing. Agents never run it, and
    it refuses when stdin isn't a terminal.

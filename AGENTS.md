@@ -213,7 +213,8 @@ cargo deny check
   `.github/`, itself, `Cargo.*` and `TRUST_CODE` (all of `crates/origin/`, the tag, release
   and signer code in core, the agent's verifier and judge, the CLI's verify, host, project
   and agent-release code, and `crates/cli/assets/`), with control characters escaped, and
-  wants the version typed. It protects against a stolen GitHub token, not against code
+  wants the version typed. It signs with the trusted file itself (one key) or `--signing-key`, and
+  first checks the SSH agent offers that key (`test_release_tag_signing.py`). It protects against a stolen GitHub token, not against code
   running as the owner, which can wrap `git` or edit the helper: there only the release
   key's per-signature prompt and the owner's judgment remain. Its tests are
   `test_release_tag.py`, with the terminal injected, and `test_release_tag_git.py`, with
