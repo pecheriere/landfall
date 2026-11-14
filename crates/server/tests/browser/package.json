@@ -4,6 +4,6 @@
   "type": "module",
   "description": "Drives the controller's pages in Chromium with a virtual authenticator.",
   "dependencies": {
-    "playwright": "1.64.1"
+    "playwright": "1.65.0"
   }
 }
