@@ -58,7 +58,7 @@ JOB_STEPS = {
     "build-linux": [CHECKOUT, BUILDX, BUILD, "Check the static binaries", UPLOAD],
     "build-macos": [
         CHECKOUT,
-        "dtolnay/rust-toolchain",
+        'rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal',
         "cargo build --release --locked -p landfall-cli --target aarch64-apple-darwin",
         UPLOAD,
     ],
