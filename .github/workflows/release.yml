@@ -73,8 +73,13 @@ jobs:
   ci:
     needs: on-main
     uses: $/.github/workflows/ci.yml
+    # A called workflow's jobs get no more than this, and GitHub refuses to start one whose jobs
+    # ask for more, even jobs that will be skipped. ci.yml's report-red-main (pushes to main and
+    # the daily run only) asks for issues: write; a tag skips it, and every other job there keeps
+    # contents: read.
     permissions:
       contents: read
+      issues: write # for ci.yml's report-red-main, which a tag skips
 
   # The gate: a lightweight tag, or one signed by another key, never reaches `publish`, and costs a
   # tag number and nothing else. It reads the signers from the tagged commit, and a file with no key

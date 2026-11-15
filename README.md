@@ -1,5 +1,7 @@
 # landfall
 
+[![CI on main](https://github.com/pecheriere/landfall/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pecheriere/landfall/actions/workflows/ci.yml?query=branch%3Amain)
+
 Continuous delivery for self-hosters: a signed GitHub release goes in, a
 verified and healthy container comes out on your hosts, or the previous
 version stays and you can see exactly why.
