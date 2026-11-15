@@ -427,9 +427,17 @@ class WholeFileTests(WorkflowCase):
         self.assertEqual(job_names(self.lines), JOBS)
 
     def test_only_publish_can_write(self) -> None:
-        """Four lines, all in that job, and no broader form anywhere."""
+        """Four lines, all in that job, and no broader form anywhere.
+
+        The one other write is `ci`'s `issues: write`, which only the caller can grant to the
+        called ci.yml's report-red-main, a job a tag skips.
+        """
         writing = [line.strip() for line in self.lines if WRITE.search(line)]
-        self.assertEqual(sorted(writing), sorted(PUBLISH_WRITES))
+        self.assertEqual(sorted(writing), sorted((*PUBLISH_WRITES, "issues: write")))
+        self.assertEqual(
+            [line.strip() for line in job(self.lines, "ci") if WRITE.search(line)],
+            ["issues: write"],
+        )
         self.assertEqual(
             sorted(line.strip() for line in self.publish if WRITE.search(line)),
             sorted(PUBLISH_WRITES),
@@ -472,6 +480,7 @@ class WholeFileTests(WorkflowCase):
                 "    uses: $/.github/workflows/ci.yml",
                 "    permissions:",
                 "      contents: read",
+                "      issues: write",
             ],
         )
 
