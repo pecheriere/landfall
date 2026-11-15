@@ -284,7 +284,10 @@ cargo deny check
 - Run `GH_TOKEN=$(gh auth token) uvx zizmor .` before pushing; it must report
   no findings.
 - Fix, don't exempt: a failing advisory, lint or zizmor finding is fixed, not
-  ignored in `deny.toml`, `#[allow]` or a zizmor config.
+  ignored in `deny.toml`, `#[allow]` or a zizmor config. The one exception: an
+  advisory whose fixed version no released dependency can reach yet may be ignored
+  in `deny.toml`, only on the owner's ruling, with the true exposure in a comment
+  and a bead that removes the entry.
 
 ## Conventions
 

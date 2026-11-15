@@ -5,6 +5,16 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "all"
+ignore = [
+  # Bundled SQLite before 3.54.0 can hand back uninitialised page-cache memory when it
+  # opens a database with a crafted `-wal` file. The controller service opens only its
+  # own database, but `landfall-server audit verify`, `audit show` and `backup --db`
+  # open whatever path they are given, `-wal` included: run on a copy someone else
+  # wrote, they could print memory of their own process. The owner accepts that until
+  # the fix can land. It needs libsqlite3-sys >= 0.39, so sqlx 0.9.1, which isn't
+  # released yet: sqlx 0.9.0 caps it below 0.38. Remove this with bead lf-js9.
+  { id = "RUSTSEC-2026-0459", reason = "no released sqlx allows the fixed libsqlite3-sys; bead lf-js9 removes this" },
+]
 
 [licenses]
 version = 2
