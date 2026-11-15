@@ -181,11 +181,11 @@ cargo deny check
 - Actions are pinned to the full commit SHA of a release at least 7 days old
   (comment with the tag); `persist-credentials: false` on every checkout;
   `--locked` everywhere. Only GitHub-owned actions and the allow-listed
-  third-party ones (dtolnay/rust-toolchain, Swatinem/rust-cache,
-  EmbarkStudios/cargo-deny-action, zizmorcore/zizmor-action,
-  ossf/scorecard-action, docker/setup-buildx-action,
+  third-party ones (Swatinem/rust-cache, EmbarkStudios/cargo-deny-action,
+  zizmorcore/zizmor-action, ossf/scorecard-action, docker/setup-buildx-action,
   docker/build-push-action, docker/login-action, docker/metadata-action)
-  may be used.
+  may be used. The Rust toolchain comes from the runner's own rustup
+  (`rustup toolchain install`, which reads `rust-toolchain.toml`), not an action.
 - Build caches (rust-cache, the Docker build cache) are for CI only. The
   release workflow's publish job builds without a cache.
 - The Dockerfile pins the Rust base image by digest (the version in
