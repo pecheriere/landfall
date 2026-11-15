@@ -82,13 +82,17 @@ jobs:
     # About 3 times a run with the binaries to build cold, as `docker-build`'s limit has it. The
     # tests themselves take a couple of minutes.
     timeout-minutes: 60
+    env:
+      # rust-cache sets this where it runs. This job has none, and a cold build gains nothing
+      # from incremental compilation.
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # No rust-cache: beside a Docker build, zizmor reads one as a way to poison what's built, and
-      # the test build is only a few minutes without.
-      # Installs what rust-toolchain.toml names: its channel, components and profile.
+      # the test build is only a few minutes without. The toolchain is what rust-toolchain.toml
+      # names: its channel, components and profile.
       - run: rustup toolchain install
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
