@@ -5,6 +5,14 @@ all-features = true
 version = 2
 yanked = "deny"
 unmaintained = "all"
+ignore = [
+  # Bundled SQLite before 3.54.0 can hand back uninitialised page-cache memory when it
+  # opens a database with a crafted `-wal` file. The controller opens only its own WAL
+  # database, at its configured path, so planting one already takes write access to its
+  # data directory. The fix, libsqlite3-sys >= 0.39, needs sqlx 0.9.1, which isn't
+  # released yet: sqlx 0.9.0 caps it below 0.38. Remove this with bead lf-js9.
+  { id = "RUSTSEC-2026-0459", reason = "no released sqlx allows the fixed libsqlite3-sys; bead lf-js9 removes this" },
+]
 
 [licenses]
 version = 2
