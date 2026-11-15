@@ -2,3 +2,7 @@
 __pycache__/
 node_modules/
 .superpowers/
+
+# Beads: the issue database lives in .beads/ and is backed up outside git
+.beads/
+.beads.gate.lock

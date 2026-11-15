@@ -1,6 +1,6 @@
 ## What and why
 
-<!-- What this changes, and why. Link the issue it closes. -->
+<!-- What this changes, and why. Name the bead it delivers. -->
 
 ## Checklist
 

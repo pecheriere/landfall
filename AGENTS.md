@@ -8,6 +8,23 @@ with health checks and automatic rollback, under per-deployment rules and
 passkey approvals. Agents drive it through a typed API. Design:
 `docs/design/landfall.md`.
 
+## Tracking work: beads
+
+Work in this repository is tracked with [beads](https://github.com/gastownhall/beads)
+(`bd`), prefix `lf-`, not GitHub issues. Pull requests name the bead they deliver.
+GitHub issues stay open for reports from outside the project; each one is triaged
+into a bead that links it (`--external-ref=gh-<number>`).
+
+- `bd prime` loads the workflow; `bd ready` lists work with no blockers.
+- Create a bead before starting work, claim it (`bd update <id> --claim`) and
+  close it when the change merges.
+- No markdown TODO lists or memory files: use beads, and `bd remember` for
+  durable project knowledge.
+
+The database runs as a local Dolt server that `bd` starts on demand. Its data
+lives in `.beads/` in the main checkout and is never committed: worktrees use
+the main checkout's database.
+
 ## Crate map
 
 - `landfall-core` (`crates/core`): shared library with no I/O: validated
@@ -284,7 +301,7 @@ cargo deny check
 - Keep files small: split a source file by responsibility before it passes
   about 800 lines of code, and move a large test module into its own file. When
   a change would push a file past that, split it in the same change, or track
-  the split as an issue. The parts of `foo.rs`
+  the split as a bead. The parts of `foo.rs`
   go in `foo/`, its tests in `foo/tests.rs` (shared fixtures) and
   `foo/tests/<scenario>.rs`, as `daemon` does. A test names what it imports
   rather than using `use super::*`.
